@@ -1,0 +1,637 @@
+diff --git a/tools/ingest-converter/src/main/java/org/logstash/ingest/Date.java b/tools/ingest-converter/src/main/java/org/logstash/ingest/Date.java
+index 5b3da493223..a6a4d0aac5e 100644
+--- a/tools/ingest-converter/src/main/java/org/logstash/ingest/Date.java
++++ b/tools/ingest-converter/src/main/java/org/logstash/ingest/Date.java
+@@ -1,14 +1,11 @@
+ package org.logstash.ingest;
+ 
+ import java.io.IOException;
+-import java.io.InputStreamReader;
+-import java.io.Reader;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+ import java.nio.file.Paths;
+ import javax.script.Invocable;
+ import javax.script.ScriptEngine;
+-import javax.script.ScriptEngineManager;
+ import javax.script.ScriptException;
+ 
+ /**
+@@ -21,13 +18,8 @@ private Date() {
+     }
+ 
+     public static void main(final String... args) throws ScriptException, NoSuchMethodException {
+-        try (final Reader reader = new InputStreamReader(
+-            Grok.class.getResourceAsStream("/ingest-date.js")
+-        )
+-        ) {
+-            final ScriptEngine engine =
+-                new ScriptEngineManager().getEngineByName("nashorn");
+-            engine.eval(reader);
++        try {
++            final ScriptEngine engine = JsUtil.engine("/ingest-date.js");
+             Files.write(Paths.get(args[1]), ((String) ((Invocable) engine).invokeFunction(
+                 "ingest_to_logstash_date",
+                 new String(
+diff --git a/tools/ingest-converter/src/main/java/org/logstash/ingest/Grok.java b/tools/ingest-converter/src/main/java/org/logstash/ingest/Grok.java
+index cb44384f620..0bd0f84d144 100644
+--- a/tools/ingest-converter/src/main/java/org/logstash/ingest/Grok.java
++++ b/tools/ingest-converter/src/main/java/org/logstash/ingest/Grok.java
+@@ -1,14 +1,11 @@
+ package org.logstash.ingest;
+ 
+ import java.io.IOException;
+-import java.io.InputStreamReader;
+-import java.io.Reader;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+ import java.nio.file.Paths;
+ import javax.script.Invocable;
+ import javax.script.ScriptEngine;
+-import javax.script.ScriptEngineManager;
+ import javax.script.ScriptException;
+ 
+ /**
+@@ -21,13 +18,8 @@ private Grok() {
+     }
+ 
+     public static void main(final String... args) throws ScriptException, NoSuchMethodException {
+-        try (final Reader reader = new InputStreamReader(
+-                     Grok.class.getResourceAsStream("/ingest-grok.js")
+-             )
+-        ) {
+-            final ScriptEngine engine =
+-                new ScriptEngineManager().getEngineByName("nashorn");
+-            engine.eval(reader);
++        try {
++            final ScriptEngine engine = JsUtil.engine("/ingest-grok.js");
+             Files.write(Paths.get(args[1]), ((String) ((Invocable) engine).invokeFunction(
+                 "ingest_to_logstash_grok",
+                 new String(
+diff --git a/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java b/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java
+new file mode 100644
+index 00000000000..19b386bc019
+--- /dev/null
++++ b/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java
+@@ -0,0 +1,39 @@
++package org.logstash.ingest;
++
++import java.io.IOException;
++import java.io.InputStreamReader;
++import java.io.Reader;
++import javax.script.ScriptEngine;
++import javax.script.ScriptEngineManager;
++import javax.script.ScriptException;
++
++final class JsUtil {
++
++    private JsUtil() {
++        // Utility Class
++    }
++
++    /**
++     * Sets up a {@link ScriptEngine} for a given file loaded after `ingest-shared.js`.
++     * @param file File to set up {@link ScriptEngine} for
++     * @return {@link ScriptEngine} for file
++     */
++    public static ScriptEngine engine(final String file) {
++        final ScriptEngine engine =
++            new ScriptEngineManager().getEngineByName("nashorn");
++        try (
++            final Reader shared = reader("/ingest-shared.js");
++            final Reader reader = reader(file)
++        ) {
++            engine.eval(shared);
++            engine.eval(reader);
++        } catch (final IOException | ScriptException ex) {
++            throw new IllegalStateException(ex);
++        }
++        return engine;
++    }
++
++    private static Reader reader(final String file) {
++        return new InputStreamReader(JsUtil.class.getResourceAsStream(file));
++    }
++}
+diff --git a/tools/ingest-converter/src/main/resources/ingest-date.js b/tools/ingest-converter/src/main/resources/ingest-date.js
+index 5016e3e7873..ac92129231f 100644
+--- a/tools/ingest-converter/src/main/resources/ingest-date.js
++++ b/tools/ingest-converter/src/main/resources/ingest-date.js
+@@ -3,134 +3,47 @@
+  */
+ function ingest_to_logstash_date(json) {
+ 
+-    function quote_string(string) {
+-        return "\"" + string.replace(/"/g, "\\\"") + "\"";
+-    }
+-
+-    function wrap_in_curly(string) {
+-        return "{\n" + string + "\n}";
+-    }
+-
+-    function create_field(name, content) {
+-        return name + " => " + content;
+-    }
+-
+-    function create_hash(name, content) {
+-        return name + " " + wrap_in_curly(content);
+-    }
+-
+-    /**
+-     * All hash fields in LS start on a new line.
+-     * @param fields Array of Strings of Serialized Hash Fields
+-     * @returns {string} Joined Serialization of Hash Fields
+-     */
+-    function join_hash_fields(fields) {
+-        return fields.join("\n");
+-    }
+-
+-    /**
+-     * Translates the JSON naming pattern (`name.qualifier.sub`) into the LS pattern
+-     * [name][qualifier][sub] for all applicable tokens in the given string.
+-     * This function correctly identifies and omits renaming of string literals.
+-     * @param string to replace naming pattern in
+-     * @returns {string} with Json naming translated into grok naming
+-     */
+-    function dots_to_square_brackets(string) {
+-
+-        function token_dots_to_square_brackets(string) {
+-            return string.replace(/(\w*)\.(\w*)/g, "$1][$2").replace(/(\w+)}/g, "$1]}")
+-                .replace(/{(\w+):(\w+)]/g, "{$1:[$2]");
+-        }
+-
+-        var literals = string.match(/\(\?:%{.*\|-\)/);
+-        var i;
+-        var tokens = [];
+-        // Copy String before Manipulation
+-        var right = string;
+-        if (literals) {
+-            for (i = 0; i < literals.length; ++i) {
+-                var parts = right.split(literals[i], 2);
+-                right = parts[1];
+-                tokens.push(token_dots_to_square_brackets(parts[0]));
+-                tokens.push(literals[i]);
++    function map_processor(processor) {
++
++        function date_hash(processor) {
++            var date_json = processor["date"];
++            var formats = date_json["formats"];
++            var match_contents = [IngestConverter.dots_to_square_brackets(date_json["field"])];
++            for (var f in formats) {
++                match_contents.push(formats[f]);
+             }
+-        }
+-        tokens.push(token_dots_to_square_brackets(right));
+-        return tokens.join("");
+-    }
+-
+-    /**
+-     * Converts Ingest/JSON style pattern array to LS pattern array, performing necessary variable
+-     * name and quote escaping adjustments.
+-     * @param patterns Pattern Array in JSON formatting
+-     * @returns {string} Pattern array in Grok formatting
+-     */
+-    function create_pattern_array(patterns) {
+-        return "[\n" + patterns.map(dots_to_square_brackets).map(quote_string).join(",\n") + "\n]";
+-    }
+-
+-
+-    /**
+-     * Fixes indentation in LS string.
+-     * @param string LS string to fix indentation in, that has no indentation intentionally with
+-     * all lines starting on a token without preceding spaces.
+-     * @returns {string} LS string indented by 3 spaces per level
+-     */
+-    function fix_indent(string) {
+-
+-        function indent(string, shifts) {
+-            return new Array(shifts * 3 + 1).join(" ") + string;
+-        }
+-
+-        var lines = string.split("\n");
+-        var count = 0;
+-        var i;
+-        for (i = 0; i < lines.length; ++i) {
+-            if (lines[i].match(/(\{|\[)$/)) {
+-                lines[i] = indent(lines[i], count);
+-                ++count;
+-            } else if (lines[i].match(/(\}|\])$/)) {
+-                --count;
+-                lines[i] = indent(lines[i], count);
+-                // Only indent line if previous line ended on relevant control char.
+-            } else if (i > 0 && lines[i - 1].match(/(=>\s+".+"|,|\{|\}|\[|\])$/)) {
+-                lines[i] = indent(lines[i], count);
++            var date_contents = IngestConverter.create_field(
++                "match",
++                IngestConverter.create_pattern_array(match_contents)
++            );
++            if (date_json["target_field"]) {
++                var target = IngestConverter.create_field(
++                    "target",
++                    IngestConverter.quote_string(
++                        IngestConverter.dots_to_square_brackets(date_json["target_field"])
++                    )
++                );
++                date_contents = IngestConverter.join_hash_fields([date_contents, target]);
+             }
++            if (date_json["timezone"]) {
++                var timezone = IngestConverter.create_field(
++                    "timezone",
++                    IngestConverter.quote_string(date_json["timezone"])
++                );
++                date_contents = IngestConverter.join_hash_fields([date_contents, timezone]);
++            }
++            if (date_json["locale"]) {
++                var locale = IngestConverter.create_field(
++                    "locale", IngestConverter.quote_string(date_json["locale"]));
++                date_contents = IngestConverter.join_hash_fields([date_contents, locale]);
++            }
++            return date_contents;
+         }
+-        return lines.join("\n");
+-    }
+-
+-    function date_hash(processor) {
+-        var date_json = processor["date"];
+-        var formats = date_json["formats"];
+-        var match_contents = [dots_to_square_brackets(date_json["field"])];
+-        for (var f in formats) {
+-            match_contents.push(formats[f]);
+-        }
+-        var date_contents = create_field(
+-            "match",
+-            create_pattern_array(match_contents)
+-        );
+-        if (date_json["target_field"]) {
+-            var target = create_field("target", quote_string(dots_to_square_brackets(date_json["target_field"])));
+-            date_contents = join_hash_fields([date_contents, target]);
+-        }
+-        if (date_json["timezone"]) {
+-            var timezone = create_field("timezone", quote_string(date_json["timezone"]));
+-            date_contents = join_hash_fields([date_contents, timezone]);
+-        }
+-        if (date_json["locale"]) {
+-            var locale = create_field("locale", quote_string(date_json["locale"]));
+-            date_contents = join_hash_fields([date_contents, locale]);
+-        }
+-        return date_contents;
+-    }
+ 
+-    function map_processor (processor) {
+-        return fix_indent(
+-            create_hash(
++        return IngestConverter.fix_indent(
++            IngestConverter.create_hash(
+                 "filter",
+-                create_hash(
++                IngestConverter.create_hash(
+                     "date", date_hash(processor)
+                 )
+             )
+diff --git a/tools/ingest-converter/src/main/resources/ingest-grok.js b/tools/ingest-converter/src/main/resources/ingest-grok.js
+index aebd0af4239..f4126add26b 100644
+--- a/tools/ingest-converter/src/main/resources/ingest-grok.js
++++ b/tools/ingest-converter/src/main/resources/ingest-grok.js
+@@ -3,140 +3,50 @@
+  */
+ function ingest_to_logstash_grok(json) {
+ 
+-    function quote_string(string) {
+-        return "\"" + string.replace(/"/g, "\\\"") + "\"";
+-    }
+-
+-    function wrap_in_curly(string) {
+-        return "{\n" + string + "\n}";
+-    }
+-
+-    function create_field(name, content) {
+-        return name + " => " + content;
+-    }
+-
+-    function create_hash_field(name, content) {
+-        return create_field(name, wrap_in_curly(content));
+-    }
+-
+-    function create_hash(name, content) {
+-        return name + " " + wrap_in_curly(content);
+-    }
++    function map_processor(processor) {
+ 
+-    /**
+-     * All hash fields in LS start on a new line.
+-     * @param fields Array of Strings of Serialized Hash Fields
+-     * @returns {string} Joined Serialization of Hash Fields
+-     */
+-    function join_hash_fields(fields) {
+-        return fields.join("\n");
+-    }
+-
+-    /**
+-     * Converts Ingest/JSON style pattern array to LS pattern array, performing necessary variable
+-     * name and quote escaping adjustments.
+-     * @param patterns Pattern Array in JSON formatting
+-     * @returns {string} Pattern array in LS formatting
+-     */
+-    function create_pattern_array(patterns) {
+-
+-        /**
+-         * Translates the JSON naming pattern (`name.qualifier.sub`) into the grok pattern
+-         * [name][qualifier][sub] for all applicable tokens in the given string.
+-         * This function correctly identifies and omits renaming of string literals.
+-         * @param string to replace naming pattern in
+-         * @returns {string} with Json naming translated into grok naming
+-         */
+-        function dots_to_square_brackets(string) {
+-
+-            function token_dots_to_square_brackets(string) {
+-                return string.replace(/(\w*)\.(\w*)/g, "$1][$2").replace(/(\w+)}/g, "$1]}")
+-                    .replace(/{(\w+):(\w+)]/g, "{$1:[$2]");
+-            }
+-
+-            var literals = string.match(/\(\?:%{.*\|-\)/);
+-            var i;
+-            var tokens = [];
+-            // Copy String before Manipulation
+-            var right = string;
+-            if (literals) {
+-                for (i = 0; i < literals.length; ++i) {
+-                    var parts = right.split(literals[i], 2);
+-                    right = parts[1];
+-                    tokens.push(token_dots_to_square_brackets(parts[0]));
+-                    tokens.push(literals[i]);
+-                }
+-            }
+-            tokens.push(token_dots_to_square_brackets(right));
+-            return tokens.join("");
++        function create_hash_field(name, content) {
++            return IngestConverter.create_field(
++                name, IngestConverter.wrap_in_curly(content)
++            );
+         }
+ 
+-        return "[\n" + patterns.map(dots_to_square_brackets).map(quote_string).join(",\n") + "\n]";
+-    }
+-
+-    function create_pattern_definition_hash(definitions) {
+-        var content = [];
+-        for (var key in definitions) {
+-            if (definitions.hasOwnProperty(key)) {
+-                content.push(create_field(quote_string(key), quote_string(definitions[key])));
+-            }
+-        }
+-        return create_hash_field("pattern_definitions", content);
+-    }
+-
+-    /**
+-     * Fixes indentation in LS string.
+-     * @param string LS string to fix indentation in, that has no indentation intentionally with
+-     * all lines starting on a token without preceding spaces.
+-     * @returns {string} LS string indented by 3 spaces per level
+-     */
+-    function fix_indent(string) {
+-
+-        function indent(string, shifts) {
+-            return new Array(shifts * 3 + 1).join(" ") + string;
+-        }
+-
+-        var lines = string.split("\n");
+-        var count = 0;
+-        var i;
+-        for (i = 0; i < lines.length; ++i) {
+-            if (lines[i].match(/(\{|\[)$/)) {
+-                lines[i] = indent(lines[i], count);
+-                ++count;
+-            } else if (lines[i].match(/(\}|\])$/)) {
+-                --count;
+-                lines[i] = indent(lines[i], count);
+-            // Only indent line if previous line ended on relevant control char.
+-            } else if (i > 0 && lines[i - 1].match(/(=>\s+".+"|,|\{|\}|\[|\])$/)) {
+-                lines[i] = indent(lines[i], count);
++        function grok_hash(processor) {
++            function create_pattern_definition_hash(definitions) {
++                var content = [];
++                for (var key in definitions) {
++                    if (definitions.hasOwnProperty(key)) {
++                        content.push(
++                            IngestConverter.create_field(
++                                IngestConverter.quote_string(key),
++                                IngestConverter.quote_string(definitions[key]))
++                        );
++                    }
++                }
++                return create_hash_field("pattern_definitions", content);
+             }
+-        }
+-        return lines.join("\n");
+-    }
+ 
+-    function grok_hash(processor) {
+-        var grok_data = processor["grok"];
+-        var grok_contents = create_hash_field(
+-            "match",
+-            create_field(
+-                quote_string(grok_data["field"]),
+-                create_pattern_array(grok_data["patterns"])
+-            )
+-        );
+-        if (grok_data["pattern_definitions"]) {
+-            grok_contents = join_hash_fields([
++            var grok_data = processor["grok"];
++            var grok_contents = create_hash_field(
++                "match",
++                IngestConverter.create_field(
++                    IngestConverter.quote_string(grok_data["field"]),
++                    IngestConverter.create_pattern_array(grok_data["patterns"])
++                )
++            );
++            if (grok_data["pattern_definitions"]) {
++                grok_contents = IngestConverter.join_hash_fields([
+                     grok_contents,
+                     create_pattern_definition_hash(grok_data["pattern_definitions"])
+-            ])
++                ])
++            }
++            return grok_contents;
+         }
+-        return grok_contents;
+-    }
+ 
+-    function map_processor (processor) {
+-        return fix_indent(
+-            create_hash(
++        return IngestConverter.fix_indent(
++            IngestConverter.create_hash(
+                 "filter",
+-                create_hash(
++                IngestConverter.create_hash(
+                     "grok", grok_hash(processor)
+                 )
+             )
+diff --git a/tools/ingest-converter/src/main/resources/ingest-shared.js b/tools/ingest-converter/src/main/resources/ingest-shared.js
+new file mode 100644
+index 00000000000..d195d68d917
+--- /dev/null
++++ b/tools/ingest-converter/src/main/resources/ingest-shared.js
+@@ -0,0 +1,93 @@
++var IngestConverter = {
++    /**
++     * Translates the JSON naming pattern (`name.qualifier.sub`) into the LS pattern
++     * [name][qualifier][sub] for all applicable tokens in the given string.
++     * This function correctly identifies and omits renaming of string literals.
++     * @param string to replace naming pattern in
++     * @returns {string} with Json naming translated into grok naming
++     */
++    dots_to_square_brackets: function (string) {
++
++        function token_dots_to_square_brackets(string) {
++            return string.replace(/(\w*)\.(\w*)/g, "$1][$2")
++                .replace(/\[(\w+)(}|$)/g, "[$1]$2")
++                .replace(/{(\w+):(\w+)]/g, "{$1:[$2]")
++                .replace(/^(\w+)]\[/g, "[$1][");
++        }
++
++        var literals = string.match(/\(\?:%{.*\|-\)/);
++        var i;
++        var tokens = [];
++        // Copy String before Manipulation
++        var right = string;
++        if (literals) {
++            for (i = 0; i < literals.length; ++i) {
++                var parts = right.split(literals[i], 2);
++                right = parts[1];
++                tokens.push(token_dots_to_square_brackets(parts[0]));
++                tokens.push(literals[i]);
++            }
++        }
++        tokens.push(token_dots_to_square_brackets(right));
++        return tokens.join("");
++    }, quote_string: function (string) {
++        return "\"" + string.replace(/"/g, "\\\"") + "\"";
++    }, wrap_in_curly: function (string) {
++        return "{\n" + string + "\n}";
++    }, create_field: function (name, content) {
++        return name + " => " + content;
++    }, create_hash: function (name, content) {
++        return name + " " + this.wrap_in_curly(content);
++    },
++
++    /**
++     * All hash fields in LS start on a new line.
++     * @param fields Array of Strings of Serialized Hash Fields
++     * @returns {string} Joined Serialization of Hash Fields
++     */
++    join_hash_fields: function (fields) {
++        return fields.join("\n");
++    },
++
++    /**
++     * Fixes indentation in LS string.
++     * @param string LS string to fix indentation in, that has no indentation intentionally with
++     * all lines starting on a token without preceding spaces.
++     * @returns {string} LS string indented by 3 spaces per level
++     */
++    fix_indent: function (string) {
++
++        function indent(string, shifts) {
++            return new Array(shifts * 3 + 1).join(" ") + string;
++        }
++
++        var lines = string.split("\n");
++        var count = 0;
++        var i;
++        for (i = 0; i < lines.length; ++i) {
++            if (lines[i].match(/(\{|\[)$/)) {
++                lines[i] = indent(lines[i], count);
++                ++count;
++            } else if (lines[i].match(/(\}|\])$/)) {
++                --count;
++                lines[i] = indent(lines[i], count);
++                // Only indent line if previous line ended on relevant control char.
++            } else if (i > 0 && lines[i - 1].match(/(=>\s+".+"|,|\{|\}|\[|\])$/)) {
++                lines[i] = indent(lines[i], count);
++            }
++        }
++        return lines.join("\n");
++    },
++
++    /**
++     * Converts Ingest/JSON style pattern array to LS pattern array, performing necessary variable
++     * name and quote escaping adjustments.
++     * @param patterns Pattern Array in JSON formatting
++     * @returns {string} Pattern array in LS formatting
++     */
++    create_pattern_array: function (patterns) {
++        return "[\n" 
++            + patterns.map(this.dots_to_square_brackets).map(this.quote_string).join(",\n") 
++            + "\n]";
++    }
++};
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/DateTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/DateTest.java
+index 33a71ed3262..e8b036efd93 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/DateTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/DateTest.java
+@@ -24,4 +24,13 @@ public void convertsFieldDefinitionsCorrectly() throws Exception {
+             utf8File(date), is(utf8File(resourcePath("logstashDateExtraFields.conf")))
+         );
+     }
++
++    @Test
++    public void convertsDotsInDateField() throws Exception {
++        final String date = getResultPath(temp);
++        Date.main(resourcePath("dotsInDateField.json"), date);
++        assertThat(
++            utf8File(date), is(utf8File(resourcePath("dotsInDateField.conf")))
++        );
++    }
+ }
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/IngestTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/IngestTest.java
+index c5ac7402d28..af3036a4426 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/IngestTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/IngestTest.java
+@@ -23,7 +23,7 @@ static String resourcePath(final String name) {
+         return IngestTest.class.getResource(name).getPath();
+     }
+ 
+-    static String getResultPath(TemporaryFolder temp) throws Exception {
++    static String getResultPath(TemporaryFolder temp) throws IOException {
+         return temp.newFolder().toPath().resolve("converted").toString();
+     }
+ }
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/dotsInDateField.conf b/tools/ingest-converter/src/test/resources/org/logstash/ingest/dotsInDateField.conf
+new file mode 100644
+index 00000000000..ab945d17553
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/dotsInDateField.conf
+@@ -0,0 +1,12 @@
++filter {
++   date {
++      match => [
++         "initial_date",
++         "dd/MM/yyyy hh:mm:ss",
++         "dd/MM/yyyy"
++      ]
++      target => "[apache][timestamp]"
++      timezone => "Europe/Amsterdam"
++      locale => "en"
++   }
++}
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/dotsInDateField.json b/tools/ingest-converter/src/test/resources/org/logstash/ingest/dotsInDateField.json
+new file mode 100644
+index 00000000000..4a9a3576604
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/dotsInDateField.json
+@@ -0,0 +1,14 @@
++{
++  "description" : "...",
++  "processors" : [
++    {
++      "date" : {
++        "field" : "initial_date",
++        "target_field" : "apache.timestamp",
++        "formats" : ["dd/MM/yyyy hh:mm:ss", "dd/MM/yyyy"],
++        "timezone" : "Europe/Amsterdam",
++        "locale": "en"
++      }
++    }
++  ]
++}

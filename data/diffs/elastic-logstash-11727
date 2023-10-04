@@ -1,0 +1,1190 @@
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index e09d7907c9a..3e2096e7729 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -386,7 +386,7 @@ def worker_loop(batch_size, batch_delay)
+   end
+ 
+   def filter_batch(batch)
+-    filter_func(batch.to_a).each do |e|
++    filter_func(batch.collection).each do |e|
+       #these are both original and generated events
+       batch.merge(e) unless e.cancelled?
+     end
+@@ -408,11 +408,13 @@ def filter_batch(batch)
+   # Take an array of events and send them to the correct output
+   def output_batch(batch, output_events_map)
+     # Build a mapping of { output_plugin => [events...]}
+-    batch.to_a.each do |event|
++    batch.collection.each do |event|
+       # We ask the AST to tell us which outputs to send each event to
+       # Then, we stick it in the correct bin
+-      output_func(event).each do |output|
+-        output_events_map[output].push(event)
++      unless event.cancelled?
++        output_func(event).each do |output|
++          output_events_map[output].push(event)
++        end
+       end
+     end
+     # Now that we have our output to event mapping we can just invoke each output
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/AckedBatch.java b/logstash-core/src/main/java/org/logstash/ackedqueue/AckedBatch.java
+index 8daceb2b46c..a09a7844b6a 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/AckedBatch.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/AckedBatch.java
+@@ -21,11 +21,12 @@
+ package org.logstash.ackedqueue;
+ 
+ import java.io.IOException;
+-import org.jruby.Ruby;
+-import org.jruby.RubyBoolean;
+-import org.jruby.RubyHash;
++import java.util.LinkedHashSet;
++import java.util.Set;
+ import org.logstash.Event;
+-import org.logstash.ext.JrubyEventExtLibrary;
++import org.logstash.ext.JrubyEventExtLibrary.RubyEvent;
++
++import static org.logstash.RubyUtil.RUBY;
+ 
+ public final class AckedBatch {
+     private Batch batch;
+@@ -36,13 +37,10 @@ public static AckedBatch create(Batch batch) {
+         return ackedBatch;
+     }
+ 
+-    public RubyHash toRubyHash(final Ruby runtime) {
+-        final RubyBoolean trueValue = runtime.getTrue();
+-        final RubyHash result = RubyHash.newHash(runtime);
+-        this.batch.getElements().forEach(e -> result.fastASet(
+-            JrubyEventExtLibrary.RubyEvent.newRubyEvent(runtime, (Event) e),
+-            trueValue
+-            )
++    public Set<RubyEvent> toSet() {
++        final Set<RubyEvent> result = new LinkedHashSet<>(this.batch.size());
++        this.batch.getElements().forEach(e ->
++            result.add(RubyEvent.newRubyEvent(RUBY, (Event) e))
+         );
+         return result;
+     }
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/AckedReadBatch.java b/logstash-core/src/main/java/org/logstash/ackedqueue/AckedReadBatch.java
+index 74a2dafec8d..35bad8db037 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/AckedReadBatch.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/AckedReadBatch.java
+@@ -21,14 +21,16 @@
+ package org.logstash.ackedqueue;
+ 
+ import org.jruby.RubyArray;
+-import org.jruby.RubyHash;
++import org.jruby.runtime.builtin.IRubyObject;
+ import org.logstash.ackedqueue.ext.JRubyAckedQueueExt;
+ import org.logstash.execution.MemoryReadBatch;
+ import org.logstash.execution.QueueBatch;
+ import org.logstash.ext.JrubyEventExtLibrary.RubyEvent;
+-
+ import java.io.IOException;
+ import java.util.Collection;
++import java.util.HashSet;
++import java.util.LinkedHashSet;
++import java.util.Set;
+ 
+ import static org.logstash.RubyUtil.RUBY;
+ 
+@@ -36,9 +38,7 @@ public final class AckedReadBatch implements QueueBatch {
+ 
+     private AckedBatch ackedBatch;
+ 
+-    private RubyHash originals;
+-
+-    private RubyHash generated;
++    private Set<RubyEvent> events;
+ 
+     public static AckedReadBatch create(
+         final JRubyAckedQueueExt queue,
+@@ -59,41 +59,42 @@ private AckedReadBatch(
+         } catch (IOException e) {
+             throw new IllegalStateException(e);
+         }
+-        if (batch == null) {
+-            originals = RubyHash.newHash(RUBY);
+-            ackedBatch = null;
+-        } else {
+-            ackedBatch = batch;
+-            originals = ackedBatch.toRubyHash(RUBY);
+-        }
+-        generated = RubyHash.newHash(RUBY);
++        events = (batch == null) ? new LinkedHashSet<>() : batch.toSet();
++        ackedBatch = batch;
+     }
+ 
+     @Override
+     public void merge(final RubyEvent event) {
+-        if (!event.isNil() && !originals.containsKey(event)) {
+-            generated.put(event, RUBY.getTrue());
+-        }
++        events.add(event);
+     }
+ 
+-    @SuppressWarnings({"unchecked", "rawtypes"})
++
++
++//    IRubyObject[] rubyEvents = new IRubyObject[events.length];
++//            for (int i = 0; i < events.length; i++) {
++//        rubyEvents[i] = RubyEvent.newRubyEvent(context.runtime, events[i]);
++//    }
++//            return result;
++//            return context.runtime.newArrayNoCopy(rubyEvents);
++
++
++    @SuppressWarnings({"unchecked"})
+     @Override
+-    public RubyArray to_a() {
+-        final RubyArray result = RUBY.newArray(filteredSize());
+-        for (final RubyEvent event : (Collection<RubyEvent>) originals.keys()) {
+-            if (!MemoryReadBatch.isCancelled(event)) {
+-                result.append(event);
+-            }
+-        }
+-        for (final RubyEvent event : (Collection<RubyEvent>) generated.keys()) {
++    public RubyArray<RubyEvent> to_a() {
++//        @SuppressWarnings({"unchecked"}) final RubyArray<RubyEvent> result = RUBY.newArray(events.size());
++
++        IRubyObject[] result = new IRubyObject[events.size()];
++
++        int i = 0;
++        for (final RubyEvent event : events) {
+             if (!MemoryReadBatch.isCancelled(event)) {
+-                result.append(event);
++                result[i++] = event;
+             }
+         }
+-        return result;
++        return RUBY.newArrayNoCopy(result);
++//       return result;
+     }
+ 
+-    @SuppressWarnings({"unchecked"})
+     @Override
+     public Collection<RubyEvent> collection() {
+         // This only returns the originals and does not filter cancelled one
+@@ -101,7 +102,7 @@ public Collection<RubyEvent> collection() {
+         // non-cancelled exists. We should revisit this AckedReadBatch
+         // implementation and get rid of this dual original/generated idea.
+         // The MemoryReadBatch does not use such a strategy.
+-        return originals.directKeySet();
++        return events;
+     }
+ 
+     public void close() throws IOException {
+@@ -112,6 +113,6 @@ public void close() throws IOException {
+ 
+     @Override
+     public int filteredSize() {
+-        return originals.size() + generated.size();
++        return events.size();
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java b/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
+index 015cbed05b8..7e121f900de 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
+@@ -22,7 +22,6 @@
+ import co.elastic.logstash.api.Codec;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+-import org.jruby.RubyArray;
+ import org.jruby.RubyHash;
+ import org.jruby.javasupport.JavaUtil;
+ import org.jruby.runtime.builtin.IRubyObject;
+@@ -318,19 +317,20 @@ public void compute(final QueueBatch batch, final boolean flush, final boolean s
+            compute(batch.collection(), flush, shutdown);
+         }
+ 
+-        @SuppressWarnings({"rawtypes", "unchecked"})
+-        @Override
+-        public void compute(final RubyArray batch, final boolean flush, final boolean shutdown) {
+-            compute((Collection<RubyEvent>) batch, flush, shutdown);
+-        }
++//        @SuppressWarnings({"unchecked"})
++//        @Override
++//        public void compute(final RubyArray<RubyEvent> batch, final boolean flush, final boolean shutdown) {
++//            compute((Collection<RubyEvent>) batch, flush, shutdown);
++//        }
+ 
+-        @SuppressWarnings({"rawtypes", "unchecked"})
+-        private void compute(final Collection<RubyEvent> batch, final boolean flush, final boolean shutdown) {
+-            final RubyArray<RubyEvent> outputBatch = RubyUtil.RUBY.newArray();
++        @Override
++        public void compute(final Collection<RubyEvent> batch, final boolean flush, final boolean shutdown) {
++            final ArrayList<RubyEvent> outputBatch = new ArrayList<>();
+             // send batch one-by-one as single-element batches down the filters
+-            final RubyArray<RubyEvent> filterBatch = RubyUtil.RUBY.newArray(1);
++            final ArrayList<RubyEvent> filterBatch = new ArrayList<>(1);
+             for (final RubyEvent e : batch) {
+-                filterBatch.set(0, e);
++                filterBatch.clear();
++                filterBatch.add(e);
+                 final Collection<RubyEvent> result = compiledFilters.compute(filterBatch, flush, shutdown);
+                 copyNonCancelledEvents(result, outputBatch);
+                 compiledFilters.clear();
+@@ -343,13 +343,12 @@ public final class CompiledUnorderedExecution extends CompiledExecution {
+ 
+         @Override
+         public void compute(final QueueBatch batch, final boolean flush, final boolean shutdown) {
+-            compute(batch.to_a(), flush, shutdown);
++            compute(batch.collection(), flush, shutdown);
+         }
+ 
+-        @SuppressWarnings({"rawtypes", "unchecked"})
+         @Override
+-        public void compute(final RubyArray batch, final boolean flush, final boolean shutdown) {
+-            final RubyArray<RubyEvent> outputBatch = RubyUtil.RUBY.newArray();
++        public void compute(final Collection<RubyEvent> batch, final boolean flush, final boolean shutdown) {
++            final ArrayList<RubyEvent> outputBatch = new ArrayList<>();
+             final Collection<RubyEvent> result = compiledFilters.compute(batch, flush, shutdown);
+             copyNonCancelledEvents(result, outputBatch);
+             compiledFilters.clear();
+@@ -385,8 +384,7 @@ public abstract class CompiledExecution {
+ 
+         public abstract void compute(final QueueBatch batch, final boolean flush, final boolean shutdown);
+ 
+-        @SuppressWarnings({"rawtypes"})
+-        public abstract void compute(final RubyArray batch, final boolean flush, final boolean shutdown);
++        public abstract void compute(final Collection<RubyEvent> batch, final boolean flush, final boolean shutdown);
+ 
+         /**
+          * Instantiates the graph of compiled filter section {@link Dataset}.
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractFilterDelegatorExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractFilterDelegatorExt.java
+index d79c2d8c37c..d322716c781 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractFilterDelegatorExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractFilterDelegatorExt.java
+@@ -31,12 +31,14 @@
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.logstash.RubyUtil;
+-import org.logstash.ext.JrubyEventExtLibrary;
++import org.logstash.ext.JrubyEventExtLibrary.RubyEvent;
+ import org.logstash.instrument.metrics.AbstractNamespacedMetricExt;
+ import org.logstash.instrument.metrics.MetricKeys;
+ import org.logstash.instrument.metrics.counter.LongCounter;
+ 
++import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.LinkedHashSet;
+ import java.util.concurrent.TimeUnit;
+ 
+ @JRubyClass(name = "AbstractFilterDelegator")
+@@ -125,26 +127,63 @@ public IRubyObject getId() {
+         return id;
+     }
+ 
++    private final Collection<RubyEvent> COL = new LinkedHashSet<>(0);
++
+     @JRubyMethod(name = "multi_filter")
+     @SuppressWarnings({"unchecked", "rawtypes"})
+     public RubyArray multiFilter(final IRubyObject input) {
+-        RubyArray batch = (RubyArray) input;
++        final RubyArray batch;
++        if (input instanceof RubyArray) {
++            batch = (RubyArray<RubyEvent>) input;
++        } else {
++            batch = RubyArray.newArray(RubyUtil.RUBY, input.toJava(COL.getClass()));
++        }
++        batch.removeIf(e -> ((RubyEvent)e).getEvent().isCancelled());
++
+         eventMetricIn.increment((long) batch.size());
+         final long start = System.nanoTime();
+-        final RubyArray result = doMultiFilter(batch);
++        final RubyArray<RubyEvent> result = doMultiFilter(batch);
+         eventMetricTime.increment(TimeUnit.MILLISECONDS.convert(System.nanoTime() - start, TimeUnit.NANOSECONDS));
+-        int count = 0;
+-        for (final JrubyEventExtLibrary.RubyEvent event : (Collection<JrubyEventExtLibrary.RubyEvent>) result) {
+-            if (!event.getEvent().isCancelled()) {
+-                ++count;
+-            }
++//        int count = 0;
++
++        result.removeIf(e -> ((RubyEvent)e).getEvent().isCancelled());
++
++//        for (final RubyEvent event : (Collection<RubyEvent>) result) {
++//            if (!event.getEvent().isCancelled()) {
++//                ++count;
++//            }
++//        }
++        eventMetricOut.increment(result.size());
++        return result;
++    }
++
++    @SuppressWarnings({"unchecked", "rawtypes"})
++    public RubyArray multiFilter(final Collection<RubyEvent> input) {
++        eventMetricIn.increment((long) input.size());
++        final long start = System.nanoTime();
++        final RubyArray<RubyEvent> batch;
++        if (input instanceof RubyArray) {
++            batch = (RubyArray<RubyEvent>) input;
++        } else {
++            batch = RubyArray.newArray(RubyUtil.RUBY, input);
+         }
+-        eventMetricOut.increment((long) count);
++        batch.removeIf(e -> ((RubyEvent)e).getEvent().isCancelled());
++        final RubyArray result = doMultiFilter(batch);
++        eventMetricTime.increment(TimeUnit.MILLISECONDS.convert(System.nanoTime() - start, TimeUnit.NANOSECONDS));
++//        int count = 0;
++//        for (final RubyEvent event : (Collection<RubyEvent>) result) {
++//            if (!event.getEvent().isCancelled()) {
++//                ++count;
++//            }
++//        }
++//        eventMetricOut.increment((long) count);
++
++        result.removeIf(e -> ((RubyEvent)e).getEvent().isCancelled());
++        eventMetricOut.increment(result.size());
+         return result;
+     }
+ 
+-    @SuppressWarnings({"rawtypes"})
+-    protected abstract RubyArray doMultiFilter(final RubyArray batch);
++    protected abstract RubyArray<RubyEvent> doMultiFilter(final RubyArray<RubyEvent> batch);
+ 
+     @JRubyMethod(name = "flush")
+     @SuppressWarnings("rawtypes")
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractOutputDelegatorExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractOutputDelegatorExt.java
+index 7dd28e955d8..0f6a3cc4528 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractOutputDelegatorExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractOutputDelegatorExt.java
+@@ -32,7 +32,7 @@
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.logstash.RubyUtil;
+-import org.logstash.ext.JrubyEventExtLibrary;
++import org.logstash.ext.JrubyEventExtLibrary.RubyEvent;
+ import org.logstash.instrument.metrics.AbstractMetricExt;
+ import org.logstash.instrument.metrics.AbstractNamespacedMetricExt;
+ import org.logstash.instrument.metrics.MetricKeys;
+@@ -113,8 +113,7 @@ public IRubyObject metricEvents() {
+     @SuppressWarnings("unchecked")
+     @JRubyMethod(name = OUTPUT_METHOD_NAME)
+     public IRubyObject multiReceive(final IRubyObject events) {
+-        @SuppressWarnings("rawtypes")
+-        final RubyArray batch = (RubyArray) events;
++        final RubyArray<RubyEvent> batch = (RubyArray<RubyEvent>) events;
+         final int count = batch.size();
+         eventMetricIn.increment((long) count);
+         final long start = System.nanoTime();
+@@ -124,6 +123,16 @@ public IRubyObject multiReceive(final IRubyObject events) {
+         return this;
+     }
+ 
++    public IRubyObject multiReceive(final Collection<RubyEvent> events) {
++        final int count = events.size();
++        eventMetricIn.increment((long) count);
++        final long start = System.nanoTime();
++        doOutput(events);
++        eventMetricTime.increment(TimeUnit.MILLISECONDS.convert(System.nanoTime() - start, TimeUnit.NANOSECONDS));
++        eventMetricOut.increment((long) count);
++        return this;
++    }
++
+     protected void initMetrics(final String id, final AbstractMetricExt metric) {
+         this.metric = metric;
+         final ThreadContext context = RubyUtil.RUBY.getCurrentContext();
+@@ -142,7 +151,7 @@ protected void initMetrics(final String id, final AbstractMetricExt metric) {
+ 
+     protected abstract IRubyObject getConcurrency(ThreadContext context);
+ 
+-    protected abstract void doOutput(Collection<JrubyEventExtLibrary.RubyEvent> batch);
++    protected abstract void doOutput(Collection<RubyEvent> batch);
+ 
+     protected abstract void close(ThreadContext context);
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/CommonActions.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/CommonActions.java
+index a1cd558b761..6454d19de65 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/CommonActions.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/CommonActions.java
+@@ -26,6 +26,7 @@
+ import org.logstash.StringInterpolation;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.function.Consumer;
+@@ -116,7 +117,7 @@ static void addField(Event evt, Map<String, Object> fieldsToAdd) {
+                         ((List) val).add(valueToSet);
+                         evt.setField(keyToSet, val);
+                     } else {
+-                        @SuppressWarnings("rawtypes") RubyArray list = RubyArray.newArray(RubyUtil.RUBY, 2);
++                        ArrayList<Object> list = new ArrayList<>(2);
+                         list.add(val);
+                         list.add(valueToSet);
+                         evt.setField(keyToSet, list);
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/Dataset.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/Dataset.java
+index 4f28aa710a7..7591c637f25 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/Dataset.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/Dataset.java
+@@ -22,7 +22,7 @@
+ 
+ import java.util.Collection;
+ import org.jruby.RubyArray;
+-import org.logstash.ext.JrubyEventExtLibrary;
++import org.logstash.ext.JrubyEventExtLibrary.RubyEvent;
+ 
+ /**
+  * <p>A data structure backed by a {@link RubyArray} that represents one step of execution flow of a
+@@ -44,8 +44,11 @@ public interface Dataset {
+     Dataset IDENTITY = new Dataset() {
+         @SuppressWarnings("unchecked")
+         @Override
+-        public Collection<JrubyEventExtLibrary.RubyEvent> compute(final @SuppressWarnings("rawtypes") RubyArray batch,
+-                                                                  final boolean flush, final boolean shutdown) {
++        public Collection<RubyEvent> compute(
++                final Collection<RubyEvent> batch,
++                final boolean flush,
++                final boolean shutdown)
++        {
+             return batch;
+         }
+ 
+@@ -64,7 +67,7 @@ public void clear() {
+      * the pipeline it belongs to is shut down
+      * @return Computed {@link RubyArray} of {@link org.logstash.ext.JrubyEventExtLibrary.RubyEvent}
+      */
+-    Collection<JrubyEventExtLibrary.RubyEvent> compute(@SuppressWarnings({"rawtypes"}) RubyArray batch,
++    Collection<RubyEvent> compute(Collection<RubyEvent> batch,
+         boolean flush, boolean shutdown);
+ 
+     /**
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
+index 2e30d678ca7..8cf82545ebe 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
+@@ -25,13 +25,12 @@
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.stream.Collectors;
+-import org.jruby.RubyArray;
+ import org.jruby.RubyHash;
+ import org.jruby.internal.runtime.methods.DynamicMethod;
+ import org.jruby.runtime.Block;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.logstash.RubyUtil;
+-import org.logstash.ext.JrubyEventExtLibrary;
++import org.logstash.ext.JrubyEventExtLibrary.RubyEvent;
+ 
+ /**
+  * Compiler that can compile implementations of {@link Dataset} at runtime.
+@@ -62,7 +61,7 @@ public static ComputeStepSyntaxElement<SplitDataset> splitDataset(
+         final ValueSyntaxElement elseData = fields.add(new ArrayList<>());
+         final ValueSyntaxElement right = fields.add(DatasetCompiler.Complement.class);
+         final VariableDefinition event =
+-            new VariableDefinition(JrubyEventExtLibrary.RubyEvent.class, "event");
++            new VariableDefinition(RubyEvent.class, "event");
+         fields.addAfterInit(
+             Closure.wrap(
+                 SyntaxFactory.assignment(
+@@ -122,7 +121,7 @@ public static ComputeStepSyntaxElement<Dataset> filterDataset(
+                 .map(fields::add)
+                 .collect(Collectors.toList()
+             );
+-            @SuppressWarnings("rawtypes") final RubyArray inputBuffer = RubyUtil.RUBY.newArray();
++            final ArrayList<RubyEvent> inputBuffer = new ArrayList<>();
+             clear.add(clearSyntax(parentFields));
+             final ValueSyntaxElement inputBufferField = fields.add(inputBuffer);
+             compute = withInputBuffering(
+@@ -137,7 +136,7 @@ public static ComputeStepSyntaxElement<Dataset> filterDataset(
+      * <p>Builds a terminal {@link Dataset} for the filters from the given parent {@link Dataset}s.</p>
+      * <p>If the given set of parent {@link Dataset} is empty the sum is defined as the
+      * trivial dataset that does not invoke any computation whatsoever.</p>
+-     * {@link Dataset#compute(RubyArray, boolean, boolean)} is always
++     * {@link Dataset#compute(Collection, boolean, boolean)} is always
+      * {@link Collections#emptyList()}.
+      * @param parents Parent {@link Dataset} to sum
+      * @return Dataset representing the sum of given parent {@link Dataset}
+@@ -159,7 +158,7 @@ public static Dataset terminalFilterDataset(final Collection<Dataset> parents) {
+             .stream()
+             .map(fields::add)
+             .collect(Collectors.toList());
+-        @SuppressWarnings("rawtypes") final RubyArray inputBuffer = RubyUtil.RUBY.newArray();
++        final ArrayList<RubyEvent> inputBuffer = new ArrayList<>();
+         final ValueSyntaxElement inputBufferField = fields.add(inputBuffer);
+         final ValueSyntaxElement outputBufferField = fields.add(new ArrayList<>());
+         final Closure clear = Closure.wrap().add(clearSyntax(parentFields));
+@@ -179,7 +178,7 @@ public static Dataset terminalFilterDataset(final Collection<Dataset> parents) {
+      * <p>Builds a terminal {@link Dataset} for the outputs from the given parent {@link Dataset}s.</p>
+      * <p>If the given set of parent {@link Dataset} is empty the sum is defined as the
+      * trivial dataset that does not invoke any computation whatsoever.</p>
+-     * {@link Dataset#compute(RubyArray, boolean, boolean)} is always
++     * {@link Dataset#compute(Collection, boolean, boolean)} is always
+      * {@link Collections#emptyList()}.
+      * @param parents Parent {@link Dataset} to sum and terminate
+      * @return Dataset representing the sum of given parent {@link Dataset}
+@@ -245,8 +244,7 @@ public static ComputeStepSyntaxElement<Dataset> outputDataset(
+         } else {
+             final Collection<ValueSyntaxElement> parentFields =
+                 parents.stream().map(fields::add).collect(Collectors.toList());
+-            @SuppressWarnings("rawtypes")
+-            final RubyArray buffer = RubyUtil.RUBY.newArray();
++            final ArrayList<RubyEvent> buffer = new ArrayList<>();
+             final Closure inlineClear;
+             if (terminal) {
+                 clearSyntax = Closure.EMPTY;
+@@ -294,9 +292,13 @@ private static Closure filterBody(
+         return body;
+     }
+ 
+-    private static Closure conditionalLoop(final VariableDefinition event,
+-        final MethodLevelSyntaxElement inputBuffer, final ValueSyntaxElement condition,
+-        final ValueSyntaxElement ifData, final ValueSyntaxElement elseData) {
++    private static Closure conditionalLoop(
++        final VariableDefinition event,
++        final MethodLevelSyntaxElement inputBuffer,
++        final ValueSyntaxElement condition,
++        final ValueSyntaxElement ifData,
++        final ValueSyntaxElement elseData)
++    {
+         final ValueSyntaxElement eventVal = event.access();
+         return Closure.wrap(
+             SyntaxFactory.value("org.logstash.config.ir.compiler.Utils").call(
+@@ -465,30 +467,33 @@ public static final class Complement implements Dataset {
+          * mutated when calling its {@code compute} method. This class does not directly compute
+          * it.
+          */
+-        private final Collection<JrubyEventExtLibrary.RubyEvent> data;
++        private final Collection<RubyEvent> data;
+ 
+         private boolean done;
+ 
+         public static Dataset from(final Dataset parent,
+-            final Collection<JrubyEventExtLibrary.RubyEvent> complement) {
++            final Collection<RubyEvent> complement) {
+             return new DatasetCompiler.Complement(parent, complement);
+         }
+ 
+         /**
+          * Ctor.
+          * @param left Positive Branch {@link SplitDataset}
+-         * @param complement Collection of {@link JrubyEventExtLibrary.RubyEvent}s that did
++         * @param complement Collection of {@link RubyEvent}s that did
+          * not match {@code left}
+          */
+         private Complement(
+-            final Dataset left, final Collection<JrubyEventExtLibrary.RubyEvent> complement) {
++            final Dataset left, final Collection<RubyEvent> complement) {
+             this.parent = left;
+             data = complement;
+         }
+ 
+         @Override
+-        public Collection<JrubyEventExtLibrary.RubyEvent> compute(@SuppressWarnings("rawtypes") final RubyArray batch,
+-                                                                  final boolean flush, final boolean shutdown) {
++        public Collection<RubyEvent> compute(
++                final Collection<RubyEvent> batch,
++                final boolean flush,
++                final boolean shutdown)
++        {
+             if (done) {
+                 return data;
+             }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java
+index d61e0c13221..0872daa6f04 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java
+@@ -32,6 +32,7 @@
+ import org.jruby.internal.runtime.methods.DynamicMethod;
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
++import org.logstash.ext.JrubyEventExtLibrary.RubyEvent;
+ import org.logstash.instrument.metrics.AbstractNamespacedMetricExt;
+ import org.logstash.instrument.metrics.counter.LongCounter;
+ 
+@@ -119,13 +120,17 @@ protected IRubyObject getConfigName(final ThreadContext context) {
+     }
+ 
+     @Override
+-    @SuppressWarnings({"rawtypes"})
+-    protected RubyArray doMultiFilter(final RubyArray batch) {
++    @SuppressWarnings({"unchecked"})
++    protected RubyArray<RubyEvent> doMultiFilter(final RubyArray<RubyEvent> batch) {
+         final IRubyObject pluginId = this.getId();
+         org.apache.logging.log4j.ThreadContext.put("plugin.id", pluginId.toString());
+         try {
+-            return (RubyArray) filterMethod.call(
+-                    RUBY.getCurrentContext(), filter, filterClass, FILTER_METHOD_NAME, batch);
++            return (RubyArray<RubyEvent>) filterMethod.call(
++                    RUBY.getCurrentContext(),
++                    filter,
++                    filterClass,
++                    FILTER_METHOD_NAME,
++                    batch);
+         } finally {
+             org.apache.logging.log4j.ThreadContext.remove("plugin.id");
+         }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/JavaFilterDelegatorExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/JavaFilterDelegatorExt.java
+index 043af3f9fb4..8cb1f9e1add 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/JavaFilterDelegatorExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/JavaFilterDelegatorExt.java
+@@ -33,7 +33,7 @@
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.logstash.RubyUtil;
+-import org.logstash.ext.JrubyEventExtLibrary;
++import org.logstash.ext.JrubyEventExtLibrary.RubyEvent;
+ import org.logstash.instrument.metrics.AbstractNamespacedMetricExt;
+ 
+ import java.util.ArrayList;
+@@ -76,14 +76,14 @@ public static JavaFilterDelegatorExt create(final String configName, final Strin
+ 
+     @SuppressWarnings({"unchecked","rawtypes"})
+     @Override
+-    protected RubyArray doMultiFilter(final RubyArray batch) {
++    protected RubyArray<RubyEvent> doMultiFilter(final RubyArray<RubyEvent> batch) {
+         List<Event> inputEvents = (List<Event>) batch.stream()
+-                .map(x -> ((JrubyEventExtLibrary.RubyEvent) x).getEvent())
++                .map(x -> ((RubyEvent) x).getEvent())
+                 .collect(Collectors.toList());
+         Collection<Event> outputEvents = filter.filter(inputEvents, filterMatchListener);
+         RubyArray newBatch = RubyArray.newArray(RubyUtil.RUBY, outputEvents.size());
+         for (Event outputEvent : outputEvents) {
+-            newBatch.add(JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, (org.logstash.Event)outputEvent));
++            newBatch.add(RubyEvent.newRubyEvent(RubyUtil.RUBY, (org.logstash.Event)outputEvent));
+         }
+         return newBatch;
+     }
+@@ -99,7 +99,7 @@ protected IRubyObject doFlush(final ThreadContext context, final RubyHash option
+             final Ruby runtime = context.runtime;
+             @SuppressWarnings("rawtypes") RubyArray newBatch = RubyArray.newArray(runtime, outputEvents.size());
+             for (Event outputEvent : outputEvents) {
+-                newBatch.add(JrubyEventExtLibrary.RubyEvent.newRubyEvent(runtime, (org.logstash.Event)outputEvent));
++                newBatch.add(RubyEvent.newRubyEvent(runtime, (org.logstash.Event)outputEvent));
+             }
+             return newBatch;
+         }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/MethodSyntaxElement.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/MethodSyntaxElement.java
+index ed419e954ff..f278401fb0f 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/MethodSyntaxElement.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/MethodSyntaxElement.java
+@@ -63,7 +63,7 @@ static MethodSyntaxElement clear(final Closure body) {
+     static MethodSyntaxElement compute(final Closure body) {
+         return new MethodSyntaxElement.MethodSyntaxElementImpl(
+             Collection.class, "compute", body,
+-            new VariableDefinition(RubyArray.class, DatasetCompiler.BATCH_ARG),
++            new VariableDefinition(Collection.class, DatasetCompiler.BATCH_ARG),
+             new VariableDefinition(boolean.class, DatasetCompiler.FLUSH_ARG),
+             new VariableDefinition(boolean.class, DatasetCompiler.SHUTDOWN_ARG)
+         );
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputDelegatorExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputDelegatorExt.java
+index 6979d6d242e..f9c2080c560 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputDelegatorExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputDelegatorExt.java
+@@ -99,7 +99,7 @@ protected void doOutput(final Collection<JrubyEventExtLibrary.RubyEvent> batch)
+         try {
+             final IRubyObject pluginId = this.getId();
+             org.apache.logging.log4j.ThreadContext.put("plugin.id", pluginId.toString());
+-            strategy.multiReceive(RUBY.getCurrentContext(), (IRubyObject) batch);
++            strategy.multiReceive(RUBY.getCurrentContext(), batch);
+         } catch (final InterruptedException ex) {
+             throw new IllegalStateException(ex);
+         } finally {
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputStrategyExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputStrategyExt.java
+index c5afaac0592..60c0633d8df 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputStrategyExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputStrategyExt.java
+@@ -20,6 +20,7 @@
+ 
+ package org.logstash.config.ir.compiler;
+ 
++import java.util.Collection;
+ import java.util.concurrent.ArrayBlockingQueue;
+ import java.util.concurrent.BlockingQueue;
+ import java.util.stream.Collectors;
+@@ -35,6 +36,7 @@
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.logstash.RubyUtil;
++import org.logstash.ext.JrubyEventExtLibrary.RubyEvent;
+ 
+ public final class OutputStrategyExt {
+ 
+@@ -138,22 +140,51 @@ public final IRubyObject multiReceive(final ThreadContext context, final IRubyOb
+             return output(context, events);
+         }
+ 
++        public final IRubyObject multiReceive(final ThreadContext context, final Collection<RubyEvent> events)
++                throws InterruptedException {
++            return output(context, events);
++        }
++
+         protected final void initOutputCallsite(final RubyClass outputClass) {
+             outputMethod = outputClass.searchMethod(AbstractOutputDelegatorExt.OUTPUT_METHOD_NAME);
+             this.outputClass = outputClass;
+         }
+ 
+-        protected final void invokeOutput(final ThreadContext context, final IRubyObject batch,
+-            final IRubyObject pluginInstance) {
++        protected final void invokeOutput(
++            final ThreadContext context,
++            final IRubyObject batch,
++            final IRubyObject pluginInstance)
++        {
+             outputMethod.call(
+-                context, pluginInstance, outputClass, AbstractOutputDelegatorExt.OUTPUT_METHOD_NAME,
++                context,
++                pluginInstance,
++                outputClass,
++                AbstractOutputDelegatorExt.OUTPUT_METHOD_NAME,
+                 batch
+             );
+         }
+ 
++        protected final void invokeOutput(
++                final ThreadContext context,
++                final Collection<RubyEvent> batch,
++                final IRubyObject pluginInstance)
++        {
++            @SuppressWarnings("rawtypes") final RubyArray rubyArray = RubyArray.newArray(RubyUtil.RUBY, batch);
++            outputMethod.call(
++                context,
++                pluginInstance,
++                outputClass,
++                AbstractOutputDelegatorExt.OUTPUT_METHOD_NAME,
++                rubyArray
++            );
++        }
++
+         protected abstract IRubyObject output(ThreadContext context, IRubyObject events)
+             throws InterruptedException;
+ 
++        protected abstract IRubyObject output(ThreadContext context, Collection<RubyEvent> events)
++            throws InterruptedException;
++
+         protected abstract IRubyObject close(ThreadContext context);
+ 
+         protected abstract IRubyObject reg(ThreadContext context);
+@@ -208,7 +239,26 @@ public IRubyObject workers() {
+         }
+ 
+         @Override
+-        protected IRubyObject output(final ThreadContext context, final IRubyObject events) throws InterruptedException {
++        protected IRubyObject output(
++            final ThreadContext context,
++            final IRubyObject events)
++            throws InterruptedException
++        {
++            final IRubyObject worker = workerQueue.take();
++            try {
++                invokeOutput(context, events, worker);
++                return context.nil;
++            } finally {
++                workerQueue.put(worker);
++            }
++        }
++
++        @Override
++        protected IRubyObject output(
++            final ThreadContext context,
++            final Collection<RubyEvent> events)
++            throws InterruptedException
++        {
+             final IRubyObject worker = workerQueue.take();
+             try {
+                 invokeOutput(context, events, worker);
+@@ -266,6 +316,11 @@ protected final IRubyObject reg(final ThreadContext context) {
+             return output.callMethod(context, "register");
+         }
+ 
++        protected final IRubyObject doOutput(final ThreadContext context, final Collection<RubyEvent> events) {
++            invokeOutput(context, events, output);
++            return context.nil;
++        }
++
+         protected final IRubyObject doOutput(final ThreadContext context, final IRubyObject events) {
+             invokeOutput(context, events, output);
+             return context.nil;
+@@ -287,6 +342,13 @@ protected IRubyObject output(final ThreadContext context, final IRubyObject even
+                 return doOutput(context, events);
+             }
+         }
++
++        @Override
++        protected IRubyObject output(final ThreadContext context, final Collection<RubyEvent> events) {
++            synchronized (this) {
++                return doOutput(context, events);
++            }
++        }
+     }
+ 
+     @JRubyClass(name = "Shared", parent = "SimpleAbstractStrategy")
+@@ -302,5 +364,9 @@ public SharedOutputStrategyExt(final Ruby runtime, final RubyClass metaClass) {
+         protected IRubyObject output(final ThreadContext context, final IRubyObject events) {
+             return doOutput(context, events);
+         }
++
++        protected IRubyObject output(final ThreadContext context, final Collection<RubyEvent> events) {
++            return doOutput(context, events);
++        }
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/Utils.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/Utils.java
+index 3bf64beb058..9c3eb8e904e 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/Utils.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/Utils.java
+@@ -20,30 +20,30 @@
+ 
+ package org.logstash.config.ir.compiler;
+ 
+-import org.logstash.ext.JrubyEventExtLibrary;
+-
++import org.logstash.ext.JrubyEventExtLibrary.RubyEvent;
+ import java.util.Collection;
+-import java.util.List;
+ 
+ /**
+  * Static utility methods that replace common blocks of generated code in the Java execution.
+  */
+ public class Utils {
+ 
+-    @SuppressWarnings({"unchecked", "rawtypes"})
+     // has field1.compute(batchArg, flushArg, shutdownArg) passed as input
+-    public static void copyNonCancelledEvents(Collection<JrubyEventExtLibrary.RubyEvent> input, List output) {
+-        for (JrubyEventExtLibrary.RubyEvent e : input) {
++    public static void copyNonCancelledEvents(Collection<RubyEvent> input, Collection<RubyEvent> output) {
++        for (RubyEvent e : input) {
+             if (!(e.getEvent().isCancelled())) {
+                 output.add(e);
+             }
+         }
+     }
+ 
+-    @SuppressWarnings({"unchecked", "rawtypes"})
+-    public static void filterEvents(Collection<JrubyEventExtLibrary.RubyEvent> input, EventCondition filter,
+-                                    List fulfilled, List unfulfilled) {
+-        for (JrubyEventExtLibrary.RubyEvent e : input) {
++    public static void filterEvents(
++        Collection<RubyEvent> input,
++        EventCondition filter,
++        Collection<RubyEvent> fulfilled,
++        Collection<RubyEvent> unfulfilled)
++    {
++        for (RubyEvent e : input) {
+             if (filter.fulfilled(e)) {
+                 fulfilled.add(e);
+             } else {
+@@ -51,5 +51,4 @@ public static void filterEvents(Collection<JrubyEventExtLibrary.RubyEvent> input
+             }
+         }
+     }
+-
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/execution/MemoryReadBatch.java b/logstash-core/src/main/java/org/logstash/execution/MemoryReadBatch.java
+index d7713a119d2..17fbfeb06d5 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/MemoryReadBatch.java
++++ b/logstash-core/src/main/java/org/logstash/execution/MemoryReadBatch.java
+@@ -20,16 +20,19 @@
+ package org.logstash.execution;
+ 
+ import org.jruby.RubyArray;
++import org.jruby.runtime.builtin.IRubyObject;
+ import org.logstash.ext.JrubyEventExtLibrary.RubyEvent;
+ import java.util.Collection;
+ import java.util.LinkedHashSet;
++import java.util.Set;
++
+ import static org.logstash.RubyUtil.RUBY;
+ 
+ public final class MemoryReadBatch implements QueueBatch {
+ 
+-    private final LinkedHashSet<RubyEvent> events;
++    private final Set<RubyEvent> events;
+ 
+-    public MemoryReadBatch(final LinkedHashSet<RubyEvent> events) {
++    public MemoryReadBatch(final Set<RubyEvent> events) {
+         this.events = events;
+     }
+ 
+@@ -37,7 +40,7 @@ public static boolean isCancelled(final RubyEvent event) {
+         return event.getEvent().isCancelled();
+     }
+ 
+-    public static MemoryReadBatch create(LinkedHashSet<RubyEvent> events) {
++    public static MemoryReadBatch create(Set<RubyEvent> events) {
+         return new MemoryReadBatch(events);
+     }
+ 
+@@ -45,16 +48,32 @@ public static MemoryReadBatch create() {
+         return create(new LinkedHashSet<>());
+     }
+ 
++//    @Override
++//    public RubyArray<RubyEvent> to_a() {
++//        @SuppressWarnings({"unchecked"}) final RubyArray<RubyEvent> result = RUBY.<RubyEvent>newArray(events.size());
++//        for (final RubyEvent event : events) {
++//            if (!isCancelled(event)) {
++//                result.append(event);
++//            }
++//        }
++//        return result;
++//    }
++
++    @SuppressWarnings({"unchecked"})
+     @Override
+-    @SuppressWarnings({"rawtypes"})
+-    public RubyArray to_a() {
+-        final RubyArray result = RUBY.newArray(events.size());
++    public RubyArray<RubyEvent> to_a() {
++//        @SuppressWarnings({"unchecked"}) final RubyArray<RubyEvent> result = RUBY.newArray(events.size());
++
++        IRubyObject[] result = new IRubyObject[events.size()];
++
++        int i = 0;
+         for (final RubyEvent event : events) {
+-            if (!isCancelled(event)) {
+-                result.append(event);
++            if (!MemoryReadBatch.isCancelled(event)) {
++                result[i++] = event;
+             }
+         }
+-        return result;
++        return RUBY.newArrayNoCopy(result);
++//       return result;
+     }
+ 
+     @Override
+diff --git a/logstash-core/src/main/java/org/logstash/execution/QueueBatch.java b/logstash-core/src/main/java/org/logstash/execution/QueueBatch.java
+index d303ff40428..bfd0acbc87e 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/QueueBatch.java
++++ b/logstash-core/src/main/java/org/logstash/execution/QueueBatch.java
+@@ -26,7 +26,7 @@
+ 
+ public interface QueueBatch {
+     int filteredSize();
+-    @SuppressWarnings({"rawtypes"}) RubyArray to_a();
++    RubyArray<RubyEvent> to_a();
+     Collection<RubyEvent> collection();
+     void merge(RubyEvent event);
+     void close() throws IOException;
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java b/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java
+index 2764bd1524e..c55cd99f8cf 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java
+@@ -115,6 +115,7 @@ public void afterEach() {
+         EVENT_SINKS.remove(runId);
+     }
+ 
++    @SuppressWarnings({"unchecked"})
+     @Test
+     public void buildsTrivialPipeline() throws Exception {
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+@@ -134,6 +135,7 @@ public void buildsTrivialPipeline() throws Exception {
+         MatcherAssert.assertThat(outputEvents.contains(testEvent), CoreMatchers.is(true));
+     }
+ 
++    @SuppressWarnings({"unchecked"})
+     @Test
+     public void buildsStraightPipeline() throws Exception {
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+@@ -155,6 +157,7 @@ public void buildsStraightPipeline() throws Exception {
+         MatcherAssert.assertThat(outputEvents.contains(testEvent), CoreMatchers.is(true));
+     }
+ 
++    @SuppressWarnings({"unchecked"})
+     @Test
+     public void buildsForkedPipeline() throws Exception {
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(IRHelpers.toSourceWithMetadata(
+@@ -280,6 +283,7 @@ public void correctlyCompilesRegexNoMatchesWithConstant() throws IncompleteSourc
+         verifyRegex("!~", 0);
+     }
+ 
++    @SuppressWarnings({"unchecked"})
+     private void verifyRegex(String operator, int expectedEvents)
+             throws IncompleteSourceWithMetadataException {
+         final Event event = new Event();
+@@ -307,6 +311,7 @@ private void verifyRegex(String operator, int expectedEvents)
+         outputEvents.clear();
+     }
+ 
++    @SuppressWarnings({"unchecked"})
+     @Test
+     public void equalityCheckOnCompositeField() throws Exception {
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+@@ -338,6 +343,7 @@ public void equalityCheckOnCompositeField() throws Exception {
+         MatcherAssert.assertThat(testEvent.getEvent().getField("foo"), CoreMatchers.nullValue());
+     }
+ 
++    @SuppressWarnings({"unchecked"})
+     @Test
+     public void conditionalWithNullField() throws Exception {
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+@@ -362,6 +368,7 @@ public void conditionalWithNullField() throws Exception {
+         MatcherAssert.assertThat(testEvent.getEvent().getField("foo"), CoreMatchers.is("bar"));
+     }
+ 
++    @SuppressWarnings({"unchecked"})
+     @Test
+     public void conditionalNestedMetaFieldPipeline() throws Exception {
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+@@ -387,6 +394,7 @@ public void conditionalNestedMetaFieldPipeline() throws Exception {
+         MatcherAssert.assertThat(testEvent.getEvent().getField("foo"), CoreMatchers.nullValue());
+     }
+ 
++    @SuppressWarnings({"unchecked"})
+     @Test
+     public void moreThan255Parents() throws Exception {
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+@@ -440,6 +448,7 @@ private void assertCorrectFieldToFieldComparison(final String op, final int valu
+         verifyComparison(expected, String.format("[brr] %s [baz]", op), event);
+     }
+ 
++    @SuppressWarnings({"unchecked"})
+     private void verifyComparison(final boolean expected, final String conditional,
+         final Event event) throws IncompleteSourceWithMetadataException {
+         final JrubyEventExtLibrary.RubyEvent testEvent =
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/EventConditionTest.java b/logstash-core/src/test/java/org/logstash/config/ir/EventConditionTest.java
+index 4a56b5a9878..d65b526528c 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/EventConditionTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/EventConditionTest.java
+@@ -72,7 +72,7 @@ public void afterEach() {
+     }
+ 
+     @Test
+-    @SuppressWarnings("rawtypes")
++    @SuppressWarnings({"rawtypes", "unchecked"})
+     public void testInclusionWithFieldInField() throws Exception {
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+                 IRHelpers.toSourceWithMetadata("input {mockinput{}} filter { " +
+@@ -154,6 +154,7 @@ public void testConditionWithConstantEmptyStringValue() throws Exception {
+         testConditionWithConstantValue("\"\"", 0);
+     }
+ 
++    @SuppressWarnings({"unchecked"})
+     private void testConditionWithConstantValue(String condition, int expectedMatches) throws Exception {
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+                 IRHelpers.toSourceWithMetadata("input {mockinput{}} filter { " +
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java b/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java
+index 4881035a090..0cb77250155 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java
+@@ -20,6 +20,7 @@
+ 
+ package org.logstash.config.ir.compiler;
+ 
++import java.util.ArrayList;
+ import java.util.Collections;
+ import org.jruby.RubyArray;
+ import org.junit.Test;
+@@ -27,7 +28,7 @@
+ import org.logstash.FieldReference;
+ import org.logstash.RubyUtil;
+ import org.logstash.config.ir.PipelineTestUtil;
+-import org.logstash.ext.JrubyEventExtLibrary;
++import org.logstash.ext.JrubyEventExtLibrary.RubyEvent;
+ 
+ import static org.hamcrest.CoreMatchers.is;
+ import static org.hamcrest.CoreMatchers.nullValue;
+@@ -38,6 +39,7 @@ public final class DatasetCompilerTest {
+     /**
+      * Smoke test ensuring that output {@link Dataset} is compiled correctly.
+      */
++    @SuppressWarnings({"unchecked"})
+     @Test
+     public void compilesOutputDataset() {
+         assertThat(
+@@ -58,13 +60,12 @@ public void compilesSplitDataset() {
+         ).instantiate();
+         final Event trueEvent = new Event();
+         trueEvent.setField(key, "val");
+-        final JrubyEventExtLibrary.RubyEvent falseEvent =
+-            JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event());
++        final RubyEvent falseEvent = RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event());
+         final Dataset right = left.right();
+-        @SuppressWarnings("rawtypes")
+-        final RubyArray batch = RubyUtil.RUBY.newArray(
+-            JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, trueEvent), falseEvent
+-        );
++        final ArrayList<RubyEvent> batch = new ArrayList<>();
++        batch.add(RubyEvent.newRubyEvent(RubyUtil.RUBY, trueEvent));
++        batch.add(falseEvent);
++
+         assertThat(left.compute(batch, false, false).size(), is(1));
+         assertThat(right.compute(batch, false, false).size(), is(1));
+     }
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/compiler/OutputDelegatorTest.java b/logstash-core/src/test/java/org/logstash/config/ir/compiler/OutputDelegatorTest.java
+index 44d6b615976..25a1187e538 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/compiler/OutputDelegatorTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/compiler/OutputDelegatorTest.java
+@@ -31,6 +31,10 @@
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.logstash.Event;
++import org.logstash.ext.JrubyEventExtLibrary;
++
++import java.util.ArrayList;
++import java.util.Collection;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.junit.Assert.assertEquals;
+@@ -42,7 +46,7 @@
+ public class OutputDelegatorTest extends PluginDelegatorTestCase {
+ 
+     private RubyHash pluginArgs;
+-    private RubyArray events;
++    private Collection<JrubyEventExtLibrary.RubyEvent> events;
+     private static final int EVENT_COUNT = 7;
+     public static final RubyClass FAKE_OUT_CLASS;
+ 
+@@ -51,12 +55,13 @@ public class OutputDelegatorTest extends PluginDelegatorTestCase {
+         FAKE_OUT_CLASS.defineAnnotatedMethods(FakeOutClass.class);
+     }
+ 
++    @SuppressWarnings("unchecked")
+     @Before
+     public void setup() {
+         super.setup();
+-        events = RUBY.newArray(EVENT_COUNT);
++        events = new ArrayList<>(EVENT_COUNT);
+         for (int k = 0; k < EVENT_COUNT; k++) {
+-            events.add(k, new Event());
++            events.add(JrubyEventExtLibrary.RubyEvent.newRubyEvent(RUBY));
+         }
+         pluginArgs = RubyHash.newHash(RUBY);
+         pluginArgs.put("id", "foo");
+@@ -82,6 +87,7 @@ public void plainOutputPluginPushesPluginNameToMetric() {
+         assertEquals(FakeOutClass.configName(RUBY.getCurrentContext(), null).asJavaString(), pluginName);
+     }
+ 
++    @SuppressWarnings({"unchecked"})
+     @Test
+     public void multiReceivePassesBatch() {
+         OutputDelegatorExt outputDelegator = constructOutputDelegator();
+@@ -90,6 +96,7 @@ public void multiReceivePassesBatch() {
+         assertEquals(EVENT_COUNT, ((RubyArray) FakeOutClass.latestInstance.getMultiReceiveArgs()).size());
+     }
+ 
++    @SuppressWarnings({"unchecked"})
+     @Test
+     public void multiReceiveIncrementsEventCount() {
+         OutputDelegatorExt outputDelegator = constructOutputDelegator();
+@@ -99,6 +106,7 @@ public void multiReceiveIncrementsEventCount() {
+         assertEquals(EVENT_COUNT, getMetricLongValue("out"));
+     }
+ 
++    @SuppressWarnings({"unchecked"})
+     @Test
+     public void multiReceiveRecordsDurationInMillis() {
+         final int delay = 100;
+@@ -164,6 +172,7 @@ public void outputStrategyTests() {
+         }
+     }
+ 
++    @SuppressWarnings({"unchecked"})
+     @Test
+     public void outputStrategyMethodDelegationTests() {
+         RubySymbol[] outputStrategies = new RubySymbol[]{
+@@ -183,7 +192,7 @@ public void outputStrategyMethodDelegationTests() {
+             outputDelegator.doClose(RUBY.getCurrentContext());
+             assertEquals(1, instance.getCloseCallCount());
+ 
+-            outputDelegator.multiReceive(RUBY.newArray(0));
++            outputDelegator.multiReceive(new ArrayList<>(0));
+             assertEquals(1, instance.getMultiReceiveCallCount());
+         }
+ 

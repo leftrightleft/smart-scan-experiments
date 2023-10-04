@@ -1,0 +1,1866 @@
+diff --git a/logstash-core/lib/logstash/config/modules_common.rb b/logstash-core/lib/logstash/config/modules_common.rb
+index 8325724cfb7..d294b4c302a 100644
+--- a/logstash-core/lib/logstash/config/modules_common.rb
++++ b/logstash-core/lib/logstash/config/modules_common.rb
+@@ -1,7 +1,9 @@
+ # encoding: utf-8
+ require "logstash/util/loggable"
+ require "logstash/elasticsearch_client"
+-require "logstash/modules/importer"
++require "logstash/modules/kibana_client"
++require "logstash/modules/elasticsearch_importer"
++require "logstash/modules/kibana_importer"
+ require "logstash/errors"
+ 
+ module LogStash module Config
+@@ -44,24 +46,31 @@ def self.pipeline_configs(settings)
+           alt_name = "module-#{module_name}"
+           pipeline_id = alt_name
+           module_settings.set("pipeline.id", pipeline_id)
+-
+           current_module.with_settings(module_hash)
+-          esclient = LogStash::ElasticsearchClient.build(module_hash)
+           config_test = settings.get("config.test_and_exit")
+-          if esclient.can_connect? || config_test
+-            if !config_test
+-              current_module.import(LogStash::Modules::Importer.new(esclient))
++          if !config_test
++            esclient = LogStash::ElasticsearchClient.build(module_hash)
++            kbnclient = LogStash::Modules::KibanaClient.new(module_hash)
++            esconnected = esclient.can_connect?
++            kbnconnected = kbnclient.can_connect?
++            if esconnected && kbnconnected
++              current_module.add_kibana_version(kbnclient.version_parts)
++              current_module.import(
++                  LogStash::Modules::ElasticsearchImporter.new(esclient),
++                  LogStash::Modules::KibanaImporter.new(kbnclient)
++                )
++            else
++              connect_fail_args[:module_name] = module_name
++              connect_fail_args[:elasticsearch_hosts] = esclient.host_settings
++              connect_fail_args[:kibana_hosts] = kbnclient.host_settings
+             end
+-
+-            config_string = current_module.config_string
+-
+-            pipelines << {"pipeline_id" => pipeline_id, "alt_name" => alt_name, "config_string" => config_string, "settings" => module_settings}
+-          else
+-            connect_fail_args[:module_name] = module_name
+-            connect_fail_args[:hosts] = esclient.host_settings
+           end
++          config_string = current_module.config_string
++          pipelines << {"pipeline_id" => pipeline_id, "alt_name" => alt_name, "config_string" => config_string, "settings" => module_settings}
+         rescue => e
+-          raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.parse-failed", :error => e.message)
++          new_error = LogStash::ConfigLoadingError.new(I18n.t("logstash.modules.configuration.parse-failed", :error => e.message))
++          new_error.set_backtrace(e.backtrace)
++          raise new_error
+         end
+ 
+         if !connect_fail_args.empty?
+diff --git a/logstash-core/lib/logstash/config/source/modules.rb b/logstash-core/lib/logstash/config/source/modules.rb
+index 8d3dbd4e8bd..0f3b5368d0f 100644
+--- a/logstash-core/lib/logstash/config/source/modules.rb
++++ b/logstash-core/lib/logstash/config/source/modules.rb
+@@ -3,8 +3,6 @@
+ require "logstash/config/modules_common"
+ require "logstash/config/pipeline_config"
+ require "logstash/util/loggable"
+-require "logstash/elasticsearch_client"
+-require "logstash/modules/importer"
+ require "logstash/errors"
+ 
+ module LogStash module Config module Source
+diff --git a/logstash-core/lib/logstash/elasticsearch_client.rb b/logstash-core/lib/logstash/elasticsearch_client.rb
+index 3b4a497bf89..d0161a19569 100644
+--- a/logstash-core/lib/logstash/elasticsearch_client.rb
++++ b/logstash-core/lib/logstash/elasticsearch_client.rb
+@@ -26,6 +26,13 @@ def initialize(settings, logger)
+       @settings = settings
+       @logger = logger
+       @client_args = client_args
++
++      username = @settings["var.output.elasticsearch.user"]
++      password = @settings["var.output.elasticsearch.password"]
++      if username
++        @client_args[:transport_options] = { :headers => { "Authorization" => 'Basic ' + Base64.encode64( "#{username}:#{password}" ).chomp } }
++      end
++
+       @client = Elasticsearch::Client.new(@client_args)
+     end
+ 
+@@ -117,4 +124,4 @@ def can_connect?
+   def host_settings
+     @client.host_settings
+   end
+-end end # class LogStash::ModulesImporter
++end end
+diff --git a/logstash-core/lib/logstash/modules/importer.rb b/logstash-core/lib/logstash/modules/elasticsearch_importer.rb
+similarity index 88%
+rename from logstash-core/lib/logstash/modules/importer.rb
+rename to logstash-core/lib/logstash/modules/elasticsearch_importer.rb
+index 485dfe8b332..bcf81c0cec5 100644
+--- a/logstash-core/lib/logstash/modules/importer.rb
++++ b/logstash-core/lib/logstash/modules/elasticsearch_importer.rb
+@@ -2,7 +2,7 @@
+ require "logstash/namespace"
+ require "logstash/logging"
+ 
+-module LogStash module Modules class Importer
++module LogStash module Modules class ElasticsearchImporter
+   include LogStash::Util::Loggable
+ 
+   def initialize(client)
+@@ -31,7 +31,7 @@ def put_overwrite(path, content)
+ 
+   def content_exists?(path)
+     response = @client.head(path)
+-    response.status >= 200 && response.status <= 299
++    response.status >= 200 && response.status < 300
+   end
+ 
+ end end end # class LogStash::Modules::Importer
+diff --git a/logstash-core/lib/logstash/modules/kibana_base.rb b/logstash-core/lib/logstash/modules/kibana_base.rb
+new file mode 100644
+index 00000000000..4a9c76c43c6
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/kibana_base.rb
+@@ -0,0 +1,24 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/json"
++
++module LogStash module Modules class KibanaBase
++  attr_reader :import_path, :content
++
++  def initialize(import_path, content)
++    @import_path, @content = import_path, content
++  end
++
++  def import(client)
++    raise NotImplementedError, "#{self.class.name} needs to implement `#import`"
++  end
++
++  def to_s
++    import_path
++  end
++
++  def content_as_object
++    return content unless content.is_a?(String)
++    LogStash::Json.load(content) rescue nil
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/modules/kibana_base_resource.rb b/logstash-core/lib/logstash/modules/kibana_base_resource.rb
+deleted file mode 100644
+index e93dda4641a..00000000000
+--- a/logstash-core/lib/logstash/modules/kibana_base_resource.rb
++++ /dev/null
+@@ -1,10 +0,0 @@
+-# encoding: utf-8
+-require "logstash/namespace"
+-require_relative "resource_base"
+-
+-module LogStash module Modules class KibanaBaseResource
+-  include ResourceBase
+-  def import_path
+-    base
+-  end
+-end end end
+diff --git a/logstash-core/lib/logstash/modules/kibana_client.rb b/logstash-core/lib/logstash/modules/kibana_client.rb
+new file mode 100644
+index 00000000000..97687fa41ce
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/kibana_client.rb
+@@ -0,0 +1,102 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++require "logstash/json"
++require "manticore/client"
++
++module LogStash module Modules class KibanaClient
++  include LogStash::Util::Loggable
++
++  class Response
++    # to create a custom response with body as an Object (Hash or Array)
++    attr_reader :status, :body, :headers
++    def initialize(status, body, headers={})
++      @status, @body, @headers = status, body, headers
++      @body = body.is_a?(String) ? LogStash::Json.load(body) : body
++    end
++
++    def succeeded?
++      @status >= 200 && @status < 300
++    end
++
++    def failed?
++      !succeeded?
++    end
++  end
++
++  attr_reader :version
++
++  def initialize(settings)
++    @settings = settings
++    @client = Manticore::Client.new(request_timeout: 5, connect_timeout: 5, socket_timeout: 5, pool_max: 10, pool_max_per_route: 2)
++    @host = @settings.fetch("var.kibana.host", "localhost:5601")
++    username = @settings["var.kibana.username"]
++    password = @settings["var.kibana.password"]
++
++    @scheme = @settings.fetch("var.kibana.scheme", "http")
++    @http_options = {:headers => {'Content-Type' => 'application/json'}}
++    if username
++      @http_options[:headers]['Authorization'] = 'Basic ' + Base64.encode64( "#{username}:#{password}" ).chomp
++    end
++
++    # e.g. {"name":"Elastics-MacBook-Pro.local","version":{"number":"6.0.0-alpha3","build_hash":"41e69","build_number":15613,"build_snapshot":true}..}
++    @version = "0.0.0"
++    response = get("api/status")
++    if response.succeeded?
++      status = response.body
++      if status["version"].is_a?(Hash)
++        @version = status["version"]["number"]
++        if status["version"]["build_snapshot"]
++          @version.concat("-SNAPSHOT")
++        end
++      end
++    end
++    @http_options[:headers]['kbn-version'] = @version
++  end
++
++  def version_parts
++    @version.split(/\.|\-/)
++  end
++
++  def host_settings
++    "[\"#{@host}\"]"
++  end
++
++  def get(relative_path)
++    # e.g. api/kibana/settings
++    safely(:get, relative_path, @http_options)
++  end
++
++  # content will be converted to a json string
++  def post(relative_path, content, headers = nil)
++
++    body = content.is_a?(String) ? content : LogStash::Json.dump(content)
++    options = {:body => body}.merge(headers || @http_options)
++    safely(:post, relative_path, options)
++  end
++
++  def head(relative_path)
++    safely(:head, relative_path)
++  end
++
++  def can_connect?
++    head("api/status").succeeded?
++  end
++
++  private
++
++  def safely(method_sym, relative_path, options = {})
++    begin
++      resp = @client.http(method_sym, full_url(relative_path), options).call
++      Response.new(resp.code, resp.body, resp.headers)
++    rescue Manticore::ManticoreException => e
++      logger.error("Error when executing Kibana client request", :error => e)
++      body = {"statusCode" => 0, "error" => e.message}
++      Response.new(0, body, {})
++    end
++  end
++
++  def full_url(relative)
++    "#{@scheme}://#{@host}/#{relative}"
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/modules/kibana_config.rb b/logstash-core/lib/logstash/modules/kibana_config.rb
+index 0ae83a57111..b3ec2ffe40e 100644
+--- a/logstash-core/lib/logstash/modules/kibana_config.rb
++++ b/logstash-core/lib/logstash/modules/kibana_config.rb
+@@ -3,23 +3,29 @@
+ require "logstash/logging"
+ 
+ require_relative "file_reader"
++require_relative "kibana_settings"
++require_relative "kibana_dashboards"
+ require_relative "kibana_resource"
+-require_relative "kibana_base_resource"
+ 
+ module LogStash module Modules class KibanaConfig
+   include LogStash::Util::Loggable
+ 
+   ALLOWED_DIRECTORIES = ["search", "visualization"]
+   METRICS_MAX_BUCKETS = (24 * 60 * 60).freeze # 24 hours of events/sec buckets.
+-  KIBANA_CONFIG_CONTENT_ID = "5.5.0".freeze
+-  attr_reader :index_name
++  attr_reader :index_name # not used when importing via kibana but for BWC with ElastsearchConfig
+ 
+   # We name it `modul` here because `module` has meaning in Ruby.
+   def initialize(modul, settings)
+-    @directory = ::File.join(modul.directory, "kibana")
++    build_versioned_directory(modul)
+     @name = modul.module_name
+     @settings = settings
+-    @index_name = @settings.fetch("dashboards.kibana_index", ".kibana")
++    @index_name = "kibana"
++    @pattern_name = "#{@name}-*"
++    @metrics_max_buckets = @settings.fetch("dashboards.metrics_max_buckets", METRICS_MAX_BUCKETS).to_i
++    @kibana_settings = [
++      KibanaSettings::Setting.new("defaultIndex", @pattern_name),
++      KibanaSettings::Setting.new("metrics:max_buckets", @metrics_max_buckets)
++    ]
+   end
+ 
+   def dashboards
+@@ -30,35 +36,48 @@ def dashboards
+     end
+   end
+ 
+-  def kibana_config_patches
+-    pattern_name = "#{@name}-*"
+-    metrics_max_buckets = @settings.fetch("dashboards.metrics_max_buckets", METRICS_MAX_BUCKETS).to_s
+-    kibana_config_json = '{"defaultIndex": "' + pattern_name + '}", "metrics:max_buckets": "' + metrics_max_buckets + '"}'
+-    kibana_config_content_id = @settings.fetch("index_pattern.kibana_version", KIBANA_CONFIG_CONTENT_ID)
+-    [
+-      KibanaResource.new(@index_name, "index-pattern", dynamic("index-pattern"),nil, pattern_name),
+-      KibanaResource.new(@index_name, "config", nil, kibana_config_json, kibana_config_content_id)
+-    ]
++  def index_pattern
++    [KibanaResource.new(@index_name, "index-pattern", dynamic("index-pattern"),nil, @pattern_name)]
+   end
+ 
+   def resources
+-    list = kibana_config_patches
++    list = index_pattern
+     dashboards.each do |board|
++      list << board
+       extract_panels_into(board, list)
+     end
+-    list.concat(extract_saved_searches(list))
++    list.concat(extract_saved_searches_into(list))
++    [
++      KibanaSettings.new("api/kibana/settings", @kibana_settings),
++      KibanaDashboards.new("api/kibana/dashboards/import", list)
++    ]
+   end
+ 
+   private
+ 
++  def build_versioned_directory(modul)
++    # try to detect which directory holds the config for the kibana version
++    base_dir = ::File.join(modul.directory, "kibana")
++    maj, min, patch = modul.kibana_version_parts
++    version_dir = "#{maj}.#{min}.#{patch}"
++    @directory = ::File.join(base_dir, version_dir)
++    return if ::File.directory?(@directory)
++    version_dir = "#{maj}.#{min}.x"
++    @directory = ::File.join(base_dir, version_dir)
++    return if ::File.directory?(@directory)
++    version_dir = "#{maj}.x"
++    @directory = ::File.join(base_dir, version_dir)
++    unless ::File.directory?(@directory)
++      logger.error("Cannot find kibana version sub-directory", :module => @name, :base_directory => base_dir)
++    end
++  end
++
+   def dynamic(dynamic_folder, filename = @name)
+     ::File.join(@directory, dynamic_folder, "#{filename}.json")
+   end
+ 
+   def extract_panels_into(dashboard, list)
+-    list << dashboard
+-
+-    dash = FileReader.read_json(dashboard.content_path)
++    dash = dashboard.content_as_object
+ 
+     if !dash.is_a?(Hash)
+       logger.warn("Kibana dashboard JSON is not an Object", :module => @name)
+@@ -87,20 +106,20 @@ def extract_panels_into(dashboard, list)
+         logger.warn("panelJSON contained unknown type", :type => panel_type)
+       end
+     end
++  end
+ 
+-    def extract_saved_searches(list)
+-      result = [] # must not add to list while iterating
+-      list.each do |resource|
+-        next unless resource.contains?("savedSearchId")
+-        content = resource.content_as_object
+-        next if content.nil?
+-        saved_search = content["savedSearchId"]
+-        next if saved_search.nil?
+-        ss_resource = KibanaResource.new(@index_name, "search", dynamic("search", saved_search))
+-        next if list.member?(ss_resource) || result.member?(ss_resource)
+-        result << ss_resource
+-      end
+-      result
++  def extract_saved_searches_into(list)
++    result = [] # must not add to list while iterating
++    list.each do |resource|
++      content = resource.content_as_object
++      next if content.nil?
++      next unless content.keys.include?("savedSearchId")
++      saved_search = content["savedSearchId"]
++      next if saved_search.nil?
++      ss_resource = KibanaResource.new(@index_name, "search", dynamic("search", saved_search))
++      next if list.member?(ss_resource) || result.member?(ss_resource)
++      result << ss_resource
+     end
++    result
+   end
+ end end end
+diff --git a/logstash-core/lib/logstash/modules/kibana_dashboards.rb b/logstash-core/lib/logstash/modules/kibana_dashboards.rb
+new file mode 100644
+index 00000000000..c6f9606fead
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/kibana_dashboards.rb
+@@ -0,0 +1,36 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++require_relative "kibana_base"
++
++module LogStash module Modules class KibanaDashboards < KibanaBase
++  include LogStash::Util::Loggable
++
++  attr_reader :import_path, :content
++
++  # content is a list of kibana file resources
++  def initialize(import_path, content)
++    @import_path, @content = import_path, content
++  end
++
++  def import(client)
++    # e.g. curl "http://localhost:5601/api/kibana/dashboards/import"
++    # extract and prepare all objects
++    objects = []
++    content.each do |resource|
++      hash = {
++        "id" => resource.content_id,
++        "type" => resource.content_type,
++        "version" => 1,
++        "attributes" => resource.content_as_object
++      }
++      objects << hash
++    end
++    body = {"version": client.version, "objects": objects}
++    response = client.post(import_path, body)
++    if response.failed?
++      logger.error("Attempted POST failed", :url_path => import_path, :response => response.body)
++    end
++    response
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/modules/kibana_importer.rb b/logstash-core/lib/logstash/modules/kibana_importer.rb
+new file mode 100644
+index 00000000000..4093bccdbda
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/kibana_importer.rb
+@@ -0,0 +1,17 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++
++module LogStash module Modules class KibanaImporter
++  include LogStash::Util::Loggable
++
++  def initialize(client)
++    @client = client
++  end
++
++  def put(via_kibana)
++    path = via_kibana.import_path
++    logger.debug("Attempting POST", :url_path => path, :content => via_kibana.content)
++    via_kibana.import(@client)
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/modules/kibana_settings.rb b/logstash-core/lib/logstash/modules/kibana_settings.rb
+new file mode 100644
+index 00000000000..6332a9f7a80
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/kibana_settings.rb
+@@ -0,0 +1,40 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++require_relative "kibana_base"
++
++module LogStash module Modules class KibanaSettings < KibanaBase
++  include LogStash::Util::Loggable
++
++  class Setting
++    attr_reader :name, :value
++    def initialize(name, value)
++      @name, @value = name, value
++    end
++  end
++
++  attr_reader :import_path, :content
++
++  # content is an array of Setting required for this module
++  def initialize(import_path, content)
++    @import_path, @content = import_path, content
++  end
++
++  def import(client)
++    # e.g. curl "http://localhost:5601/api/kibana/settings"
++    # 6.0.0-alpha3 -> {"settings":{"buildNum":{"userValue":15613},"defaultIndex":{"userValue":"arcsight-*"}}}
++    # 5.4 -> {"settings":{"defaultIndex":{"userValue":"cef-*"},"metrics:max_buckets":{"userValue":"600000"}}}
++    # array of Setting objects
++    # The POST api body { "changes": { "defaultIndex": "arcsight-*", "metrics:max_buckets": "400" } }
++    settings = {}
++    content.each do |setting|
++      settings[setting.name] = "#{setting.value}"
++    end
++    body = {"changes" => settings}
++    response = client.post(import_path, body)
++    if response.failed?
++      logger.error("Attempted POST failed", :url_path => import_path, :response => response.body)
++    end
++    response
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/modules/logstash_config.rb b/logstash-core/lib/logstash/modules/logstash_config.rb
+index 4089848bbc7..79e24085301 100644
+--- a/logstash-core/lib/logstash/modules/logstash_config.rb
++++ b/logstash-core/lib/logstash/modules/logstash_config.rb
+@@ -62,19 +62,17 @@ def elasticsearch_output_config(type_string = nil)
+     hosts = array_to_string(get_setting(LogStash::Setting::SplittableStringArray.new("var.output.elasticsearch.hosts", String, ["localhost:9200"])))
+     index = "#{@name}-#{setting("var.output.elasticsearch.index_suffix", "%{+YYYY.MM.dd}")}"
+     user = @settings["var.output.elasticsearch.user"]
+-    user_line = user ? "user => \"#{user}\"" : ""
+     password = @settings["var.output.elasticsearch.password"]
+-    password_line = password ? "password => \"#{password}\"" : ""
+-    document_type_line = type_string ? "document_type => #{type_string}" : ""
++    lines = ["hosts => #{hosts}", "index => \"#{index}\""]
++    lines.push(user ? "user => \"#{user}\"" : nil)
++    lines.push(password ? "password => \"#{password}\"" : nil)
++    lines.push(type_string ? "document_type => #{type_string}" : nil)
++    # NOTE: the first line should be indented in the conf.erb
+     <<-CONF
+ elasticsearch {
+-hosts => #{hosts}
+-index => "#{index}"
+-#{user_line}
+-#{password_line}
+-manage_template => false
+-#{document_type_line}
+-}
++    #{lines.compact.join("\n    ")}
++    manage_template => false
++  }
+ CONF
+   end
+ 
+diff --git a/logstash-core/lib/logstash/modules/resource_base.rb b/logstash-core/lib/logstash/modules/resource_base.rb
+index f1886b0fee8..81148333d46 100644
+--- a/logstash-core/lib/logstash/modules/resource_base.rb
++++ b/logstash-core/lib/logstash/modules/resource_base.rb
+@@ -1,5 +1,6 @@
+ # encoding: utf-8
+ require "logstash/namespace"
++require "logstash/json"
+ require_relative "file_reader"
+ 
+ module LogStash module Modules module ResourceBase
+@@ -8,7 +9,11 @@ module LogStash module Modules module ResourceBase
+   def initialize(base, content_type, content_path, content = nil, content_id = nil)
+     @base, @content_type, @content_path = base, content_type, content_path
+     @content_id =  content_id || ::File.basename(@content_path, ".*")
++    # content at this time will be a JSON string
+     @content = content
++    if !@content.nil?
++      @content_as_object = LogStash::Json.load(@content) rescue {}
++    end
+   end
+ 
+   def content
+@@ -19,12 +24,8 @@ def to_s
+     "#{base}, #{content_type}, #{content_path}, #{content_id}"
+   end
+ 
+-  def contains?(text)
+-    content.include?(text)
+-  end
+-
+   def content_as_object
+-    LogStash::Json.load(content) rescue nil
++    @content_as_object ||= FileReader.read_json(@content_path) rescue nil
+   end
+ 
+   def <=>(other)
+diff --git a/logstash-core/lib/logstash/modules/scaffold.rb b/logstash-core/lib/logstash/modules/scaffold.rb
+index c6efa218e1d..5572b1b372d 100644
+--- a/logstash-core/lib/logstash/modules/scaffold.rb
++++ b/logstash-core/lib/logstash/modules/scaffold.rb
+@@ -10,19 +10,25 @@
+ module LogStash module Modules class Scaffold
+   include LogStash::Util::Loggable
+ 
+-  attr_reader :directory, :module_name, :logstash_configuration, :kibana_configuration, :elasticsearch_configuration
++  attr_reader :directory, :module_name, :kibana_version_parts
++  attr_reader :kibana_configuration, :logstash_configuration, :elasticsearch_configuration
+ 
+   def initialize(name, directory)
+     @module_name = name
+     @directory = directory  # this is the 'configuration folder in the GEM root.'
++    @kibana_version_parts = "6.0.0".split('.') # this is backup in case kibana client fails to connect
+   end
+ 
+-  def import(import_engine)
++  def add_kibana_version(version_parts)
++    @kibana_version_parts = version_parts
++  end
++
++  def import(import_engine, kibana_import_engine)
+     @elasticsearch_configuration.resources.each do |resource|
+       import_engine.put(resource)
+     end
+     @kibana_configuration.resources.each do |resource|
+-      import_engine.put(resource)
++      kibana_import_engine.put(resource)
+     end
+   end
+ 
+diff --git a/logstash-core/lib/logstash/modules/util.rb b/logstash-core/lib/logstash/modules/util.rb
+index 678bba8043a..0e52ca15628 100644
+--- a/logstash-core/lib/logstash/modules/util.rb
++++ b/logstash-core/lib/logstash/modules/util.rb
+@@ -5,13 +5,13 @@
+ # x-pack defines modules in their folder structures.
+ module LogStash module Modules module Util
+   def self.register_local_modules(path)
+-    modules_path = ::File.join(path, ::File::Separator, "modules")
++    modules_path = ::File.join(path, "modules")
+     ::Dir.foreach(modules_path) do |item|
+       # Ignore unix relative path ids
+       next if item == '.' or item == '..'
+       # Ignore non-directories
+       next if !::File.directory?(::File.join(modules_path, ::File::Separator, item))
+-      LogStash::PLUGIN_REGISTRY.add(:modules, item, Scaffold.new(item, ::File.join(modules_path, ::File::Separator, item, ::File::Separator, "configuration")))
++      LogStash::PLUGIN_REGISTRY.add(:modules, item, Scaffold.new(item, ::File.join(modules_path, item, "configuration")))
+     end
+   end
+ end end end
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index 9491afaa16d..9e1be6cfab9 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -155,6 +155,12 @@ def reloadable_plugins?
+   def non_reloadable_plugins
+     (inputs + filters + outputs).select { |plugin| !plugin.reloadable? }
+   end
++
++  private
++
++  def default_logging_keys(other_keys = {})
++    { :pipeline_id => pipeline_id }.merge(other_keys)
++  end
+ end; end
+ 
+ module LogStash; class Pipeline < BasePipeline
+@@ -779,12 +785,9 @@ def inspect
+   private
+ 
+   def default_logging_keys(other_keys = {})
+-    default_options = if thread
+-                        { :pipeline_id => pipeline_id, :thread => thread.inspect }
+-                      else
+-                        { :pipeline_id => pipeline_id }
+-                      end
+-    default_options.merge(other_keys)
++    keys = super
++    keys[:thread] = thread.inspect if thread
++    keys
+   end
+ 
+   def draining_queue?
+diff --git a/logstash-core/locales/en.yml b/logstash-core/locales/en.yml
+index 109c8bb9190..0025213366f 100644
+--- a/logstash-core/locales/en.yml
++++ b/logstash-core/locales/en.yml
+@@ -102,8 +102,8 @@ en:
+           Specified modules: %{specified_modules}
+           Available modules: %{available_modules}
+         elasticsearch_connection_failed: >-
+-          Failed to import module configurations to Elasticsearch.
+-          Module: %{module_name} has hosts: %{hosts}
++          Failed to import module configurations to Elasticsearch and/or Kibana.
++          Module: %{module_name} has Elasticsearch hosts: %{elasticsearch_hosts} and Kibana hosts: %{kibana_hosts}
+ 
+     runner:
+       short-help: |-
+diff --git a/logstash-core/spec/logstash/modules/scaffold_spec.rb b/logstash-core/spec/logstash/modules/scaffold_spec.rb
+index a26af154181..bef60cd6762 100644
+--- a/logstash-core/spec/logstash/modules/scaffold_spec.rb
++++ b/logstash-core/spec/logstash/modules/scaffold_spec.rb
+@@ -1,10 +1,12 @@
+ # encoding: utf-8
+ #
+ require "logstash/namespace"
++require "logstash/elasticsearch_client"
++require "logstash/modules/kibana_client"
+ require "logstash/modules/kibana_config"
+ require "logstash/modules/scaffold"
+-require "logstash/modules/importer"
+-require "logstash/elasticsearch_client"
++require "logstash/modules/elasticsearch_importer"
++require "logstash/modules/kibana_importer"
+ 
+ require_relative "../../support/helpers"
+ 
+@@ -18,38 +20,41 @@
+       "var.output.elasticsearch.user" => "foo",
+       "var.output.elasticsearch.password" => "password",
+       "var.input.tcp.port" => 5606,
+-      "dashboards.kibana_index" => ".kibana"
+     }
+   end
+-  let(:dashboard_json) do
+-<<-JSON
+-{
+-"hits": 0,
+-"timeRestore": false,
+-"description": "",
+-"title": "Filebeat Apache2 Dashboard",
+-"uiStateJSON": "{\\"P-1\\":{\\"mapCenter\\":[40.713955826286046,-0.17578125]}}",
+-"panelsJSON": "[{\\"col\\":1,\\"id\\":\\"foo-c\\",\\"panelIndex\\":1,\\"row\\":1,\\"size_x\\":12,\\"size_y\\":3,\\"type\\":\\"visualization\\"},{\\"col\\":1,\\"id\\":\\"foo-d\\",\\"panelIndex\\":2,\\"row\\":6,\\"size_x\\":8,\\"size_y\\":3,\\"type\\":\\"visualization\\"},{\\"id\\":\\"foo-e\\",\\"type\\":\\"search\\",\\"panelIndex\\":7,\\"size_x\\":12,\\"size_y\\":3,\\"col\\":1,\\"row\\":11,\\"columns\\":[\\"apache2.error.client\\",\\"apache2.error.level\\",\\"apache2.error.module\\",\\"apache2.error.message\\"],\\"sort\\":[\\"@timestamp\\",\\"desc\\"]}]",
+-"optionsJSON": "{\\"darkTheme\\":false}",
+-"version": 1,
+-"kibanaSavedObjectMeta": {
+-  "searchSourceJSON": "{\\"filter\\":[{\\"query\\":{\\"query_string\\":{\\"analyze_wildcard\\":true,\\"query\\":\\"*\\"}}}]}"
+-}
+-}
+-JSON
++  let(:dashboard_hash) do
++    {
++      "hits" => 0,
++      "timeRestore" => false,
++      "description" => "",
++      "title" => "Filebeat Apache2 Dashboard",
++      "uiStateJSON" => "{}",
++      "panelsJSON" => '[{"col":1,"id":"foo-c","panelIndex":1,"row":1,"size_x":12,"size_y":3,"type":"visualization"},{"id":"foo-d","type":"search","panelIndex":7,"size_x":12,"size_y":3,"col":1,"row":11,"columns":["apache2.error.client","apache2.error.level","apache2.error.module","apache2.error.message"],"sort":["@timestamp","desc"]}]',
++      "optionsJSON" => "{}",
++      "version" => 1,
++      "kibanaSavedObjectMeta" => {
++        "searchSourceJSON" => "{}"
++      }
++    }
+   end
+-  let(:viz_json) do
+-<<-JSON
+-{
+-"visState": "",
+-"description": "",
+-"title": "foo-c",
+-"uiStateJSON": "",
+-"version": 1,
+-"savedSearchId": "foo-f",
+-"kibanaSavedObjectMeta": {}
+-}
+-JSON
++  let(:viz_hash) do
++    {
++      "visState" => "",
++      "description" => "",
++      "title" => "foo-c",
++      "uiStateJSON" => "",
++      "version" => 1,
++      "savedSearchId" => "foo-e",
++      "kibanaSavedObjectMeta" => {}
++    }
++  end
++  let(:index_pattern_hash) do
++    {
++      "title" => "foo-*",
++      "timeFieldName" =>"time",
++      "fieldFormatMap" => "{some map}",
++      "fields" => "[some array]"
++    }
+   end
+   context "logstash operation" do
+     let(:ls_conf) do
+@@ -98,85 +103,117 @@
+ 
+   context "kibana operation" do
+     before do
+-      allow(LogStash::Modules::FileReader).to receive(:read).and_return("{}")
+-      allow(LogStash::Modules::FileReader).to receive(:read).with("gem-home/kibana/dashboard/foo.json").and_return("[\"Foo-Dashboard\"]")
+-      allow(LogStash::Modules::FileReader).to receive(:read).with("gem-home/kibana/dashboard/Foo-Dashboard.json").and_return(dashboard_json)
+-      allow(LogStash::Modules::FileReader).to receive(:read).with("gem-home/kibana/visualization/foo-c.json").and_return(viz_json)
++      # allow(LogStash::Modules::FileReader).to receive(:read_json).and_return({})
++      allow(LogStash::Modules::FileReader).to receive(:read_json).with("gem-home/kibana/6.x/dashboard/foo.json").and_return(["Foo-Dashboard"])
++      allow(LogStash::Modules::FileReader).to receive(:read_json).with("gem-home/kibana/6.x/dashboard/Foo-Dashboard.json").and_return(dashboard_hash)
++      allow(LogStash::Modules::FileReader).to receive(:read_json).with("gem-home/kibana/6.x/visualization/foo-c.json").and_return(viz_hash)
++      allow(LogStash::Modules::FileReader).to receive(:read_json).with("gem-home/kibana/6.x/search/foo-d.json").and_return({"d" => "search"})
++      allow(LogStash::Modules::FileReader).to receive(:read_json).with("gem-home/kibana/6.x/search/foo-e.json").and_return({"e" => "search"})
++      allow(LogStash::Modules::FileReader).to receive(:read_json).with("gem-home/kibana/6.x/index-pattern/foo.json").and_return(index_pattern_hash)
+     end
+ 
+     it "provides a list of importable files" do
+       expect(test_module.kibana_configuration).to be_nil
+       test_module.with_settings(module_settings)
+       expect(test_module.kibana_configuration).not_to be_nil
+-      files = test_module.kibana_configuration.resources
+-      expect(files.size).to eq(7)
+-      expect(files.map{|o| o.class.name}.uniq).to eq(["LogStash::Modules::KibanaResource"])
+-      expect(files[0].content_path).to eq("gem-home/kibana/index-pattern/foo.json")
+-      expect(files[0].import_path).to eq(".kibana/index-pattern/foo-*")
+-
+-      expect(files[1].content).to eq("{\"defaultIndex\": \"foo-*}\", \"metrics:max_buckets\": \"#{LogStash::Modules::KibanaConfig::METRICS_MAX_BUCKETS}\"}")
+-      expect(files[1].import_path).to eq(".kibana/config/#{LogStash::Modules::KibanaConfig::KIBANA_CONFIG_CONTENT_ID}")
+-
+-      expect(files[2].content_path).to eq("gem-home/kibana/dashboard/Foo-Dashboard.json")
+-      expect(files[2].import_path).to eq(".kibana/dashboard/Foo-Dashboard")
+-      expect(files[3].content_path).to eq("gem-home/kibana/visualization/foo-c.json")
+-      expect(files[3].import_path).to eq(".kibana/visualization/foo-c")
+-      expect(files[4].content_path).to eq("gem-home/kibana/visualization/foo-d.json")
+-      expect(files[4].import_path).to eq(".kibana/visualization/foo-d")
+-      expect(files[5].content_path).to eq("gem-home/kibana/search/foo-e.json") #<- the panels can contain items from other folders
+-      expect(files[5].import_path).to eq(".kibana/search/foo-e")
+-      expect(files[6].content_path).to eq("gem-home/kibana/search/foo-f.json") #<- the visualization can contain items from the search folder
+-      expect(files[6].import_path).to eq(".kibana/search/foo-f")
+-    end
++      resources = test_module.kibana_configuration.resources
++      expect(resources.size).to eq(2)
++      resource1 = resources[0]
++      resource2 = resources[1]
++      expect(resource1).to be_a(LogStash::Modules::KibanaSettings)
++      expect(resource2).to be_a(LogStash::Modules::KibanaDashboards)
++      expect(resource1.import_path).to eq("api/kibana/settings")
++      expect(resource1.content).to be_a(Array)
++      expect(resource1.content.size).to eq(2)
+ 
+-    it "provides the kibana index string" do
+-      test_module.with_settings(module_settings)
+-      expect(test_module.kibana_configuration).not_to be_nil
+-      expect(test_module.kibana_configuration.index_name).to eq(".kibana")
++      test_object = resource1.content[0]
++      expect(test_object).to be_a(LogStash::Modules::KibanaSettings::Setting)
++      expect(test_object.name).to eq("defaultIndex")
++      expect(test_object.value).to eq("foo-*")
++
++      test_object = resource1.content[1]
++      expect(test_object).to be_a(LogStash::Modules::KibanaSettings::Setting)
++      expect(test_object.name).to eq("metrics:max_buckets")
++      expect(test_object.value).to eq(86400)
++
++      expect(resource2.import_path).to eq("api/kibana/dashboards/import")
++      expect(resource2.content).to be_a(Array)
++      expect(resource2.content.size).to eq(5)
++      expect(resource2.content.map{|o| o.class}.uniq).to eq([LogStash::Modules::KibanaResource])
++
++      test_object = resource2.content[0]
++      expect(test_object.content_id).to eq("foo-*")
++      expect(test_object.content_type).to eq("index-pattern")
++      expect(test_object.content_as_object).to eq(index_pattern_hash)
++
++      test_object = resource2.content[1]
++      expect(test_object.content_id).to eq("Foo-Dashboard")
++      expect(test_object.content_type).to eq("dashboard")
++      expect(test_object.content_as_object).to eq(dashboard_hash)
++
++      test_object = resource2.content[2]
++      expect(test_object.content_id).to eq("foo-c") #<- the panels can contain items from other folders
++      expect(test_object.content_type).to eq("visualization")
++      expect(test_object.content_as_object).to eq(viz_hash)
++      expect(test_object.content_as_object["savedSearchId"]).to eq("foo-e")
++
++      test_object = resource2.content[3]
++      expect(test_object.content_id).to eq("foo-d") #<- the panels can contain items from other folders
++      expect(test_object.content_type).to eq("search")
++      expect(test_object.content_as_object).to eq("d"=>"search")
++
++      test_object = resource2.content[4]
++      expect(test_object.content_id).to eq("foo-e") # <- the visualization can contain items from the search folder
++      expect(test_object.content_type).to eq("search")
++      expect(test_object.content_as_object).to eq("e"=>"search")
+     end
+   end
+ 
+   context "importing to elasticsearch stubbed client" do
+-    let(:mname) { "cef" }
+-    let(:base_dir) { File.expand_path(File.join(File.dirname(__FILE__), "..", "..", "modules_test_files", "#{mname}")) }
++    let(:mname) { "tester" }
++    let(:base_dir) { File.expand_path(File.join(File.dirname(__FILE__), "..", "..", "modules_test_files", "modules", "#{mname}", "configuration")) }
+     let(:response) { double(:response) }
+     let(:client) { double(:client) }
++    let(:kbnclient) { double(:kbnclient) }
+     let(:paths) { [] }
+-    let(:expected_paths) do
++    let(:expected_paths) { ["_template/tester", "api/kibana/settings", "api/kibana/dashboards/import"] }
++    let(:contents) { [] }
++    let(:expected_objects) do
+       [
+-        "_template/cef",
+-        ".kibana/index-pattern/cef-*",
+-        ".kibana/config/#{LogStash::Modules::KibanaConfig::KIBANA_CONFIG_CONTENT_ID}",
+-        ".kibana/dashboard/FW-Dashboard",
+-        ".kibana/visualization/FW-Metrics",
+-        ".kibana/visualization/FW-Last-Update",
+-        ".kibana/visualization/FW-Area-by-Outcome",
+-        ".kibana/visualization/FW-Count-by-Source,-Destination-Address-and-Ports",
+-        ".kibana/visualization/FW-Traffic-by-Outcome",
+-        ".kibana/visualization/FW-Device-Vendor-by-Category-Outcome",
+-        ".kibana/visualization/FW-Geo-Traffic-by-Destination-Address",
+-        ".kibana/visualization/FW-Geo-Traffic-by-Source-Address",
+-        ".kibana/visualization/FW-Destination-Country-Data-Table",
+-        ".kibana/visualization/FW-Source-Country-Data-Table",
+-        ".kibana/visualization/FW-Destination-Ports-by-Outcome",
+-        ".kibana/visualization/FW-Source,-Destination-Address-and-Port-Sunburst",
+-        ".kibana/search/Firewall-Events"
++        "index-pattern tester-*",
++        "dashboard FW-Dashboard",
++        "visualization FW-Viz-1",
++        "visualization FW-Viz-2",
++        "search Search-Tester"
+       ]
+     end
+ 
+     before do
+       allow(response).to receive(:status).and_return(404)
+       allow(client).to receive(:head).and_return(response)
++      allow(kbnclient).to receive(:version).and_return("9.8.7-6")
+     end
+ 
+     it "calls the import method" do
+-      expect(client).to receive(:put).at_least(15).times do |path, content|
++      expect(client).to receive(:put).once do |path, content|
+         paths << path
+         LogStash::ElasticsearchClient::Response.new(201, "", {})
+       end
++      expect(kbnclient).to receive(:post).twice do |path, content|
++        paths << path
++        contents << content
++        LogStash::Modules::KibanaClient::Response.new(201, "", {})
++      end
+       test_module.with_settings(module_settings)
+-      test_module.import(LogStash::Modules::Importer.new(client))
++      test_module.import(LogStash::Modules::ElasticsearchImporter.new(client), LogStash::Modules::KibanaImporter.new(kbnclient))
+       expect(paths).to eq(expected_paths)
++      expect(contents[0]).to eq({"changes"=>{"defaultIndex"=>"tester-*", "metrics:max_buckets"=>"86400"}})
++      second_kbn_post = contents[1]
++      expect(second_kbn_post[:version]).to eq("9.8.7-6")
++      expect(second_kbn_post[:objects]).to be_a(Array)
++      expect(second_kbn_post[:objects].size).to eq(5)
++      objects_types_ids = second_kbn_post[:objects].map {|h| "#{h["type"]} #{h["id"]}"}
++      expect(objects_types_ids).to eq(expected_objects)
+     end
+   end
+ 
+diff --git a/logstash-core/spec/logstash/runner_spec.rb b/logstash-core/spec/logstash/runner_spec.rb
+index 2b54652aacf..732d2ccdc96 100644
+--- a/logstash-core/spec/logstash/runner_spec.rb
++++ b/logstash-core/spec/logstash/runner_spec.rb
+@@ -8,6 +8,7 @@
+ require "logstash/logging/json"
+ require "logstash/config/source_loader"
+ require "logstash/config/modules_common"
++require "logstash/modules/util"
+ require "logstash/elasticsearch_client"
+ require "json"
+ require_relative "../support/helpers"
+@@ -308,14 +309,18 @@
+   end
+ 
+   describe "logstash modules" do
++    before(:each) do
++      test_modules_dir = File.expand_path(File.join(File.dirname(__FILE__), "..", "modules_test_files"))
++      LogStash::Modules::Util.register_local_modules(test_modules_dir)
++    end
++
+     describe "--config.test_and_exit" do
+       subject { LogStash::Runner.new("") }
+       let(:args) { ["-t", "--modules", module_string] }
+ 
+       context "with a good configuration" do
+-        let(:module_string) { "cef" }
++        let(:module_string) { "tester" }
+         it "should exit successfully" do
+-          skip("Skipped until cef module is added back to the codebase as explained in #7455")
+           expect(logger).not_to receive(:fatal)
+           expect(subject.run(args)).to eq(0)
+         end
+@@ -333,14 +338,13 @@
+     describe "--modules" do
+       let(:args) { ["--modules", module_string] }
+ 
+-
+       context "with an available module specified but no connection to elasticsearch" do
+-        let(:module_string) { "cef" }
++        let(:module_string) { "tester" }
+         before do
+           expect(logger).to receive(:fatal) do |msg, hash|
+             expect(msg).to eq("An unexpected error occurred!")
+             expect(hash).to be_a_config_loading_error_hash(
+-              /Failed to import module configurations to Elasticsearch. Module: cef/)
++              /Failed to import module configurations to Elasticsearch and\/or Kibana. Module: tester has/)
+           end
+           expect(LogStash::Agent).to receive(:new) do |settings, source_loader|
+             pipelines = LogStash::Config::ModulesCommon.pipeline_configs(settings)
+@@ -349,38 +353,46 @@
+           end
+         end
+         it "should log fatally and return a bad exit code" do
+-          skip("Skipped until cef module is added back to the codebase as explained in #7455")
+           expect(subject.run("bin/logstash", args)).to eq(1)
+         end
+       end
+ 
+       context "with an available module specified and a mocked connection to elasticsearch" do
+-        let(:module_string) { "cef" }
+-        let(:client) { double(:client) }
++        let(:module_string) { "tester" }
++        let(:kbn_version) { "6.0.0" }
++        let(:esclient) { double(:esclient) }
++        let(:kbnclient) { double(:kbnclient) }
+         let(:response) { double(:response) }
+         before do
+           allow(response).to receive(:status).and_return(404)
+-          allow(client).to receive(:head).and_return(response)
+-          allow(client).to receive(:can_connect?).and_return(true)
+-          allow(LogStash::ElasticsearchClient).to receive(:build).and_return(client)
+-
+-          expect(client).to receive(:put).at_least(15).times do |path, content|
++          allow(esclient).to receive(:head).and_return(response)
++          allow(esclient).to receive(:can_connect?).and_return(true)
++          allow(kbnclient).to receive(:version).and_return(kbn_version)
++          allow(kbnclient).to receive(:version_parts).and_return(kbn_version.split('.'))
++          allow(kbnclient).to receive(:can_connect?).and_return(true)
++          allow(LogStash::ElasticsearchClient).to receive(:build).and_return(esclient)
++          allow(LogStash::Modules::KibanaClient).to receive(:new).and_return(kbnclient)
++
++          expect(esclient).to receive(:put).once do |path, content|
+             LogStash::ElasticsearchClient::Response.new(201, "", {})
+           end
++          expect(kbnclient).to receive(:post).twice do |path, content|
++            LogStash::Modules::KibanaClient::Response.new(201, "", {})
++          end
++
+           expect(LogStash::Agent).to receive(:new) do |settings, source_loader|
+             pipelines = LogStash::Config::ModulesCommon.pipeline_configs(settings)
+             expect(pipelines).not_to be_empty
+-            cef_pipeline = pipelines.first
+-            expect(cef_pipeline).to include("pipeline_id", "config_string")
+-            expect(cef_pipeline["pipeline_id"]).to include('cef')
+-            expect(cef_pipeline["config_string"]).to include('index => "cef-')
++            module_pipeline = pipelines.first
++            expect(module_pipeline).to include("pipeline_id", "config_string")
++            expect(module_pipeline["pipeline_id"]).to include('tester')
++            expect(module_pipeline["config_string"]).to include('index => "tester-')
+             agent
+           end
+           expect(logger).not_to receive(:fatal)
+           expect(logger).not_to receive(:error)
+         end
+         it "should not terminate logstash" do
+-          skip("Skipped until cef module is added back to the codebase as explained in #7455")
+           expect(subject.run("bin/logstash", args)).to be_nil
+         end
+       end
+diff --git a/logstash-core/spec/modules_test_files/cef/elasticsearch/cef.json b/logstash-core/spec/modules_test_files/cef/elasticsearch/cef.json
+deleted file mode 100755
+index 691b19bc63d..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/elasticsearch/cef.json
++++ /dev/null
+@@ -1,221 +0,0 @@
+-{
+-    "order": 100,
+-    "template": "cef-*",
+-    "mappings": {
+-      "_default_": {
+-        "dynamic": true,
+-        "dynamic_templates": [
+-          {
+-            "string_fields": {
+-              "mapping": {
+-                "type": "keyword"
+-              },
+-              "match_mapping_type": "string",
+-              "match": "*"
+-            }
+-          }
+-        ],
+-        "_all": {
+-          "enabled": true
+-        },
+-        "properties": {
+-          "destinationPort": {
+-            "type": "integer"
+-          },
+-          "flexDate1": {
+-            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
+-            "type": "date"
+-          },
+-          "sourcePort": {
+-            "type": "integer"
+-          },
+-          "baseEventCount": {
+-            "type": "integer"
+-          },
+-          "destinationAddress": {
+-            "type": "ip"
+-          },
+-          "destinationProcessId": {
+-            "type": "integer"
+-          },
+-          "oldFileSize": {
+-            "type": "integer"
+-          },
+-          "destination": {
+-            "dynamic": false,
+-            "type": "object",
+-            "properties": {
+-              "city_name": {
+-                "type": "keyword"
+-              },
+-              "country_name": {
+-                "type": "keyword"
+-              },
+-              "location": {
+-                "type": "geo_point"
+-              },
+-              "region_name": {
+-                "type": "keyword"
+-              }
+-            }
+-          },
+-          "source": {
+-            "dynamic": false,
+-            "type": "object",
+-            "properties": {
+-              "city_name": {
+-                "type": "keyword"
+-              },
+-              "country_name": {
+-                "type": "keyword"
+-              },
+-              "location": {
+-                "type": "geo_point"
+-              },
+-              "region_name": {
+-                "type": "keyword"
+-              }
+-            }
+-          },
+-          "deviceReceiptTime": {
+-            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
+-            "type": "date"
+-          },
+-          "destinationTranslatedPort": {
+-            "type": "integer"
+-          },
+-          "deviceTranslatedAddress": {
+-            "type": "ip"
+-          },
+-          "deviceAddress": {
+-            "type": "ip"
+-          },
+-          "agentReceiptTime": {
+-            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
+-            "type": "date"
+-          },
+-          "startTime": {
+-            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
+-            "type": "date"
+-          },
+-          "sourceProcessId": {
+-            "type": "integer"
+-          },
+-          "bytesIn": {
+-            "type": "integer"
+-          },
+-          "bytesOut": {
+-            "type": "integer"
+-          },
+-          "severity": {
+-            "omit_norms": true,
+-            "type": "string"
+-          },
+-          "deviceProcessId": {
+-            "type": "integer"
+-          },
+-          "agentAddress": {
+-            "type": "ip"
+-          },
+-          "sourceAddress": {
+-            "type": "ip"
+-          },
+-          "sourceTranslatedPort": {
+-            "type": "integer"
+-          },
+-          "deviceCustomDate2": {
+-            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
+-            "type": "date"
+-          },
+-          "deviceCustomDate1": {
+-            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
+-            "type": "date"
+-          },
+-          "flexNumber1": {
+-            "type": "long"
+-          },
+-          "deviceCustomFloatingPoint1": {
+-            "type": "float"
+-          },
+-          "oldFileModificationTime": {
+-            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
+-            "type": "date"
+-          },
+-          "deviceCustomFloatingPoint2": {
+-            "type": "float"
+-          },
+-          "oldFileCreateTime": {
+-            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
+-            "type": "date"
+-          },
+-          "deviceCustomFloatingPoint3": {
+-            "type": "float"
+-          },
+-          "sourceTranslatedAddress": {
+-            "type": "ip"
+-          },
+-          "deviceCustomFloatingPoint4": {
+-            "type": "float"
+-          },
+-          "flexNumber2": {
+-            "type": "long"
+-          },
+-          "fileCreateTime": {
+-            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
+-            "type": "date"
+-          },
+-          "fileModificationTime": {
+-            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
+-            "type": "date"
+-          },
+-          "fileSize": {
+-            "type": "integer"
+-          },
+-          "destinationTranslatedAddress": {
+-            "type": "ip"
+-          },
+-          "endTime": {
+-            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
+-            "type": "date"
+-          },
+-          "deviceCustomNumber1": {
+-            "type": "long"
+-          },
+-          "deviceDirection": {
+-            "type": "integer"
+-          },
+-          "device": {
+-            "dynamic": false,
+-            "type": "object",
+-            "properties": {
+-              "city_name": {
+-                "type": "keyword"
+-              },
+-              "country_name": {
+-                "type": "keyword"
+-              },
+-              "location": {
+-                "type": "geo_point"
+-              },
+-              "region_name": {
+-                "type": "keyword"
+-              }
+-            }
+-          },
+-          "deviceCustomNumber3": {
+-            "type": "long"
+-          },
+-          "deviceCustomNumber2": {
+-            "type": "long"
+-          },
+-          "categoryOutcome": {
+-            "type": "keyword"
+-          },
+-          "destinationHostName": {
+-            "type": "keyword"
+-          }
+-        }
+-      }
+-    },
+-    "aliases": {}
+-}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/dashboard/FW-Dashboard.json b/logstash-core/spec/modules_test_files/cef/kibana/dashboard/FW-Dashboard.json
+deleted file mode 100755
+index 569c7ffaaa4..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/kibana/dashboard/FW-Dashboard.json
++++ /dev/null
+@@ -1,20 +0,0 @@
+-{
+-  "title": "FW - Dashboard",
+-  "hits": 0,
+-  "description": "",
+-  "panelsJSON": "[{\"col\":1,\"id\":\"FW-Metrics\",\"panelIndex\":7,\"row\":1,\"size_x\":8,\"size_y\":2,\"type\":\"visualization\"},{\"col\":9,\"id\":\"FW-Last-Update\",\"panelIndex\":10,\"row\":1,\"size_x\":4,\"size_y\":2,\"type\":\"visualization\"},{\"col\":1,\"id\":\"FW-Area-by-Outcome\",\"panelIndex\":1,\"row\":3,\"size_x\":4,\"size_y\":3,\"type\":\"visualization\"},{\"col\":5,\"id\":\"FW-Count-by-Source,-Destination-Address-and-Ports\",\"panelIndex\":2,\"row\":3,\"size_x\":4,\"size_y\":3,\"type\":\"visualization\"},{\"col\":9,\"id\":\"FW-Traffic-by-Outcome\",\"panelIndex\":9,\"row\":3,\"size_x\":4,\"size_y\":3,\"type\":\"visualization\"},{\"col\":1,\"id\":\"FW-Device-Vendor-by-Category-Outcome\",\"panelIndex\":4,\"row\":6,\"size_x\":4,\"size_y\":3,\"type\":\"visualization\"},{\"col\":7,\"id\":\"FW-Geo-Traffic-by-Destination-Address\",\"panelIndex\":5,\"row\":9,\"size_x\":6,\"size_y\":4,\"type\":\"visualization\"},{\"col\":1,\"id\":\"FW-Geo-Traffic-by-Source-Address\",\"panelIndex\":6,\"row\":9,\"size_x\":6,\"size_y\":4,\"type\":\"visualization\"},{\"col\":10,\"id\":\"FW-Destination-Country-Data-Table\",\"panelIndex\":3,\"row\":13,\"size_x\":3,\"size_y\":3,\"type\":\"visualization\"},{\"col\":7,\"id\":\"FW-Source-Country-Data-Table\",\"panelIndex\":8,\"row\":13,\"size_x\":3,\"size_y\":3,\"type\":\"visualization\"},{\"id\":\"FW-Destination-Ports-by-Outcome\",\"type\":\"visualization\",\"panelIndex\":12,\"size_x\":4,\"size_y\":3,\"col\":9,\"row\":6},{\"id\":\"FW-Source,-Destination-Address-and-Port-Sunburst\",\"type\":\"visualization\",\"panelIndex\":13,\"size_x\":4,\"size_y\":3,\"col\":5,\"row\":6},{\"id\":\"Firewall-Events\",\"type\":\"search\",\"panelIndex\":14,\"size_x\":6,\"size_y\":3,\"col\":1,\"row\":13,\"columns\":[\"sevCode\",\"name\",\"deviceVendor\",\"deviceProduct\",\"categoryDeviceType\",\"categoryBehavior\",\"categoryOutcome\",\"sourceAddress\",\"sourcePort\",\"sourceHostName\",\"destinationAddress\",\"destinationPort\",\"destinationHostName\",\"sourceUserName\",\"destinationUserName\"],\"sort\":[\"@timestamp\",\"desc\"]}]",
+-  "optionsJSON": "{\"darkTheme\":false}",
+-  "uiStateJSON": "{\"P-1\":{\"vis\":{\"legendOpen\":true,\"colors\":{\"/Success\":\"#629E51\",\"/Failure\":\"#BF1B00\"}}},\"P-2\":{\"vis\":{\"legendOpen\":true}},\"P-3\":{\"vis\":{\"params\":{\"sort\":{\"columnIndex\":null,\"direction\":null}}}},\"P-4\":{\"vis\":{\"legendOpen\":true,\"colors\":{\"/Success\":\"#629E51\",\"/Failure\":\"#BF1B00\",\"Check Point\":\"#C15C17\",\"CISCO\":\"#EF843C\",\"NetScreen\":\"#F9BA8F\"}}},\"P-5\":{\"mapCenter\":[46.195042108660154,-56.42578125]},\"P-6\":{\"mapCenter\":[15.961329081596647,-0.3515625],\"mapZoom\":1},\"P-8\":{\"vis\":{\"params\":{\"sort\":{\"columnIndex\":null,\"direction\":null}}}},\"P-12\":{\"vis\":{\"legendOpen\":false}}}",
+-  "version": 1,
+-  "timeRestore": true,
+-  "timeTo": "now",
+-  "timeFrom": "now-1h",
+-  "refreshInterval": {
+-    "display": "Off",
+-    "pause": false,
+-    "value": 0
+-  },
+-  "kibanaSavedObjectMeta": {
+-    "searchSourceJSON": "{\"filter\":[{\"query\":{\"query_string\":{\"analyze_wildcard\":true,\"query\":\"*\"}}}]}"
+-  }
+-}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/index-pattern/cef.json b/logstash-core/spec/modules_test_files/cef/kibana/index-pattern/cef.json
+deleted file mode 100644
+index 877187ca6cc..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/kibana/index-pattern/cef.json
++++ /dev/null
+@@ -1 +0,0 @@
+-{"title":"cef-*","timeFieldName":"deviceReceiptTime","notExpandable":true,"fieldFormatMap": "{\"bytesIn\":{\"id\":\"bytes\"},\"bytesOut\":{\"id\":\"bytes\"},\"totalBytes\":{\"id\":\"bytes\"}}","fields":"[  {\"name\":\"flexDate1\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"fileName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString3Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"modelConfidence\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categoryObject\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"oldFileSize\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"type\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceLongitude\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceSeverity\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"source.country_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceServiceName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"device.region_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categoryOutcome\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"applicationProtocol\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString2Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceProcessId\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"deviceAction\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categoryBehavior\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"locality\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"priority\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomFloatingPoint1\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"relevance\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"oldFileModificationTime\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"deviceCustomFloatingPoint2\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"tags\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destination.location\",\"type\":\"geo_point\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceAssetId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomFloatingPoint3\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"sourceTranslatedAddress\",\"type\":\"ip\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomFloatingPoint4\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"fileCreateTime\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"device.location\",\"type\":\"geo_point\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"_source\",\"type\":\"_source\",\"count\":0,\"scripted\":false,\"indexed\":false,\"analyzed\":false,\"doc_values\":false,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"deviceFacility\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceUserId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationProcessName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomNumber1\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceDirection\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"source.region_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomNumber3\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomNumber2\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationPort\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"source.city_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceLatitude\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"device.country_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceHostName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"agentType\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationProcessId\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"destinationTimeZone\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString6Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomNumber2Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceOutboundInterface\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceAddress\",\"type\":\"ip\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString5Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destination.region_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"requestUrl\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"transportProtocol\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceProcessName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"startTime\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceProduct\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceProcessId\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"deviceCustomNumber1Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categoryDeviceType\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"bytesOut\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationDnsDomain\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceAddress\",\"type\":\"ip\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationServiceName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceTranslatedPort\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString1\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString3\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString2\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationHostName\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString5\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"flexNumber1\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"devicePayloadId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString4\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"oldFileCreateTime\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"deviceCustomString6\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceEventCategory\",\"type\":\"string\",\"count\":3,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"flexNumber2\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"@timestamp\",\"type\":\"date\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"fileModificationTime\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"destinationTranslatedAddress\",\"type\":\"ip\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categoryDeviceGroup\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"endTime\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destination.city_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationMacAddress\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourcePort\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationAddress\",\"type\":\"ip\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceReceiptTime\",\"type\":\"date\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationTranslatedZoneURI\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomDate2Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categoryTupleDescription\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationTranslatedPort\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceTranslatedAddress\",\"type\":\"ip\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"sourceTranslatedZoneURI\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceInboundInterface\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"source.location\",\"type\":\"geo_point\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"host\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"agentReceiptTime\",\"type\":\"date\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomDate1Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationLatitude\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceHostName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"eventId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"agentAddress\",\"type\":\"ip\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceDnsDomain\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomDate2\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"deviceCustomDate1\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categorySignificance\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceEventClassId\",\"type\":\"string\",\"count\":3,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"port\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"fileSize\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"name\",\"type\":\"string\",\"count\":3,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"cefVersion\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationNTDomain\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"agentId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"baseEventCount\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceVendor\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categoryTechnique\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"agentTimeZone\",\"type\":\"string\",\"count\":2,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"managerReceiptTime\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"customerURI\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceExternalId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationUserName\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationAssetId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"@version\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"agentHost\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationUserId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"bytesIn\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"severity\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomNumber3Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceUserName\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"filePath\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"externalId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString1Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceVersion\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"message\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationLongitude\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destination.country_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"device.city_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString4Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"agentVersion\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"fileType\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationUserPrivileges\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"fileId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"originator\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceNtDomain\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceNtDomain\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceProcessName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"requestMethod\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"amac\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"dvcmac\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"_id\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":false,\"analyzed\":false,\"doc_values\":false,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"_type\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":false,\"analyzed\":false,\"doc_values\":false,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"_index\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":false,\"analyzed\":false,\"doc_values\":false,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"_score\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":false,\"analyzed\":false,\"doc_values\":false,\"searchable\":false,\"aggregatable\":false}]"}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/search/Firewall-Events.json b/logstash-core/spec/modules_test_files/cef/kibana/search/Firewall-Events.json
+deleted file mode 100644
+index bebc6ddd655..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/kibana/search/Firewall-Events.json
++++ /dev/null
+@@ -1,30 +0,0 @@
+-{
+-  "title": "Firewall Events",
+-  "description": "",
+-  "hits": 0,
+-  "columns": [
+-    "sevCode",
+-    "name",
+-    "deviceVendor",
+-    "deviceProduct",
+-    "categoryDeviceType",
+-    "categoryBehavior",
+-    "categoryOutcome",
+-    "sourceAddress",
+-    "sourcePort",
+-    "sourceHostName",
+-    "destinationAddress",
+-    "destinationPort",
+-    "destinationHostName",
+-    "sourceUserName",
+-    "destinationUserName"
+-  ],
+-  "sort": [
+-    "@timestamp",
+-    "desc"
+-  ],
+-  "version": 1,
+-  "kibanaSavedObjectMeta": {
+-    "searchSourceJSON": "{\"index\":\"cef-*\",\"query\":{\"query_string\":{\"query\":\"categoryDeviceType:\\\"Firewall\\\"\",\"analyze_wildcard\":true}},\"filter\":[],\"highlight\":{\"pre_tags\":[\"@kibana-highlighted-field@\"],\"post_tags\":[\"@/kibana-highlighted-field@\"],\"fields\":{\"*\":{}},\"require_field_match\":false,\"fragment_size\":2147483647}}"
+-  }
+-}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Destination-Country-Data-Table.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Destination-Country-Data-Table.json
+deleted file mode 100644
+index 88c878bf30a..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Destination-Country-Data-Table.json
++++ /dev/null
+@@ -1,11 +0,0 @@
+-{
+-  "title": "FW - Destination Country Data Table",
+-  "visState": "{\"title\":\"FW - Destination Country Data Table\",\"type\":\"table\",\"params\":{\"perPage\":10,\"showMeticsAtAllLevels\":false,\"showPartialRows\":false,\"showTotal\":false,\"sort\":{\"columnIndex\":null,\"direction\":null},\"totalFunc\":\"sum\"},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"bucket\",\"params\":{\"field\":\"destination.country_name\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\",\"customLabel\":\"Destination Countries\"}}],\"listeners\":{}}",
+-  "uiStateJSON": "{\"vis\":{\"params\":{\"sort\":{\"columnIndex\":null,\"direction\":null}}}}",
+-  "description": "",
+-  "savedSearchId": "Firewall-Events",
+-  "version": 1,
+-  "kibanaSavedObjectMeta": {
+-    "searchSourceJSON": "{\"filter\":[]}"
+-  }
+-}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Destination-Ports-by-Outcome.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Destination-Ports-by-Outcome.json
+deleted file mode 100644
+index ef535d1c0c0..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Destination-Ports-by-Outcome.json
++++ /dev/null
+@@ -1,11 +0,0 @@
+-{
+-  "title": "FW - Destination Ports by Outcome",
+-  "visState": "{\"title\":\"FW - Destination Ports by Outcome\",\"type\":\"histogram\",\"params\":{\"shareYAxis\":true,\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\",\"scale\":\"linear\",\"mode\":\"percentage\",\"times\":[],\"addTimeMarker\":false,\"defaultYExtents\":false,\"setYExtents\":false,\"yAxis\":{}},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"segment\",\"params\":{\"field\":\"destinationPort\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\"}},{\"id\":\"3\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"group\",\"params\":{\"field\":\"categoryOutcome\",\"size\":2,\"order\":\"desc\",\"orderBy\":\"1\"}}],\"listeners\":{}}",
+-  "uiStateJSON": "{\"vis\":{\"colors\":{\"/Failure\":\"#BF1B00\",\"/Success\":\"#629E51\"}}}",
+-  "description": "",
+-  "savedSearchId": "Firewall-Events",
+-  "version": 1,
+-  "kibanaSavedObjectMeta": {
+-    "searchSourceJSON": "{\"filter\":[]}"
+-  }
+-}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Device-Vendor-by-Category-Outcome.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Device-Vendor-by-Category-Outcome.json
+deleted file mode 100644
+index 1b37ac79ee8..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Device-Vendor-by-Category-Outcome.json
++++ /dev/null
+@@ -1,11 +0,0 @@
+-{
+-  "title": "FW - Device Vendor by Category Outcome",
+-  "visState": "{\"title\":\"FW - Device Vendor by Category Outcome\",\"type\":\"pie\",\"params\":{\"shareYAxis\":true,\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\",\"isDonut\":true},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"segment\",\"params\":{\"field\":\"deviceVendor\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\"}},{\"id\":\"3\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"segment\",\"params\":{\"field\":\"categoryOutcome\",\"size\":5,\"order\":\"desc\",\"orderBy\":\"1\"}}],\"listeners\":{}}",
+-  "uiStateJSON": "{\"vis\":{\"colors\":{\"/Success\":\"#629E51\",\"/Failure\":\"#BF1B00\",\"Check Point\":\"#C15C17\",\"CISCO\":\"#EF843C\",\"NetScreen\":\"#F9BA8F\"}}}",
+-  "description": "",
+-  "savedSearchId": "Firewall-Events",
+-  "version": 1,
+-  "kibanaSavedObjectMeta": {
+-    "searchSourceJSON": "{\"filter\":[]}"
+-  }
+-}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Geo-Traffic-by-Destination-Address.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Geo-Traffic-by-Destination-Address.json
+deleted file mode 100644
+index afd18fd09a0..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Geo-Traffic-by-Destination-Address.json
++++ /dev/null
+@@ -1,11 +0,0 @@
+-{
+-  "title": "FW - Geo Traffic by Destination Address",
+-  "visState": "{\"title\":\"FW - Geo Traffic by Destination Address\",\"type\":\"tile_map\",\"params\":{\"mapType\":\"Shaded Circle Markers\",\"isDesaturated\":true,\"addTooltip\":true,\"heatMaxZoom\":16,\"heatMinOpacity\":0.1,\"heatRadius\":25,\"heatBlur\":15,\"heatNormalizeData\":true,\"mapZoom\":2,\"mapCenter\":[15,5],\"wms\":{\"enabled\":false,\"url\":\"https://basemap.nationalmap.gov/arcgis/services/USGSTopo/MapServer/WMSServer\",\"options\":{\"version\":\"1.3.0\",\"layers\":\"0\",\"format\":\"image/png\",\"transparent\":true,\"attribution\":\"Maps provided by USGS\",\"styles\":\"\"}}},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"geohash_grid\",\"schema\":\"segment\",\"params\":{\"field\":\"destination.location\",\"autoPrecision\":true,\"customLabel\":\"Source Address\"}}],\"listeners\":{}}",
+-  "uiStateJSON": "{\"mapCenter\":[14.604847155053898,4.921875]}",
+-  "description": "",
+-  "savedSearchId": "Firewall-Events",
+-  "version": 1,
+-  "kibanaSavedObjectMeta": {
+-    "searchSourceJSON": "{\"filter\":[]}"
+-  }
+-}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Geo-Traffic-by-Source-Address.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Geo-Traffic-by-Source-Address.json
+deleted file mode 100644
+index 8eed943ae7d..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Geo-Traffic-by-Source-Address.json
++++ /dev/null
+@@ -1,11 +0,0 @@
+-{
+-  "title": "FW - Geo Traffic by Source Address",
+-  "visState": "{\"title\":\"FW - Geo Traffic by Source Address\",\"type\":\"tile_map\",\"params\":{\"mapType\":\"Shaded Circle Markers\",\"isDesaturated\":true,\"addTooltip\":true,\"heatMaxZoom\":16,\"heatMinOpacity\":0.1,\"heatRadius\":25,\"heatBlur\":15,\"heatNormalizeData\":true,\"mapZoom\":2,\"mapCenter\":[15,5],\"wms\":{\"enabled\":false,\"url\":\"https://basemap.nationalmap.gov/arcgis/services/USGSTopo/MapServer/WMSServer\",\"options\":{\"version\":\"1.3.0\",\"layers\":\"0\",\"format\":\"image/png\",\"transparent\":true,\"attribution\":\"Maps provided by USGS\",\"styles\":\"\"}}},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"geohash_grid\",\"schema\":\"segment\",\"params\":{\"field\":\"source.location\",\"autoPrecision\":true,\"customLabel\":\"Source Address\"}}],\"listeners\":{}}",
+-  "uiStateJSON": "{\"mapCenter\":[14.944784875088372,4.921875]}",
+-  "description": "",
+-  "savedSearchId": "Firewall-Events",
+-  "version": 1,
+-  "kibanaSavedObjectMeta": {
+-    "searchSourceJSON": "{\"filter\":[]}"
+-  }
+-}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Last-Update.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Last-Update.json
+deleted file mode 100644
+index e0f9e01cdb8..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Last-Update.json
++++ /dev/null
+@@ -1,11 +0,0 @@
+-{
+-  "title": "FW - Last Update",
+-  "visState": "{\"title\":\"FW - Last Update\",\"type\":\"metric\",\"params\":{\"handleNoResults\":true,\"fontSize\":\"20\"},\"aggs\":[{\"id\":\"2\",\"enabled\":true,\"type\":\"min\",\"schema\":\"metric\",\"params\":{\"field\":\"@timestamp\",\"customLabel\":\"Start Time\"}},{\"id\":\"1\",\"enabled\":true,\"type\":\"max\",\"schema\":\"metric\",\"params\":{\"field\":\"@timestamp\",\"customLabel\":\"Latest Log Time\"}}],\"listeners\":{}}",
+-  "uiStateJSON": "{}",
+-  "description": "",
+-  "savedSearchId": "Firewall-Events",
+-  "version": 1,
+-  "kibanaSavedObjectMeta": {
+-    "searchSourceJSON": "{\"filter\":[]}"
+-  }
+-}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Metrics.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Metrics.json
+deleted file mode 100644
+index 23b8a67c8c7..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Metrics.json
++++ /dev/null
+@@ -1,11 +0,0 @@
+-{
+-  "title": "FW - Metrics",
+-  "visState": "{\"title\":\"FW - Metrics\",\"type\":\"metric\",\"params\":{\"handleNoResults\":true,\"fontSize\":60},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"sourceAddress\",\"customLabel\":\"Source IPs\"}},{\"id\":\"3\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"destinationAddress\",\"customLabel\":\"Destination IPs\"}},{\"id\":\"4\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"destinationPort\",\"customLabel\":\"Destination Ports / Services\"}}],\"listeners\":{}}",
+-  "uiStateJSON": "{}",
+-  "description": "",
+-  "savedSearchId": "Firewall-Events",
+-  "version": 1,
+-  "kibanaSavedObjectMeta": {
+-    "searchSourceJSON": "{\"filter\":[]}"
+-  }
+-}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Source,-Destination-Address-and-Port-Sunburst.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Source,-Destination-Address-and-Port-Sunburst.json
+deleted file mode 100644
+index 9824f5f3d4e..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Source,-Destination-Address-and-Port-Sunburst.json
++++ /dev/null
+@@ -1,11 +0,0 @@
+-{
+-  "title": "FW - Source, Destination Address and Port - Sunburst",
+-  "visState": "{\"title\":\"FW - Source, Destination Address and Port - Sunburst\",\"type\":\"pie\",\"params\":{\"shareYAxis\":true,\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\",\"isDonut\":true},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"segment\",\"params\":{\"field\":\"sourceAddress\",\"size\":5,\"order\":\"desc\",\"orderBy\":\"1\"}},{\"id\":\"3\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"segment\",\"params\":{\"field\":\"destinationAddress\",\"size\":5,\"order\":\"desc\",\"orderBy\":\"1\"}},{\"id\":\"4\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"segment\",\"params\":{\"field\":\"destinationPort\",\"size\":5,\"order\":\"desc\",\"orderBy\":\"1\"}}],\"listeners\":{}}",
+-  "uiStateJSON": "{}",
+-  "description": "",
+-  "savedSearchId": "Firewall-Events",
+-  "version": 1,
+-  "kibanaSavedObjectMeta": {
+-    "searchSourceJSON": "{\"filter\":[]}"
+-  }
+-}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Source-Country-Data-Table.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Source-Country-Data-Table.json
+deleted file mode 100644
+index c16f56e8e0b..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Source-Country-Data-Table.json
++++ /dev/null
+@@ -1,11 +0,0 @@
+-{
+-  "title": "FW - Source Country Data Table",
+-  "visState": "{\"title\":\"FW - Source Country Data Table\",\"type\":\"table\",\"params\":{\"perPage\":10,\"showMeticsAtAllLevels\":false,\"showPartialRows\":false,\"showTotal\":false,\"sort\":{\"columnIndex\":null,\"direction\":null},\"totalFunc\":\"sum\"},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"bucket\",\"params\":{\"field\":\"source.country_name\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\",\"customLabel\":\"Source Countries\"}}],\"listeners\":{}}",
+-  "uiStateJSON": "{\"vis\":{\"params\":{\"sort\":{\"columnIndex\":null,\"direction\":null}}}}",
+-  "description": "",
+-  "savedSearchId": "Firewall-Events",
+-  "version": 1,
+-  "kibanaSavedObjectMeta": {
+-    "searchSourceJSON": "{\"filter\":[]}"
+-  }
+-}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Traffic-by-Outcome.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Traffic-by-Outcome.json
+deleted file mode 100644
+index 401e9a4383b..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Traffic-by-Outcome.json
++++ /dev/null
+@@ -1,10 +0,0 @@
+-{
+-  "title": "FW - Traffic by Outcome",
+-  "visState": "{\"type\":\"timelion\",\"title\":\"FW - Traffic by Outcome\",\"params\":{\"expression\":\"$i='cef-*', $t='@timestamp', (.es(index=$i,timefield=$t,q='categoryDeviceType:\\\"Firewall\\\" AND categoryOutcome:\\\"/Success\\\"').lines(width=2,fill=2).fit(carry).label(\\\"Accepted Traffic Count\\\"), .es(index=$i,timefield=$t,q='categoryDeviceType:\\\"Firewall\\\" AND categoryOutcome:\\\"/Failure\\\"').lines(width=2,fill=2).fit(carry).label(\\\"Dropped Traffic Count\\\"), .es(index=$i,timefield=$t,q='categoryDeviceType:\\\"Firewall\\\" AND categoryOutcome:\\\"/Success\\\"').mvavg(10).color(green).fit(carry).label(\\\"Mvg Avg - Accepted\\\"), .es(index=$i,timefield=$t,q='categoryDeviceType:\\\"Firewall\\\" AND categoryOutcome:\\\"/Failure\\\"').mvavg(10).color(red).fit(carry).label(\\\"Mvg Avg - Dropped\\\")).title(\\\"Firewall Traffic by Outcome\\\").legend(columns=4)\",\"interval\":\"auto\"}}",
+-  "uiStateJSON": "{}",
+-  "description": "",
+-  "version": 1,
+-  "kibanaSavedObjectMeta": {
+-    "searchSourceJSON": "{}"
+-  }
+-}
+diff --git a/logstash-core/spec/modules_test_files/cef/logstash/cef.conf.erb b/logstash-core/spec/modules_test_files/cef/logstash/cef.conf.erb
+deleted file mode 100755
+index 874344837de..00000000000
+--- a/logstash-core/spec/modules_test_files/cef/logstash/cef.conf.erb
++++ /dev/null
+@@ -1,36 +0,0 @@
+-input {
+-  tcp {
+-    # The delimiter config used is for TCP interpretation
+-    codec => cef { delimiter => "\r\n"}
+-    port => <%= setting("var.input.tcp.port", 5000) %>
+-    type => syslog
+-  }
+-}
+-
+-filter {
+-  # To map the attacker Geo IP if plausible
+-
+-  geoip {
+-    source => "sourceAddress"
+-    target => "source"
+-  }
+-
+-  # To map the target Geo IP if plausible
+-
+-  geoip {
+-    source => "destinationAddress"
+-    target => "destination"
+-  }
+-
+-  # To map the log producing device Geo IP if plausible
+-
+-  geoip {
+-    source => "deviceAddress"
+-    target => "device"
+-  }
+-
+-}
+-
+-output {
+-  <%= elasticsearch_output_config() %>
+-}
+diff --git a/logstash-core/spec/modules_test_files/modules/tester/configuration/README.txt b/logstash-core/spec/modules_test_files/modules/tester/configuration/README.txt
+new file mode 100644
+index 00000000000..fe389215b14
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/modules/tester/configuration/README.txt
+@@ -0,0 +1 @@
++This is not a real working module, i.e. one that will work in kibana.
+diff --git a/logstash-core/spec/modules_test_files/modules/tester/configuration/elasticsearch/tester.json b/logstash-core/spec/modules_test_files/modules/tester/configuration/elasticsearch/tester.json
+new file mode 100755
+index 00000000000..75aadcd1bc9
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/modules/tester/configuration/elasticsearch/tester.json
+@@ -0,0 +1,51 @@
++{
++    "order": 100,
++    "template": "tester-*",
++    "mappings": {
++      "_default_": {
++        "dynamic": true,
++        "dynamic_templates": [
++          {
++            "string_fields": {
++              "mapping": {
++                "type": "keyword"
++              },
++              "match_mapping_type": "string",
++              "match": "*"
++            }
++          }
++        ],
++        "_all": {
++          "enabled": true
++        },
++        "properties": {
++          "f1": {
++            "type": "integer"
++          },
++          "f2": {
++            "type": "integer"
++          },
++          "f3": {
++            "type": "ip"
++          },
++          "f4": {
++            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
++            "type": "date"
++          },
++          "f6": {
++            "type": "integer"
++          },
++          "f7": {
++            "type": "integer"
++          },
++          "f8": {
++            "type": "integer"
++          },
++          "f9": {
++            "type": "integer"
++          },
++        }
++      }
++    },
++    "aliases": {}
++}
+diff --git a/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/dashboard/FW-Dashboard.json b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/dashboard/FW-Dashboard.json
+new file mode 100755
+index 00000000000..437f61161be
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/dashboard/FW-Dashboard.json
+@@ -0,0 +1,20 @@
++{
++  "title": "FW - Dashboard",
++  "hits": 0,
++  "description": "",
++  "panelsJSON": "[{\"id\":\"FW-Viz-1\",\"type\":\"visualization\",\"panelIndex\":12,\"size_x\":4,\"size_y\":3,\"col\":9,\"row\":6},{\"id\":\"FW-Viz-2\",\"type\":\"visualization\",\"panelIndex\":13,\"size_x\":4,\"size_y\":3,\"col\":5,\"row\":6},{\"id\":\"Search-Tester\",\"type\":\"search\",\"panelIndex\":14,\"size_x\":6,\"size_y\":3,\"col\":1,\"row\":13,\"columns\":[\"sevCode\",\"name\",\"deviceVendor\",\"deviceProduct\",\"categoryDeviceType\",\"categoryBehavior\",\"categoryOutcome\",\"sourceAddress\",\"sourcePort\",\"sourceHostName\",\"destinationAddress\",\"destinationPort\",\"destinationHostName\",\"sourceUserName\",\"destinationUserName\"],\"sort\":[\"@timestamp\",\"desc\"]}]",
++  "optionsJSON": "{\"darkTheme\":false}",
++  "uiStateJSON": "{\"P-1\":{\"vis\":{\"legendOpen\":true,\"colors\":{\"/Success\":\"#629E51\",\"/Failure\":\"#BF1B00\"}}},\"P-2\":{\"vis\":{\"legendOpen\":true}},\"P-3\":{\"vis\":{\"params\":{\"sort\":{\"columnIndex\":null,\"direction\":null}}}},\"P-4\":{\"vis\":{\"legendOpen\":true,\"colors\":{\"/Success\":\"#629E51\",\"/Failure\":\"#BF1B00\",\"Check Point\":\"#C15C17\",\"CISCO\":\"#EF843C\",\"NetScreen\":\"#F9BA8F\"}}},\"P-5\":{\"mapCenter\":[46.195042108660154,-56.42578125]},\"P-6\":{\"mapCenter\":[15.961329081596647,-0.3515625],\"mapZoom\":1},\"P-8\":{\"vis\":{\"params\":{\"sort\":{\"columnIndex\":null,\"direction\":null}}}},\"P-12\":{\"vis\":{\"legendOpen\":false}}}",
++  "version": 1,
++  "timeRestore": true,
++  "timeTo": "now",
++  "timeFrom": "now-1h",
++  "refreshInterval": {
++    "display": "Off",
++    "pause": false,
++    "value": 0
++  },
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[{\"query\":{\"query_string\":{\"analyze_wildcard\":true,\"query\":\"*\"}}}]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/dashboard/cef.json b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/dashboard/tester.json
+similarity index 100%
+rename from logstash-core/spec/modules_test_files/cef/kibana/dashboard/cef.json
+rename to logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/dashboard/tester.json
+diff --git a/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/index-pattern/tester.json b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/index-pattern/tester.json
+new file mode 100644
+index 00000000000..5d8c501e033
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/index-pattern/tester.json
+@@ -0,0 +1,7 @@
++{
++  "title":"tester-*",
++  "timeFieldName":"startTime",
++  "notExpandable":true,
++  "fieldFormatMap": "{\"f3\":{\"id\":\"bytes\"},\"f4\":{\"id\":\"bytes\"},\"f5\":{\"id\":\"bytes\"}}",
++  "fields": "[{\"name\":\"f1\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},{\"name\":\"f2\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},{\"name\":\"f3\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},{\"name\":\"f3\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},{\"name\":\"f5\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},{\"name\":\"f6\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},{\"name\":\"f7\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},{\"name\":\"f8\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":false,\"analyzed\":false,\"doc_values\":false,\"searchable\":false,\"aggregatable\":false},{\"name\":\"f9\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":false,\"analyzed\":false,\"doc_values\":false,\"searchable\":true,\"aggregatable\":true}]"
++}
+diff --git a/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/search/Search-Tester.json b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/search/Search-Tester.json
+new file mode 100644
+index 00000000000..54aa0c674ad
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/search/Search-Tester.json
+@@ -0,0 +1,19 @@
++{
++  "title": "Firewall Events",
++  "description": "",
++  "hits": 0,
++  "columns": [
++    "f1",
++    "f2",
++    "f3",
++    "f4"
++  ],
++  "sort": [
++    "f4",
++    "desc"
++  ],
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"index\":\"tester-*\",\"query\":{\"query_string\":{\"query\":\"f3:\\\"Firewall\\\"\",\"analyze_wildcard\":true}},\"filter\":[],\"highlight\":{\"pre_tags\":[\"@kibana-highlighted-field@\"],\"post_tags\":[\"@/kibana-highlighted-field@\"],\"fields\":{\"*\":{}},\"require_field_match\":false,\"fragment_size\":2147483647}}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Area-by-Outcome.json b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/visualization/FW-Viz-1.json
+similarity index 93%
+rename from logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Area-by-Outcome.json
+rename to logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/visualization/FW-Viz-1.json
+index 1394aac9255..712fabd0afc 100644
+--- a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Area-by-Outcome.json
++++ b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/visualization/FW-Viz-1.json
+@@ -1,9 +1,9 @@
+ {
+-  "title": "FW - Area by Outcome",
++  "title": "FW Viz 1",
+   "visState": "{\"title\":\"FW - Area by Outcome\",\"type\":\"area\",\"params\":{\"shareYAxis\":true,\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"top\",\"smoothLines\":true,\"scale\":\"linear\",\"interpolate\":\"linear\",\"mode\":\"overlap\",\"times\":[],\"addTimeMarker\":false,\"defaultYExtents\":false,\"setYExtents\":false,\"yAxis\":{}},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"date_histogram\",\"schema\":\"segment\",\"params\":{\"field\":\"@timestamp\",\"interval\":\"auto\",\"customInterval\":\"2h\",\"min_doc_count\":1,\"extended_bounds\":{}}},{\"id\":\"3\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"group\",\"params\":{\"field\":\"categoryOutcome\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\"}}],\"listeners\":{}}",
+   "uiStateJSON": "{\"vis\":{\"colors\":{\"/Success\":\"#629E51\",\"/Failure\":\"#BF1B00\"}}}",
+   "description": "",
+-  "savedSearchId": "Firewall-Events",
++  "savedSearchId": "Search-Tester",
+   "version": 1,
+   "kibanaSavedObjectMeta": {
+     "searchSourceJSON": "{\"filter\":[]}"
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Count-by-Source,-Destination-Address-and-Ports.json b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/visualization/FW-Viz-2.json
+similarity index 94%
+rename from logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Count-by-Source,-Destination-Address-and-Ports.json
+rename to logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/visualization/FW-Viz-2.json
+index 1400070a286..c2e2d7da3f5 100644
+--- a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Count-by-Source,-Destination-Address-and-Ports.json
++++ b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/5.x/visualization/FW-Viz-2.json
+@@ -1,9 +1,9 @@
+ {
+-  "title": "FW - Count by Source, Destination Address and Ports",
++  "title": "FW Viz 2",
+   "visState": "{\"title\":\"FW - Count by Source, Destination Address and Ports\",\"type\":\"line\",\"params\":{\"shareYAxis\":true,\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"top\",\"showCircles\":true,\"smoothLines\":true,\"interpolate\":\"linear\",\"scale\":\"square root\",\"drawLinesBetweenPoints\":true,\"radiusRatio\":\"7\",\"times\":[],\"addTimeMarker\":false,\"defaultYExtents\":false,\"setYExtents\":false,\"yAxis\":{}},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{\"customLabel\":\"Overall Count\"}},{\"id\":\"2\",\"enabled\":true,\"type\":\"date_histogram\",\"schema\":\"segment\",\"params\":{\"field\":\"@timestamp\",\"interval\":\"auto\",\"customInterval\":\"2h\",\"min_doc_count\":1,\"extended_bounds\":{}}},{\"id\":\"3\",\"enabled\":true,\"type\":\"count\",\"schema\":\"radius\",\"params\":{}},{\"id\":\"4\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"sourceAddress\",\"customLabel\":\"Source Address\"}},{\"id\":\"5\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"destinationAddress\",\"customLabel\":\"Destination Address\"}},{\"id\":\"6\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"destinationPort\",\"customLabel\":\"Destination / Service Ports\"}}],\"listeners\":{}}",
+   "uiStateJSON": "{\"vis\":{\"colors\":{\"Overall Count\":\"#BF1B00\",\"Source Address\":\"#E0752D\",\"Destination Address\":\"#E5AC0E\",\"Device Address\":\"#447EBC\",\"Service Port\":\"#447EBC\",\"Destination / Service Ports\":\"#447EBC\"}}}",
+   "description": "",
+-  "savedSearchId": "Firewall-Events",
++  "savedSearchId": "Search-Tester",
+   "version": 1,
+   "kibanaSavedObjectMeta": {
+     "searchSourceJSON": "{\"filter\":[]}"
+diff --git a/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/dashboard/FW-Dashboard.json b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/dashboard/FW-Dashboard.json
+new file mode 100755
+index 00000000000..437f61161be
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/dashboard/FW-Dashboard.json
+@@ -0,0 +1,20 @@
++{
++  "title": "FW - Dashboard",
++  "hits": 0,
++  "description": "",
++  "panelsJSON": "[{\"id\":\"FW-Viz-1\",\"type\":\"visualization\",\"panelIndex\":12,\"size_x\":4,\"size_y\":3,\"col\":9,\"row\":6},{\"id\":\"FW-Viz-2\",\"type\":\"visualization\",\"panelIndex\":13,\"size_x\":4,\"size_y\":3,\"col\":5,\"row\":6},{\"id\":\"Search-Tester\",\"type\":\"search\",\"panelIndex\":14,\"size_x\":6,\"size_y\":3,\"col\":1,\"row\":13,\"columns\":[\"sevCode\",\"name\",\"deviceVendor\",\"deviceProduct\",\"categoryDeviceType\",\"categoryBehavior\",\"categoryOutcome\",\"sourceAddress\",\"sourcePort\",\"sourceHostName\",\"destinationAddress\",\"destinationPort\",\"destinationHostName\",\"sourceUserName\",\"destinationUserName\"],\"sort\":[\"@timestamp\",\"desc\"]}]",
++  "optionsJSON": "{\"darkTheme\":false}",
++  "uiStateJSON": "{\"P-1\":{\"vis\":{\"legendOpen\":true,\"colors\":{\"/Success\":\"#629E51\",\"/Failure\":\"#BF1B00\"}}},\"P-2\":{\"vis\":{\"legendOpen\":true}},\"P-3\":{\"vis\":{\"params\":{\"sort\":{\"columnIndex\":null,\"direction\":null}}}},\"P-4\":{\"vis\":{\"legendOpen\":true,\"colors\":{\"/Success\":\"#629E51\",\"/Failure\":\"#BF1B00\",\"Check Point\":\"#C15C17\",\"CISCO\":\"#EF843C\",\"NetScreen\":\"#F9BA8F\"}}},\"P-5\":{\"mapCenter\":[46.195042108660154,-56.42578125]},\"P-6\":{\"mapCenter\":[15.961329081596647,-0.3515625],\"mapZoom\":1},\"P-8\":{\"vis\":{\"params\":{\"sort\":{\"columnIndex\":null,\"direction\":null}}}},\"P-12\":{\"vis\":{\"legendOpen\":false}}}",
++  "version": 1,
++  "timeRestore": true,
++  "timeTo": "now",
++  "timeFrom": "now-1h",
++  "refreshInterval": {
++    "display": "Off",
++    "pause": false,
++    "value": 0
++  },
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[{\"query\":{\"query_string\":{\"analyze_wildcard\":true,\"query\":\"*\"}}}]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/dashboard/tester.json b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/dashboard/tester.json
+new file mode 100644
+index 00000000000..6f13d606b0b
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/dashboard/tester.json
+@@ -0,0 +1 @@
++["FW-Dashboard"]
+diff --git a/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/index-pattern/tester.json b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/index-pattern/tester.json
+new file mode 100644
+index 00000000000..5d8c501e033
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/index-pattern/tester.json
+@@ -0,0 +1,7 @@
++{
++  "title":"tester-*",
++  "timeFieldName":"startTime",
++  "notExpandable":true,
++  "fieldFormatMap": "{\"f3\":{\"id\":\"bytes\"},\"f4\":{\"id\":\"bytes\"},\"f5\":{\"id\":\"bytes\"}}",
++  "fields": "[{\"name\":\"f1\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},{\"name\":\"f2\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},{\"name\":\"f3\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},{\"name\":\"f3\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},{\"name\":\"f5\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},{\"name\":\"f6\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},{\"name\":\"f7\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},{\"name\":\"f8\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":false,\"analyzed\":false,\"doc_values\":false,\"searchable\":false,\"aggregatable\":false},{\"name\":\"f9\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":false,\"analyzed\":false,\"doc_values\":false,\"searchable\":true,\"aggregatable\":true}]"
++}
+diff --git a/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/search/Search-Tester.json b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/search/Search-Tester.json
+new file mode 100644
+index 00000000000..54aa0c674ad
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/search/Search-Tester.json
+@@ -0,0 +1,19 @@
++{
++  "title": "Firewall Events",
++  "description": "",
++  "hits": 0,
++  "columns": [
++    "f1",
++    "f2",
++    "f3",
++    "f4"
++  ],
++  "sort": [
++    "f4",
++    "desc"
++  ],
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"index\":\"tester-*\",\"query\":{\"query_string\":{\"query\":\"f3:\\\"Firewall\\\"\",\"analyze_wildcard\":true}},\"filter\":[],\"highlight\":{\"pre_tags\":[\"@kibana-highlighted-field@\"],\"post_tags\":[\"@/kibana-highlighted-field@\"],\"fields\":{\"*\":{}},\"require_field_match\":false,\"fragment_size\":2147483647}}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/visualization/FW-Viz-1.json b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/visualization/FW-Viz-1.json
+new file mode 100644
+index 00000000000..712fabd0afc
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/visualization/FW-Viz-1.json
+@@ -0,0 +1,11 @@
++{
++  "title": "FW Viz 1",
++  "visState": "{\"title\":\"FW - Area by Outcome\",\"type\":\"area\",\"params\":{\"shareYAxis\":true,\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"top\",\"smoothLines\":true,\"scale\":\"linear\",\"interpolate\":\"linear\",\"mode\":\"overlap\",\"times\":[],\"addTimeMarker\":false,\"defaultYExtents\":false,\"setYExtents\":false,\"yAxis\":{}},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"date_histogram\",\"schema\":\"segment\",\"params\":{\"field\":\"@timestamp\",\"interval\":\"auto\",\"customInterval\":\"2h\",\"min_doc_count\":1,\"extended_bounds\":{}}},{\"id\":\"3\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"group\",\"params\":{\"field\":\"categoryOutcome\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\"}}],\"listeners\":{}}",
++  "uiStateJSON": "{\"vis\":{\"colors\":{\"/Success\":\"#629E51\",\"/Failure\":\"#BF1B00\"}}}",
++  "description": "",
++  "savedSearchId": "Search-Tester",
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/visualization/FW-Viz-2.json b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/visualization/FW-Viz-2.json
+new file mode 100644
+index 00000000000..c2e2d7da3f5
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/modules/tester/configuration/kibana/6.x/visualization/FW-Viz-2.json
+@@ -0,0 +1,11 @@
++{
++  "title": "FW Viz 2",
++  "visState": "{\"title\":\"FW - Count by Source, Destination Address and Ports\",\"type\":\"line\",\"params\":{\"shareYAxis\":true,\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"top\",\"showCircles\":true,\"smoothLines\":true,\"interpolate\":\"linear\",\"scale\":\"square root\",\"drawLinesBetweenPoints\":true,\"radiusRatio\":\"7\",\"times\":[],\"addTimeMarker\":false,\"defaultYExtents\":false,\"setYExtents\":false,\"yAxis\":{}},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{\"customLabel\":\"Overall Count\"}},{\"id\":\"2\",\"enabled\":true,\"type\":\"date_histogram\",\"schema\":\"segment\",\"params\":{\"field\":\"@timestamp\",\"interval\":\"auto\",\"customInterval\":\"2h\",\"min_doc_count\":1,\"extended_bounds\":{}}},{\"id\":\"3\",\"enabled\":true,\"type\":\"count\",\"schema\":\"radius\",\"params\":{}},{\"id\":\"4\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"sourceAddress\",\"customLabel\":\"Source Address\"}},{\"id\":\"5\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"destinationAddress\",\"customLabel\":\"Destination Address\"}},{\"id\":\"6\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"destinationPort\",\"customLabel\":\"Destination / Service Ports\"}}],\"listeners\":{}}",
++  "uiStateJSON": "{\"vis\":{\"colors\":{\"Overall Count\":\"#BF1B00\",\"Source Address\":\"#E0752D\",\"Destination Address\":\"#E5AC0E\",\"Device Address\":\"#447EBC\",\"Service Port\":\"#447EBC\",\"Destination / Service Ports\":\"#447EBC\"}}}",
++  "description": "",
++  "savedSearchId": "Search-Tester",
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/modules/tester/configuration/logstash/tester.conf.erb b/logstash-core/spec/modules_test_files/modules/tester/configuration/logstash/tester.conf.erb
+new file mode 100755
+index 00000000000..2a963d79bcc
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/modules/tester/configuration/logstash/tester.conf.erb
+@@ -0,0 +1,17 @@
++input {
++  tcp {
++    codec => json
++    port => <%= setting("var.input.tcp.port", 5000) %>
++    type => syslog
++  }
++}
++
++filter {
++  date {
++    match => [ "logdate", "ISO8601" ]
++  }
++}
++
++output {
++  <%= elasticsearch_output_config() %>
++}

@@ -1,0 +1,221 @@
+diff --git a/lib/bootstrap/bundler.rb b/lib/bootstrap/bundler.rb
+index b2c0c73e10a..2672c6e0e36 100644
+--- a/lib/bootstrap/bundler.rb
++++ b/lib/bootstrap/bundler.rb
+@@ -196,6 +196,44 @@ def debug?
+       ENV["DEBUG"]
+     end
+ 
++    # @param plugin_names [Array] logstash plugin names that are going to update
++    # @return [Array] gem names that plugins depend on, including logstash plugins
++    def expand_logstash_mixin_dependencies(plugin_names)
++      plugin_names = Array(plugin_names) if plugin_names.is_a?(String)
++
++      # get gem names in Gemfile.lock. If file doesn't exist, it will be generated
++      lockfile_gems = ::Bundler::definition.specs.to_a.map { |stub_spec| stub_spec.name }.to_set
++
++      # get the array of dependencies which are eligible to update. Bundler unlock these gems in update process
++      # exclude the gems which are not in lock file. They should not be part of unlock gems.
++      # The core libs, logstash-core logstash-core-plugin-api, are not expected to update when user do plugins update
++      # constraining the transitive dependency updates to only those Logstash maintain
++      unlock_libs = plugin_names.flat_map { |plugin_name| fetch_plugin_dependencies(plugin_name) }
++                                .uniq
++                                .select { |lib_name| lockfile_gems.include?(lib_name) }
++                                .select { |lib_name| lib_name.start_with?("logstash-mixin-") }
++
++      unlock_libs + plugin_names
++    end
++
++    # get all dependencies of a single plugin, considering all versions >= current
++    # @param plugin_name [String] logstash plugin name
++    # @return [Array] gem names that plugin depends on
++    def fetch_plugin_dependencies(plugin_name)
++      old_spec = ::Gem::Specification.find_all_by_name(plugin_name).last
++      require_version = old_spec ? ">= #{old_spec.version}": nil
++      dep = ::Gem::Dependency.new(plugin_name, require_version)
++      new_specs, errors = ::Gem::SpecFetcher.fetcher.spec_for_dependency(dep)
++
++      raise(errors.first.error) if errors.length > 0
++
++      new_specs.map { |spec, source| spec }
++               .flat_map(&:dependencies)
++               .select {|spec| spec.type == :runtime }
++               .map(&:name)
++               .uniq
++    end
++
+     # build Bundler::CLI.start arguments array from the given options hash
+     # @param option [Hash] the invoke! options hash
+     # @return [Array<String>] Bundler::CLI.start string arguments array
+@@ -210,7 +248,7 @@ def bundler_arguments(options = {})
+         end
+       elsif options[:update]
+         arguments << "update"
+-        arguments << options[:update]
++        arguments << expand_logstash_mixin_dependencies(options[:update])
+         arguments << "--local" if options[:local]
+       elsif options[:clean]
+         arguments << "clean"
+diff --git a/lib/pluginmanager/install.rb b/lib/pluginmanager/install.rb
+index 6623fb06cf0..f0711348d81 100644
+--- a/lib/pluginmanager/install.rb
++++ b/lib/pluginmanager/install.rb
+@@ -74,6 +74,7 @@ def execute
+     end
+ 
+     check_for_integrations(gems)
++    update_logstash_mixin_dependencies(gems)
+     install_gems_list!(gems)
+     remove_unused_locally_installed_gems!
+     remove_unused_integration_overlaps!
+@@ -175,6 +176,27 @@ def plugins_gems
+     version ? [plugins_arg << version] : plugins_arg.map { |plugin| [plugin, nil] }
+   end
+ 
++  def local_gem?
++    plugins_arg.any? { |plugin_arg| LogStash::PluginManager.plugin_file?(plugin_arg) }
++  end
++
++  def update_logstash_mixin_dependencies(install_list)
++    return if !verify? || preserve? || development? || local? || local_gem?
++
++    puts "Resolving mixin dependencies"
++    LogStash::Bundler.setup!
++    plugins_to_update = install_list.map(&:first)
++    unlock_dependencies = LogStash::Bundler.expand_logstash_mixin_dependencies(plugins_to_update) - plugins_to_update
++
++    if unlock_dependencies.any?
++      puts "Updating mixin dependencies #{unlock_dependencies.join(', ')}"
++      options = {:update => unlock_dependencies, :rubygems_source => gemfile.gemset.sources}
++      LogStash::Bundler.invoke!(options)
++    end
++
++    unlock_dependencies
++  end
++
+   # install_list will be an array of [plugin name, version, options] tuples, version it
+   # can be nil at this point we know that plugins_arg is not empty and if the
+   # --version is specified there is only one plugin in plugins_arg
+diff --git a/spec/unit/bootstrap/bundler_spec.rb b/spec/unit/bootstrap/bundler_spec.rb
+index 98a73cbe1fb..0f8e0e2eccd 100644
+--- a/spec/unit/bootstrap/bundler_spec.rb
++++ b/spec/unit/bootstrap/bundler_spec.rb
+@@ -92,20 +92,20 @@
+   end
+ 
+   context 'when generating bundler arguments' do
+-    subject { LogStash::Bundler.bundler_arguments(options) }
++    subject(:bundler_arguments) { LogStash::Bundler.bundler_arguments(options) }
+     let(:options) { {} }
+ 
+     context 'when installing' do
+       let(:options) { { :install => true } }
+ 
+       it 'should call bundler install' do
+-        expect(subject).to include('install')
++        expect(bundler_arguments).to include('install')
+       end
+ 
+       context 'with the cleaning option' do
+         it 'should add the --clean arguments' do
+           options.merge!(:clean => true)
+-          expect(subject).to include('install','--clean')
++          expect(bundler_arguments).to include('install','--clean')
+         end
+       end
+     end
+@@ -115,14 +115,39 @@
+ 
+       context 'with a specific plugin' do
+         it 'should call `bundle update plugin-name`' do
+-          expect(subject).to include('update', 'logstash-input-stdin')
++          expect(bundler_arguments).to include('update', 'logstash-input-stdin')
+         end
+       end
+ 
+       context 'with the cleaning option' do
+         it 'should ignore the clean option' do
+           options.merge!(:clean => true)
+-          expect(subject).not_to include('--clean')
++          expect(bundler_arguments).not_to include('--clean')
++        end
++      end
++
++      context 'with ecs_compatibility' do
++        let(:plugin_name) { 'logstash-output-elasticsearch' }
++        let(:options) { { :update => plugin_name } }
++
++        it "also update dependencies" do
++          expect(bundler_arguments).to include('logstash-mixin-ecs_compatibility_support', plugin_name)
++
++          mixin_libs = bundler_arguments - ["update", plugin_name]
++          mixin_libs.each do |gem_name|
++            dep = ::Gem::Dependency.new(gem_name)
++            expect(dep.type).to eq(:runtime)
++            expect(gem_name).to start_with('logstash-mixin-')
++          end
++        end
++
++        it "do not include core lib" do
++          expect(bundler_arguments).not_to include('logstash-core', 'logstash-core-plugin-api')
++        end
++
++        it "raise error when fetcher failed" do
++          allow(::Gem::SpecFetcher.fetcher).to receive("spec_for_dependency").with(anything).and_return([nil, [StandardError.new("boom")]])
++          expect { bundler_arguments }.to raise_error(StandardError, /boom/)
+         end
+       end
+     end
+@@ -130,7 +155,7 @@
+     context "when only specifying clean" do
+       let(:options) { { :clean => true } }
+       it 'should call the `bundle clean`' do
+-        expect(subject).to include('clean')
++        expect(bundler_arguments).to include('clean')
+       end
+     end
+   end
+diff --git a/spec/unit/plugin_manager/install_spec.rb b/spec/unit/plugin_manager/install_spec.rb
+index 8307461f4c0..cf17306409e 100644
+--- a/spec/unit/plugin_manager/install_spec.rb
++++ b/spec/unit/plugin_manager/install_spec.rb
+@@ -26,8 +26,9 @@
+     let(:sources) { ["https://rubygems.org", "http://localhost:9292"] }
+ 
+     before(:each) do
+-      expect(cmd).to receive(:validate_cli_options!).and_return(nil)
++      expect(cmd).to receive(:validate_cli_options!).at_least(:once).and_return(nil)
+       expect(cmd).to receive(:plugins_gems).and_return([["dummy", nil]])
++      expect(cmd).to receive(:update_logstash_mixin_dependencies).and_return(nil)
+       expect(cmd).to receive(:install_gems_list!).and_return(nil)
+       expect(cmd).to receive(:remove_unused_locally_installed_gems!).and_return(nil)
+       cmd.verify = true
+@@ -47,6 +48,7 @@
+       expect(cmd).to receive(:validate_cli_options!).and_return(nil)
+       # used to pass indirect input to the command under test
+       expect(cmd).to receive(:plugins_gems).and_return([["logstash-input-elastic_agent", nil]])
++      expect(cmd).to receive(:update_logstash_mixin_dependencies).and_return(nil)
+       # used to skip Bundler interaction
+       expect(cmd).to receive(:install_gems_list!).and_return(nil)
+       # avoid to clean gemfile folder
+@@ -73,6 +75,7 @@
+     let(:cmd) { LogStash::PluginManager::Install.new("install my-super-pack") }
+     before do
+       expect(cmd).to receive(:plugins_arg).and_return(["my-super-pack"]).at_least(:once)
++      allow(cmd).to receive(:update_logstash_mixin_dependencies).and_return(nil)
+     end
+ 
+     it "reports `FileNotFoundError` exception" do
+diff --git a/spec/unit/plugin_manager/util_spec.rb b/spec/unit/plugin_manager/util_spec.rb
+index 26623859d8d..dfa448dc4de 100644
+--- a/spec/unit/plugin_manager/util_spec.rb
++++ b/spec/unit/plugin_manager/util_spec.rb
+@@ -61,7 +61,7 @@
+     let(:plugin)  { "foo" }
+     let(:version) { "9.0.0.0" }
+ 
+-    let(:sources) { ["http://source.01", "http://source.02"] }
++    let(:sources) { ["https://rubygems.org", "http://source.02"] }
+     let(:options) { {:rubygems_source => sources} }
+ 
+     let(:gemset)  { double("gemset") }

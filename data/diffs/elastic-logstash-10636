@@ -1,0 +1,330 @@
+diff --git a/logstash-core/lib/logstash/plugin.rb b/logstash-core/lib/logstash/plugin.rb
+index 59fa8a9dce8..eb4db8fc915 100644
+--- a/logstash-core/lib/logstash/plugin.rb
++++ b/logstash-core/lib/logstash/plugin.rb
+@@ -3,6 +3,8 @@
+ require "concurrent"
+ require "securerandom"
+ 
++require_relative 'plugin_metadata'
++
+ class LogStash::Plugin
+   include LogStash::Util::Loggable
+ 
+@@ -136,4 +138,22 @@ def self.lookup(type, name)
+     require "logstash/plugins/registry"
+     LogStash::PLUGIN_REGISTRY.lookup_pipeline_plugin(type, name)
+   end
++
++  ##
++  # Returns this plugin's metadata key/value store.
++  #
++  # @see LogStash::PluginMetadata for restrictions and caveats.
++  # @since 7.1
++  #
++  # @usage:
++  # ~~~
++  # if defined?(plugin_metadata)
++  #   plugin_metadata.set(:foo, 'value')
++  # end
++  # ~~~
++  #
++  # @return [LogStash::PluginMetadata]
++  def plugin_metadata
++    LogStash::PluginMetadata.for_plugin(self.id)
++  end
+ end # class LogStash::Plugin
+diff --git a/logstash-core/lib/logstash/plugin_metadata.rb b/logstash-core/lib/logstash/plugin_metadata.rb
+new file mode 100644
+index 00000000000..24cb9802dcd
+--- /dev/null
++++ b/logstash-core/lib/logstash/plugin_metadata.rb
+@@ -0,0 +1,108 @@
++# encoding: utf-8
++
++require 'thread_safe/cache'
++
++module LogStash
++  ##
++  # `PluginMetadata` provides a space to store key/value metadata about a plugin, typically metadata about
++  # external resources that can be gleaned during plugin registration.
++  #
++  # Data is persisted across pipeline reloads, and no effort is made to clean up metadata from pipelines
++  # that no longer exist after a pipeline reload.
++  #
++  #  - It MUST NOT be used to store processing state
++  #  - It SHOULD NOT be updated frequently.
++  #  - Individual metadata keys MUST be Symbols and SHOULD NOT be dynamically generated
++  #
++  # USAGE FROM PLUGINS
++  # ------------------
++  #
++  # Since we allow plugins to be updated, it is important to introduce bindings to new Logstash features in a way
++  # that doesn't break when installed onto a Logstash that doesn't have those features, e.g.:
++  #
++  # ~~~
++  # if defined?(LogStash::PluginMetadata)
++  #   LogStash::PluginMetadata.set(id, :foo, bar)
++  # end
++  # ~~~
++  #
++  # @since 7.1
++  class PluginMetadata
++    Thread.exclusive do
++      @registry = ThreadSafe::Cache.new unless defined?(@registry)
++    end
++
++    class << self
++      ##
++      # Get the PluginMetadata object corresponding to the given plugin id
++      #
++      # @param plugin_id [String]
++      #
++      # @return [PluginMetadata]: the metadata object for the provided `plugin_id`; if no
++      #                           metadata object exists, it will be created.
++      def for_plugin(plugin_id)
++        @registry.compute_if_absent(plugin_id) { PluginMetadata.new }
++      end
++
++      ##
++      # Determine if we have an existing PluginMetadata object for the given plugin id
++      # This allows us to avoid creating a metadata object if we don't already have one.
++      #
++      # @param plugin_id [String]
++      #
++      # @return [Boolean]
++      def exists?(plugin_id)
++        @registry.key?(plugin_id)
++      end
++
++      ##
++      # @api private
++      def reset!
++        @registry.clear
++      end
++    end
++
++    ##
++    # @see [LogStash::PluginMetadata#for_plugin(String)]
++    # @api private
++    def initialize
++      @datastore = ThreadSafe::Cache.new
++    end
++
++    ##
++    # Set the metadata key for this plugin, returning the previous value (if any)
++    #
++    # @param key [Symbol]
++    # @param value [Object]
++    #
++    # @return [Object]
++    def set(key, value)
++      if value.nil?
++        @datastore.delete(key)
++      else
++        @datastore.get_and_set(key, value)
++      end
++    end
++
++    ##
++    # Get the metadata value for the given key on this plugin
++    #
++    # @param key [Symbol]
++    #
++    # @return [Object]: the value object associated with the given key on this
++    #                   plugin, or nil if no value is associated
++    def get(key)
++      @datastore.get(key)
++    end
++
++    ##
++    # Determine whether specific key/value metadata exists for this plugin
++    #
++    # @param key [Symbol]: the key
++    #
++    # @return [Boolean]: true if the plugin includes metadata for the key
++    def set?(key)
++      @datastore.key?(key)
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/logstash-core/spec/logstash/plugin_spec.rb b/logstash-core/spec/logstash/plugin_spec.rb
+index fb7f3c1c7bc..302f4017ad1 100644
+--- a/logstash-core/spec/logstash/plugin_spec.rb
++++ b/logstash-core/spec/logstash/plugin_spec.rb
+@@ -267,6 +267,69 @@ def register; end
+     end
+   end
+ 
++  describe "#plugin_metadata" do
++    plugin_types = [
++        LogStash::Filters::Base,
++        LogStash::Codecs::Base,
++        LogStash::Outputs::Base,
++        LogStash::Inputs::Base
++    ]
++
++    before(:each) { LogStash::PluginMetadata::reset! }
++
++    plugin_types.each do |plugin_type|
++      let(:plugin) do
++        Class.new(plugin_type) do
++          config_name "simple_plugin"
++
++          config :host, :validate => :string
++          config :export, :validate => :boolean
++
++          def register; end
++        end
++      end
++
++      let(:config) do
++        {
++            "host" => "127.0.0.1",
++            "export" => true
++        }
++      end
++
++      subject(:plugin_instance) { plugin.new(config) }
++
++      context "plugin type is #{plugin_type}" do
++        {
++            'when there is not ID configured for the plugin' => {},
++            'when a user provide an ID for the plugin' => { 'id' => 'ABC' },
++        }.each do |desc, config_override|
++
++
++          context(desc) do
++            let(:config) { super.merge(config_override) }
++
++            it "has a PluginMetadata" do
++              expect(plugin_instance.plugin_metadata).to be_a_kind_of(LogStash::PluginMetadata)
++            end
++
++            if config_override.include?('id')
++              it "will be shared between instance of plugins" do
++                expect(plugin_instance.plugin_metadata).to equal(plugin.new(config).plugin_metadata)
++              end
++            end
++
++            it 'stores metadata' do
++              new_value = 'foo'
++              old_value = plugin_instance.plugin_metadata.set(:foo, new_value)
++              expect(old_value).to be_nil
++              expect(plugin_instance.plugin_metadata.get(:foo)).to eq(new_value)
++            end
++          end
++        end
++      end
++    end
++  end
++
+   describe "#id" do
+     let(:plugin) do
+       Class.new(LogStash::Filters::Base,) do
+diff --git a/logstash-core/spec/plugin_metadata_spec.rb b/logstash-core/spec/plugin_metadata_spec.rb
+new file mode 100644
+index 00000000000..bedc7c0dbe3
+--- /dev/null
++++ b/logstash-core/spec/plugin_metadata_spec.rb
+@@ -0,0 +1,98 @@
++# encoding: utf-8
++
++require 'spec_helper'
++require 'logstash/plugin_metadata'
++require 'securerandom'
++
++describe LogStash::PluginMetadata do
++
++  let(:registry) { described_class }
++  before(:each) { registry.reset! }
++
++  let(:plugin_id) { SecureRandom.uuid }
++
++  describe 'registry' do
++    describe '#for_plugin' do
++      it 'returns the same instance when given the same id' do
++        expect(registry.for_plugin(plugin_id)).to be(registry.for_plugin(plugin_id))
++      end
++      it 'returns different instances when given different ids' do
++        expect(registry.for_plugin(plugin_id)).to_not equal(registry.for_plugin(plugin_id.next))
++      end
++    end
++    describe '#exists?' do
++      context 'when the plugin has not yet been registered' do
++        it 'returns false' do
++          expect(registry.exists?(plugin_id)).to be false
++        end
++      end
++      context 'when the plugin has already been registered' do
++        before(:each) { registry.for_plugin(plugin_id).set(:foo, 'bar') }
++        it 'returns true' do
++          expect(registry.exists?(plugin_id)).to be true
++        end
++      end
++    end
++  end
++
++  describe 'instance' do
++    let(:instance) { registry.for_plugin(plugin_id) }
++
++    describe '#set' do
++      context 'when the key is not set' do
++        it 'sets the new value' do
++          instance.set(:foo, 'bar')
++          expect(instance.get(:foo)).to eq('bar')
++        end
++        it 'returns the nil' do
++          expect(instance.set(:foo, 'bar')).to be_nil
++        end
++      end
++      context 'when the key is set' do
++        before(:each) { instance.set(:foo, 'bananas') }
++
++        it 'sets the new value' do
++          instance.set(:foo, 'bar')
++          expect(instance.get(:foo)).to eq('bar')
++        end
++        it 'returns the previous associated value' do
++          expect(instance.set(:foo, 'bar')).to eq('bananas')
++        end
++        context 'when the new value is nil' do
++          it 'unsets the value' do
++            instance.set(:foo, nil)
++            expect(instance.set?(:foo)).to be false
++          end
++        end
++      end
++    end
++
++    describe '#get' do
++      context 'when the key is set' do
++        before(:each) { instance.set(:foo, 'bananas') }
++        it 'returns the associated value' do
++          expect(instance.get(:foo)).to eq('bananas')
++        end
++      end
++      context 'when the key is not set' do
++        it 'returns nil' do
++          expect(instance.get(:foo)).to be_nil
++        end
++      end
++    end
++
++    describe '#set?' do
++      context 'when the key is set' do
++        before(:each) { instance.set(:foo, 'bananas')}
++        it 'returns true' do
++          expect(instance.set?(:foo)).to be true
++        end
++      end
++      context 'when the key is not set' do
++        it 'returns false' do
++          expect(instance.set?(:foo)).to be false
++        end
++      end
++    end
++  end
++end
+\ No newline at end of file

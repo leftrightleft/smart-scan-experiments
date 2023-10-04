@@ -1,0 +1,198 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index e7ca3eaad2b..87f28a74106 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -342,6 +342,12 @@ def shutdown(pipeline)
+   def register_pipeline(pipeline_id, settings)
+     pipeline = create_pipeline(settings.merge(:pipeline_id => pipeline_id))
+     return unless pipeline.is_a?(LogStash::Pipeline)
++    if @auto_reload && pipeline.non_reloadable_plugins.any?
++      @logger.error(I18n.t("logstash.agent.non_reloadable_config_register"),
++                    :pipeline_id => pipeline_id,
++                    :plugins => pipeline.non_reloadable_plugins.map(&:class))
++      return
++    end
+     @pipelines[pipeline_id] = pipeline
+   end
+ 
+@@ -424,6 +430,10 @@ def reload_pipeline!(id)
+     if old_pipeline.config_str == new_pipeline.config_str
+       @logger.debug("no configuration change for pipeline",
+                     :pipeline => id, :config => old_pipeline.config_str)
++    elsif new_pipeline.non_reloadable_plugins.any?
++      @logger.error(I18n.t("logstash.agent.non_reloadable_config_reload"),
++                    :pipeline_id => id,
++                    :plugins => new_pipeline.non_reloadable_plugins.map(&:class))
+     else
+       @logger.log("fetched new config for pipeline. upgrading..",
+                    :pipeline => id, :config => new_pipeline.config_str)
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index da8b26cb947..afc653c2dfb 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -28,6 +28,10 @@ module LogStash; class Pipeline
+   }
+   MAX_INFLIGHT_WARN_THRESHOLD = 10_000
+ 
++  RELOAD_INCOMPATIBLE_PLUGINS = [
++    "LogStash::Inputs::Stdin"
++  ]
++
+   def self.validate_config(config_str, settings = {})
+     begin
+       # There should be a better way to test this
+@@ -488,4 +492,11 @@ def stalling_threads_info
+       .each {|t| t.delete("blocked_on") }
+       .each {|t| t.delete("status") }
+   end
++
++  def non_reloadable_plugins
++    (inputs + filters + outputs).select do |plugin|
++      RELOAD_INCOMPATIBLE_PLUGINS.include?(plugin.class.name)
++    end
++  end
++
+ end end
+diff --git a/logstash-core/locales/en.yml b/logstash-core/locales/en.yml
+index 6b796e9dcf2..78fa5767d0b 100644
+--- a/logstash-core/locales/en.yml
++++ b/logstash-core/locales/en.yml
+@@ -73,6 +73,11 @@ en:
+         data loss.
+       forced_sigint: >-
+         SIGINT received. Terminating immediately..
++      non_reloadable_config_reload: >-
++        Unable to reload configuration because it does not support dynamic reloading
++      non_reloadable_config_register: |-
++        Logstash was not able to load configuration since it does not support
++        dynamic reloading and -r or --auto-reload flag was enabled
+       configtest-flag-information: |-
+         You may be interested in the '--configtest' flag which you can
+         use to validate logstash's configuration before you choose
+diff --git a/logstash-core/spec/logstash/agent_spec.rb b/logstash-core/spec/logstash/agent_spec.rb
+index 71f7a215645..30904302a98 100644
+--- a/logstash-core/spec/logstash/agent_spec.rb
++++ b/logstash-core/spec/logstash/agent_spec.rb
+@@ -25,8 +25,9 @@
+ 
+   describe "register_pipeline" do
+     let(:pipeline_id) { "main" }
++    let(:config_string) { "input { } filter { } output { }" }
+     let(:settings) { {
+-      :config_string => "input { } filter { } output { }",
++      :config_string => config_string,
+       :pipeline_workers => 4
+     } }
+ 
+@@ -50,14 +51,20 @@
+ 
+     context "when auto_reload is false" do
+       let(:agent_args) { [ "--config", config_file] } #reload_interval => 0.01, :config_path => } }
++      let(:pipeline_id) { "main" }
++      let(:pipeline_settings) { { :config_path => config_file } }
+ 
+-      before :each do
+-        allow(subject).to receive(:sleep)
+-        allow(subject).to receive(:clean_state?).and_return(false)
+-        allow(subject).to receive(:running_pipelines?).and_return(true)
++      before(:each) do
++        subject.register_pipeline(pipeline_id, pipeline_settings)
+       end
+ 
+       context "if state is clean" do
++        before :each do
++          allow(subject).to receive(:running_pipelines?).and_return(true)
++          allow(subject).to receive(:sleep)
++          allow(subject).to receive(:clean_state?).and_return(false)
++        end
++
+         it "should not reload_state!" do
+           expect(subject).to_not receive(:reload_state!)
+           t = Thread.new { subject.execute }
+@@ -66,10 +73,49 @@
+           t.join
+         end
+       end
++
++      context "when calling reload_state!" do
++        context "with a config that contains reload incompatible plugins" do
++          let(:second_pipeline_config) { "input { stdin {} } filter { } output { }" }
++
++          it "does not reload if new config contains reload incompatible plugins" do
++            t = Thread.new { subject.execute }
++            sleep 0.01 until subject.running_pipelines? && subject.pipelines.values.first.ready?
++            expect(subject).to_not receive(:upgrade_pipeline)
++            File.open(config_file, "w") { |f| f.puts second_pipeline_config }
++            subject.send(:reload_state!)
++            sleep 0.1
++            Stud.stop!(t)
++            t.join
++          end
++        end
++
++        context "with a config that does not contain reload incompatible plugins" do
++          let(:second_pipeline_config) { "input { generator { } } filter { } output { }" }
++
++          it "does not reload if new config contains reload incompatible plugins" do
++            t = Thread.new { subject.execute }
++            sleep 0.01 until subject.running_pipelines? && subject.pipelines.values.first.ready?
++            expect(subject).to receive(:upgrade_pipeline)
++            File.open(config_file, "w") { |f| f.puts second_pipeline_config }
++            subject.send(:reload_state!)
++            sleep 0.1
++            Stud.stop!(t)
++            t.join
++          end
++        end
++      end
+     end
+ 
+     context "when auto_reload is true" do
+       let(:agent_args) { [ "--auto-reload", "--config", config_file] } #reload_interval => 0.01, :config_path => } }
++      let(:pipeline_id) { "main" }
++      let(:pipeline_settings) { { :config_path => config_file } }
++
++      before(:each) do
++        subject.register_pipeline(pipeline_id, pipeline_settings)
++      end
++
+       context "if state is clean" do
+         it "should periodically reload_state" do
+           expect(subject).to receive(:reload_state!).at_least(3).times
+@@ -81,6 +127,36 @@
+           t.join
+         end
+       end
++
++      context "when calling reload_state!" do
++        context "with a config that contains reload incompatible plugins" do
++          let(:second_pipeline_config) { "input { stdin {} } filter { } output { }" }
++
++          it "does not reload if new config contains reload incompatible plugins" do
++            t = Thread.new { subject.execute }
++            sleep 0.01 until subject.running_pipelines? && subject.pipelines.values.first.ready?
++            expect(subject).to_not receive(:upgrade_pipeline)
++            File.open(config_file, "w") { |f| f.puts second_pipeline_config }
++            sleep 0.1
++            Stud.stop!(t)
++            t.join
++          end
++        end
++
++        context "with a config that does not contain reload incompatible plugins" do
++          let(:second_pipeline_config) { "input { generator { } } filter { } output { }" }
++
++          it "does not reload if new config contains reload incompatible plugins" do
++            t = Thread.new { subject.execute }
++            sleep 0.01 until subject.running_pipelines? && subject.pipelines.values.first.ready?
++            expect(subject).to receive(:upgrade_pipeline).at_least(2).times
++            File.open(config_file, "w") { |f| f.puts second_pipeline_config }
++            sleep 0.1
++            Stud.stop!(t)
++            t.join
++          end
++        end
++      end
+     end
+   end
+ 

@@ -1,0 +1,155 @@
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index 283f6327cc7..c4b1dcf4bd2 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -27,9 +27,9 @@ def initialize(pipeline_config, namespaced_metric = nil, agent = nil)
+     @agent = agent
+ 
+     @plugin_factory = LogStash::Plugins::PluginFactory.new(
+-      # use NullMetric if called in the BasePipeline context otherwise use the @metric value
+-      lir, LogStash::Plugins::PluginMetricFactory.new(pipeline_id, metric),
+-      LogStash::Plugins::ExecutionContextFactory.new(@agent, self, dlq_writer),
++      lir,
++      LogStash::Plugins::PluginMetricFactory.new(pipeline_id, metric),
++      LogStash::Plugins::ExecutionContextFactory.new(self, dlq_writer),
+       FilterDelegator
+     )
+     grammar = LogStashConfigParser.new
+diff --git a/logstash-core/spec/logstash/execution_context_spec.rb b/logstash-core/spec/logstash/execution_context_spec.rb
+index a34c0377919..ca35a3183e4 100644
+--- a/logstash-core/spec/logstash/execution_context_spec.rb
++++ b/logstash-core/spec/logstash/execution_context_spec.rb
+@@ -14,7 +14,7 @@
+     allow(pipeline).to receive(:pipeline_id).and_return(pipeline_id)
+   end
+ 
+-  subject { described_class.new(pipeline, agent, plugin_id, plugin_type, dlq_writer) }
++  subject { described_class.new(pipeline, plugin_id, plugin_type, dlq_writer) }
+ 
+   it "returns the `pipeline_id`" do
+     expect(subject.pipeline_id).to eq(pipeline_id)
+@@ -24,10 +24,6 @@
+     expect(subject.pipeline).to eq(pipeline)
+   end
+ 
+-  it "returns the agent" do
+-    expect(subject.agent).to eq(agent)
+-  end
+-
+   it "returns the plugin-specific dlq writer" do
+     expect(subject.dlq_writer.plugin_type).to eq(plugin_type)
+     expect(subject.dlq_writer.plugin_id).to eq(plugin_id)
+diff --git a/logstash-core/spec/support/shared_contexts.rb b/logstash-core/spec/support/shared_contexts.rb
+index 55ddfd7e9f4..7439aaeb468 100644
+--- a/logstash-core/spec/support/shared_contexts.rb
++++ b/logstash-core/spec/support/shared_contexts.rb
+@@ -6,7 +6,7 @@
+   let(:plugin_type) { :plugin_type }
+   let(:dlq_writer) { double("dlq_writer") }
+   let(:execution_context) do
+-    ::LogStash::ExecutionContext.new(pipeline, agent, plugin_id, plugin_type, dlq_writer)
++    ::LogStash::ExecutionContext.new(pipeline, plugin_id, plugin_type, dlq_writer)
+   end
+ 
+   before do
+diff --git a/logstash-core/src/main/java/org/logstash/execution/ExecutionContextExt.java b/logstash-core/src/main/java/org/logstash/execution/ExecutionContextExt.java
+index 4bef02b2838..3f9d38c62c0 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/ExecutionContextExt.java
++++ b/logstash-core/src/main/java/org/logstash/execution/ExecutionContextExt.java
+@@ -17,22 +17,22 @@ public final class ExecutionContextExt extends RubyObject {
+ 
+     private AbstractDeadLetterQueueWriterExt dlqWriter;
+ 
+-    private IRubyObject agent;
+-
+     private IRubyObject pipeline;
+ 
+     public ExecutionContextExt(final Ruby runtime, final RubyClass metaClass) {
+         super(runtime, metaClass);
+     }
+ 
+-    @JRubyMethod(required = 5)
+-    public ExecutionContextExt initialize(final ThreadContext context,
+-        final IRubyObject[] args) {
++    @JRubyMethod(required = 4)
++    public ExecutionContextExt initialize(final ThreadContext context, final IRubyObject[] args) {
+         pipeline = args[0];
+-        agent = args[1];
++        final IRubyObject pluginId = args[1];
++        final IRubyObject pluginType = args[2];
++        final IRubyObject _dlqWriter = args[3];
++
+         dlqWriter = new AbstractDeadLetterQueueWriterExt.PluginDeadLetterQueueWriterExt(
+             context.runtime, RubyUtil.PLUGIN_DLQ_WRITER_CLASS
+-        ).initialize(context, args[4], args[2], args[3]);
++        ).initialize(context, _dlqWriter, pluginId, pluginType);
+         return this;
+     }
+ 
+@@ -40,12 +40,7 @@ public ExecutionContextExt initialize(final ThreadContext context,
+     public AbstractDeadLetterQueueWriterExt dlqWriter(final ThreadContext context) {
+         return dlqWriter;
+     }
+-
+-    @JRubyMethod
+-    public IRubyObject agent(final ThreadContext context) {
+-        return agent;
+-    }
+-
++    
+     @JRubyMethod
+     public IRubyObject pipeline(final ThreadContext context) {
+         return pipeline;
+diff --git a/logstash-core/src/main/java/org/logstash/execution/JavaBasePipelineExt.java b/logstash-core/src/main/java/org/logstash/execution/JavaBasePipelineExt.java
+index f8ac46672ba..6c944a39c82 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/JavaBasePipelineExt.java
++++ b/logstash-core/src/main/java/org/logstash/execution/JavaBasePipelineExt.java
+@@ -54,7 +54,7 @@ public JavaBasePipelineExt initialize(final ThreadContext context, final IRubyOb
+                 ).initialize(context, pipelineId(), metric()),
+                 new PluginFactoryExt.ExecutionContext(
+                     context.runtime, RubyUtil.EXECUTION_CONTEXT_FACTORY_CLASS
+-                ).initialize(context, args[3], this, dlqWriter(context)),
++                ).initialize(context, this, dlqWriter(context)),
+                 RubyUtil.FILTER_DELEGATOR_CLASS
+             )
+         );
+diff --git a/logstash-core/src/main/java/org/logstash/plugins/PluginFactoryExt.java b/logstash-core/src/main/java/org/logstash/plugins/PluginFactoryExt.java
+index 1176058fab2..4d05b03eca8 100644
+--- a/logstash-core/src/main/java/org/logstash/plugins/PluginFactoryExt.java
++++ b/logstash-core/src/main/java/org/logstash/plugins/PluginFactoryExt.java
+@@ -354,11 +354,7 @@ private IRubyObject plugin(final ThreadContext context, final PluginLookup.Plugi
+     public static final class ExecutionContext extends RubyBasicObject {
+ 
+         private static final long serialVersionUID = 1L;
+-
+-        private IRubyObject agent;
+-
+         private IRubyObject pipeline;
+-
+         private IRubyObject dlqWriter;
+ 
+         public ExecutionContext(final Ruby runtime, final RubyClass metaClass) {
+@@ -366,9 +362,11 @@ public ExecutionContext(final Ruby runtime, final RubyClass metaClass) {
+         }
+ 
+         @JRubyMethod
+-        public PluginFactoryExt.ExecutionContext initialize(final ThreadContext context,
+-            final IRubyObject agent, final IRubyObject pipeline, final IRubyObject dlqWriter) {
+-            this.agent = agent;
++        public PluginFactoryExt.ExecutionContext initialize(
++            final ThreadContext context,
++            final IRubyObject pipeline,
++            final IRubyObject dlqWriter
++        ) {
+             this.pipeline = pipeline;
+             this.dlqWriter = dlqWriter;
+             return this;
+@@ -380,7 +378,7 @@ public ExecutionContextExt create(final ThreadContext context, final IRubyObject
+             return new ExecutionContextExt(
+                 context.runtime, RubyUtil.EXECUTION_CONTEXT_CLASS
+             ).initialize(
+-                context, new IRubyObject[]{pipeline, agent, id, classConfigName, dlqWriter}
++                context, new IRubyObject[]{pipeline, id, classConfigName, dlqWriter}
+             );
+         }
+ 

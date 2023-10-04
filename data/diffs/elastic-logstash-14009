@@ -1,0 +1,204 @@
+diff --git a/logstash-core/src/main/java/org/logstash/plugins/AliasRegistryConcurrentProof.java b/logstash-core/src/main/java/org/logstash/plugins/AliasRegistryConcurrentProof.java
+new file mode 100644
+index 00000000000..675ef9e4150
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/plugins/AliasRegistryConcurrentProof.java
+@@ -0,0 +1,107 @@
++package org.logstash.plugins;
++
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.List;
++import java.util.concurrent.*;
++
++/*
++ * Run with ./gradlew assemble && java -cp "logstash-core/lib/jars/*:vendor/jruby/lib/jruby.jar" org.logstash.plugins.AliasRegistryConcurrentProof
++ * */
++public class AliasRegistryConcurrentProof {
++
++//    @SuppressWarnings("rawtypes")
++//    public static void main(String[] args) throws ExecutionException, InterruptedException, TimeoutException {
++//        int cpus = Runtime.getRuntime().availableProcessors();
++//        ExecutorService pool = Executors.newFixedThreadPool(4);
++//
++//        List<Throwable> errors = new ArrayList<>();
++//        List<Future> taskResults = new ArrayList<>(cpus * 1000);
++//
++//        System.out.println("Creating all tasks");
++//        Runnable task = createTestTask(errors);
++//        for (int i = 0; i < cpus * 1000; i++) {
++//            Future<?> taskFuture = pool.submit(task);
++//            taskResults.add(taskFuture);
++//        }
++//
++//        for (Future taskResult: taskResults) {
++//            taskResult.get(1_000, TimeUnit.SECONDS);
++//        }
++//        System.out.println("Joining all results");
++//
++//        pool.shutdown();
++//        System.out.println("Thread pool shutdown");
++//
++//        printFoundErrors(errors);
++//    }
++
++    public static void main(String[] args) throws ExecutionException, InterruptedException, TimeoutException {
++        int runningTime = 30_000;
++        int numThreads = 10;
++
++        ArrayBlockingQueue<Throwable> errors = new ArrayBlockingQueue<Throwable>(numThreads);
++        Runnable task = new Runnable() {
++            @Override
++            public void run() {
++                long start = System.currentTimeMillis();
++                while (System.currentTimeMillis() - start <= runningTime && !Thread.currentThread().isInterrupted()) {
++                    try {
++                        AliasRegistry aliasRegistry = new AliasRegistry();
++                        if (!"beats".equals(aliasRegistry.originalFromAlias(PluginLookup.PluginType.INPUT, "elastic_agent"))) {
++                            System.out.println("Problem encountered with AliasRegistry");
++                        }
++                    } catch (Throwable th) {
++                        errors.add(th);
++                    }
++                }
++            }
++        };
++
++        System.out.println("Creating tasks and running them for 5 seconds");
++
++        List<Thread> threads = new ArrayList<>(numThreads);
++        for (int i = 0; i < numThreads; i++) {
++            threads.add(new Thread(task));
++        }
++
++        threads.forEach(Thread::start);
++        System.out.println("Started threads");
++
++        threads.forEach(thread -> {
++            try {
++                thread.join();
++            } catch (InterruptedException e) {
++                e.printStackTrace();
++            }
++        });
++        System.out.println("Joining threads and exit");
++
++        printFoundErrors(errors);
++    }
++
++    private static void printFoundErrors(Collection<Throwable> errors) {
++        if (!errors.isEmpty()) {
++            System.out.printf("Terminated with %d errors%n", errors.size());
++            for (Throwable error : errors) {
++                System.out.println(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
++                error.printStackTrace(System.out);
++                System.out.println("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<");
++            }
++        }
++    }
++
++
++    private static Runnable createTestTask(List<Throwable> errors) {
++        return () -> {
++            try {
++                AliasRegistry aliasRegistry = new AliasRegistry();
++                if (!"beats".equals(aliasRegistry.originalFromAlias(PluginLookup.PluginType.INPUT, "elastic_agent"))) {
++                    System.out.println("Problem encountered with AliasRegistry");
++                }
++            } catch (Throwable th) {
++                errors.add(th);
++            }
++        };
++    }
++}
+diff --git a/logstash-core/src/test/java/org/logstash/plugins/AliasRegistryTest.java b/logstash-core/src/test/java/org/logstash/plugins/AliasRegistryTest.java
+index 054bfbef7a2..714b8c56ea7 100644
+--- a/logstash-core/src/test/java/org/logstash/plugins/AliasRegistryTest.java
++++ b/logstash-core/src/test/java/org/logstash/plugins/AliasRegistryTest.java
+@@ -8,7 +8,10 @@
+ import java.net.URL;
+ import java.nio.file.Path;
+ import java.nio.file.Paths;
++import java.util.ArrayList;
++import java.util.List;
+ import java.util.Map;
++import java.util.concurrent.*;
+ 
+ import static org.junit.Assert.*;
+ 
+@@ -43,4 +46,74 @@ public void testProductionConfigAliasesGemsExists() throws IOException {
+             assertEquals(errorMsg, 200, connection.getResponseCode());
+         }
+     }
++
++    @Test
++    @SuppressWarnings("rawtypes")
++    public void testConcurrentCreationOfAliasRegistries() throws ExecutionException, InterruptedException, TimeoutException {
++        int cpus = Runtime.getRuntime().availableProcessors();
++        ExecutorService pool = Executors.newFixedThreadPool(4);
++
++        List<Throwable> errors = new ArrayList<>();
++        List<Future> taskResults = new ArrayList<>(cpus * 1024 * 10);
++
++        Runnable task = createTestTask(errors);
++        for (int i = 0; i < cpus * 1024 * 10; i++) {
++            Future<?> taskFuture = pool.submit(task);
++            taskResults.add(taskFuture);
++        }
++
++
++        for (Future taskResult: taskResults) {
++            taskResult.get(1_000, TimeUnit.SECONDS);
++        }
++
++        pool.shutdown();
++
++        assertTrue("No errors were raised", errors.isEmpty());
++    }
++
++    private Runnable createTestTask(List<Throwable> errors) {
++        return () -> {
++            try {
++                AliasRegistry aliasRegistry = new AliasRegistry();
++                assertEquals("aliased_input1 should be the alias for beats input",
++                        "beats", aliasRegistry.originalFromAlias(PluginType.INPUT, "aliased_input1"));
++            } catch (Throwable th) {
++                errors.add(th);
++            }
++        };
++    }
++
++
++    @Test
++    public void testConcurrentCreationOfAliasRegistriesSpinning() throws InterruptedException {
++        List<Throwable> errors = new ArrayList<>();
++        Runnable task = new Runnable() {
++            @Override
++            public void run() {
++                long start = System.currentTimeMillis();
++                while (System.currentTimeMillis() - start <= 5_000 && !Thread.currentThread().isInterrupted()) {
++                    try {
++                        AliasRegistry aliasRegistry = new AliasRegistry();
++                        assertEquals("aliased_input1 should be the alias for beats input",
++                                "beats", aliasRegistry.originalFromAlias(PluginType.INPUT, "aliased_input1"));
++                    } catch (Throwable th) {
++                        errors.add(th);
++                    }
++                }
++            }
++        };
++
++
++        Thread th1 = new Thread(task);
++        Thread th2 = new Thread(task);
++
++        th1.start();
++        th2.start();
++
++        th1.join();
++        th2.join();
++
++        assertTrue("No errors were raised", errors.isEmpty());
++    }
+ }
+\ No newline at end of file

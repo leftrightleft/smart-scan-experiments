@@ -1,0 +1,183 @@
+diff --git a/Gemfile b/Gemfile
+index c5b553239bf..66d7fcb73c3 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -16,6 +16,7 @@ gem "haml"
+ 
+ # TODO(sissel): Put this into a group that's only used for monolith packaging
+ gem "mongo" # outputs/mongodb
++gem "redis" # outputs/redis
+ 
+ gem "gelf" # outputs/gelf
+ 
+diff --git a/Gemfile.lock b/Gemfile.lock
+index 093597e458f..41620284c40 100644
+--- a/Gemfile.lock
++++ b/Gemfile.lock
+@@ -24,6 +24,7 @@ GEM
+       bson (>= 1.3.0)
+     rack (1.2.2)
+     rake (0.8.7)
++    redis (2.2.0)
+     sinatra (1.2.2)
+       rack (~> 1.1)
+       tilt (>= 1.2.2, < 2.0)
+@@ -52,6 +53,7 @@ DEPENDENCIES
+   mizuno
+   mongo
+   rack
++  redis
+   sinatra
+   spoon
+   stomp
+diff --git a/lib/logstash/filters/date.rb b/lib/logstash/filters/date.rb
+index 9f0155f51a7..1c61d88bf4f 100644
+--- a/lib/logstash/filters/date.rb
++++ b/lib/logstash/filters/date.rb
+@@ -123,6 +123,7 @@ def filter(event)
+           time = nil
+           missing = []
+           success = false
++          last_exception = RuntimeError.new "Unknown"
+           fieldparsers.each do |parserconfig|
+             parser = parserconfig[:parser]
+             missing = parserconfig[:missing]
+diff --git a/lib/logstash/inputs/redis.rb b/lib/logstash/inputs/redis.rb
+new file mode 100644
+index 00000000000..fda03e6978b
+--- /dev/null
++++ b/lib/logstash/inputs/redis.rb
+@@ -0,0 +1,68 @@
++require "logstash/inputs/base"
++require "logstash/namespace"
++require "redis"
++
++class LogStash::Inputs::Redis < LogStash::Inputs::Base
++
++  config_name "redis"
++  
++  # name is used for logging in case there are multiple instances
++  config :name, :validate => :string, :default => 'default'
++
++  config :host, :validate => :string
++
++  config :port, :validate => :number
++
++  config :db, :validate => :number
++
++  config :timeout, :validate => :number
++
++  config :password, :validate => :password
++
++  config :queue, :validate => :string, :required => true
++
++  config :retries, :validate => :number, :default => 5
++
++  def register
++    @redis = nil
++  end
++
++  def connect
++    require 'redis'
++    Redis.new(
++      :host => @host,
++      :port => @port,
++      :timeout => @timeout,
++      :db => @db,
++      :password => @password
++    )
++  end
++
++  def run output_queue
++    Thread.new do
++      LogStash::Util::set_thread_name("input|redis|#{@queue}")
++      retries = @retries
++      loop do
++        begin
++          @redis ||= connect
++          response = @redis.blpop @queue, 0
++          retries = @retries
++          begin
++            output_queue << LogStash::Event.new(JSON.parse(response[1]))
++          rescue # parse or event creation error
++            @logger.error "failed to create event with '#{response[1]}'"
++            @logger.error $!
++          end
++        rescue # redis error
++          raise RuntimeError.new "Redis connection failed too many times" if retries <= 0
++          @redis = nil
++          @logger.warn "Failed to get event from redis #{@name}. "+
++                       "Will retry #{retries} times."
++          @logger.warn $!
++          retries -= 1
++          sleep 1
++        end
++      end
++    end
++  end
++end
+diff --git a/lib/logstash/outputs/redis.rb b/lib/logstash/outputs/redis.rb
+new file mode 100644
+index 00000000000..837b886affd
+--- /dev/null
++++ b/lib/logstash/outputs/redis.rb
+@@ -0,0 +1,59 @@
++require "logstash/outputs/base"
++require "logstash/namespace"
++require 'eventmachine'
++
++class LogStash::Outputs::Redis < LogStash::Outputs::Base
++
++  config_name "redis"
++  
++  # name is used for logging in case there are multiple instances
++  config :name, :validate => :string, :default => 'default'
++
++  config :host, :validate => :string
++
++  config :port, :validate => :number
++
++  config :db, :validate => :number
++
++  config :timeout, :validate => :number
++
++  config :password, :validate => :password
++
++  config :queue, :validate => :string, :required => true
++
++  def register
++    @redis = nil
++  end
++
++  def connect
++    require 'redis'
++    Redis.new(
++      :host => @host,
++      :port => @port,
++      :timeout => @timeout,
++      :db => @db,
++      :password => @password
++    )
++  end
++
++  def receive event, tries=5
++    if tries > 0
++      begin
++        @redis ||= connect
++        @redis.rpush event.sprintf(@queue), event.to_json
++      rescue
++        @redis = nil
++        @logger.warn "Failed to log #{event.to_s} to redis #{@name}. "+
++                     "Will retry #{tries} times."
++        @logger.warn $!
++        Thread.new do
++          sleep 1
++          receive event, tries - 1
++        end
++      end
++    else
++      @logger.error "Fatal error, failed to log #{event.to_s} to redis #{@name}"
++      raise RuntimeError.new "Failed to log to redis #{@name}"
++    end
++  end
++end

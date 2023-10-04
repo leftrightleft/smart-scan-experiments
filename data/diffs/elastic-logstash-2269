@@ -1,0 +1,158 @@
+diff --git a/docs/plugin-doc.asciidoc.erb b/docs/plugin-doc.asciidoc.erb
+index 36e617ad673..5e324ac3928 100644
+--- a/docs/plugin-doc.asciidoc.erb
++++ b/docs/plugin-doc.asciidoc.erb
+@@ -44,6 +44,9 @@ This plugin supports the following configuration options:
+ <% elsif config[:validate].is_a?(Array) -%>
+   * Value can be any of: `<%= config[:validate].join('`, `') %>`
+ <% end -%>
++<% if config[:allow_dynamic] -%>
++  * This configuration item allows usage of dynamic value with <<_sprintf_format,sprintf format>>
++<% end -%>
+ <% if config.include?(:default) -%>
+   * Default value is `<%= config[:default].inspect %>`
+ <% else -%>
+diff --git a/docs/plugin-doc.html.erb b/docs/plugin-doc.html.erb
+index c236314e0af..eff10bd915a 100644
+--- a/docs/plugin-doc.html.erb
++++ b/docs/plugin-doc.html.erb
+@@ -64,6 +64,9 @@ input {
+ <% elsif config[:validate].is_a?(Array) -%>
+   <li> Value can be any of: <%= config[:validate].map(&:inspect).join(", ") %> </li>
+ <% end -%>
++<% if config[:allow_dynamic] -%>
++  <li> This config item allow usage of dynamic value aka <a href="../configuration#sprintf">sprintf format</a> </li>
++<% end -%>
+ <% if config.include?(:default) -%>
+   <li> Default value is <%= config[:default].inspect %> </li>
+ <% else -%>
+diff --git a/docs/plugin-synopsis.asciidoc.erb b/docs/plugin-synopsis.asciidoc.erb
+index 87886f54aba..9d7c68e267e 100644
+--- a/docs/plugin-synopsis.asciidoc.erb
++++ b/docs/plugin-synopsis.asciidoc.erb
+@@ -18,9 +18,9 @@ Required configuration options:
+ 
+ Available configuration options:
+ 
+-[cols="<,<,<,<m",options="header",]
++[cols="<,<,<,<,<m",options="header",]
+ |=======================================================================
+-|Setting |Input type|Required|Default value
++|Setting |Input type|Required|Allow dynamic value|Default value
+ <% sorted_attributes.each do |name, config|
+    next if config[:deprecated]
+    if config[:validate].is_a?(Array) 
+@@ -39,6 +39,15 @@ Available configuration options:
+    else
+      annotation += "|No"
+    end
++   if section == "filter" || section == "output"
++     if config[:allow_dynamic] == true
++       annotation += "|Yes"
++     elsif config[:allow_dynamic] == false
++       annotation += "|No"
++     else
++       annotation += "|Unknown"
++     end
++   end
+    if config.include?(:default)
+      annotation += "|`#{config[:default].inspect}`"
+    else 
+diff --git a/lib/logstash/config/mixin.rb b/lib/logstash/config/mixin.rb
+index f4b0314db2d..051368eb6a2 100644
+--- a/lib/logstash/config/mixin.rb
++++ b/lib/logstash/config/mixin.rb
+@@ -275,7 +275,7 @@ def validate_check_parameter_values(params)
+                       || (config_key.is_a?(String) && key == config_key)
+           config_val = @config[config_key][:validate]
+           #puts "  Key matches."
+-          success, result = validate_value(value, config_val)
++          success, result = validate_value(value, config_val, @config[config_key][:allow_dynamic])
+           if success 
+             # Accept coerced value if success
+             # Used for converting values in the config to proper objects.
+@@ -307,7 +307,7 @@ def validator_find(key)
+       return nil
+     end
+ 
+-    def validate_value(value, validator)
++    def validate_value(value, validator, allow_dynamic)
+       # Validator comes from the 'config' pieces of plugins.
+       # They look like this
+       #   config :mykey => lambda do |value| ... end
+@@ -370,6 +370,11 @@ def validate_value(value, validator)
+               return false, "Expected string, got #{value.inspect}"
+             end
+             result = value.first
++            #TODO It would be better to include the nil case by doing if !allow_dynamic
++            #but this could break existing config, so let's be prudent
++            if allow_dynamic == false && result =~ /%{.*}/
++              return false, "This setting does not support dynamic value, got #{result.inspect}"
++            end
+           when :number
+             if value.size > 1 # only one value wanted
+               return false, "Expected number, got #{value.inspect} (type #{value.class})"
+diff --git a/lib/logstash/filters/base.rb b/lib/logstash/filters/base.rb
+index d71d7c5d093..63c1853d5a6 100644
+--- a/lib/logstash/filters/base.rb
++++ b/lib/logstash/filters/base.rb
+@@ -28,8 +28,6 @@ class LogStash::Filters::Base < LogStash::Plugin
+   config :exclude_tags, :validate => :array, :default => [], :deprecated => "You can achieve similar behavior with the new conditionals, like: `if !(\"sometag\" in [tags]) { %PLUGIN% { ... } }`"
+ 
+   # If this filter is successful, add arbitrary tags to the event.
+-  # Tags can be dynamic and include parts of the event using the `%{field}`
+-  # syntax.
+   #
+   # Example:
+   # [source,ruby]
+@@ -48,11 +46,9 @@ class LogStash::Filters::Base < LogStash::Plugin
+   #
+   # If the event has field `"somefield" == "hello"` this filter, on success,
+   # would add a tag `foo_hello` (and the second example would of course add a `taggedy_tag` tag).
+-  config :add_tag, :validate => :array, :default => []
++  config :add_tag, :validate => :array, :allow_dynamic => true, :default => []
+ 
+   # If this filter is successful, remove arbitrary tags from the event.
+-  # Tags can be dynamic and include parts of the event using the `%{field}`
+-  # syntax.
+   #
+   # Example:
+   # [source,ruby]
+@@ -72,10 +68,9 @@ class LogStash::Filters::Base < LogStash::Plugin
+   # If the event has field `"somefield" == "hello"` this filter, on success,
+   # would remove the tag `foo_hello` if it is present. The second example
+   # would remove a sad, unwanted tag as well.
+-  config :remove_tag, :validate => :array, :default => []
++  config :remove_tag, :validate => :array, :allow_dynamic => true, :default => []
+ 
+   # If this filter is successful, add any arbitrary fields to this event.
+-  # Field names can be dynamic and include parts of the event using the `%{field}`.
+   #
+   # Example:
+   # [source,ruby]
+@@ -99,10 +94,10 @@ class LogStash::Filters::Base < LogStash::Plugin
+   # would add field `foo_hello` if it is present, with the
+   # value above and the `%{host}` piece replaced with that value from the
+   # event. The second example would also add a hardcoded field.
+-  config :add_field, :validate => :hash, :default => {}
++  config :add_field, :validate => :hash, :allow_dynamic => true, :default => {}
+ 
+   # If this filter is successful, remove arbitrary fields from this event.
+-  # Fields names can be dynamic and include parts of the event using the %{field}
++  #
+   # Example:
+   # [source,ruby]
+   #     filter {
+diff --git a/lib/logstash/outputs/base.rb b/lib/logstash/outputs/base.rb
+index 7084ed3f4b3..99f8a700427 100644
+--- a/lib/logstash/outputs/base.rb
++++ b/lib/logstash/outputs/base.rb
+@@ -31,7 +31,7 @@ class LogStash::Outputs::Base < LogStash::Plugin
+ 
+   # The number of workers to use for this output.
+   # Note that this setting may not be useful for all outputs.
+-  config :workers, :validate => :number, :default => 1
++  config :workers, :validate => :number, :allow_dynamic => false, :default => 1
+ 
+   public
+   def workers_not_supported(message=nil)

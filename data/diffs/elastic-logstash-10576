@@ -1,0 +1,297 @@
+diff --git a/logstash-core/lib/logstash/api/commands/node.rb b/logstash-core/lib/logstash/api/commands/node.rb
+index e5b278f6f27..00f5ecd7d7c 100644
+--- a/logstash-core/lib/logstash/api/commands/node.rb
++++ b/logstash-core/lib/logstash/api/commands/node.rb
+@@ -36,7 +36,6 @@ def pipeline(pipeline_id, options={})
+             :config_reload_interval,
+             :dead_letter_queue_enabled,
+             :dead_letter_queue_path,
+-            :cluster_uuids
+           ).reject{|_, v|v.nil?}
+           if options.fetch(:graph, false)
+             metrics.merge!(extract_metrics([:stats, :pipelines, pipeline_id.to_sym, :config], :graph))
+diff --git a/logstash-core/lib/logstash/api/commands/stats.rb b/logstash-core/lib/logstash/api/commands/stats.rb
+index 3e43501a470..5f2871941b4 100644
+--- a/logstash-core/lib/logstash/api/commands/stats.rb
++++ b/logstash-core/lib/logstash/api/commands/stats.rb
+@@ -1,6 +1,7 @@
+ # encoding: utf-8
+ require "logstash/api/commands/base"
+ require 'logstash/util/thread_dump'
++require 'logstash/config/pipelines_info'
+ require_relative "hot_threads_reporter"
+ 
+ java_import java.nio.file.Files
+@@ -10,6 +11,20 @@ module LogStash
+   module Api
+     module Commands
+       class Stats < Commands::Base
++        def queue
++          pipeline_ids = service.get_shallow(:stats, :pipelines).keys
++          total_queued_events = 0
++          pipeline_ids.each do |pipeline_id|
++            p_stats = service.get_shallow(:stats, :pipelines, pipeline_id.to_sym)
++            type = p_stats[:queue] && p_stats[:queue][:type].value
++            pipeline = service.agent.get_pipeline(pipeline_id)
++            next if pipeline.nil? || pipeline.system? || type != 'persisted'
++            total_queued_events += p_stats[:queue][:events].value
++          end
++
++          {:events_count => total_queued_events}
++        end
++
+         def jvm
+           {
+             :threads => extract_metrics(
+@@ -45,14 +60,24 @@ def events
+           )
+         end
+ 
+-        def pipeline(pipeline_id = nil)
++        def pipeline(pipeline_id = nil, opts={})
++          extended_stats = LogStash::Config::PipelinesInfo.format_pipelines_info(
++            service.agent,
++            service.snapshot.metric_store,
++            true).each_with_object({}) do |pipeline_stats, memo|
++              pipeline_id = pipeline_stats["id"].to_s
++              memo[pipeline_id] = pipeline_stats
++            end
++
+           if pipeline_id.nil?
+             pipeline_ids = service.get_shallow(:stats, :pipelines).keys
+             pipeline_ids.each_with_object({}) do |pipeline_id, result|
+-              result[pipeline_id] = plugins_stats_report(pipeline_id)
++              extended_pipeline = extended_stats[pipeline_id.to_s]
++              result[pipeline_id] = plugins_stats_report(pipeline_id, extended_pipeline, opts)
+             end
+           else
+-            { pipeline_id => plugins_stats_report(pipeline_id) }
++            extended_pipeline = extended_stats[pipeline_id.to_s]
++            { pipeline_id => plugins_stats_report(pipeline_id, extended_pipeline, opts) }
+           end
+         rescue # failed to find pipeline
+           {}
+@@ -92,9 +117,9 @@ def hot_threads(options={})
+         end
+ 
+         private
+-        def plugins_stats_report(pipeline_id)
++        def plugins_stats_report(pipeline_id, extended_pipeline, opts={})
+           stats = service.get_shallow(:stats, :pipelines, pipeline_id.to_sym)
+-          PluginsStats.report(stats)
++          PluginsStats.report(stats, extended_pipeline, opts)
+         end
+ 
+         module PluginsStats
+@@ -110,8 +135,8 @@ def plugin_stats(stats, plugin_type)
+             end
+           end
+ 
+-          def report(stats)
+-            {
++          def report(stats, extended_stats=nil, opts={})
++            ret = {
+               :events => stats[:events],
+               :plugins => {
+                 :inputs => plugin_stats(stats, :inputs),
+@@ -121,8 +146,36 @@ def report(stats)
+               },
+               :reloads => stats[:reloads],
+               :queue => stats[:queue]
+-            }.merge(stats[:dlq] ? {:dead_letter_queue => stats[:dlq]} : {})
++            }
++            ret[:dead_letter_queue] = stats[:dlq] if stats.include?(:dlq)
++
++            # if extended_stats were provided, enrich the return value
++            if extended_stats
++              ret[:queue]    = extended_stats["queue"] if extended_stats.include?("queue")
++              if opts[:vertices] && extended_stats.include?("vertices")
++                ret[:vertices] = extended_stats["vertices"].map { |vertex| decorate_vertex(vertex) }
++              end
+             end
++
++            ret
++          end
++
++          ##
++          # Returns a vertex, decorated with additional metadata if available.
++          # Does not mutate the passed `vertex` object.
++          # @api private
++          # @param vertex [Hash{String=>Object}]
++          # @return [Hash{String=>Object}]
++          def decorate_vertex(vertex)
++            plugin_id = vertex["id"]&.to_s
++            return vertex unless plugin_id && LogStash::PluginMetadata.exists?(plugin_id)
++
++            plugin_metadata = LogStash::PluginMetadata.for_plugin(plugin_id)
++            cluster_uuid = plugin_metadata&.get(:cluster_uuid)
++            vertex = vertex.merge("cluster_uuid" => cluster_uuid) unless cluster_uuid.nil?
++
++            vertex
++          end
+         end # module PluginsStats
+       end
+     end
+diff --git a/logstash-core/lib/logstash/api/modules/node.rb b/logstash-core/lib/logstash/api/modules/node.rb
+index 66a08780957..96b071b3758 100644
+--- a/logstash-core/lib/logstash/api/modules/node.rb
++++ b/logstash-core/lib/logstash/api/modules/node.rb
+@@ -28,14 +28,16 @@ def node
+ 
+         get "/pipelines/:id" do
+           pipeline_id = params["id"]
+-          opts = {:graph => as_boolean(params.fetch("graph", false))}
++          opts = {:graph => as_boolean(params.fetch("graph", false)),
++                  :vertices => as_boolean(params.fetch("vertices", false))}
+           payload = node.pipeline(pipeline_id, opts)
+           halt(404) if payload.empty?
+           respond_with(:pipelines => { pipeline_id => payload } )
+         end
+ 
+         get "/pipelines" do
+-          opts = {:graph => as_boolean(params.fetch("graph", false))}
++          opts = {:graph => as_boolean(params.fetch("graph", false)),
++                  :vertices => as_boolean(params.fetch("vertices", false))}
+           payload = node.pipelines(opts)
+           halt(404) if payload.empty?
+           respond_with(:pipelines => payload )
+diff --git a/logstash-core/lib/logstash/api/modules/node_stats.rb b/logstash-core/lib/logstash/api/modules/node_stats.rb
+index 2a58fc7aecf..42b02690c79 100644
+--- a/logstash-core/lib/logstash/api/modules/node_stats.rb
++++ b/logstash-core/lib/logstash/api/modules/node_stats.rb
+@@ -21,11 +21,17 @@ class NodeStats < ::LogStash::Api::Modules::Base
+             :events => events_payload,
+             :pipelines => pipeline_payload,
+             :reloads => reloads_payload,
+-            :os => os_payload
++            :os => os_payload,
++            :queue => queue
+           }
+           respond_with(payload, {:filter => params["filter"]})
+         end
+ 
++        private
++        def queue
++          @stats.queue
++        end
++
+         private
+         def os_payload
+           @stats.os
+@@ -52,7 +58,8 @@ def mem_payload
+         end
+ 
+         def pipeline_payload(val = nil)
+-          @stats.pipeline(val)
++          opts = {:vertices => as_boolean(params.fetch("vertices", false))}
++          @stats.pipeline(val, opts)
+         end
+       end
+     end
+diff --git a/logstash-core/lib/logstash/config/lir_serializer.rb b/logstash-core/lib/logstash/config/lir_serializer.rb
+index 82b1ce2ff24..02505511303 100644
+--- a/logstash-core/lib/logstash/config/lir_serializer.rb
++++ b/logstash-core/lib/logstash/config/lir_serializer.rb
+@@ -124,3 +124,4 @@ def format_swm(source_with_metadata)
+   end
+   end
+ end
++
+diff --git a/x-pack/lib/monitoring/inputs/metrics/stats_event/pipelines_info.rb b/logstash-core/lib/logstash/config/pipelines_info.rb
+similarity index 92%
+rename from x-pack/lib/monitoring/inputs/metrics/stats_event/pipelines_info.rb
+rename to logstash-core/lib/logstash/config/pipelines_info.rb
+index 9abd227b4c5..65faf2db63b 100644
+--- a/x-pack/lib/monitoring/inputs/metrics/stats_event/pipelines_info.rb
++++ b/logstash-core/lib/logstash/config/pipelines_info.rb
+@@ -2,7 +2,7 @@
+ # or more contributor license agreements. Licensed under the Elastic License;
+ # you may not use this file except in compliance with the Elastic License.
+ #
+-module LogStash; module Inputs; class Metrics; module StatsEvent;
++module LogStash; module Config;
+   class PipelinesInfo
+     def self.format_pipelines_info(agent, metric_store, extended_performance_collection)
+       # It is important that we iterate via the agent's pipelines vs. the
+@@ -24,11 +24,9 @@ def self.format_pipelines_info(agent, metric_store, extended_performance_collect
+             "failures" => p_stats[:reloads][:failures].value
+           }
+         }
+-        
+         if extended_performance_collection
+           res["vertices"] = format_pipeline_vertex_stats(p_stats[:plugins], pipeline)
+         end
+-        
+         res
+       end.compact
+     end
+@@ -93,11 +91,18 @@ def self.format_pipeline_vertex_section_stats(stats, pipeline)
+ 
+           acc
+         end
+-        
+-        acc << {
++        segment = {
+           :id => plugin_id,
+           :pipeline_ephemeral_id => pipeline.ephemeral_id
+-        }.merge(segmented)
++        }
++
++        if LogStash::PluginMetadata.exists?(plugin_id.to_s)
++          plugin_metadata = LogStash::PluginMetadata.for_plugin(plugin_id.to_s)
++          cluster_uuid = plugin_metadata&.get(:cluster_uuid)
++          segment[:cluster_uuid] = cluster_uuid unless cluster_uuid.nil?
++        end
++
++        acc << segment.merge(segmented)
+         acc
+       end
+     end
+@@ -144,4 +149,4 @@ def self.format_queue_stats(pipeline_id, metric_store)
+       }
+     end
+   end
+-end; end; end; end
++end; end;
+diff --git a/versions.yml b/versions.yml
+index 07d44f83b37..359e20e2166 100644
+--- a/versions.yml
++++ b/versions.yml
+@@ -21,5 +21,5 @@ jruby:
+ # Note: this file is copied to the root of logstash-core because its gemspec needs it when
+ #       bundler evaluates the gemspec via bin/logstash
+ # Ensure Jackson version here is kept in sync with version used by jrjackson gem
+-jrjackson: 0.4.7
++jrjackson: 0.4.8
+ jackson: 2.9.8
+diff --git a/x-pack/lib/monitoring/inputs/metrics/state_event_factory.rb b/x-pack/lib/monitoring/inputs/metrics/state_event_factory.rb
+index 5d31d1c6c94..175557b7779 100644
+--- a/x-pack/lib/monitoring/inputs/metrics/state_event_factory.rb
++++ b/x-pack/lib/monitoring/inputs/metrics/state_event_factory.rb
+@@ -38,3 +38,4 @@ def make
+     end
+   end
+ end; end; end
++
+diff --git a/x-pack/lib/monitoring/inputs/metrics/stats_event_factory.rb b/x-pack/lib/monitoring/inputs/metrics/stats_event_factory.rb
+index ae55808dafd..a8d9a24b338 100644
+--- a/x-pack/lib/monitoring/inputs/metrics/stats_event_factory.rb
++++ b/x-pack/lib/monitoring/inputs/metrics/stats_event_factory.rb
+@@ -5,7 +5,7 @@
+ module LogStash; module Inputs; class Metrics;
+   class StatsEventFactory
+     include ::LogStash::Util::Loggable
+-    require 'monitoring/inputs/metrics/stats_event/pipelines_info'
++    require 'logstash/config/pipelines_info'
+ 
+     def initialize(global_stats, snapshot)
+       @global_stats = global_stats
+@@ -19,7 +19,7 @@ def make(agent, extended_performance_collection=true)
+         "logstash" => fetch_node_stats(agent, @metric_store),
+         "events" => format_global_event_count(@metric_store),
+         "process" => format_process_stats(@metric_store),
+-        "pipelines" => StatsEvent::PipelinesInfo.format_pipelines_info(agent, @metric_store, extended_performance_collection),
++        "pipelines" => LogStash::Config::PipelinesInfo.format_pipelines_info(agent, @metric_store, extended_performance_collection),
+         "reloads" => format_reloads(@metric_store),
+         "jvm" => format_jvm_stats(@metric_store),
+         "os" => format_os_stats(@metric_store),

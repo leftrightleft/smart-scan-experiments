@@ -1,0 +1,315 @@
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/ComputeStepSyntaxElement.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/ComputeStepSyntaxElement.java
+index 58353aa252b..42541f2a56a 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/ComputeStepSyntaxElement.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/ComputeStepSyntaxElement.java
+@@ -32,6 +32,8 @@
+ import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicLong;
+ import java.util.regex.Pattern;
+ import java.util.stream.Collectors;
+ import java.util.stream.StreamSupport;
+@@ -50,14 +52,16 @@ public final class ComputeStepSyntaxElement<T extends Dataset> {
+ 
+     private static final Path SOURCE_DIR = debugDir();
+ 
+-    private static final ISimpleCompiler COMPILER = new SimpleCompiler();
++    private static final ThreadLocal<ISimpleCompiler> COMPILER = ThreadLocal.withInitial(SimpleCompiler::new);
+ 
+     /**
+      * Global cache of runtime compiled classes to prevent duplicate classes being compiled.
+      * across pipelines and workers.
+      */
+-    private static final Map<ComputeStepSyntaxElement<?>, Class<? extends Dataset>> CLASS_CACHE
+-        = new HashMap<>(5000);
++    private static final ConcurrentHashMap<ComputeStepSyntaxElement<?>, Class<? extends Dataset>> CLASS_CACHE
++        = new ConcurrentHashMap<>(100);
++
++    private static final AtomicLong DATASET_CLASS_INDEX = new AtomicLong(0);
+ 
+     /**
+      * Pattern to remove redundant {@code ;} from formatted code since {@link Formatter} does not
+@@ -97,7 +101,6 @@ public static int classCacheSize() {
+     public static void cleanClassCache() {
+         synchronized (COMPILER) {
+             CLASS_CACHE.clear();
+-            COMPILER.setParentClassLoader(null);
+         }
+     }
+ 
+@@ -125,39 +128,34 @@ public T instantiate() {
+         }
+     }
+ 
+-    /**
+-     * This method is NOT thread-safe, and must have exclusive access to `COMPILER`
+-     * so that the resulting `ClassLoader` after each `SimpleCompiler#cook()` operation
+-     * can be teed up as the parent for the next cook operation.
+-     * Also note that synchronizing on `COMPILER` also protects the global CLASS_CACHE.
+-     */
+-
+     @SuppressWarnings("unchecked")
++    /*
++     * Returns a {@link Class<? extends Dataset>} for this {@link ComputeStepSyntaxElement}, reusing an existing
++     * equivalent implementation from the global class cache when one is available, or otherwise compiling one.
++     *
++     * This method _is_ thread-safe, and uses the locking semantics of {@link ConcurrentHashMap#computeIfAbsent}.
++     * To do so, it relies on {@link #hashCode()} and {@link #equals(Object)}.
++     */
+     private  Class<? extends Dataset> compile() {
+-        try {
+-            synchronized (COMPILER) {
+-                Class<? extends Dataset> clazz = CLASS_CACHE.get(this);
+-                if (clazz == null) {
+-                    final String name = String.format("CompiledDataset%d", CLASS_CACHE.size());
+-                    final String code = CLASS_NAME_PLACEHOLDER_REGEX.matcher(normalizedSource).replaceAll(name);
+-                    if (SOURCE_DIR != null) {
+-                        final Path sourceFile = SOURCE_DIR.resolve(String.format("%s.java", name));
+-                        Files.write(sourceFile, code.getBytes(StandardCharsets.UTF_8));
+-                        COMPILER.cookFile(sourceFile.toFile());
+-                    } else {
+-                        COMPILER.cook(code);
+-                    }
+-                    COMPILER.setParentClassLoader(COMPILER.getClassLoader());
+-                    clazz = (Class<T>) COMPILER.getClassLoader().loadClass(
+-                        String.format("org.logstash.generated.%s", name)
+-                    );
+-                    CLASS_CACHE.put(this, clazz);
++        return CLASS_CACHE.computeIfAbsent(this, (__)->{
++            try {
++                final ISimpleCompiler compiler = COMPILER.get();
++                final String name = String.format("CompiledDataset%d", DATASET_CLASS_INDEX.incrementAndGet());
++                final String code = CLASS_NAME_PLACEHOLDER_REGEX.matcher(normalizedSource).replaceAll(name);
++                if (SOURCE_DIR != null) {
++                    final Path sourceFile = SOURCE_DIR.resolve(String.format("%s.java", name));
++                    Files.write(sourceFile, code.getBytes(StandardCharsets.UTF_8));
++                    compiler.cookFile(sourceFile.toFile());
++                } else {
++                    compiler.cook(code);
+                 }
+-                return clazz;
++                return (Class<T>) compiler.getClassLoader().loadClass(
++                    String.format("org.logstash.generated.%s", name)
++                );
++            } catch (final CompileException | ClassNotFoundException | IOException ex) {
++                throw new IllegalStateException(ex);
+             }
+-        } catch (final CompileException | ClassNotFoundException | IOException ex) {
+-            throw new IllegalStateException(ex);
+-        }
++        });
+     }
+ 
+     @Override
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/VariableDefinition.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/VariableDefinition.java
+index e6644cca623..4219ac8e483 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/VariableDefinition.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/VariableDefinition.java
+@@ -72,6 +72,8 @@ private static Class<?> safeType(final Class<?> clazz) {
+             safe = EventCondition.class;
+         } else if (DynamicMethod.class.isAssignableFrom(clazz)) {
+             safe = DynamicMethod.class;
++        } else if (Dataset.class.isAssignableFrom(clazz)) {
++            safe = Dataset.class;
+         } else {
+             safe = clazz;
+         }
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java b/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java
+index 11417de3792..0ac7195273f 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java
+@@ -586,7 +586,7 @@ public void testCacheCompiledClassesWithDifferentId() throws IOException, Invali
+                 IRHelpers.toSourceWithMetadataFromPath("org/logstash/config/ir/cache/pipeline2.conf"),
+                 false);
+         final CompiledPipeline cPipelineWithDifferentId = new CompiledPipeline(pipelineWithDifferentId, pluginFactory);
+-        
++
+         // actual test: compiling a pipeline with an extra filter should only create 1 extra class
+         ComputeStepSyntaxElement.cleanClassCache();
+         cBaselinePipeline.buildExecution();
+@@ -598,6 +598,41 @@ public void testCacheCompiledClassesWithDifferentId() throws IOException, Invali
+         assertEquals(message, 0, cachedAfter - cachedBefore);
+     }
+ 
++    @Test
++    @SuppressWarnings({"unchecked"})
++    public void testReuseCompiledClasses() throws IOException, InvalidIRException {
++        final FixedPluginFactory pluginFactory = new FixedPluginFactory(
++                () -> null,
++                () -> IDENTITY_FILTER,
++                mockOutputSupplier()
++        );
++
++        // this pipeline generates 10 classes
++        // - 7 for the filters for the nested and leaf Datasets
++        // - 3 for the sequence of outputs with a conditional
++        final PipelineIR baselinePipeline = ConfigCompiler.configToPipelineIR(
++                IRHelpers.toSourceWithMetadataFromPath("org/logstash/config/ir/cache/pipeline_reuse_baseline.conf"),
++                false);
++        final CompiledPipeline cBaselinePipeline = new CompiledPipeline(baselinePipeline, pluginFactory);
++
++        // this pipeline is much bigger than the baseline
++        // but is carefully crafted to reuse the same classes as the baseline pipeline
++        final PipelineIR pipelineTwiceAsBig = ConfigCompiler.configToPipelineIR(
++                IRHelpers.toSourceWithMetadataFromPath("org/logstash/config/ir/cache/pipeline_reuse_test.conf"),
++                false);
++        final CompiledPipeline cPipelineTwiceAsBig = new CompiledPipeline(pipelineTwiceAsBig, pluginFactory);
++
++        // test: compiling a much bigger pipeline and asserting no additional classes are generated
++        ComputeStepSyntaxElement.cleanClassCache();
++        cBaselinePipeline.buildExecution();
++        final int cachedBefore = ComputeStepSyntaxElement.classCacheSize();
++        cPipelineTwiceAsBig.buildExecution();
++        final int cachedAfter = ComputeStepSyntaxElement.classCacheSize();
++
++        final String message = String.format("unexpected cache size, cachedAfter: %d, cachedBefore: %d", cachedAfter, cachedBefore);
++        assertEquals(message, 0, cachedAfter - cachedBefore);
++    }
++
+     @Test
+     @SuppressWarnings({"unchecked", "rawtypes"})
+     public void compilerBenchmark() throws Exception {
+@@ -615,12 +650,12 @@ public void compilerBenchmark() throws Exception {
+ 
+         final CompiledPipeline testCompiledPipeline = new CompiledPipeline(testPipelineIR, pluginFactory);
+ 
+-        final long compilationBaseline = time(ChronoUnit.SECONDS, () -> {
++        final long compilationBaseline = time(ChronoUnit.MILLIS, () -> {
+             final CompiledPipeline.CompiledExecution compiledExecution = baselineCompiledPipeline.buildExecution();
+             compiledExecution.compute(RubyUtil.RUBY.newArray(testEvent), false, false);
+         });
+ 
+-        final long compilationTest = time(ChronoUnit.SECONDS, () -> {
++        final long compilationTest = time(ChronoUnit.MILLIS, () -> {
+             final CompiledPipeline.CompiledExecution compiledExecution = testCompiledPipeline.buildExecution();
+             compiledExecution.compute(RubyUtil.RUBY.newArray(testEvent), false, false);
+         });
+diff --git a/logstash-core/src/test/resources/org/logstash/config/ir/cache/pipeline_reuse_baseline.conf b/logstash-core/src/test/resources/org/logstash/config/ir/cache/pipeline_reuse_baseline.conf
+new file mode 100644
+index 00000000000..4aa09f7dcf8
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/config/ir/cache/pipeline_reuse_baseline.conf
+@@ -0,0 +1,31 @@
++input {
++  stdin { }
++}
++
++filter {
++  if [a] {
++    noop {}
++    if [a] { noop {} }
++  }
++  if [a] {
++    if [a] {
++      noop {}
++      if [a] { noop {} }
++      if [a] { noop {} }
++    }
++  }
++  if [a] {
++    if [a] {
++      if [a] {
++        noop {}
++        if [a] { noop {} }
++      }
++    }
++  }
++}
++output {
++  if [a] { noop {} }
++  stdout {}
++  stdout {}
++  stdout {}
++}
+diff --git a/logstash-core/src/test/resources/org/logstash/config/ir/cache/pipeline_reuse_test.conf b/logstash-core/src/test/resources/org/logstash/config/ir/cache/pipeline_reuse_test.conf
+new file mode 100644
+index 00000000000..e4477feb80d
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/config/ir/cache/pipeline_reuse_test.conf
+@@ -0,0 +1,84 @@
++input {
++  stdin { }
++  stdin { }
++  stdin { }
++  stdin { }
++  stdin { }
++}
++
++filter {
++  if [a] {
++    noop {}
++    if [a] { noop {} }
++    if [a] { noop {} }
++    if [a] { noop {} }
++    if [a] { noop {} }
++    if [a] { noop {} }
++  }
++  if [a] {
++    noop {}
++    noop {}
++    noop {}
++    if [a] { noop {} }
++    if [a] { noop {} }
++    if [a] { noop {} }
++    if [a] { noop {} }
++  }
++  if [a] {
++    noop {}
++    if [a] { noop {} }
++  }
++  if [a] {
++    if [a] {
++      noop {}
++      if [a] { noop {} }
++    }
++  }
++  if [a] {
++    if [a] {
++      noop {}
++      if [a] { noop {} }
++    }
++  }
++  if [a] {
++    if [a] {
++      noop {}
++      if [a] { noop {} }
++    }
++    if [a] {
++      noop {}
++      if [a] { noop {} }
++    }
++  }
++  if [a] {
++    if [a] {
++      noop {}
++      if [a] { noop {} }
++      if [a] { noop {} }
++      if [a] { noop {} }
++    }
++  }
++  if [a] {
++    if [a] {
++      if [a] {
++        noop {}
++        if [a] { noop {} }
++        if [a] { noop {} }
++        if [a] { noop {} }
++      }
++    }
++  }
++}
++output {
++  if [a] {
++    noop {}
++  } else {
++    noop {}
++  }
++  if [a] {
++    noop {}
++  } else {
++    noop {}
++  }
++}
++

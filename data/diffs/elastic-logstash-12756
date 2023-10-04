@@ -1,0 +1,830 @@
+diff --git a/logstash-core/logstash-core.gemspec b/logstash-core/logstash-core.gemspec
+index 03a5cbedcd6..7b8c8f63781 100644
+--- a/logstash-core/logstash-core.gemspec
++++ b/logstash-core/logstash-core.gemspec
+@@ -74,6 +74,7 @@ Gem::Specification.new do |gem|
+   gem.add_runtime_dependency "manticore", '~> 0.6'
+ 
+   # xpack geoip database service
++  gem.add_development_dependency 'logstash-filter-geoip', '~> 7.1' # package hierarchy change
+   gem.add_dependency 'faraday' #(MIT license)
+   gem.add_dependency 'down', '~> 5.2.0' #(MIT license)
+   gem.add_dependency 'tzinfo-data' #(MIT license)
+diff --git a/x-pack/lib/filters/geoip/database_manager.rb b/x-pack/lib/filters/geoip/database_manager.rb
+index c9c151a8ade..6147ede0838 100644
+--- a/x-pack/lib/filters/geoip/database_manager.rb
++++ b/x-pack/lib/filters/geoip/database_manager.rb
+@@ -54,7 +54,10 @@ def initialize(geoip, database_path, database_type, vendor_path)
+     end
+   end
+ 
+-  DEFAULT_DATABASE_FILENAME = ["GeoLite2-ASN.mmdb", "GeoLite2-City.mmdb"].freeze
++  DEFAULT_DATABASE_FILENAME = %w{
++    GeoLite2-City.mmdb
++    GeoLite2-ASN.mmdb
++  }.map(&:freeze).freeze
+ 
+   public
+ 
+@@ -98,7 +101,7 @@ def database_path
+   # return a valid database path or default database path
+   def patch_database_path(database_path)
+     return database_path if file_exist?(database_path)
+-    return database_path if database_path = get_file_path("GeoLite2-#{@database_type}.mmdb") and file_exist?(database_path)
++    return database_path if database_path = get_file_path("#{DB_PREFIX}#{@database_type}.#{DB_EXT}") and file_exist?(database_path)
+     raise "You must specify 'database => ...' in your geoip filter (I looked for '#{database_path}')"
+   end
+ 
+@@ -120,11 +123,12 @@ def check_age
+     end
+   end
+ 
+-  # Clean up files .mmdb, .gz which are not mentioned in metadata and not default database
++  # Clean up files .mmdb, .tgz which are not mentioned in metadata and not default database
+   def clean_up_database
+     if @metadata.exist?
+       protected_filenames = (@metadata.database_filenames + DEFAULT_DATABASE_FILENAME).uniq
+-      existing_filenames = ::Dir.glob(get_file_path('*.{mmdb,gz}')).map { |path| path.split("/").last }
++      existing_filenames = ::Dir.glob(get_file_path("*.{#{DB_EXT},#{GZ_EXT}}"))
++                                .map { |path| ::File.basename(path) }
+ 
+       (existing_filenames - protected_filenames).each do |filename|
+         ::File.delete(get_file_path(filename))
+diff --git a/x-pack/lib/filters/geoip/database_metadata.rb b/x-pack/lib/filters/geoip/database_metadata.rb
+index c71c296517c..1274d6d7155 100644
+--- a/x-pack/lib/filters/geoip/database_metadata.rb
++++ b/x-pack/lib/filters/geoip/database_metadata.rb
+@@ -22,7 +22,8 @@ def initialize(database_type, vendor_path)
+   # csv format: database_type, update_at, gz_md5, md5, filename
+   def save_timestamp(database_path)
+     metadata = get_metadata(false)
+-    metadata << [@database_type, Time.now.to_i, md5(database_path + '.gz'), md5(database_path), database_path.split("/").last]
++    metadata << [@database_type, Time.now.to_i, md5(get_gz_name(database_path)), md5(database_path),
++                 ::File.basename(database_path)]
+ 
+     ::CSV.open @metadata_path, 'w' do |csv|
+       metadata.each { |row| csv << row }
+@@ -58,9 +59,9 @@ def updated_at
+                  .last || 0).to_i
+   end
+ 
+-  # Return database related filenames in .mmdb .gz
++  # Return database related filenames in .mmdb .tgz
+   def database_filenames
+-    get_all.flat_map { |metadata| [metadata[Column::FILENAME], metadata[Column::FILENAME] + '.gz'] }
++    get_all.flat_map { |metadata| [ metadata[Column::FILENAME], get_gz_name(metadata[Column::FILENAME]) ] }
+   end
+   
+   def exist?
+diff --git a/x-pack/lib/filters/geoip/download_manager.rb b/x-pack/lib/filters/geoip/download_manager.rb
+index 3b39e168475..351a4747135 100644
+--- a/x-pack/lib/filters/geoip/download_manager.rb
++++ b/x-pack/lib/filters/geoip/download_manager.rb
+@@ -2,6 +2,7 @@
+ # or more contributor license agreements. Licensed under the Elastic License;
+ # you may not use this file except in compliance with the Elastic License.
+ 
++require_relative '../../../../lib/bootstrap/util/compress'
+ require "logstash/util/loggable"
+ require_relative "util"
+ require_relative "database_metadata"
+@@ -11,6 +12,7 @@
+ require "zlib"
+ require "stud/try"
+ require "down"
++require "fileutils"
+ 
+ module LogStash module Filters module Geoip class DownloadManager
+   include LogStash::Util::Loggable
+@@ -23,7 +25,8 @@ def initialize(database_type, metadata, vendor_path)
+   end
+ 
+   GEOIP_HOST = "https://geoip.elastic.co".freeze
+-  GEOIP_ENDPOINT = "#{GEOIP_HOST}/v1/database".freeze
++  GEOIP_PATH = "/v1/database".freeze
++  GEOIP_ENDPOINT = "#{GEOIP_HOST}#{GEOIP_PATH}".freeze
+ 
+   public
+   # Check available update and download it. Unzip and validate the file.
+@@ -40,6 +43,14 @@ def fetch_database
+     [false, nil]
+   end
+ 
++  def database_name
++    @database_name ||= "#{DB_PREFIX}#{@database_type}"
++  end
++
++  def database_name_ext
++    @database_name_ext ||= "#{database_name}.#{DB_EXT}"
++  end
++  
+   private
+   # Call infra endpoint to get md5 of latest database and verify with metadata
+   # return [has_update, server db info]
+@@ -49,7 +60,7 @@ def check_update
+     logger.debug("check update", :endpoint => GEOIP_ENDPOINT, :response => res.status)
+ 
+     dbs = JSON.parse(res.body)
+-    target_db = dbs.select { |db| db['name'].include?(@database_type) }.first
++    target_db = dbs.select { |db| db['name'].eql?("#{database_name}.#{GZ_EXT}") }.first
+     has_update = @metadata.gz_md5 != target_db['md5_hash']
+     logger.info "new database version detected? #{has_update}"
+ 
+@@ -58,7 +69,7 @@ def check_update
+ 
+   def download_database(server_db)
+     Stud.try(3.times) do
+-      new_database_zip_path = get_file_path("GeoLite2-#{@database_type}_#{Time.now.to_i}.mmdb.gz")
++      new_database_zip_path = get_file_path("#{database_name}_#{Time.now.to_i}.#{GZ_EXT}")
+       Down.download(server_db['url'], destination: new_database_zip_path)
+       raise "the new download has wrong checksum" if md5(new_database_zip_path) != server_db['md5_hash']
+ 
+@@ -67,19 +78,24 @@ def download_database(server_db)
+     end
+   end
+ 
++  # extract COPYRIGHT.txt, LICENSE.txt and GeoLite2-{ASN,City}.mmdb from .tgz to temp directory
+   def unzip(zip_path)
+-    database_path = zip_path[0...-3]
+-    Zlib::GzipReader.open(zip_path) do |gz|
+-      ::File.open(database_path, "wb") do |f|
+-        f.print gz.read
+-      end
+-    end
+-    database_path
++    new_database_path = zip_path[0...-(GZ_EXT.length)] + DB_EXT
++    temp_dir = Stud::Temporary.pathname
++
++    LogStash::Util::Tar.extract(zip_path, temp_dir)
++    logger.debug("extract database to ", :path => temp_dir)
++
++
++    FileUtils.cp(::File.join(temp_dir, database_name_ext), new_database_path)
++    FileUtils.cp_r(::Dir.glob(::File.join(temp_dir, "{COPYRIGHT,LICENSE}.txt")), @vendor_path)
++
++    new_database_path
+   end
+ 
+   # Make sure the path has usable database
+   def assert_database!(database_path)
+-    raise "failed to load database #{database_path}" unless org.logstash.filters.GeoIPFilter.database_valid?(database_path)
++    raise "failed to load database #{database_path}" unless org.logstash.filters.geoip.GeoIPFilter.database_valid?(database_path)
+   end
+ 
+   def rest_client
+diff --git a/x-pack/lib/filters/geoip/util.rb b/x-pack/lib/filters/geoip/util.rb
+index 4dfe7899acb..64d55abd7a7 100644
+--- a/x-pack/lib/filters/geoip/util.rb
++++ b/x-pack/lib/filters/geoip/util.rb
+@@ -5,18 +5,29 @@
+ require "digest"
+ 
+ 
+-module LogStash module Filters module Geoip module Util
++module LogStash module Filters
++  module Geoip
++    GZ_EXT = 'tgz'.freeze
++    DB_EXT = 'mmdb'.freeze
++    DB_PREFIX = 'GeoLite2-'.freeze
+ 
+-  def get_file_path(filename)
+-    ::File.join(@vendor_path, filename)
+-  end
++    module Util
++      def get_file_path(filename)
++        ::File.join(@vendor_path, filename)
++      end
+ 
+-  def file_exist?(path)
+-    !path.nil? && ::File.exist?(path) && !::File.empty?(path)
+-  end
++      def file_exist?(path)
++        !path.nil? && ::File.exist?(path) && !::File.empty?(path)
++      end
+ 
+-  def md5(file_path)
+-    file_exist?(file_path) ? Digest::MD5.hexdigest(::File.read(file_path)): ""
+-  end
++      def md5(file_path)
++        file_exist?(file_path) ? Digest::MD5.hexdigest(::File.read(file_path)): ""
++      end
+ 
+-end end end end
+\ No newline at end of file
++      # replace *.mmdb to *.tgz
++      def get_gz_name(filename)
++        filename[0...-(DB_EXT.length)] + GZ_EXT
++      end
++    end
++  end
++end end
+\ No newline at end of file
+diff --git a/x-pack/spec/filters/geoip/database_manager_spec.rb b/x-pack/spec/filters/geoip/database_manager_spec.rb
+index 86ab9aae766..e5f52c5a7a0 100644
+--- a/x-pack/spec/filters/geoip/database_manager_spec.rb
++++ b/x-pack/spec/filters/geoip/database_manager_spec.rb
+@@ -5,15 +5,15 @@
+ require_relative 'test_helper'
+ require "filters/geoip/database_manager"
+ 
+-module LogStash module Filters module Geoip
++describe LogStash::Filters::Geoip do
+ 
+-  describe DatabaseManager, :aggregate_failures do
++  describe 'DatabaseManager', :aggregate_failures do
+     let(:mock_geoip_plugin)  { double("geoip_plugin") }
+     let(:mock_metadata)  { double("database_metadata") }
+     let(:mock_download_manager)  { double("download_manager") }
+     let(:mock_scheduler)  { double("scheduler") }
+     let(:db_manager) do
+-      manager = DatabaseManager.new(mock_geoip_plugin, DEFAULT_CITY_DB_PATH, "City", get_vendor_path)
++      manager = LogStash::Filters::Geoip::DatabaseManager.new(mock_geoip_plugin, default_city_db_path, "City", get_vendor_path)
+       manager.instance_variable_set(:@metadata, mock_metadata)
+       manager.instance_variable_set(:@download_manager, mock_download_manager)
+       manager.instance_variable_set(:@scheduler, mock_scheduler)
+@@ -23,13 +23,13 @@ module LogStash module Filters module Geoip
+ 
+     context "patch database" do
+       it "use input path" do
+-        path = db_manager.send(:patch_database_path, DEFAULT_ASN_DB_PATH)
+-        expect(path).to eq(DEFAULT_ASN_DB_PATH)
++        path = db_manager.send(:patch_database_path, default_asn_db_path)
++        expect(path).to eq(default_asn_db_path)
+       end
+ 
+       it "use CC license database as default" do
+         path = db_manager.send(:patch_database_path, "")
+-        expect(path).to eq(DEFAULT_CITY_DB_PATH)
++        expect(path).to eq(default_city_db_path)
+       end
+ 
+       it "failed when default database is missing" do
+@@ -40,7 +40,7 @@ module LogStash module Filters module Geoip
+ 
+     context "md5" do
+       it "return md5 if file exists" do
+-        str = db_manager.send(:md5, DEFAULT_CITY_DB_PATH)
++        str = db_manager.send(:md5, default_city_db_path)
+         expect(str).not_to eq("")
+         expect(str).not_to be_nil
+       end
+@@ -61,7 +61,7 @@ module LogStash module Filters module Geoip
+       it "should give warning after 25 days" do
+         expect(mock_metadata).to receive(:updated_at).and_return((Time.now - (60 * 60 * 24 * 26)).to_i)
+         expect(mock_geoip_plugin).to receive(:terminate_filter).never
+-        expect(DatabaseManager).to receive(:logger).at_least(:once).and_return(logger)
++        expect(LogStash::Filters::Geoip::DatabaseManager).to receive(:logger).at_least(:once).and_return(logger)
+         expect(logger).to receive(:warn)
+         expect(logger).to receive(:info)
+ 
+@@ -130,11 +130,11 @@ module LogStash module Filters module Geoip
+ 
+     context "clean up database" do
+       let(:asn00) { get_file_path("GeoLite2-ASN_000000000.mmdb") }
+-      let(:asn00gz) { get_file_path("GeoLite2-ASN_000000000.gz") }
++      let(:asn00gz) { get_file_path("GeoLite2-ASN_000000000.tgz") }
+       let(:city00) { get_file_path("GeoLite2-City_000000000.mmdb") }
+-      let(:city00gz) { get_file_path("GeoLite2-City_000000000.gz") }
++      let(:city00gz) { get_file_path("GeoLite2-City_000000000.tgz") }
+       let(:city44) { get_file_path("GeoLite2-City_4444444444.mmdb") }
+-      let(:city44gz) { get_file_path("GeoLite2-City_4444444444.gz") }
++      let(:city44gz) { get_file_path("GeoLite2-City_4444444444.tgz") }
+ 
+       before(:each) do
+         [asn00, asn00gz, city00, city00gz, city44, city44gz].each { |file_path| ::File.delete(file_path) if ::File.exist?(file_path) }
+@@ -154,7 +154,7 @@ module LogStash module Filters module Geoip
+ 
+         db_manager.send(:clean_up_database)
+         [asn00, asn00gz, city00, city00gz, city44gz].each { |file_path| expect(::File.exist?(file_path)).to be_falsey }
+-        [DEFAULT_CITY_DB_PATH, DEFAULT_ASN_DB_PATH, city44].each { |file_path| expect(::File.exist?(file_path)).to be_truthy }
++        [default_city_db_path, default_asn_db_path, city44].each { |file_path| expect(::File.exist?(file_path)).to be_truthy }
+       end
+ 
+       it "should keep the default database" do
+@@ -162,13 +162,13 @@ module LogStash module Filters module Geoip
+         expect(mock_metadata).to receive(:database_filenames).and_return(["GeoLite2-City_4444444444.mmdb"])
+ 
+         db_manager.send(:clean_up_database)
+-        [DEFAULT_CITY_DB_PATH, DEFAULT_ASN_DB_PATH].each { |file_path| expect(::File.exist?(file_path)).to be_truthy }
++        [default_city_db_path, default_asn_db_path].each { |file_path| expect(::File.exist?(file_path)).to be_truthy }
+       end
+     end
+ 
+     context "setup metadata" do
+       let(:db_metadata) do
+-        dbm = DatabaseMetadata.new("City", get_vendor_path)
++        dbm = LogStash::Filters::Geoip::DatabaseMetadata.new("City", get_vendor_path)
+         dbm.instance_variable_set(:@metadata_path, Stud::Temporary.file.path)
+         dbm
+       end
+@@ -177,40 +177,40 @@ module LogStash module Filters module Geoip
+ 
+       before(:each) do
+         expect(::File.empty?(temp_metadata_path)).to be_truthy
+-        allow(DatabaseMetadata).to receive(:new).and_return(db_metadata)
++        allow(LogStash::Filters::Geoip::DatabaseMetadata).to receive(:new).and_return(db_metadata)
+       end
+ 
+       after(:each) do
+-        ::File.delete(SECOND_CITY_DB_PATH) if ::File.exist?(SECOND_CITY_DB_PATH)
++        ::File.delete(second_city_db_path) if ::File.exist?(second_city_db_path)
+       end
+ 
+       it "create metadata when file is missing" do
+         db_manager.send(:setup)
+-        expect(db_manager.instance_variable_get(:@database_path)).to eql(DEFAULT_CITY_DB_PATH)
+-        expect(db_metadata.database_path).to eql(DEFAULT_CITY_DB_PATH)
++        expect(db_manager.instance_variable_get(:@database_path)).to eql(default_city_db_path)
++        expect(db_metadata.database_path).to eql(default_city_db_path)
+         expect(::File.exist?(temp_metadata_path)).to be_truthy
+         expect(::File.empty?(temp_metadata_path)).to be_falsey
+       end
+ 
+       it "manager should use database path in metadata" do
+         write_temp_metadata(temp_metadata_path, city2_metadata)
+-        copy_city_database(SECOND_CITY_DB_NAME)
++        copy_city_database(second_city_db_name)
+         expect(db_metadata).to receive(:save_timestamp).never
+ 
+         db_manager.send(:setup)
+         filename = db_manager.instance_variable_get(:@database_path).split('/').last
+-        expect(filename).to match /#{SECOND_CITY_DB_NAME}/
++        expect(filename).to match /#{second_city_db_name}/
+       end
+ 
+       it "ignore database_path in metadata if md5 does not match" do
+-        write_temp_metadata(temp_metadata_path, ["City","","","INVALID_MD5",SECOND_CITY_DB_NAME])
+-        copy_city_database(SECOND_CITY_DB_NAME)
++        write_temp_metadata(temp_metadata_path, ["City","","","INVALID_MD5",second_city_db_name])
++        copy_city_database(second_city_db_name)
+         expect(db_metadata).to receive(:save_timestamp).never
+ 
+         db_manager.send(:setup)
+         filename = db_manager.instance_variable_get(:@database_path).split('/').last
+-        expect(filename).to match /#{DEFAULT_CITY_DB_NAME}/
++        expect(filename).to match /#{default_city_db_name}/
+       end
+     end
+   end
+-end end end
+\ No newline at end of file
++end
+\ No newline at end of file
+diff --git a/x-pack/spec/filters/geoip/database_metadata_spec.rb b/x-pack/spec/filters/geoip/database_metadata_spec.rb
+index 307fd48d804..83b78927f0b 100644
+--- a/x-pack/spec/filters/geoip/database_metadata_spec.rb
++++ b/x-pack/spec/filters/geoip/database_metadata_spec.rb
+@@ -6,11 +6,11 @@
+ require "filters/geoip/database_metadata"
+ require "stud/temporary"
+ 
+-module LogStash module Filters module Geoip
++describe LogStash::Filters::Geoip do
+ 
+-  describe DatabaseMetadata, :aggregate_failures do
++  describe 'DatabaseMetadata', :aggregate_failures do
+     let(:dbm) do
+-      dbm = DatabaseMetadata.new("City", get_vendor_path)
++      dbm = LogStash::Filters::Geoip::DatabaseMetadata.new("City", get_vendor_path)
+       dbm.instance_variable_set(:@metadata_path, Stud::Temporary.file.path)
+       dbm
+     end
+@@ -50,16 +50,25 @@ module LogStash module Filters module Geoip
+     end
+ 
+     context "save timestamp" do
++      before do
++        ::File.open(default_city_gz_path, "w") { |f| f.write "make a non empty file" }
++      end
++
++      after do
++        delete_file(default_city_gz_path)
++      end
++
+       it "write the current time" do
+-        dbm.save_timestamp(DEFAULT_CITY_DB_PATH)
++        dbm.save_timestamp(default_city_db_path)
+ 
+         metadata = dbm.get_metadata.last
+-        expect(metadata[DatabaseMetadata::Column::DATABASE_TYPE]).to eq("City")
+-        past = metadata[DatabaseMetadata::Column::UPDATE_AT]
++        expect(metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::DATABASE_TYPE]).to eq("City")
++        past = metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::UPDATE_AT]
+         expect(Time.now.to_i - past.to_i).to be < 100
+-        expect(metadata[DatabaseMetadata::Column::GZ_MD5]).to eq('')
+-        expect(metadata[DatabaseMetadata::Column::MD5]).to eq(DEFAULT_CITY_DB_MD5)
+-        expect(metadata[DatabaseMetadata::Column::FILENAME]).to eq(DEFAULT_CITY_DB_NAME)
++        expect(metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::GZ_MD5]).not_to be_empty
++        expect(metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::GZ_MD5]).to eq(md5(default_city_gz_path))
++        expect(metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::MD5]).to eq(default_cith_db_md5)
++        expect(metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::FILENAME]).to eq(default_city_db_name)
+       end
+     end
+ 
+@@ -67,18 +76,18 @@ module LogStash module Filters module Geoip
+       it "return the default city database path" do
+         write_temp_metadata(temp_metadata_path)
+ 
+-        expect(dbm.database_path).to eq(DEFAULT_CITY_DB_PATH)
++        expect(dbm.database_path).to eq(default_city_db_path)
+       end
+ 
+       it "return the last database path with valid md5" do
+         write_temp_metadata(temp_metadata_path, city2_metadata)
+ 
+-        expect(dbm.database_path).to eq(DEFAULT_CITY_DB_PATH)
++        expect(dbm.database_path).to eq(default_city_db_path)
+       end
+ 
+       context "with ASN database type" do
+         let(:dbm) do
+-          dbm = DatabaseMetadata.new("ASN", get_vendor_path)
++          dbm = LogStash::Filters::Geoip::DatabaseMetadata.new("ASN", get_vendor_path)
+           dbm.instance_variable_set(:@metadata_path, Stud::Temporary.file.path)
+           dbm
+         end
+@@ -86,13 +95,13 @@ module LogStash module Filters module Geoip
+         it "return the default asn database path" do
+           write_temp_metadata(temp_metadata_path)
+ 
+-          expect(dbm.database_path).to eq(DEFAULT_ASN_DB_PATH)
++          expect(dbm.database_path).to eq(default_asn_db_path)
+         end
+       end
+ 
+       context "with invalid database type" do
+         let(:dbm) do
+-          dbm = DatabaseMetadata.new("???", get_vendor_path)
++          dbm = LogStash::Filters::Geoip::DatabaseMetadata.new("???", get_vendor_path)
+           dbm.instance_variable_set(:@metadata_path, Stud::Temporary.file.path)
+           dbm
+         end
+@@ -107,7 +116,7 @@ module LogStash module Filters module Geoip
+ 
+     context "gz md5" do
+       it "should give the last gz md5" do
+-        write_temp_metadata(temp_metadata_path, ["City","","SOME_GZ_MD5","SOME_MD5",SECOND_CITY_DB_NAME])
++        write_temp_metadata(temp_metadata_path, ["City","","SOME_GZ_MD5","SOME_MD5",second_city_db_name])
+         expect(dbm.gz_md5).to eq("SOME_GZ_MD5")
+       end
+ 
+@@ -118,7 +127,7 @@ module LogStash module Filters module Geoip
+ 
+     context "updated at" do
+       it "should give the last update timestamp" do
+-        write_temp_metadata(temp_metadata_path, ["City","1611690807","SOME_GZ_MD5","SOME_MD5",SECOND_CITY_DB_NAME])
++        write_temp_metadata(temp_metadata_path, ["City","1611690807","SOME_GZ_MD5","SOME_MD5",second_city_db_name])
+         expect(dbm.updated_at).to eq(1611690807)
+       end
+ 
+@@ -128,9 +137,10 @@ module LogStash module Filters module Geoip
+     end
+ 
+     context "database filenames" do
+-      it "should give filename in .mmdb .gz" do
++      it "should give filename in .mmdb .tgz" do
+         write_temp_metadata(temp_metadata_path)
+-        expect(dbm.database_filenames).to match_array([DEFAULT_CITY_DB_NAME, DEFAULT_ASN_DB_NAME, 'GeoLite2-City.mmdb.gz', 'GeoLite2-ASN.mmdb.gz'])
++        expect(dbm.database_filenames).to match_array([default_city_db_name, default_asn_db_name,
++                                                       'GeoLite2-City.tgz', 'GeoLite2-ASN.tgz'])
+       end
+     end
+ 
+@@ -145,5 +155,6 @@ module LogStash module Filters module Geoip
+         expect(dbm.exist?).to be_truthy
+       end
+     end
++
+   end
+-end end end
+\ No newline at end of file
++end
+\ No newline at end of file
+diff --git a/x-pack/spec/filters/geoip/download_manager_spec.rb b/x-pack/spec/filters/geoip/download_manager_spec.rb
+index bd26a5a1ca2..efd3ac0edf6 100644
+--- a/x-pack/spec/filters/geoip/download_manager_spec.rb
++++ b/x-pack/spec/filters/geoip/download_manager_spec.rb
+@@ -5,16 +5,22 @@
+ require_relative 'test_helper'
+ require "filters/geoip/download_manager"
+ 
+-module LogStash module Filters module Geoip
++describe LogStash::Filters::Geoip do
+ 
+-  describe DownloadManager, :aggregate_failures do
++  describe 'DownloadManager', :aggregate_failures do
+     let(:mock_metadata)  { double("database_metadata") }
+     let(:download_manager) do
+-      manager = DownloadManager.new( "City", mock_metadata, get_vendor_path)
++      manager = LogStash::Filters::Geoip::DownloadManager.new( "City", mock_metadata, get_vendor_path)
+       manager
+     end
+     let(:logger) { double("Logger") }
+ 
++    GEOIP_STAGING_HOST = "https://geoip.elastic.dev"
++    GEOIP_STAGING_ENDPOINT = "#{GEOIP_STAGING_HOST}#{LogStash::Filters::Geoip::DownloadManager::GEOIP_PATH}"
++
++    before do
++      stub_const('LogStash::Filters::Geoip::DownloadManager::GEOIP_ENDPOINT', GEOIP_STAGING_ENDPOINT)
++    end
+ 
+     context "rest client" do
+       it "can call endpoint" do
+@@ -32,7 +38,9 @@ module LogStash module Filters module Geoip
+     context "check update" do
+       before(:each) do
+         expect(download_manager).to receive(:get_uuid).and_return(SecureRandom.uuid)
+-        mock_resp = double("geoip_endpoint", :body => ::File.read(::File.expand_path("./fixtures/normal_resp.json", ::File.dirname(__FILE__))), :status => 200)
++        mock_resp = double("geoip_endpoint",
++                           :body => ::File.read(::File.expand_path("./fixtures/normal_resp.json", ::File.dirname(__FILE__))),
++                           :status => 200)
+         allow(download_manager).to receive_message_chain("rest_client.get").and_return(mock_resp)
+       end
+ 
+@@ -50,7 +58,7 @@ module LogStash module Filters module Geoip
+       end
+ 
+       it "should return false when md5 is the same" do
+-        expect(mock_metadata).to receive(:gz_md5).and_return("2449075797a3ecd7cd2d4ea9d01e6e8f")
++        expect(mock_metadata).to receive(:gz_md5).and_return("89d225ac546310b1e7979502ac9ad11c")
+ 
+         has_update, info = download_manager.send(:check_update)
+         expect(has_update).to be_falsey
+@@ -75,7 +83,7 @@ module LogStash module Filters module Geoip
+         }
+       end
+       let(:md5_hash) { SecureRandom.hex }
+-      let(:filename) { "GeoLite2-City.mmdb.gz"}
++      let(:filename) { "GeoLite2-City.tgz"}
+ 
+       it "should raise error if md5 does not match" do
+         allow(Down).to receive(:download)
+@@ -86,22 +94,34 @@ module LogStash module Filters module Geoip
+         expect(download_manager).to receive(:md5).and_return(md5_hash)
+ 
+         path = download_manager.send(:download_database, db_info)
+-        expect(path).to match /GeoLite2-City_\d+\.mmdb\.gz/
++        expect(path).to match /GeoLite2-City_\d+\.tgz/
+         expect(::File.exist?(path)).to be_truthy
+-        ::File.delete(path) if ::File.exist?(path)
++
++        delete_file(path)
+       end
+     end
+ 
+     context "unzip" do
+-      before(:each) do
++      let(:copyright_path) { get_file_path('COPYRIGHT.txt') }
++      let(:license_path) { get_file_path('LICENSE.txt') }
++      let(:readme_path) { get_file_path('README.txt') }
++
++      before do
+         file_path = ::File.expand_path("./fixtures/sample", ::File.dirname(__FILE__))
+-        ::File.delete(file_path) if ::File.exist?(file_path)
++        delete_file(file_path, copyright_path, license_path, readme_path)
+       end
+ 
+-      it "gz file" do
+-        path = ::File.expand_path("./fixtures/sample.gz", ::File.dirname(__FILE__))
+-        unzip_path = download_manager.send(:unzip, path)
+-        expect(::File.exist?(unzip_path)).to be_truthy
++      it "should extract database and license related files" do
++        path = ::File.expand_path("./fixtures/sample.tgz", ::File.dirname(__FILE__))
++        unzip_db_path = download_manager.send(:unzip, path)
++
++        expect(unzip_db_path).to match /\.mmdb/
++        expect(::File.exist?(unzip_db_path)).to be_truthy
++        expect(::File.exist?(copyright_path)).to be_truthy
++        expect(::File.exist?(license_path)).to be_truthy
++        expect(::File.exist?(readme_path)).to be_falsey
++
++        delete_file(unzip_db_path, copyright_path, license_path)
+       end
+     end
+ 
+@@ -111,7 +131,7 @@ module LogStash module Filters module Geoip
+       end
+ 
+       it "should pass validation" do
+-        expect(download_manager.send(:assert_database!, DEFAULT_CITY_DB_PATH)).to be_nil
++        expect(download_manager.send(:assert_database!, default_city_db_path)).to be_nil
+       end
+     end
+ 
+@@ -145,4 +165,4 @@ module LogStash module Filters module Geoip
+     end
+ 
+   end
+-end end end
+\ No newline at end of file
++end
+\ No newline at end of file
+diff --git a/x-pack/spec/filters/geoip/fixtures/normal_resp.json b/x-pack/spec/filters/geoip/fixtures/normal_resp.json
+index 054efd9ab06..383a32d6427 100644
+--- a/x-pack/spec/filters/geoip/fixtures/normal_resp.json
++++ b/x-pack/spec/filters/geoip/fixtures/normal_resp.json
+@@ -1,23 +1,44 @@
+ [
+   {
+-    "md5_hash": "668bcf8347ecdad372c774a24ca7694f",
++    "md5_hash": "bcfc39b5677554e091dbb19cd5cea4b0",
+     "name": "GeoLite2-ASN.mmdb.gz",
+     "provider": "maxmind",
+-    "updated": 1614643265,
+-    "url": "https://storage.googleapis.com/elastic-paisano-production/maxmind/GeoLite2-ASN.mmdb.gz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-production%40elastic-apps-163815.iam.gserviceaccount.com%2F20210305%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210305T054128Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=8dc1ed96530b511fbd846201731c0b27904d91df75ada73bcbd9a7963979d13929fff0cbd5e04c087889335e1b27265fb6457bc38ab7f2f39c17c41bc254d2cac38ad69dba61ef3464d3e2899f6e091d3ebcd4369747a527f2687423eaae75816a54a267512b1970f5370b4da356ff247255a9deaf1ed0cb0e5ab53c8bad430ce2dd0adf7cebddf3ff5a440ac78fcc7ce9411bec0851f96202a478abb8b958e5c5aa77047715242027e658de6472ceffcb8f1caf4a7708c7394f5dc8c11a095aee2c1af6eecb3fef104f745441718630a54133fde41b99595fce264c5c2888c8fc89a1b0d6d8b34027382687406e4846846d953825d774f9bfc584ef4f306e52"
++    "updated": 1615852860,
++    "url": "https://storage.googleapis.com/elastic-paisano-staging/maxmind/GeoLite2-ASN.mmdb.gz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-staging%40elastic-apps-163815.iam.gserviceaccount.com%2F20210317%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210317T103241Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=ada6463b28177577f4981cbe5f29708d0196ed71cea0bf3c0bf8e9965c8f9fd3d184be852c4e84f24b2896d8043a466039e15b5581ba4fc7aa37a15c85c79999674a0966b28f53b0c5a8b1220b428d3c1e958f20a61e06758426b7308f1ba1966b04a2bf86a5a9f96b88c05753b429574829344d3043de1f7d2b93cade7b57d53ac6d3bcb4e6d11405f6f2e7ff8c25d813e3917177b9438f686f10bc4a006aadc6a7dde2343c9bc0017487684ad64f59bb2d0b7b73b3c817f24c91bd9afd2f36725937c8938def67d5cf6df3a7705bb40098548b55a6777ef2cd8e26c32efaa1bd0474f7f24d5e386d90e87d8a3c3aa63203a78004bccf2ad65cc97b26e94675"
+   },
+   {
+-    "md5_hash": "2449075797a3ecd7cd2d4ea9d01e6e8f",
++    "md5_hash": "be4e335eb819af148fa4e365f176923d",
++    "name": "GeoLite2-ASN.tgz",
++    "provider": "maxmind",
++    "updated": 1615939277,
++    "url": "https://storage.googleapis.com/elastic-paisano-staging/maxmind/GeoLite2-ASN.tgz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-staging%40elastic-apps-163815.iam.gserviceaccount.com%2F20210317%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210317T103241Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=8d8566fdf8167d9874966c16663a76bf8a678083c753fae0397de2eaffdb9f1d19ff36dd28bb2dc3bd9230dab5256a6d08d694574b9c50cae4b8614115ef9d3d638caf29eb18cefd7a7f0154e7baaeab4c565c828a2f050bbdbb8f5a9647d67d0748960b77846674097f76ea0d721cadda9fd99379ee604eba692c9274d238a1a3d56b7c29e236182cf5e91bae63b72d1c9a1ee7c598d7c5156683aa71a9776151bec83cb99f07f75a83483d620960fd97eca4e12c3789d72ac272912df74da1d63572609883157c6d2f115f7ab1be6b3e4503e7dd501946124f1250a299338529b8abc199afe52ff9d38904603b12b674149b85d7597e57502fda05c4b65a75"
++  },
++  {
++    "md5_hash": "6cd9be41557fd4c6dd0a8609a3f96bbe",
+     "name": "GeoLite2-City.mmdb.gz",
+     "provider": "maxmind",
+-    "updated": 1614729669,
+-    "url": "https://storage.googleapis.com/elastic-paisano-production/maxmind/GeoLite2-City.mmdb.gz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-production%40elastic-apps-163815.iam.gserviceaccount.com%2F20210304%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210304T120346Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=39b77d0708f1551201118d1875dc12637ebc28b6ab0478a1af30d34e8c7d75130b9308941db1dcc4450059e4812e7d94f3dab44702d551f98674f81a53fa2a328a16c4d102b521fa526bb174a4fd4e26c0e1bd3f82000f0ee6b50da9a7f4dbe0c71fcbc9edcd1aee4be8f7fb37b161caf6cd9d0286dabd8635ffc00d2f63d5796968774ed5e66dadabd620176ef5667309fb1dbf7b1e60a4bb140caf1048519de2e360dddf5075f081115630f319c6c8537a2e2d69f4d0e4f34bbd4fdf007f40bb619181a08517613db44377156442786cc5b018a890ecbfa65b62359f084ff7a37dc4f82975c1ff73775a0385fcf6d921d389f2ebb4917f3c5a465c789e5c8a"
++    "updated": 1615420855,
++    "url": "https://storage.googleapis.com/elastic-paisano-staging/maxmind/GeoLite2-City.mmdb.gz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-staging%40elastic-apps-163815.iam.gserviceaccount.com%2F20210317%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210317T103241Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=630106105d8f476a6d4e7de9fd777d8c250391ce1fbc799c7c683efeb39b319e1263948bcd326dc15f3ee0c9578f1fc95e5afe2d6b026dfac00b1fe188961df8ce3a8e5e0d71355fc0ea4d7f957af2ce8bf433210b0224d7175122ce0c1ced64dc39d2db7a979c1d173b72da58441a2358f605b92b71355cf00af4fdaa20943f21827506756b52706daaf780f173fe9f37a41fd7fc5539bbc41e79110fc4b00b37334d37179efa78c0a2ccd20ef6a5faff3baf1b5c2dfb2ef0ebb7ae4ef949f986a3cfbc8df4885476aef4ba6c06012a83418623219b48ee7ff04a41ae2ff2f421fb85fcbc04255df174647d6b9302f15441a783252c7443edfa70ef5f44068a"
+   },
+   {
+-    "md5_hash": "9f8260dbb60df49c5c0c3cc43f64afe1",
++    "md5_hash": "89d225ac546310b1e7979502ac9ad11c",
++    "name": "GeoLite2-City.tgz",
++    "provider": "maxmind",
++    "updated": 1615939277,
++    "url": "https://storage.googleapis.com/elastic-paisano-staging/maxmind/GeoLite2-City.tgz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-staging%40elastic-apps-163815.iam.gserviceaccount.com%2F20210317%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210317T103241Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=3f5e84337ef78e8039ed391cddbcc92b0ceb3b946d4a7f60476f0633584cd3324356c9ead4bfc19f1c8776849a26b850c7e388386c5dfa8eccc2afe7e7c21d4c7fdd093cfae5c52899d9df5ffe13db6c29a0558329c8a8aecda058f9778dd23615471023fc77cc514d372d9786cbd256e27818883c1ee4b7edee75c393c89d57e94e58c2be2f9c8ee7354864b53f66d61c917eae296e071f84776e8c358218d890333fd376753a4c0f903581480629bca86d1abf3bc65efc7da30617c4847367d0ae24ba1ce0528feba3c3c3c38ecdd9a8d820d7f1a9141e30578822564c192181a97761858b9e06cc05f7db4143c89c402cbb888dcabc1f6559f4f701b79a7c"
++  },
++  {
++    "md5_hash": "03bef5fb1fdc877304da3391052246dc",
+     "name": "GeoLite2-Country.mmdb.gz",
+     "provider": "maxmind",
+-    "updated": 1614729667,
+-    "url": "https://storage.googleapis.com/elastic-paisano-production/maxmind/GeoLite2-Country.mmdb.gz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-production%40elastic-apps-163815.iam.gserviceaccount.com%2F20210304%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210304T120346Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=52e0494daff2d42287fde4fc45d811151ac59d33419c645497f18b8f1066dd59b6131042c23ddb05dd0571d8435d7f7af72dd3a3defe7b7342ca566cde20e734332b1fdc366ba03ac68262324ebd79fc0c2675c30fc0f4599f0b3c50360a47fb4f4aa46fd3d9e43984aab1a1828218ba1441b187177cf6762313fa35a89a1196ed773894e4f5a11b94b2b255a23d3280c101195cbff1c79369862c34b1477d9b19de75a8719d703eab7a03f0dc679f2b35067b03bf394a009c29933a04a9e6ae486a57db30cdc07b3a027eeca3d063fbb72ba3c78201574d78b999d0bb11d50ebf45e791b18a386d5585de790bfcb460e601bec5a0785c4654a2078578565957"
++    "updated": 1615420855,
++    "url": "https://storage.googleapis.com/elastic-paisano-staging/maxmind/GeoLite2-Country.mmdb.gz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-staging%40elastic-apps-163815.iam.gserviceaccount.com%2F20210317%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210317T103241Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=18d3266f09a8b208573fa48ca9c30cf0041b69de4eac1656cafebcf737a9f2637b0be12f9df4dd26c07bc297a4070cd0248f8874d3d03bb3fc992f7110c1c0def845f182dcc6289d5fe4faa97daf98e3bdcd2e37405bae1f04e1b293c556c352a0c574f7a52f0f0ea92bcbfb5a74542be9e651453c79a0df1f7a84f2d48d5e704ee11df9a180f9c4c76a809c6a7edab7e36b4863556d815042b9cf43fe8bb1c60f432fcae56b1779d610e8b1388addc277b0259ac595eee34227fc9884065c7aaf44c8446c4f00849d3f8dad6eba9cc7213bac33ff166dc86c344fd14da736390615bc4d00de5ba007b0b1013f46b7e81b9827d32ae9e20f779a6580f97164f9"
++  },
++  {
++    "md5_hash": "c0e76a2e7e0f781028e849c2d389d8a1",
++    "name": "GeoLite2-Country.tgz",
++    "provider": "maxmind",
++    "updated": 1615939276,
++    "url": "https://storage.googleapis.com/elastic-paisano-staging/maxmind/GeoLite2-Country.tgz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-staging%40elastic-apps-163815.iam.gserviceaccount.com%2F20210317%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210317T103241Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=5eaf641191c25f111afed9c569e31a5369733b3723db365b76cfbf93a7b39fd77481fe07f93fc5be2fb9ef987ef6f1c32bcb863d9d2de0e74aeece8ff568c41573c8a465e9ec5301bdc77c75b2ab369f5352f2da3f5262ae889facaf27f1685584ca49fa3bf4556ed0a92b6a4b1f1985f62378c92467d73b0c66fd1ed04cb311b903343249aed6d3ba32d7b80f0be9a08816737016038306886dcffaf141932e5fb06dfe96ff1caf8ed37f6f8128a0bdc6abf9516aeac891a791656d14f4c37b31f4c86d5dba430d92402c78d8b53dcf4ec557f0f8b6c1fb59357ae1aa7f6310289fdf16c094028570431312ea35f2c00f8cd2dcef8b98d2af5ed3ee09a7fefd"
+   }
+ ]
+\ No newline at end of file
+diff --git a/x-pack/spec/filters/geoip/fixtures/sample.gz b/x-pack/spec/filters/geoip/fixtures/sample.gz
+deleted file mode 100644
+index 1b30dad7022..00000000000
+Binary files a/x-pack/spec/filters/geoip/fixtures/sample.gz and /dev/null differ
+diff --git a/x-pack/spec/filters/geoip/fixtures/sample.tgz b/x-pack/spec/filters/geoip/fixtures/sample.tgz
+new file mode 100644
+index 00000000000..22bb93cb7a1
+Binary files /dev/null and b/x-pack/spec/filters/geoip/fixtures/sample.tgz differ
+diff --git a/x-pack/spec/filters/geoip/test_helper.rb b/x-pack/spec/filters/geoip/test_helper.rb
+index 224eb261822..df138a07c71 100644
+--- a/x-pack/spec/filters/geoip/test_helper.rb
++++ b/x-pack/spec/filters/geoip/test_helper.rb
+@@ -5,57 +5,92 @@
+ require 'spec_helper'
+ require "digest"
+ 
+-def get_vendor_path
+-  ::File.expand_path("./vendor/", ::File.dirname(__FILE__))
+-end
++module GeoipHelper
++  def get_vendor_path
++    ::File.expand_path("vendor", ::File.dirname(__FILE__))
++  end
+ 
+-def get_file_path(filename)
+-  ::File.join(get_vendor_path, filename)
+-end
++  def get_file_path(filename)
++    ::File.join(get_vendor_path, filename)
++  end
+ 
+-def md5(file_path)
+-  ::File.exist?(file_path) ? Digest::MD5.hexdigest(::File.read(file_path)) : ''
+-end
++  def md5(file_path)
++    ::File.exist?(file_path) ? Digest::MD5.hexdigest(::File.read(file_path)) : ''
++  end
+ 
+-DEFAULT_CITY_DB_PATH = get_file_path("GeoLite2-City.mmdb")
+-DEFAULT_ASN_DB_PATH = get_file_path("GeoLite2-ASN.mmdb")
+-METADATA_PATH = get_file_path("metadata.csv")
+-DEFAULT_CITY_DB_NAME = "GeoLite2-City.mmdb"
+-DEFAULT_ASN_DB_NAME = "GeoLite2-ASN.mmdb"
+-SECOND_CITY_DB_NAME = "GeoLite2-City_20200220.mmdb"
+-SECOND_CITY_DB_PATH = get_file_path("GeoLite2-City_20200220.mmdb")
+-DEFAULT_CITY_DB_MD5 = md5(DEFAULT_CITY_DB_PATH)
+-DEFAULT_ASN_DB_MD5 = md5(DEFAULT_ASN_DB_PATH)
+-GEOIP_STAGING_HOST = "https://geoip.elastic.dev"
+-GEOIP_STAGING_ENDPOINT = "#{GEOIP_STAGING_HOST}/v1/database"
+-
+-def write_temp_metadata(temp_file_path, row = nil)
+-  now = Time.now.to_i
+-  city = md5(DEFAULT_CITY_DB_PATH)
+-  asn = md5(DEFAULT_ASN_DB_PATH)
+-
+-  metadata = []
+-  metadata << ["ASN",now,"",asn,DEFAULT_ASN_DB_NAME]
+-  metadata << ["City",now,"",city,DEFAULT_CITY_DB_NAME]
+-  metadata << row if row
+-  CSV.open temp_file_path, 'w' do |csv|
+-    metadata.each { |row| csv << row }
++  def default_city_db_path
++    get_file_path("GeoLite2-City.mmdb")
+   end
+-end
+ 
+-def city2_metadata
+-  ["City",Time.now.to_i,"",md5(DEFAULT_CITY_DB_PATH),SECOND_CITY_DB_NAME]
+-end
++  def default_city_gz_path
++    get_file_path("GeoLite2-City.tgz")
++  end
+ 
+-def copy_city_database(filename)
+-  new_path = DEFAULT_CITY_DB_PATH.gsub(DEFAULT_CITY_DB_NAME, filename)
+-  FileUtils.cp(DEFAULT_CITY_DB_PATH, new_path)
+-end
++  def default_asn_db_path
++    get_file_path("GeoLite2-ASN.mmdb")
++  end
++
++  def metadata_path
++    get_file_path("metadata.csv")
++  end
++
++  def default_city_db_name
++    "GeoLite2-City.mmdb"
++  end
++
++  def default_asn_db_name
++    "GeoLite2-ASN.mmdb"
++  end
++
++  def second_city_db_name
++    "GeoLite2-City_20200220.mmdb"
++  end
++
++  def second_city_db_path
++    get_file_path("GeoLite2-City_20200220.mmdb")
++  end
++
++  def default_cith_db_md5
++    md5(default_city_db_path)
++  end
++
++  def DEFAULT_ASN_DB_MD5
++    md5(default_asn_db_path)
++  end
++
++
++  def write_temp_metadata(temp_file_path, row = nil)
++    now = Time.now.to_i
++    city = md5(default_city_db_path)
++    asn = md5(default_asn_db_path)
+ 
+-def delete_file(*filepaths)
+-  filepaths.map { |filepath| ::File.delete(filepath) if ::File.exist?(filepath) }
++    metadata = []
++    metadata << ["ASN",now,"",asn,default_asn_db_name]
++    metadata << ["City",now,"",city,default_city_db_name]
++    metadata << row if row
++    CSV.open temp_file_path, 'w' do |csv|
++      metadata.each { |row| csv << row }
++    end
++  end
++
++  def city2_metadata
++    ["City",Time.now.to_i,"",md5(default_city_db_path),second_city_db_name]
++  end
++
++  def copy_city_database(filename)
++    new_path = default_city_db_path.gsub(default_city_db_name, filename)
++    FileUtils.cp(default_city_db_path, new_path)
++  end
++
++  def delete_file(*filepaths)
++    filepaths.map { |filepath| ::File.delete(filepath) if ::File.exist?(filepath) }
++  end
++
++  def get_metadata_database_name
++    ::File.exist?(metadata_path) ? ::File.read(metadata_path).split(",").last[0..-2] : nil
++  end
+ end
+ 
+-def get_metadata_database_name
+-  ::File.exist?(METADATA_PATH) ? ::File.read(METADATA_PATH).split(",").last[0..-2] : nil
++RSpec.configure do |c|
++  c.include GeoipHelper
+ end
+\ No newline at end of file

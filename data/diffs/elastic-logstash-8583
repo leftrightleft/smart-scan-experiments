@@ -1,0 +1,201 @@
+diff --git a/Dockerfile b/Dockerfile
+index bac1168c8bb..a7e6a32e975 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -4,12 +4,13 @@ RUN ln -s /tmp/vendor /opt/logstash/vendor
+ 
+ ADD gradlew /opt/logstash/gradlew
+ ADD gradle/wrapper /opt/logstash/gradle/wrapper
++ADD buildSrc /opt/logstash/buildSrc
+ RUN /opt/logstash/gradlew wrapper
+ 
+ ADD versions.yml /opt/logstash/versions.yml
+ ADD LICENSE /opt/logstash/LICENSE
+ ADD CONTRIBUTORS /opt/logstash/CONTRIBUTORS
+-ADD Gemfile.template /opt/logstash/Gemfile
++ADD Gemfile.template /opt/logstash/Gemfile.template
+ ADD Rakefile /opt/logstash/Rakefile
+ ADD build.gradle /opt/logstash/build.gradle
+ ADD rakelib /opt/logstash/rakelib
+diff --git a/README.md b/README.md
+index dcb510cc107..b1732a638ce 100644
+--- a/README.md
++++ b/README.md
+@@ -126,20 +126,20 @@ Most of the unit tests in Logstash are written using [rspec](http://rspec.info/)
+ 
+ ### Core tests
+ 
+-1- In order to run the core tests, a small set of plugins must first be installed:
++1- To run the core tests you can use the Gradle task:
+ 
+-    rake test:install-core
+-
+-2- To run the core tests you can use the rake task:
+-
+-    rake test:core
++    ./gradlew test
+ 
+   or use the `rspec` tool to run all tests or run a specific test:
+ 
+     bin/rspec
+     bin/rspec spec/foo/bar_spec.rb
+     
+-3- To run the subset of tests covering the Java codebase only run:
++  Note that before running the `rspec` command for the first time you need to set up the RSpec test dependencies by running:
++
++    ./gradlew bootstrap
++
++2- To run the subset of tests covering the Java codebase only run:
+     
+     ./gradlew javaTests
+ 
+diff --git a/build.gradle b/build.gradle
+index 19ceb1ba64b..1a1e1974d8f 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -15,6 +15,7 @@ apply plugin: 'de.undercouch.download'
+ 
+ import de.undercouch.gradle.tasks.download.Download
+ import de.undercouch.gradle.tasks.download.Verify
++import org.logstash.gradle.ExecLogOutputStream
+ import org.yaml.snakeyaml.Yaml
+ 
+ allprojects {
+@@ -90,8 +91,24 @@ if (versionMap["jruby-runtime-override"]) {
+ }
+ 
+ // Tasks
++
++clean {
++  delete "${projectDir}/Gemfile"
++  delete "${projectDir}/Gemfile.lock"
++  delete "${projectDir}/vendor"
++  delete "${projectDir}/NOTICE.TXT"
++}
++
+ task bootstrap {}
+ 
++project(":logstash-core") {
++  ["rubyTests", "test"].each { tsk ->
++    tasks.getByPath(":logstash-core:" + tsk).configure {
++      dependsOn bootstrap
++    }
++  }
++}
++
+ task downloadJRuby(type: Download) {
+     description "Download JRuby artifact from this specific URL: ${jRubyURL}"
+     src jRubyURL
+@@ -108,6 +125,8 @@ task verifyFile(dependsOn: downloadJRuby, type: Verify) {
+ 
+ task downloadAndInstallJRuby(dependsOn: verifyFile, type: Copy) {
+     description "Install JRuby in the vendor directory"
++    inputs.files file("${projectDir}/versions.yml")
++    outputs.files fileTree("${projectDir}/vendor/jruby")
+     from tarTree(downloadJRuby.dest)
+     eachFile { f ->
+       f.path = f.path.replaceFirst("^jruby-${jRubyVersion}", '')
+@@ -117,6 +136,20 @@ task downloadAndInstallJRuby(dependsOn: verifyFile, type: Copy) {
+     into "${projectDir}/vendor/jruby"
+ }
+ 
++task installTestGems(dependsOn: downloadAndInstallJRuby, type: Exec) {
++  workingDir projectDir
++  inputs.files file("${projectDir}/Gemfile.template")
++  inputs.files fileTree("${projectDir}/rakelib")
++  inputs.files file("${projectDir}/versions.yml")
++  outputs.files file("${projectDir}/Gemfile")
++  outputs.files file("${projectDir}/Gemfile.lock")
++  outputs.files fileTree("${projectDir}/vendor/bundle/gems")
++  outputs.files fileTree("${projectDir}/vendor/jruby")
++  standardOutput = new ExecLogOutputStream(System.out)
++  errorOutput =  new ExecLogOutputStream(System.err)
++  commandLine './vendor/jruby/bin/jruby', "${projectDir}/vendor/jruby/bin/rake".toString(), "test:install-core"
++}
++
+ // If you are running a JRuby snapshot we will skip the integrity check.
+ verifyFile.onlyIf { doChecksum }
+-bootstrap.dependsOn downloadAndInstallJRuby
++bootstrap.dependsOn installTestGems
+diff --git a/buildSrc/build.gradle b/buildSrc/build.gradle
+new file mode 100644
+index 00000000000..21cb3515562
+--- /dev/null
++++ b/buildSrc/build.gradle
+@@ -0,0 +1,3 @@
++group = 'org.logstash'
++
++apply plugin: 'java'
+diff --git a/buildSrc/src/main/java/org/logstash/gradle/ExecLogOutputStream.java b/buildSrc/src/main/java/org/logstash/gradle/ExecLogOutputStream.java
+new file mode 100644
+index 00000000000..2f39436bbe4
+--- /dev/null
++++ b/buildSrc/src/main/java/org/logstash/gradle/ExecLogOutputStream.java
+@@ -0,0 +1,29 @@
++package org.logstash.gradle;
++
++import java.io.ByteArrayOutputStream;
++import java.io.PrintStream;
++
++/**
++ * Stream that can be used to forward Gradle Exec task output to an arbitrary {@link PrintStream}.
++ */
++public final class ExecLogOutputStream extends ByteArrayOutputStream {
++
++    /**
++     * Underlying {@link PrintStream} to flush output to.
++     */
++    private final PrintStream stream;
++
++    /**
++     * Ctor.
++     * @param stream PrintStream to flush to
++     */
++    public ExecLogOutputStream(final PrintStream stream) {
++        this.stream = stream;
++    }
++
++    @Override
++    public synchronized void flush() {
++        stream.print(toString());
++        reset();
++    }
++}
+diff --git a/ci/unit_tests.sh b/ci/unit_tests.sh
+index 0284d31ea86..d53608a6f8d 100755
+--- a/ci/unit_tests.sh
++++ b/ci/unit_tests.sh
+@@ -18,19 +18,12 @@ if [[ $SELECTED_TEST_SUITE == $"core-fail-fast" ]]; then
+   echo "Running test:core-fail-fast"
+   rake test:core-fail-fast
+ elif [[ $SELECTED_TEST_SUITE == $"java" ]]; then
+-  echo "Running Java unit tests"
+   echo "Running Java Tests"
+   ./gradlew javaTests
+ elif [[ $SELECTED_TEST_SUITE == $"ruby" ]]; then
+   echo "Running Ruby unit tests"
+-  echo "Running test:install-core"
+-  rake test:install-core
+-  echo "Running Ruby Tests"
+   ./gradlew rubyTests
+ else
+   echo "Running Java and Ruby unit tests"
+-  echo "Running test:install-core"
+-  rake test:install-core
+-  echo "Running test:core"
+-  rake test:core
++  ./gradlew test
+ fi
+diff --git a/rakelib/vendor.rake b/rakelib/vendor.rake
+index e846ec3e2e7..847bc7d4a03 100644
+--- a/rakelib/vendor.rake
++++ b/rakelib/vendor.rake
+@@ -4,7 +4,7 @@ namespace "vendor" do
+   end
+ 
+   task "jruby" do |task, args|
+-    system('./gradlew bootstrap')
++    system('./gradlew downloadAndInstallJRuby')
+   end # jruby
+ 
+   task "all" => "jruby"

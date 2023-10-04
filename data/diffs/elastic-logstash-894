@@ -1,0 +1,303 @@
+diff --git a/lib/logstash/event.rb b/lib/logstash/event.rb
+index 3a374ecfb71..f4dde9c5b86 100644
+--- a/lib/logstash/event.rb
++++ b/lib/logstash/event.rb
+@@ -4,6 +4,7 @@
+ require "date"
+ require "logstash/namespace"
+ require "logstash/util/fieldreference"
++require "logstash/time_addon"
+ 
+ # Use a custom serialization for jsonifying Time objects.
+ # TODO(sissel): Put this in a separate file.
+@@ -42,20 +43,25 @@ def inspect
+ class LogStash::Event
+   class DeprecatedMethod < StandardError; end
+ 
++  CHAR_PLUS = "+"
++  TIMESTAMP = "@timestamp"
++  VERSION = "@version"
++  VERSION_ONE = "1"
++
+   public
+   def initialize(data={})
+     @cancelled = false
+ 
+     @data = data
+-    if data.include?("@timestamp")
+-      t = data["@timestamp"]
++    data[VERSION] = VERSION_ONE if !@data.include?(VERSION)
++    if data.include?(TIMESTAMP) 
++      t = data[TIMESTAMP]
+       if t.is_a?(String)
+-        data["@timestamp"] = Time.parse(t).gmtime
++        data[TIMESTAMP] = LogStash::Time.parse_iso8601(t)
+       end
+     else
+-      data["@timestamp"] = ::Time.now.utc 
++      data[TIMESTAMP] = ::Time.now.utc
+     end
+-    data["@version"] = "1" if !@data.include?("@version")
+   end # def initialize
+ 
+   public
+@@ -97,8 +103,8 @@ def to_s
+   end
+ 
+   public
+-  def timestamp; return @data["@timestamp"]; end # def timestamp
+-  def timestamp=(val); return @data["@timestamp"] = val; end # def timestamp=
++  def timestamp; return @data[TIMESTAMP]; end # def timestamp
++  def timestamp=(val); return @data[TIMESTAMP] = val; end # def timestamp=
+ 
+   def unix_timestamp
+     raise DeprecatedMethod
+@@ -111,7 +117,8 @@ def ruby_timestamp
+   # field-related access
+   public
+   def [](str)
+-    if str[0,1] == "+"
++    if str[0,1] == CHAR_PLUS
++      # nothing?
+     else
+       return LogStash::Util::FieldReference.exec(str, @data)
+     end
+@@ -119,7 +126,7 @@ def [](str)
+   
+   public
+   def []=(str, value)
+-    if str == "@timestamp" && !value.is_a?(Time)
++    if str == TIMESTAMP && !value.is_a?(Time)
+       raise TypeError, "The field '@timestamp' must be a Time, not a #{value.class} (#{value})"
+     end
+ 
+diff --git a/lib/logstash/filters/date.rb b/lib/logstash/filters/date.rb
+index d3fde0985fb..7f57f8a9781 100644
+--- a/lib/logstash/filters/date.rb
++++ b/lib/logstash/filters/date.rb
+@@ -149,21 +149,24 @@ def setupMatcher(field, locale, value)
+           else
+             joda_parser = joda_parser.withOffsetParsed
+           end
+-          parser = lambda { |date| joda_parser.parseDateTime(date) }
++          parser = lambda { |date| joda_parser.parseMillis(date) }
+         when "UNIX" # unix epoch
+           joda_instant = org.joda.time.Instant.java_class.constructor(Java::long).method(:new_instance)
+-          parser = lambda { |date| joda_instant.call((date.to_f * 1000).to_i).to_java.toDateTime }
++          #parser = lambda { |date| joda_instant.call((date.to_f * 1000).to_i).to_java.toDateTime }
++          parser = lambda { |date| (date.to_f * 1000).to_i }
+         when "UNIX_MS" # unix epoch in ms
+           joda_instant = org.joda.time.Instant.java_class.constructor(Java::long).method(:new_instance)
+           parser = lambda do |date| 
+-            return joda_instant.call(date.to_i).to_java.toDateTime
++            #return joda_instant.call(date.to_i).to_java.toDateTime
++            return date.to_i
+           end
+         when "TAI64N" # TAI64 with nanoseconds, -10000 accounts for leap seconds
+           joda_instant = org.joda.time.Instant.java_class.constructor(Java::long).method(:new_instance)
+           parser = lambda do |date| 
+             # Skip leading "@" if it is present (common in tai64n times)
+             date = date[1..-1] if date[0, 1] == "@"
+-            return joda_instant.call((date[1..15].hex * 1000 - 10000)+(date[16..23].hex/1000000)).to_java.toDateTime 
++            #return joda_instant.call((date[1..15].hex * 1000 - 10000)+(date[16..23].hex/1000000)).to_java.toDateTime 
++            return (date[1..15].hex * 1000 - 10000)+(date[16..23].hex/1000000)
+           end
+         else
+           joda_parser = org.joda.time.format.DateTimeFormat.forPattern(format).withDefaultYear(Time.new.year)
+@@ -175,7 +178,7 @@ def setupMatcher(field, locale, value)
+           if (locale != nil)
+             joda_parser = joda_parser.withLocale(locale)
+           end
+-          parser = lambda { |date| joda_parser.parseDateTime(date) }
++          parser = lambda { |date| joda_parser.parseMillis(date) }
+       end
+ 
+       @logger.debug("Adding type with date config", :type => @type,
+@@ -203,13 +206,13 @@ def filter(event)
+       fieldvalues.each do |value|
+         next if value.nil?
+         begin
+-          time = nil
++          epochmillis = nil
+           success = false
+           last_exception = RuntimeError.new "Unknown"
+           fieldparsers.each do |parserconfig|
+             parser = parserconfig[:parser]
+             begin
+-              time = parser.call(value)
++              epochmillis = parser.call(value)
+               success = true
+               break # success
+             rescue StandardError, JavaException => e
+@@ -219,13 +222,9 @@ def filter(event)
+ 
+           raise last_exception unless success
+ 
+-          time = time.withZone(UTC)
+           # Convert joda DateTime to a ruby Time
+-          event[@target] = Time.utc(
+-            time.getYear, time.getMonthOfYear, time.getDayOfMonth,
+-            time.getHourOfDay, time.getMinuteOfHour, time.getSecondOfMinute,
+-            time.getMillisOfSecond * 1000
+-          )
++          event[@target] = Time.at(epochmillis / 1000, (epochmillis % 1000) * 1000)
++          #event[@target] = Time.at(epochmillis / 1000.0).utc
+ 
+           @logger.debug? && @logger.debug("Date parsing done", :value => value, :timestamp => event[@target])
+         rescue StandardError, JavaException => e
+diff --git a/lib/logstash/time_addon.rb b/lib/logstash/time_addon.rb
+index 258ce703af8..42592ec173b 100644
+--- a/lib/logstash/time_addon.rb
++++ b/lib/logstash/time_addon.rb
+@@ -13,4 +13,21 @@ module LogStash::Time
+   def self.now
+     return Time.new.utc
+   end
++
++  if RUBY_PLATFORM == "java"
++    #JODA_ISO8601_PARSER = org.joda.time.format.ISODateTimeFormat.dateTimeParser
++    #JODA_ISO8601_PARSER = org.joda.time.format.ISODateTimeFormat.dateTimeParser
++    JODA_ISO8601_PARSER = org.joda.time.format.DateTimeFormat.forPattern("yyyy-MM-dd'T'HH:mm:ss.SSSZ")
++    UTC = org.joda.time.DateTimeZone.forID("UTC")
++    def self.parse_iso8601(t)
++      millis = JODA_ISO8601_PARSER.parseMillis(t)
++      return Time.at(millis / 1000, (millis % 1000) * 1000)
++    end
++  else
++    def self.parse_iso8601(t)
++      # Warning, ruby's Time.parse is *really* terrible and slow.
++      return unless t.is_a?(String)
++      return Time.parse(t).gmtime
++    end
++  end
+ end # module LogStash::Time
+diff --git a/spec/codecs/json.rb b/spec/codecs/json.rb
+index 764159ea7e6..d08e5e0b43b 100644
+--- a/spec/codecs/json.rb
++++ b/spec/codecs/json.rb
+@@ -17,6 +17,25 @@
+         insist { event["bah"] } == data["bah"]
+       end
+     end
++
++    it "should be fast" do
++      json = '{"message":"Hello world!","@timestamp":"2013-12-21T07:01:25.616Z","@version":"1","host":"Macintosh.local","sequence":1572456}'
++      iterations = 500000
++      count = 0
++
++      # Warmup
++      10000.times { subject.decode(json) { } }
++
++      start = Time.now
++      iterations.times do
++        subject.decode(json) do |event|
++          count += 1
++        end
++      end
++      duration = Time.now - start
++      insist { count } == iterations
++      puts "codecs/json speed: #{iterations/duration}/sec"
++    end
+   end
+ 
+   context "#encode" do
+diff --git a/spec/event.rb b/spec/event.rb
+index adf12197ec2..e65671f6958 100644
+--- a/spec/event.rb
++++ b/spec/event.rb
+@@ -142,4 +142,24 @@
+       end
+     end
+   end
++
++  it "timestamp parsing speed", :if => ENV["SPEEDTEST"] do
++    warmup = 10000
++    count = 1000000
++
++    data = { "@timestamp" => "2013-12-21T07:25:06.605Z" }
++    event = LogStash::Event.new(data)
++    insist { event["@timestamp"] }.is_a?(Time)
++
++    duration = 0
++    [warmup, count].each do |i|
++      start = Time.now
++      i.times do
++        data = { "@timestamp" => "2013-12-21T07:25:06.605Z" }
++        LogStash::Event.new(data.clone)
++      end
++      duration = Time.now - start
++    end
++    puts "event @timestamp parse rate: #{count / duration}/sec"
++  end
+ end
+diff --git a/spec/filters/date.rb b/spec/filters/date.rb
+index 9038e8a9a65..c59f9dd2271 100644
+--- a/spec/filters/date.rb
++++ b/spec/filters/date.rb
+@@ -54,7 +54,7 @@
+           insist { subject["mydate"] } == input
+           insist { subject["@timestamp"] } == Time.iso8601(output).utc
+         rescue
+-          require "pry"; binding.pry
++          #require "pry"; binding.pry
+           raise
+         end
+       end
+diff --git a/spec/filters/date_performance.rb b/spec/filters/date_performance.rb
+index 96430478dd4..c96aba98334 100644
+--- a/spec/filters/date_performance.rb
++++ b/spec/filters/date_performance.rb
+@@ -5,34 +5,27 @@
+ describe LogStash::Filters::Date, :if => RUBY_ENGINE == "jruby" do
+   extend LogStash::RSpec
+ 
+-  describe "performance test of java syntax parsing", :if => ENV["SPEEDTEST"] do
++  describe "speed test of date parsing", :if => ENV["SPEEDTEST"] do
++    it "should be fast" do
++      event_count = 100000
++      min_rate = 4000
++      max_duration = event_count / min_rate
++      input = "Nov 24 01:29:01 -0800"
+ 
+-    event_count = 100000
+-    min_rate = 4000
+-
+-    max_duration = event_count / min_rate
+-    input = "Nov 24 01:29:01 -0800"
+-    config <<-CONFIG
+-      input {
+-        generator {
+-          add_field => ["mydate", "#{input}"]
+-          count => #{event_count}
+-          type => "generator"
+-        }
+-      }
+-      filter {
+-        date {
+-          match => [ "mydate", "MMM dd HH:mm:ss Z" ]
+-        }
+-      }
+-      output { null { } }
+-    CONFIG
+-
+-    2.times do
+-      agent do
+-        puts "date parse rate: #{event_count / @duration}"
+-        insist { @duration } < max_duration
++      filter = LogStash::Filters::Date.new("match" => [ "mydate", "MMM dd HH:mm:ss Z" ])
++      filter.register
++      duration = 0
++      # 10000 for warmup
++      [10000, event_count].each do |iterations|
++        start = Time.now
++        iterations.times do
++          event = LogStash::Event.new("mydate" => input)
++          filter.execute(event)
++        end
++        duration = Time.now - start
+       end
++      puts "date parse rate: #{event_count / duration}"
++      insist { duration } < max_duration
+     end
+   end
+ end

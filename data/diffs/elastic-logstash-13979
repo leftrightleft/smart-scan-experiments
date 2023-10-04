@@ -1,0 +1,205 @@
+diff --git a/logstash-core/lib/logstash/plugins/registry.rb b/logstash-core/lib/logstash/plugins/registry.rb
+index 342b1d288b1..029af95c48d 100644
+--- a/logstash-core/lib/logstash/plugins/registry.rb
++++ b/logstash-core/lib/logstash/plugins/registry.rb
+@@ -147,18 +147,62 @@ def load_xpack
+       require("x-pack/logstash_registry")
+     end
+ 
++    JarSearchResult = Struct.new(:jar_file, :relative_path)
++
++    ##
++    # Return the jar containing the Java plugin or nil if not found
++    #
++    # @param spec [Gem::Specification]
++    #
++    # @return [String] relative path to the matching jar or nil
++    def find_plugin_jar(spec)
++      if spec.kind_of? Gem::Specification
++        # installed from local gem, so consider "files" as valid
++        # search for jars in files attribute of the Specification provided by the plugin
++        logger.debug("Plugin #{spec.name} installed from local")
++        jar_files = spec.files.select {|f| f =~ /.*\.jar/}
++      else
++        # spec is a Bundler::StubSpecification, so installed from rubygems, check the glob
++        logger.debug("Plugin #{spec.name} installed from remote")
++        jar_files = spec.matches_for_glob("**/*.jar")
++      end
++      logger.debug("jar files examined", :jar_files => jar_files)
++      expected_jar_name = spec.name + "-" + spec.version.to_s + ".jar"
++      if jar_files.length == 1
++        if !jar_files[0].end_with?(expected_jar_name)
++          return nil
++        end
++        return jar_files[0]
++      end
++
++      # plugin with multiple jars, check the Manifest of the main jar is correct
++      target_jar = find_plugin_jar_by_manifest(jar_files, spec)
++
++      return nil if !target_jar
++      target_jar.relative_path
++    end
++
++    # return an instance of JarSearchResult if found, nil else.
++    def find_plugin_jar_by_manifest(jar_files, spec)
++      java_import 'java.util.jar.JarFile'
++
++      jar_pathname = Pathname.new(spec.base_dir) + spec.full_name
++      jar_files.map { |f| JarSearchResult.new(JarFile.new(jar_pathname.join(f).to_s), f) }
++        .select { |tuple| tuple.jar_file.manifest != nil }
++        .select { |tuple| tuple.jar_file.manifest.main_attributes != nil }
++        .find { |tuple| tuple.jar_file.manifest.main_attributes.get_value("Logstash-plugin") == spec.full_name }
++    end
++
+     def load_available_plugins
+       require "logstash/plugins/builtin"
+ 
+       GemRegistry.logstash_plugins.each do |plugin_context|
+         if plugin_context.spec.metadata.key?('java_plugin')
+-          # Find *.jar file from the require path
+-          jar_files = plugin_context.spec.matches_for_glob("**/*.jar")
+-          expected_jar_name = plugin_context.spec.name + "-" + plugin_context.spec.version.to_s + ".jar"
+-          if jar_files.length != 1 || !jar_files.first.end_with?(expected_jar_name)
+-            raise LoadError, "Java plugin '#{plugin_context.spec.name}' does not contain a single jar file with the plugin's name and version"
++          jar_file = find_plugin_jar(plugin_context.spec)
++          if !jar_file
++            raise LoadError, "Java plugin '#{plugin_context.spec.name}' does not contain any jar file with valid plugin's definition"
+           end
+-          @java_plugins[plugin_context.spec.name] = jar_files.first
++          @java_plugins[plugin_context.spec.name] = jar_file
+         end
+ 
+         # When a plugin has a HOOK_FILE defined, its the responsibility of the plugin
+@@ -170,7 +214,7 @@ def load_available_plugins
+             logger.debug("Executing hooks", :name => plugin_context.name, :type => plugin_context.type, :hooks_file => plugin_context.hooks_file)
+             plugin_context.execute_hooks!
+           rescue => e
+-            logger.error("error occured when loading plugins hooks file", :name => plugin_context.name, :type => plugin_context.type, :exception => e.message, :stacktrace => e.backtrace )
++            logger.error("Error occurred when loading plugins hooks file", :name => plugin_context.name, :type => plugin_context.type, :exception => e.message, :stacktrace => e.backtrace )
+           end
+         end
+       end
+diff --git a/qa/integration/fixtures/logstash-input-java_input_example-1.0.3.gem b/qa/integration/fixtures/logstash-input-java_input_example-1.0.3.gem
+new file mode 100644
+index 00000000000..729a219454d
+Binary files /dev/null and b/qa/integration/fixtures/logstash-input-java_input_example-1.0.3.gem differ
+diff --git a/qa/integration/specs/install_java_plugin_spec.rb b/qa/integration/specs/install_java_plugin_spec.rb
+index 03f4d5bcf41..c69c770f7d0 100644
+--- a/qa/integration/specs/install_java_plugin_spec.rb
++++ b/qa/integration/specs/install_java_plugin_spec.rb
+@@ -48,33 +48,47 @@
+   let(:plugin_name) { "logstash-input-java_input_example" }
+   let(:install_command) { "bin/logstash-plugin install" }
+ 
+-  it "successfully runs a pipeline with an installed Java plugins" do
+-    execute = @logstash_plugin.run_raw("#{install_command} #{plugin_name}")
++  shared_examples "install a plugin and run it with" do
++    it "should be successful" do
++      execute = @logstash_plugin.run_raw("#{install_command} #{install_detail}")
+ 
+-    expect(execute.stderr_and_stdout).to match(/Installation successful/)
+-    expect(execute.exit_code).to eq(0)
++      expect(execute.stderr_and_stdout).to match(/Installation successful/)
++      expect(execute.exit_code).to eq(0)
+ 
+-    installed = @logstash_plugin.list(plugin_name)
+-    expect(installed.stderr_and_stdout).to match(/#{plugin_name}/)
++      installed = @logstash_plugin.list(plugin_name)
++      expect(installed.stderr_and_stdout).to match(/#{plugin_name}/)
+ 
+-    @logstash.start_background_with_config_settings(config_to_temp_file(@fixture.config), settings_dir)
++      @logstash.start_background_with_config_settings(config_to_temp_file(@fixture.config), settings_dir)
+ 
+-    # wait for Logstash to start
+-    started = false
+-    while !started
+-      begin
+-        sleep(1)
++      # wait for Logstash to start
++      started = false
++      while !started
++        begin
++          sleep(1)
++          result = @logstash.monitoring_api.event_stats
++          started = !result.nil?
++        rescue
++          retry
++        end
++      end
++
++      Stud.try(max_retry.times, RSpec::Expectations::ExpectationNotMetError) do
+         result = @logstash.monitoring_api.event_stats
+-        started = !result.nil?
+-      rescue
+-        retry
++        expect(result["in"]).to eq(4)
+       end
+     end
++  end
+ 
+-    Stud.try(max_retry.times, RSpec::Expectations::ExpectationNotMetError) do
+-      result = @logstash.monitoring_api.event_stats
+-      expect(result["in"]).to eq(4)
++  context "successfully runs a pipeline with an installed Java plugins" do
++    it_behaves_like 'install a plugin and run it with' do
++      let(:install_detail) { "logstash-input-java_input_example" }
+     end
++  end
+ 
++  context "local multi-jar plugin" do
++    it_behaves_like 'install a plugin and run it with' do
++      let(:plugin_filepath) { File.join(File.dirname(__FILE__), "..", "fixtures", "logstash-input-java_input_example-1.0.3.gem") }
++      let(:install_detail) { "--local #{plugin_filepath}" }
++    end
+   end
+ end
+diff --git a/rubyUtils.gradle b/rubyUtils.gradle
+index 85cc8de6ab8..076e56cb47a 100644
+--- a/rubyUtils.gradle
++++ b/rubyUtils.gradle
+@@ -354,7 +354,7 @@ class PluginInfo {
+     }
+ }
+ 
+-void generateRubySupportFilesForPlugin(String projectDescription, String projectGroup, String version) {
++void generateRubySupportFilesForPlugin(String projectDescription, String projectGroup, String version, Collection classpathDependencies) {
+     File gemFile = file("Gemfile")
+     gemFile.write("# AUTOGENERATED BY THE GRADLE SCRIPT. EDITS WILL BE OVERWRITTEN.\n")
+     gemFile.append("source 'https://rubygems.org'\n")
+@@ -388,6 +388,8 @@ void generateRubySupportFilesForPlugin(String projectDescription, String project
+     gemspecFile.append("  s.metadata = { 'logstash_plugin' => 'true', 'logstash_group' => '" + pluginInfo.pluginType + "', 'java_plugin' => 'true'}\n")
+     gemspecFile.append("\n")
+     gemspecFile.append("  # Gem dependencies\n")
++    // native Java plugins with multiple jars requires a Logstash version which exposes such functionality
++    gemspecFile.append("  s.add_runtime_dependency 'logstash-core', '>= 8.9.0'\n") // TODO this has to match the version of LS that ships this feature
+     gemspecFile.append("  s.add_runtime_dependency \"logstash-core-plugin-api\", \">= 1.60\", \"<= 2.99\"\n")
+     gemspecFile.append("  s.add_runtime_dependency 'jar-dependencies'\n")
+     gemspecFile.append("  s.add_development_dependency 'logstash-devutils'\n")
+@@ -414,6 +416,11 @@ void generateRubySupportFilesForPlugin(String projectDescription, String project
+     pluginJarsRb.append("# encoding: utf-8\n")
+     pluginJarsRb.append("\n")
+     pluginJarsRb.append("require 'jar_dependencies'\n")
++
++    // explicitly list all the classpath defined jars
++    classpathDependencies.each {
++        pluginJarsRb.append("require_jar(\'${it.group}\', \'${it.name}\', \'${it.version}\')\n")
++    }
+     pluginJarsRb.append("require_jar('" + projectGroup + "', '" + pluginInfo.pluginFullName() + "', '" + version +"')\n")
+ }
+ 
+@@ -426,7 +433,13 @@ void validatePluginJar(File pluginJar, String group) {
+                 String.join(System.lineSeparator(), validationErrors), null)
+     }
+ 
+-    URLClassLoader cl = URLClassLoader.newInstance([pluginJar.toURI().toURL()] as URL[])
++    // all the jars bundled in a native Java plugin must be used to create the classpath
++    URL[] runtimeClassPath = []
++    runtimeClassPath += pluginJar.toURI().toURL()
++    configurations.getByName('implementation').asFileTree.each {File jarFile ->
++        runtimeClassPath += jarFile.toURI().toURL()
++    }
++    URLClassLoader cl = URLClassLoader.newInstance(runtimeClassPath as URL[])
+     String pluginClassName = group + "." + pluginInfo.pluginClass
+ 
+     Class<?> pluginClass = null

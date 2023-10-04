@@ -1,0 +1,127 @@
+diff --git a/logstash-core/lib/logstash/elasticsearch_client.rb b/logstash-core/lib/logstash/elasticsearch_client.rb
+index d0161a19569..c1bdbc29dc2 100644
+--- a/logstash-core/lib/logstash/elasticsearch_client.rb
++++ b/logstash-core/lib/logstash/elasticsearch_client.rb
+@@ -27,8 +27,19 @@ def initialize(settings, logger)
+       @logger = logger
+       @client_args = client_args
+ 
+-      username = @settings["var.output.elasticsearch.user"]
+-      password = @settings["var.output.elasticsearch.password"]
++      ssl_options = {}
++
++      if @settings["var.elasticsearch.ssl.enabled"] == "true"
++        ssl_options[:verify] = @settings.fetch("var.elasticsearch.ssl.verification_mode", true)
++        ssl_options[:ca_file] = @settings.fetch("var.elasticsearch.ssl.certificate_authority", nil)
++        ssl_options[:client_cert] = @settings.fetch("var.elasticsearch.ssl.certificate", nil)
++        ssl_options[:client_key] = @settings.fetch("var.elasticsearch.ssl.key", nil)
++      end
++
++      @client_args[:ssl] = ssl_options
++
++      username = @settings["var.elasticsearch.username"]
++      password = @settings["var.elasticsearch.password"]
+       if username
+         @client_args[:transport_options] = { :headers => { "Authorization" => 'Basic ' + Base64.encode64( "#{username}:#{password}" ).chomp } }
+       end
+@@ -97,7 +108,7 @@ def client_args
+     end
+ 
+     def unpack_hosts
+-      @settings.fetch("var.output.elasticsearch.hosts", "localhost:9200").split(',').map(&:strip)
++      @settings.fetch("var.elasticsearch.hosts", "localhost:9200").split(',').map(&:strip)
+     end
+   end
+ 
+diff --git a/logstash-core/lib/logstash/modules/kibana_client.rb b/logstash-core/lib/logstash/modules/kibana_client.rb
+index d58f188daa3..adbd2041366 100644
+--- a/logstash-core/lib/logstash/modules/kibana_client.rb
++++ b/logstash-core/lib/logstash/modules/kibana_client.rb
+@@ -28,7 +28,27 @@ def failed?
+ 
+   def initialize(settings)
+     @settings = settings
+-    @client = Manticore::Client.new(request_timeout: 5, connect_timeout: 5, socket_timeout: 5, pool_max: 10, pool_max_per_route: 2)
++
++    client_options = {
++      request_timeout: 5,
++      connect_timeout: 5,
++      socket_timeout: 5,
++      pool_max: 10,
++      pool_max_per_route: 2
++    }
++
++    ssl_options = {}
++
++    if @settings["var.kibana.ssl.enabled"] == "true"
++      ssl_options[:verify] = @settings.fetch("var.kibana.ssl.verification_mode", "strict").to_sym
++      ssl_options[:ca_file] = @settings.fetch("var.kibana.ssl.certificate_authority", nil)
++      ssl_options[:client_cert] = @settings.fetch("var.kibana.ssl.certificate", nil)
++      ssl_options[:client_key] = @settings.fetch("var.kibana.ssl.key", nil)
++    end
++
++    client_options[:ssl] = ssl_options
++
++    @client = Manticore::Client.new(client_options)
+     @host = @settings.fetch("var.kibana.host", "localhost:5601")
+     username = @settings["var.kibana.username"]
+     password = @settings["var.kibana.password"]
+diff --git a/logstash-core/lib/logstash/modules/logstash_config.rb b/logstash-core/lib/logstash/modules/logstash_config.rb
+index 79e24085301..7a58857dce3 100644
+--- a/logstash-core/lib/logstash/modules/logstash_config.rb
++++ b/logstash-core/lib/logstash/modules/logstash_config.rb
+@@ -59,14 +59,18 @@ def setting(name, default)
+   end
+ 
+   def elasticsearch_output_config(type_string = nil)
+-    hosts = array_to_string(get_setting(LogStash::Setting::SplittableStringArray.new("var.output.elasticsearch.hosts", String, ["localhost:9200"])))
+-    index = "#{@name}-#{setting("var.output.elasticsearch.index_suffix", "%{+YYYY.MM.dd}")}"
+-    user = @settings["var.output.elasticsearch.user"]
+-    password = @settings["var.output.elasticsearch.password"]
++    hosts = array_to_string(get_setting(LogStash::Setting::SplittableStringArray.new("var.elasticsearch.hosts", String, ["localhost:9200"])))
++    index = "#{@name}-#{setting("var.elasticsearch.index_suffix", "%{+YYYY.MM.dd}")}"
++    user = @settings["var.elasticsearch.username"]
++    password = @settings["var.elasticsearch.password"]
+     lines = ["hosts => #{hosts}", "index => \"#{index}\""]
+     lines.push(user ? "user => \"#{user}\"" : nil)
+     lines.push(password ? "password => \"#{password}\"" : nil)
+     lines.push(type_string ? "document_type => #{type_string}" : nil)
++    lines.push("ssl => #{@settings.fetch('var.elasticsearch.ssl.enabled', false)}")
++    if cacert = @settings["var.elasticsearch.ssl.certificate_authority"]
++      lines.push("cacert => \"#{cacert}\"") if cacert
++    end
+     # NOTE: the first line should be indented in the conf.erb
+     <<-CONF
+ elasticsearch {
+diff --git a/logstash-core/spec/logstash/modules/scaffold_spec.rb b/logstash-core/spec/logstash/modules/scaffold_spec.rb
+index bef60cd6762..2112e3848d6 100644
+--- a/logstash-core/spec/logstash/modules/scaffold_spec.rb
++++ b/logstash-core/spec/logstash/modules/scaffold_spec.rb
+@@ -16,9 +16,9 @@
+   subject(:test_module) { described_class.new(mname, base_dir) }
+   let(:module_settings) do
+     {
+-      "var.output.elasticsearch.hosts" => "es.mycloud.com:9200",
+-      "var.output.elasticsearch.user" => "foo",
+-      "var.output.elasticsearch.password" => "password",
++      "var.elasticsearch.hosts" => "es.mycloud.com:9200",
++      "var.elasticsearch.user" => "foo",
++      "var.elasticsearch.password" => "password",
+       "var.input.tcp.port" => 5606,
+     }
+   end
+@@ -222,11 +222,10 @@
+     let(:base_dir) { File.expand_path(File.join(File.dirname(__FILE__), "..", "..", "modules_test_files", "#{mname}")) }
+     let(:module_settings) do
+       {
+-        "var.output.elasticsearch.hosts" => "localhost:9200",
+-        "var.output.elasticsearch.user" => "foo",
+-        "var.output.elasticsearch.password" => "password",
++        "var.elasticsearch.hosts" => "localhost:9200",
++        "var.elasticsearch.user" => "foo",
++        "var.elasticsearch.password" => "password",
+         "var.input.tcp.port" => 5606,
+-        "dashboards.kibana_index" => ".kibana"
+       }
+     end
+     it "puts stuff in ES" do

@@ -1,0 +1,402 @@
+diff --git a/logstash-core/lib/logstash/api/app_helpers.rb b/logstash-core/lib/logstash/api/app_helpers.rb
+index 4eeb7b788c6..98e6c377576 100644
+--- a/logstash-core/lib/logstash/api/app_helpers.rb
++++ b/logstash-core/lib/logstash/api/app_helpers.rb
+@@ -1,27 +1,43 @@
+ # encoding: utf-8
+ require "logstash/json"
++require "logstash/api/errors"
+ 
+ module LogStash::Api::AppHelpers
+-
++  # This method handle both of the normal flow *happy path*
++  # and the display or errors, if more custom logic is added here
++  # it will make sense to separate them.
++  #
++  # See `#error` method in the `LogStash::Api::Module::Base`
+   def respond_with(data, options={})
+     as     = options.fetch(:as, :json)
+     filter = options.fetch(:filter, "")
+-    pretty = params.has_key?("pretty")
++
++    status data.respond_to?(:status_code) ? data.status_code : 200
+ 
+     if as == :json
+-      selected_fields = extract_fields(filter.to_s.strip)
+-      data.select! { |k,v| selected_fields.include?(k) } unless selected_fields.empty?
+-      unless options.include?(:exclude_default_metadata)
+-        data = default_metadata.merge(data)
++      if api_error?(data)
++        data = generate_error_hash(data)
++      else
++        selected_fields = extract_fields(filter.to_s.strip)
++        data.select! { |k,v| selected_fields.include?(k) } unless selected_fields.empty?
++        unless options.include?(:exclude_default_metadata)
++          data = data.to_hash
++          if data.values.size == 0 && selected_fields.size > 0
++            raise LogStash::Api::NotFoundError
++          end
++          data = default_metadata.merge(data)
++        end
+       end
++
+       content_type "application/json"
+-      LogStash::Json.dump(data, {:pretty => pretty})
++      LogStash::Json.dump(data, {:pretty => pretty?})
+     else
+       content_type "text/plain"
+       data.to_s
+     end
+   end
+ 
++  protected
+   def extract_fields(filter_string)
+     (filter_string.empty? ? [] : filter_string.split(",").map { |s| s.strip.to_sym })
+   end
+@@ -35,4 +51,24 @@ def as_boolean(string)
+   def default_metadata
+     @factory.build(:default_metadata).all
+   end
++
++  def api_error?(error)
++    error.is_a?(LogStash::Api::ApiError)
++  end
++
++  def pretty?
++    params.has_key?("pretty")
++  end
++
++  def generate_error_hash(error)
++    {
++      :path => request.path,
++      :status => error.status_code,
++      :error => error.to_hash
++    }
++  end
++
++  def human?
++    params.has_key?("human") && (params["human"].nil? || as_boolean(params["human"]) == true)
++  end
+ end
+diff --git a/logstash-core/lib/logstash/api/errors.rb b/logstash-core/lib/logstash/api/errors.rb
+new file mode 100644
+index 00000000000..e080305d9d1
+--- /dev/null
++++ b/logstash-core/lib/logstash/api/errors.rb
+@@ -0,0 +1,28 @@
++# encoding: utf-8
++module LogStash
++  module Api
++    class ApiError < StandardError;
++      def initialize(message = nil)
++        super(message || "Api Error")
++      end
++
++      def status_code
++        500
++      end
++
++      def to_hash
++        { :message => to_s }
++      end
++    end
++
++    class NotFoundError < ApiError
++      def initialize
++        super("Not Found")
++      end
++
++      def status_code
++        404
++      end
++    end
++  end
++end
+diff --git a/logstash-core/lib/logstash/api/modules/base.rb b/logstash-core/lib/logstash/api/modules/base.rb
+index 2c1a56cb8b0..9e84dc91811 100644
+--- a/logstash-core/lib/logstash/api/modules/base.rb
++++ b/logstash-core/lib/logstash/api/modules/base.rb
+@@ -1,11 +1,13 @@
+ # encoding: utf-8
+ require "logstash/api/app_helpers"
+ require "logstash/api/command_factory"
++require "logstash/api/errors"
+ 
+ module LogStash
+   module Api
+     module Modules
+       class Base < ::Sinatra::Base
++
+         helpers AppHelpers
+ 
+         # These options never change
+@@ -29,15 +31,15 @@ def initialize(app=nil, agent)
+         end
+ 
+         not_found do
+-          status 404
+-          as   = params.has_key?("human") ? :string : :json
+-          text = as == :string ? "" : {}
+-          respond_with(text, :as => as)
++          # We cannot raise here because it wont be catched by the `error` handler.
++          # So we manually create a new instance of NotFound and just pass it down.
++          respond_with(NotFoundError.new)
+         end
+ 
+-        protected
+-        def human?
+-          params.has_key?("human") && (params["human"].nil? || as_boolean(params["human"]) == true)
++        # This allow to have custom exception but keep a consistent
++        # format to report them.
++        error ApiError do |error|
++          respond_with(error)
+         end
+       end
+     end
+diff --git a/logstash-core/lib/logstash/api/modules/node.rb b/logstash-core/lib/logstash/api/modules/node.rb
+index 85263a63805..32bf09149fa 100644
+--- a/logstash-core/lib/logstash/api/modules/node.rb
++++ b/logstash-core/lib/logstash/api/modules/node.rb
+@@ -1,5 +1,6 @@
+ # encoding: utf-8
+ require "logstash/api/modules/base"
++require "logstash/api/errors"
+ 
+ module LogStash
+   module Api
+@@ -12,20 +13,23 @@ def node
+         get "/hot_threads" do
+           ignore_idle_threads = params["ignore_idle_threads"] || true
+ 
+-          options = {
+-            :ignore_idle_threads => as_boolean(ignore_idle_threads),
+-            :human => human?
+-          }
++          options = { :ignore_idle_threads => as_boolean(ignore_idle_threads) }
+           options[:threads] = params["threads"].to_i if params.has_key?("threads")
+ 
+-          as = options[:human] ? :string : :json
++          as = human? ? :string : :json
+           respond_with(node.hot_threads(options), {:as => as})
+         end
+ 
+-        get "/?:filter?" do
+-          selected_fields = extract_fields(params["filter"].to_s.strip)
+-          respond_with node.all(selected_fields)
+-        end
++         get "/?:filter?" do
++           selected_fields = extract_fields(params["filter"].to_s.strip)
++           values = node.all(selected_fields)
++
++           if values.size == 0
++             raise NotFoundError
++           else
++             respond_with(values)
++           end
++         end
+       end
+     end
+   end
+diff --git a/logstash-core/lib/logstash/api/modules/root.rb b/logstash-core/lib/logstash/api/modules/root.rb
+index 66dc4d8730b..10a414187ac 100644
+--- a/logstash-core/lib/logstash/api/modules/root.rb
++++ b/logstash-core/lib/logstash/api/modules/root.rb
+@@ -3,12 +3,10 @@ module LogStash
+   module Api
+     module Modules
+       class Root < ::LogStash::Api::Modules::Base
+-        
+         get "/" do
+           command = factory.build(:system_basic_info)
+           respond_with command.run
+         end
+-        
+       end
+     end
+   end
+diff --git a/logstash-core/lib/logstash/api/modules/stats.rb b/logstash-core/lib/logstash/api/modules/stats.rb
+index 377a3156d97..eee3d0b8b65 100644
+--- a/logstash-core/lib/logstash/api/modules/stats.rb
++++ b/logstash-core/lib/logstash/api/modules/stats.rb
+@@ -3,7 +3,6 @@ module LogStash
+   module Api
+     module Modules
+       class Stats < ::LogStash::Api::Modules::Base
+-
+         def stats_command
+           factory.build(:stats)
+         end
+@@ -36,7 +35,6 @@ def stats_command
+           }
+           respond_with(payload, {:filter => params["filter"]})
+         end
+-
+       end
+     end
+   end
+diff --git a/logstash-core/spec/api/lib/api/node_plugins_spec.rb b/logstash-core/spec/api/lib/api/node_plugins_spec.rb
+index d78340effd3..5389e10c418 100644
+--- a/logstash-core/spec/api/lib/api/node_plugins_spec.rb
++++ b/logstash-core/spec/api/lib/api/node_plugins_spec.rb
+@@ -1,4 +1,5 @@
+ # encoding: utf-8
++require_relative "../../../support/shared_examples"
+ require_relative "../../spec_helper"
+ require "sinatra"
+ require "logstash/api/modules/plugins"
+@@ -6,10 +7,11 @@
+ 
+ describe LogStash::Api::Modules::Plugins do
+   include_context "api setup"
++  include_examples "not found"
+ 
+   extend ResourceDSLMethods
+ 
+-  before(:all) do
++  before(:each) do
+     do_request { get "/" }
+   end
+ 
+@@ -20,13 +22,12 @@
+       expect(last_response).to be_ok
+     end
+ 
+-    it "should return a list of plugins" do      
++    it "should return a list of plugins" do
+       expect(payload["plugins"]).to be_a(Array)
+     end
+ 
+     it "should return the total number of plugins" do
+       expect(payload["total"]).to be_a(Numeric)
+     end
+-    
+   end
+ end
+diff --git a/logstash-core/spec/api/lib/api/node_spec.rb b/logstash-core/spec/api/lib/api/node_spec.rb
+index 17cf5620958..a8f8b009f5b 100644
+--- a/logstash-core/spec/api/lib/api/node_spec.rb
++++ b/logstash-core/spec/api/lib/api/node_spec.rb
+@@ -1,11 +1,13 @@
+ # encoding: utf-8
+ require_relative "../../spec_helper"
++require_relative "../../../support/shared_examples"
+ require "sinatra"
+ require "logstash/api/modules/node"
+ require "logstash/json"
+ 
+ describe LogStash::Api::Modules::Node do
+   include_context "api setup"
++  include_examples "not found"
+ 
+   describe "#hot threads" do
+ 
+diff --git a/logstash-core/spec/api/lib/api/node_stats_spec.rb b/logstash-core/spec/api/lib/api/node_stats_spec.rb
+index 074f83c3158..448543d250b 100644
+--- a/logstash-core/spec/api/lib/api/node_stats_spec.rb
++++ b/logstash-core/spec/api/lib/api/node_stats_spec.rb
+@@ -1,11 +1,13 @@
+ # encoding: utf-8
+ require_relative "../../spec_helper"
++require_relative "../../../support/shared_examples"
+ require "sinatra"
+ require "logstash/api/modules/node_stats"
+ require "logstash/json"
+ 
+ describe LogStash::Api::Modules::NodeStats do
+   include_context "api setup"
++  include_examples "not found"
+ 
+   extend ResourceDSLMethods
+ 
+diff --git a/logstash-core/spec/api/lib/api/plugins_spec.rb b/logstash-core/spec/api/lib/api/plugins_spec.rb
+index aecb6f46542..ee554dae22f 100644
+--- a/logstash-core/spec/api/lib/api/plugins_spec.rb
++++ b/logstash-core/spec/api/lib/api/plugins_spec.rb
+@@ -1,13 +1,15 @@
+ # encoding: utf-8
+ require_relative "../../spec_helper"
++require_relative "../../../support/shared_examples"
+ require "sinatra"
+ require "logstash/api/modules/plugins"
+ require "logstash/json"
+ 
+ describe LogStash::Api::Modules::Plugins do
+   include_context "api setup"
++  include_examples "not found"
+ 
+-  before(:all) do
++  before(:each) do
+     get "/"
+   end
+ 
+diff --git a/logstash-core/spec/api/lib/api/root_spec.rb b/logstash-core/spec/api/lib/api/root_spec.rb
+index 8347580a639..ad9dc08381a 100644
+--- a/logstash-core/spec/api/lib/api/root_spec.rb
++++ b/logstash-core/spec/api/lib/api/root_spec.rb
+@@ -1,5 +1,6 @@
+ # encoding: utf-8
+ require_relative "../../spec_helper"
++require_relative "../../../support/shared_examples"
+ require "sinatra"
+ require "logstash/api/modules/root"
+ require "logstash/json"
+@@ -11,5 +12,7 @@
+     do_request { get "/" }
+     expect(last_response).to be_ok
+   end
++
++  include_examples "not found"
+ end
+ 
+diff --git a/logstash-core/spec/api/lib/errors_spec.rb b/logstash-core/spec/api/lib/errors_spec.rb
+new file mode 100644
+index 00000000000..430671402d0
+--- /dev/null
++++ b/logstash-core/spec/api/lib/errors_spec.rb
+@@ -0,0 +1,27 @@
++# encoding: utf-8
++require_relative "../spec_helper"
++require "logstash/api/errors"
++
++describe LogStash::Api::ApiError do
++  subject { described_class.new }
++
++  it "#status_code returns 500" do
++    expect(subject.status_code).to eq(500)
++  end
++
++  it "#to_hash return the message of the exception" do
++    expect(subject.to_hash).to include(:message => "Api Error")
++  end
++end
++
++describe LogStash::Api::NotFoundError do
++  subject { described_class.new }
++
++  it "#status_code returns 404" do
++    expect(subject.status_code).to eq(404)
++  end
++
++  it "#to_hash return the message of the exception" do
++    expect(subject.to_hash).to include(:message => "Not Found")
++  end
++end
+diff --git a/logstash-core/spec/support/shared_examples.rb b/logstash-core/spec/support/shared_examples.rb
+index b65f2acfaaf..0218bebb53c 100644
+--- a/logstash-core/spec/support/shared_examples.rb
++++ b/logstash-core/spec/support/shared_examples.rb
+@@ -95,4 +95,14 @@
+   end
+ end
+ 
++shared_examples "not found" do
++  it "should return a 404 to unknown request" do
++    do_request { get "/i_want_to_believe-#{Time.now.to_i}" }
++    expect(last_response.content_type).to eq("application/json")
++    expect(last_response).not_to be_ok
++    expect(last_response.status).to eq(404)
++    expect(LogStash::Json.load(last_response.body)).to include("status" => 404)
++    expect(LogStash::Json.load(last_response.body)["path"]).not_to be_nil
++  end
++end
+ 

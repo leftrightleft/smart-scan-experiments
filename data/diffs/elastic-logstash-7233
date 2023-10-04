@@ -1,0 +1,144 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index 11ca63339d0..9f0eddfab7b 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -245,27 +245,35 @@ def pipelines_count
+     end
+   end
+ 
+-  def running_pipelines
++  def with_running_pipelines
+     with_pipelines do |pipelines|
+-      pipelines.select {|pipeline_id, _| running_pipeline?(pipeline_id) }
++      yield pipelines.select {|pipeline_id, _| running_pipeline?(pipeline_id) }
+     end
+   end
+ 
+   def running_pipelines?
+-    with_pipelines do |pipelines|
+-      pipelines.select {|pipeline_id, _| running_pipeline?(pipeline_id) }.any?
++    running_pipelines_count > 0
++  end
++
++  def running_pipelines_count
++    with_running_pipelines do |pipelines|
++      pipelines.size
+     end
+   end
+ 
+   def running_user_defined_pipelines?
+-    running_user_defined_pipelines.any?
++    with_running_user_defined_pipelines do |pipelines|
++      pipelines.size > 0
++    end
+   end
+ 
+-  def running_user_defined_pipelines
++  def with_running_user_defined_pipelines
+     with_pipelines do |pipelines|
+-      pipelines.select do |_, pipeline|
++      found = pipelines.select do |_, pipeline|
+         pipeline.running? && !pipeline.system?
+       end
++
++      yield found
+     end
+   end
+ 
+@@ -362,8 +370,10 @@ def resolve_actions(pipeline_configs)
+ 
+   def report_currently_running_pipelines(converge_result)
+     if converge_result.success? && converge_result.total > 0
+-      number_of_running_pipeline = running_pipelines.size
+-      logger.info("Pipelines running", :count => number_of_running_pipeline, :pipelines => running_pipelines.values.collect(&:pipeline_id) )
++      with_running_pipelines do |pipelines|
++        number_of_running_pipeline = pipelines.size
++        logger.info("Pipelines running", :count => number_of_running_pipeline, :pipelines => pipelines.values.collect(&:pipeline_id) )
++      end
+     end
+   end
+ 
+diff --git a/logstash-core/lib/logstash/instrument/periodic_poller/pq.rb b/logstash-core/lib/logstash/instrument/periodic_poller/pq.rb
+index d0028031f1f..e9237985100 100644
+--- a/logstash-core/lib/logstash/instrument/periodic_poller/pq.rb
++++ b/logstash-core/lib/logstash/instrument/periodic_poller/pq.rb
+@@ -11,7 +11,7 @@ def initialize(metric, queue_type, agent, options = {})
+     end
+ 
+     def collect
+-      pipeline_id, pipeline = @agent.running_pipelines.first
++      pipeline_id, pipeline = @agent.with_running_pipelines {|pipelines| pipelines.first }
+       unless pipeline.nil?
+         pipeline.collect_stats
+       end
+diff --git a/logstash-core/spec/logstash/agent/converge_spec.rb b/logstash-core/spec/logstash/agent/converge_spec.rb
+index 6dc91405045..3ecd06b63a7 100644
+--- a/logstash-core/spec/logstash/agent/converge_spec.rb
++++ b/logstash-core/spec/logstash/agent/converge_spec.rb
+@@ -74,8 +74,10 @@
+         describe "#running_user_defined_pipelines" do
+           it "returns the user defined pipelines" do
+             start_agent(subject)
+-            expect(subject.running_user_defined_pipelines.keys).to include(:main)
+-            expect(subject.running_user_defined_pipelines.keys).not_to include(:system_pipeline)
++            subject.with_running_user_defined_pipelines do |pipelines|
++              expect(pipelines).to include(:main)
++              expect(pipelines).not_to include(:system_pipeline)
++            end
+             subject.shutdown
+           end
+         end
+@@ -185,7 +187,7 @@
+ 
+     it "stops the running pipelines" do
+       expect(subject.converge_state_and_update).to be_a_successful_converge
+-      expect { subject.shutdown }.to change { subject.running_pipelines.size }.from(2).to(0)
++      expect { subject.shutdown }.to change { subject.running_pipelines_count }.from(2).to(0)
+     end
+   end
+ 
+@@ -206,7 +208,7 @@
+       it "creates and starts the new pipeline" do
+         expect {
+           expect(subject.converge_state_and_update).to be_a_successful_converge
+-        }.to change { subject.running_pipelines.count }.from(0).to(1)
++        }.to change { subject.running_pipelines_count }.from(0).to(1)
+         expect(subject).to have_running_pipeline?(pipeline_config)
+       end
+     end
+@@ -223,7 +225,7 @@
+         it "start a new pipeline and keep the original" do
+           expect {
+             expect(subject.converge_state_and_update).to be_a_successful_converge
+-          }.to change { subject.running_pipelines.count }.from(1).to(2)
++          }.to change { subject.running_pipelines_count }.from(1).to(2)
+           expect(subject).to have_running_pipeline?(pipeline_config)
+           expect(subject).to have_running_pipeline?(new_pipeline_config)
+         end
+@@ -240,7 +242,7 @@
+         it "stops the missing pipeline and start the new one" do
+           expect {
+             expect(subject.converge_state_and_update).to be_a_successful_converge
+-          }.not_to change { subject.running_pipelines.count }
++          }.not_to change { subject.running_pipelines_count }
+           expect(subject).not_to have_pipeline?(pipeline_config)
+           expect(subject).to have_running_pipeline?(new_pipeline_config)
+         end
+@@ -260,7 +262,7 @@
+       it "reloads the modified pipeline" do
+         expect {
+           expect(subject.converge_state_and_update).to be_a_successful_converge
+-        }.not_to change { subject.running_pipelines.count }
++        }.not_to change { subject.running_pipelines_count }
+         expect(subject).to have_running_pipeline?(modified_pipeline_config)
+         expect(subject).not_to have_pipeline?(pipeline_config)
+       end
+@@ -277,7 +279,7 @@
+       it "stops all the pipelines" do
+         expect {
+           expect(subject.converge_state_and_update).to be_a_successful_converge
+-        }.to change { subject.running_pipelines.count }.from(2).to(0)
++        }.to change { subject.running_pipelines_count }.from(2).to(0)
+         expect(subject).not_to have_pipeline?(pipeline_config)
+       end
+     end

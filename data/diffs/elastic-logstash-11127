@@ -1,0 +1,1245 @@
+diff --git a/config/logstash.yml b/config/logstash.yml
+index db8ca3cd00e..8b8a26de5c2 100644
+--- a/config/logstash.yml
++++ b/config/logstash.yml
+@@ -178,6 +178,14 @@
+ # Default is 1024mb
+ # dead_letter_queue.max_bytes: 1024mb
+ 
++# If using dead_letter_queue.enable: true, the interval in milliseconds where if no further events eligible for the DLQ
++# have been created, a dead letter queue file will be written. A low value here will mean that more, smaller, queue files
++# may be written, while a larger value will introduce more latency between items being "written" to the dead letter queue, and
++# being available to be read by the dead_letter_queue input when items are are written infrequently.
++# Default is 5000.
++#
++# dead_letter_queue.flush_interval: 5000
++
+ # If using dead_letter_queue.enable: true, the directory path where the data files will be stored.
+ # Default is path.data/dead_letter_queue
+ #
+diff --git a/config/pipelines.yml b/config/pipelines.yml
+index 5ea696462f5..99d96c53094 100644
+--- a/config/pipelines.yml
++++ b/config/pipelines.yml
+@@ -70,6 +70,15 @@
+ #   will be dropped if they would increase the size of the dead letter queue beyond this setting.
+ #   Default is 1024mb
+ #   dead_letter_queue.max_bytes: 1024mb
++#
++#   If using dead_letter_queue.enable: true, the interval in milliseconds where if no further events eligible for the DLQ
++#   have been created, a dead letter queue file will be written. A low value here will mean that more, smaller, queue files
++#   may be written, while a larger value will introduce more latency between items being "written" to the dead letter queue, and
++#   being available to be read by the dead_letter_queue input when items are are written infrequently.
++#   Default is 5000.
++#
++#   dead_letter_queue.flush_interval: 5000
++
+ #
+ #   If using dead_letter_queue.enable: true, the directory path where the data files will be stored.
+ #   Default is path.data/dead_letter_queue
+diff --git a/docker/data/logstash/env2yaml/env2yaml.go b/docker/data/logstash/env2yaml/env2yaml.go
+index e63390e8cf5..618313e9d83 100644
+--- a/docker/data/logstash/env2yaml/env2yaml.go
++++ b/docker/data/logstash/env2yaml/env2yaml.go
+@@ -76,6 +76,7 @@ func normalizeSetting(setting string) (string, error) {
+ 		"queue.drain",
+ 		"dead_letter_queue.enable",
+ 		"dead_letter_queue.max_bytes",
++		"dead_letter_queue.flush_interval",
+ 		"path.dead_letter_queue",
+ 		"http.host",
+ 		"http.port",
+diff --git a/docs/static/dead-letter-queues.asciidoc b/docs/static/dead-letter-queues.asciidoc
+index 4d1c283c700..b4c4679d207 100644
+--- a/docs/static/dead-letter-queues.asciidoc
++++ b/docs/static/dead-letter-queues.asciidoc
+@@ -57,6 +57,25 @@ specify a different path for the files:
+ path.dead_letter_queue: "path/to/data/dead_letter_queue"
+ -------------------------------------------------------------------------------
+ 
++Dead letter queue entries are written to a temporary file, which is then renamed
++ to a dead letter queue file, which is then eligible for ingestion. The rename
++ happens either when this temporary file is considered 'full', or when a period
++ of time has elapsed since the last dead letter queue eligible event was written
++ to the temporary file.
++
++This length of time can be set using the `dead_letter_queue.flush_interval` setting.
++ This setting is in milliseconds, and defaults to 5000ms. A low value here will mean
++ in the event of infrequent writes to the dead letter queue more, smaller, queue
++ files may be written, while a larger value will introduce more latency between
++ items being "written" to the dead letter queue, and being made available for
++ reading by the dead_letter_queue input.
++
++ Note that this value cannot be set to lower than 1000ms.
++
++[source,yaml]
++-------------------------------------------------------------------------------
++dead_letter_queue.flush_interval: 5000
++-------------------------------------------------------------------------------
+ 
+ NOTE: You may not use the same `dead_letter_queue` path for two different
+ Logstash instances.
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 8e8dd22ec9d..569127613fb 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -65,6 +65,7 @@ module Environment
+             Setting::Boolean.new("queue.checkpoint.retry", false),
+             Setting::Boolean.new("dead_letter_queue.enable", false),
+             Setting::Bytes.new("dead_letter_queue.max_bytes", "1024mb"),
++            Setting::Numeric.new("dead_letter_queue.flush_interval", 5000),
+             Setting::TimeValue.new("slowlog.threshold.warn", "-1"),
+             Setting::TimeValue.new("slowlog.threshold.info", "-1"),
+             Setting::TimeValue.new("slowlog.threshold.debug", "-1"),
+diff --git a/logstash-core/lib/logstash/settings.rb b/logstash-core/lib/logstash/settings.rb
+index 7dc594808a8..80b52518f5c 100644
+--- a/logstash-core/lib/logstash/settings.rb
++++ b/logstash-core/lib/logstash/settings.rb
+@@ -18,6 +18,7 @@ class Settings
+       "config.reload.interval",
+       "config.string",
+       "dead_letter_queue.enable",
++      "dead_letter_queue.flush_interval",
+       "dead_letter_queue.max_bytes",
+       "metric.collect",
+       "pipeline.java_execution",
+diff --git a/logstash-core/src/main/java/org/logstash/common/DeadLetterQueueFactory.java b/logstash-core/src/main/java/org/logstash/common/DeadLetterQueueFactory.java
+index 2a884b66865..49592779350 100644
+--- a/logstash-core/src/main/java/org/logstash/common/DeadLetterQueueFactory.java
++++ b/logstash-core/src/main/java/org/logstash/common/DeadLetterQueueFactory.java
+@@ -24,6 +24,7 @@
+ 
+ import java.io.IOException;
+ import java.nio.file.Paths;
++import java.time.Duration;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+ /**
+@@ -53,19 +54,20 @@ private DeadLetterQueueFactory() {
+      *                for each id
+      * @param maxQueueSize Maximum size of the dead letter queue (in bytes). No entries will be written
+      *                     that would make the size of this dlq greater than this value
++     * @param flushInterval Maximum duration between flushes of dead letter queue files if no data is sent.
+      * @return The write manager for the specific id's dead-letter-queue context
+      */
+-    public static DeadLetterQueueWriter getWriter(String id, String dlqPath, long maxQueueSize) {
+-        return REGISTRY.computeIfAbsent(id, key -> newWriter(key, dlqPath, maxQueueSize));
++    public static DeadLetterQueueWriter getWriter(String id, String dlqPath, long maxQueueSize, Duration flushInterval) {
++        return REGISTRY.computeIfAbsent(id, key -> newWriter(key, dlqPath, maxQueueSize, flushInterval));
+     }
+ 
+     public static DeadLetterQueueWriter release(String id) {
+         return REGISTRY.remove(id);
+     }
+ 
+-    private static DeadLetterQueueWriter newWriter(final String id, final String dlqPath, final long maxQueueSize) {
++    private static DeadLetterQueueWriter newWriter(final String id, final String dlqPath, final long maxQueueSize, final Duration flushInterval) {
+         try {
+-            return new DeadLetterQueueWriter(Paths.get(dlqPath, id), MAX_SEGMENT_SIZE_BYTES, maxQueueSize);
++            return new DeadLetterQueueWriter(Paths.get(dlqPath, id), MAX_SEGMENT_SIZE_BYTES, maxQueueSize, flushInterval);
+         } catch (IOException e) {
+             logger.error("unable to create dead letter queue writer", e);
+         }
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
+index bc333bc70ee..9cd92b27c3a 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
+@@ -23,11 +23,19 @@
+ import java.nio.channels.FileLock;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+-import java.nio.file.Paths;
++import java.nio.file.StandardCopyOption;
++import java.time.Duration;
++import java.time.Instant;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.LongAdder;
++import java.util.concurrent.locks.ReentrantLock;
+ import java.util.stream.Collectors;
+ import java.util.stream.Stream;
++
++import com.google.common.annotations.VisibleForTesting;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ import org.logstash.DLQEntry;
+@@ -40,85 +48,93 @@
+ 
+ public final class DeadLetterQueueWriter implements Closeable {
+ 
+-    private static final Logger logger = LogManager.getLogger(DeadLetterQueueWriter.class);
+-    private static final long MAX_SEGMENT_SIZE_BYTES = 10 * 1024 * 1024;
+-
++    @VisibleForTesting
+     static final String SEGMENT_FILE_PATTERN = "%d.log";
+-    static final String LOCK_FILE = ".lock";
++    private static final Logger logger = LogManager.getLogger(DeadLetterQueueWriter.class);
++    private enum FinalizeWhen {ALWAYS, ONLY_IF_STALE};
++    private static final String TEMP_FILE_PATTERN = "%d.log.tmp";
++    private static final String LOCK_FILE = ".lock";
++    private final ReentrantLock lock = new ReentrantLock();
+     private static final FieldReference DEAD_LETTER_QUEUE_METADATA_KEY =
+         FieldReference.from(String.format("%s[dead_letter_queue]", Event.METADATA_BRACKETS));
+     private final long maxSegmentSize;
+     private final long maxQueueSize;
+     private LongAdder currentQueueSize;
+     private final Path queuePath;
+-    private final FileLock lock;
++    private final FileLock fileLock;
+     private volatile RecordIOWriter currentWriter;
+     private int currentSegmentIndex;
+     private Timestamp lastEntryTimestamp;
++    private Duration flushInterval;
++    private Instant lastWrite;
+     private final AtomicBoolean open = new AtomicBoolean(true);
++    private ScheduledExecutorService flushScheduler;
+ 
+-    public DeadLetterQueueWriter(Path queuePath, long maxSegmentSize, long maxQueueSize) throws IOException {
+-        this.lock = FileLockFactory.obtainLock(queuePath, LOCK_FILE);
++    public DeadLetterQueueWriter(final Path queuePath, final long maxSegmentSize, final long maxQueueSize, final Duration flushInterval) throws IOException {
++        this.fileLock = FileLockFactory.obtainLock(queuePath, LOCK_FILE);
+         this.queuePath = queuePath;
+         this.maxSegmentSize = maxSegmentSize;
+         this.maxQueueSize = maxQueueSize;
++        this.flushInterval = flushInterval;
+         this.currentQueueSize = new LongAdder();
+         this.currentQueueSize.add(getStartupQueueSize());
+ 
++        cleanupTempFiles();
+         currentSegmentIndex = getSegmentPaths(queuePath)
+                 .map(s -> s.getFileName().toString().split("\\.")[0])
+                 .mapToInt(Integer::parseInt)
+                 .max().orElse(0);
+         nextWriter();
+         this.lastEntryTimestamp = Timestamp.now();
++        createFlushScheduler();
+     }
+ 
+-    /**
+-     * Constructor for Writer that uses defaults
+-     *
+-     * @param queuePath the path to the dead letter queue segments directory
+-     * @throws IOException if the size of the file cannot be determined
+-     */
+-    public DeadLetterQueueWriter(String queuePath) throws IOException {
+-        this(Paths.get(queuePath), MAX_SEGMENT_SIZE_BYTES, Long.MAX_VALUE);
++    public boolean isOpen() {
++        return open.get();
+     }
+ 
+-    private long getStartupQueueSize() throws IOException {
+-        return getSegmentPaths(queuePath)
+-                .mapToLong((p) -> {
+-                    try {
+-                        return Files.size(p);
+-                    } catch (IOException e) {
+-                        throw new IllegalStateException(e);
+-                    }
+-                } )
+-                .sum();
++    public Path getPath(){
++        return queuePath;
+     }
+ 
+-    private void nextWriter() throws IOException {
+-        currentWriter = new RecordIOWriter(queuePath.resolve(String.format(SEGMENT_FILE_PATTERN, ++currentSegmentIndex)));
+-        currentQueueSize.increment();
++    public long getCurrentQueueSize() {
++        return currentQueueSize.longValue();
+     }
+ 
+-    static Stream<Path> getSegmentPaths(Path path) throws IOException {
+-        try(final Stream<Path> files = Files.list(path)) {
+-            return files.filter(p -> p.toString().endsWith(".log"))
+-                .collect(Collectors.toList()).stream();
++    public void writeEntry(Event event, String pluginName, String pluginId, String reason) throws IOException {
++        writeEntry(new DLQEntry(event, pluginName, pluginId, reason));
++    }
++
++    @Override
++    public void close() {
++        if (open.compareAndSet(true, false)) {
++            try {
++                finalizeSegment(FinalizeWhen.ALWAYS);
++            } catch (Exception e) {
++                logger.debug("Unable to close dlq writer", e);
++            }
++            releaseFileLock();
++            flushScheduler.shutdown();
+         }
+     }
+ 
+-    public synchronized void writeEntry(DLQEntry entry) throws IOException {
+-        innerWriteEntry(entry);
++    static Stream<Path> getSegmentPaths(Path path) throws IOException {
++        return listFiles(path, ".log");
+     }
+ 
+-    public synchronized void writeEntry(Event event, String pluginName, String pluginId, String reason) throws IOException {
+-        Timestamp entryTimestamp = Timestamp.now();
+-        if (entryTimestamp.getTime().isBefore(lastEntryTimestamp.getTime())) {
+-            entryTimestamp = lastEntryTimestamp;
++    @VisibleForTesting
++    void writeEntry(DLQEntry entry) throws IOException {
++        lock.lock();
++        try {
++            Timestamp entryTimestamp = Timestamp.now();
++            if (entryTimestamp.getTime().isBefore(lastEntryTimestamp.getTime())) {
++                entryTimestamp = lastEntryTimestamp;
++            }
++            innerWriteEntry(entry);
++            lastEntryTimestamp = entryTimestamp;
++        } finally {
++            lock.unlock();
+         }
+-        DLQEntry entry = new DLQEntry(event, pluginName, pluginId, reason);
+-        innerWriteEntry(entry);
+-        lastEntryTimestamp = entryTimestamp;
+     }
+ 
+     private void innerWriteEntry(DLQEntry entry) throws IOException {
+@@ -134,10 +150,10 @@ private void innerWriteEntry(DLQEntry entry) throws IOException {
+             logger.error("cannot write event to DLQ: reached maxQueueSize of " + maxQueueSize);
+             return;
+         } else if (currentWriter.getPosition() + eventPayloadSize > maxSegmentSize) {
+-            currentWriter.close();
+-            nextWriter();
++            finalizeSegment(FinalizeWhen.ALWAYS);
+         }
+         currentQueueSize.add(currentWriter.writeEvent(record));
++        lastWrite = Instant.now();
+     }
+ 
+     /**
+@@ -152,42 +168,117 @@ private static boolean alreadyProcessed(final Event event) {
+         return event.includes(DEAD_LETTER_QUEUE_METADATA_KEY);
+     }
+ 
+-    @Override
+-    public void close() {
+-        if (open.compareAndSet(true, false)) {
+-            if (currentWriter != null) {
+-                try {
+-                    currentWriter.close();
+-                } catch (Exception e) {
+-                    logger.debug("Unable to close dlq writer", e);
++    private void flushCheck() {
++        try{
++            finalizeSegment(FinalizeWhen.ONLY_IF_STALE);
++        } catch (Exception e){
++            logger.warn("unable to finalize segment", e);
++        }
++    }
++
++    /**
++     * Determines whether the current writer is stale. It is stale if writes have been performed, but the
++     * last time it was written is further in the past than the flush interval.
++     * @return
++     */
++    private boolean isCurrentWriterStale(){
++        return currentWriter.hasWritten() && lastWrite != null && Instant.now().minus(flushInterval).isAfter(lastWrite);
++    }
++
++    private void finalizeSegment(final FinalizeWhen finalizeWhen) throws IOException {
++        lock.lock();
++        try {
++            if (!isCurrentWriterStale() && finalizeWhen == FinalizeWhen.ONLY_IF_STALE)
++                return;
++
++            if (currentWriter != null && currentWriter.hasWritten()) {
++                currentWriter.close();
++                Files.move(queuePath.resolve(String.format(TEMP_FILE_PATTERN, currentSegmentIndex)),
++                        queuePath.resolve(String.format(SEGMENT_FILE_PATTERN, currentSegmentIndex)),
++                        StandardCopyOption.ATOMIC_MOVE);
++                if (isOpen()) {
++                    nextWriter();
++                }
++            } else {
++                if (RecordIOReader.validNonEmptySegment(queuePath.resolve(String.format(TEMP_FILE_PATTERN, currentSegmentIndex)))) {
++                    Files.delete(queuePath.resolve(String.format(TEMP_FILE_PATTERN, currentSegmentIndex)));
+                 }
+             }
+-            releaseLock();
++        } finally {
++            lock.unlock();
+         }
+     }
+ 
+-    private void releaseLock() {
++    private void createFlushScheduler() {
++        flushScheduler = Executors.newScheduledThreadPool(1, r -> {
++            Thread t = new Thread(r);
++            //Allow this thread to die when the JVM dies
++            t.setDaemon(true);
++            //Set the name
++            t.setName("dlq-flush-check");
++            return t;
++        });
++        flushScheduler.scheduleAtFixedRate(this::flushCheck, 1L, 1L, TimeUnit.SECONDS);
++    }
++
++    private long getStartupQueueSize() throws IOException {
++        return getSegmentPaths(queuePath)
++                .mapToLong((p) -> {
++                    try {
++                        return Files.size(p);
++                    } catch (IOException e) {
++                        throw new IllegalStateException(e);
++                    }
++                } )
++                .sum();
++    }
++
++    private void releaseFileLock() {
+         try {
+-            FileLockFactory.releaseLock(lock);
++            FileLockFactory.releaseLock(fileLock);
+         } catch (IOException e) {
+-            logger.debug("Unable to release lock", e);
++            logger.debug("Unable to release fileLock", e);
+         }
+         try {
+             Files.deleteIfExists(queuePath.resolve(LOCK_FILE));
+         } catch (IOException e){
+-            logger.debug("Unable to delete lock file", e);
++            logger.debug("Unable to delete fileLock file", e);
+         }
+     }
+ 
+-    public boolean isOpen() {
+-        return open.get();
++    private void nextWriter() throws IOException {
++        currentWriter = new RecordIOWriter(queuePath.resolve(String.format(TEMP_FILE_PATTERN, ++currentSegmentIndex)));
++        currentQueueSize.increment();
+     }
+ 
+-    public Path getPath(){
+-        return queuePath;
++    private void cleanupTempFiles() throws IOException {
++        // List files that end in .log.tmp - check if there is a corresponding .log file - if yes delete, if no remove.
++        DeadLetterQueueWriter.listFiles(queuePath, ".log.tmp")
++                .forEach(this::cleanupTempFile);
+     }
+ 
+-    public long getCurrentQueueSize() {
+-        return currentQueueSize.longValue();
++    private static Stream<Path> listFiles(Path path, String suffix) throws IOException {
++        try(final Stream<Path> files = Files.list(path)) {
++            return files.filter(p -> p.toString().endsWith(suffix))
++                    .collect(Collectors.toList()).stream();
++        }
++    }
++
++    private void cleanupTempFile(final Path file) {
++        String filename = file.getFileName().toString().split("\\.")[0];
++        Path segmentFile = queuePath.resolve(String.format("%s.log", filename));
++        try {
++            if (Files.exists(segmentFile)) {
++                Files.delete(file);
++            }
++            else {
++                if (RecordIOReader.validNonEmptySegment(file)) {
++                    Files.move(file, segmentFile, StandardCopyOption.ATOMIC_MOVE);
++                }
++            }
++        } catch (IOException e){
++            logger.error("Unable to clean up temp files", e);
++            throw new IllegalStateException("Unable to clean up temp files", e);
++        }
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/RecordIOReader.java b/logstash-core/src/main/java/org/logstash/common/io/RecordIOReader.java
+index 390f93a096a..0d30df9728e 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/RecordIOReader.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/RecordIOReader.java
+@@ -18,6 +18,9 @@
+  */
+ package org.logstash.common.io;
+ 
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
+ import java.io.Closeable;
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+@@ -40,6 +43,7 @@
+  */
+ public final class RecordIOReader implements Closeable {
+ 
++    private static final Logger logger = LogManager.getLogger(RecordIOReader.class);
+     private final FileChannel channel;
+     private ByteBuffer currentBlock;
+     private int currentBlockSizeReadFromChannel;
+@@ -58,7 +62,7 @@ public RecordIOReader(Path path) throws IOException {
+         byte versionInFile = versionBuffer.get();
+         if (versionInFile != VERSION) {
+             this.channel.close();
+-            throw new RuntimeException(String.format(
++            throw new IllegalStateException(String.format(
+                     "Invalid version on DLQ data file %s. Expected version: %c. Version found on file: %c",
+                     path, VERSION, versionInFile));
+         }
+@@ -218,7 +222,7 @@ private void getRecord(ByteBuffer buffer, RecordHeader header) {
+         computedChecksum.update(currentBlock.array(), currentBlock.position(), header.getSize());
+ 
+         if ((int) computedChecksum.getValue() != header.getChecksum()) {
+-            throw new RuntimeException("invalid checksum of record");
++            throw new IllegalStateException("invalid checksum of record");
+         }
+ 
+         buffer.put(currentBlock.array(), currentBlock.position(), header.getSize());
+@@ -323,4 +327,27 @@ BufferState build(){
+             }
+         }
+     }
++
++    /**
++     * Verify whether a segment is valid and non-empty.
++     * @param path Path to segment
++     * @return True if the segment is valid, false otherwise
++     */
++    static boolean validNonEmptySegment(Path path) {
++        try (RecordIOReader ioReader = new RecordIOReader(path)) {
++            boolean moreEvents = true;
++            boolean nonEmpty = false;
++            while (moreEvents) {
++                // If all events in the segment can be read, then assume that this is a valid segment
++                moreEvents = (ioReader.readEvent() != null);
++                if (moreEvents){
++                    nonEmpty = true;
++                }
++            }
++            return nonEmpty;
++        } catch (IOException | IllegalStateException e){
++            logger.warn("Error reading segment file {}", path, e);
++            return false;
++        }
++    }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/RecordIOWriter.java b/logstash-core/src/main/java/org/logstash/common/io/RecordIOWriter.java
+index d8bbcb562e6..8515d53460a 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/RecordIOWriter.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/RecordIOWriter.java
+@@ -25,6 +25,7 @@
+ import java.nio.file.Path;
+ import java.nio.file.StandardOpenOption;
+ import java.util.OptionalInt;
++import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.zip.CRC32;
+ import java.util.zip.Checksum;
+ 
+@@ -75,7 +76,12 @@ public final class RecordIOWriter implements Closeable {
+     static final int VERSION_SIZE = 1;
+     static final char VERSION = '1';
+ 
++    private Path recordsFile;
++
++    private final AtomicBoolean hasWritten = new AtomicBoolean(false);
++
+     public RecordIOWriter(Path recordsFile) throws IOException {
++        this.recordsFile = recordsFile;
+         this.posInBlock = 0;
+         this.currentBlockIdx = 0;
+         recordsFile.toFile().createNewFile();
+@@ -113,6 +119,7 @@ public long getPosition() throws IOException {
+     }
+ 
+     public long writeEvent(byte[] eventArray) throws IOException {
++        hasWritten.set(true);
+         ByteBuffer eventBuffer = ByteBuffer.wrap(eventArray);
+         RecordType nextType = null;
+         ByteBuffer slice = eventBuffer.slice();
+@@ -140,6 +147,15 @@ public long writeEvent(byte[] eventArray) throws IOException {
+         return channel.position() - startPosition;
+     }
+ 
++
++    public boolean hasWritten(){
++        return hasWritten.get();
++    }
++
++    public Path getPath(){
++        return  this.recordsFile;
++    }
++
+     @Override
+     public void close() throws IOException {
+         channel.close();
+diff --git a/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java b/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
+index 2c6cd93f616..52641ea3e09 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
++++ b/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
+@@ -6,6 +6,7 @@
+ import java.nio.file.Paths;
+ import java.security.MessageDigest;
+ import java.security.NoSuchAlgorithmException;
++import java.time.Duration;
+ import java.util.Arrays;
+ import java.util.UUID;
+ import org.apache.commons.codec.binary.Hex;
+@@ -247,10 +248,9 @@ public final IRubyObject dlqWriter(final ThreadContext context) {
+                     DeadLetterQueueFactory.getWriter(
+                         pipelineId.asJavaString(),
+                         getSetting(context, "path.dead_letter_queue").asJavaString(),
+-                        getSetting(context, "dead_letter_queue.max_bytes").convertToInteger()
+-                            .getLongValue()
+-                    )
+-                );
++                        getSetting(context, "dead_letter_queue.max_bytes").convertToInteger().getLongValue(),
++                        Duration.ofMillis(getSetting(context, "dead_letter_queue.flush_interval").convertToInteger().getLongValue()))
++                    );
+             } else {
+                 dlqWriter = RubyUtil.DUMMY_DLQ_WRITER_CLASS.callMethod(context, "new");
+             }
+diff --git a/logstash-core/src/test/java/org/logstash/common/DeadLetterQueueFactoryTest.java b/logstash-core/src/test/java/org/logstash/common/DeadLetterQueueFactoryTest.java
+index bbd2f249096..8ab9f71a4be 100644
+--- a/logstash-core/src/test/java/org/logstash/common/DeadLetterQueueFactoryTest.java
++++ b/logstash-core/src/test/java/org/logstash/common/DeadLetterQueueFactoryTest.java
+@@ -27,6 +27,7 @@
+ 
+ import java.io.IOException;
+ import java.nio.file.Path;
++import java.time.Duration;
+ 
+ import static junit.framework.TestCase.assertSame;
+ import static org.junit.Assert.assertTrue;
+@@ -47,9 +48,9 @@ public void setUp() throws Exception {
+     public void testSameBeforeRelease() throws IOException {
+         try {
+             Path pipelineA = dir.resolve(PIPELINE_NAME);
+-            DeadLetterQueueWriter writer = DeadLetterQueueFactory.getWriter(PIPELINE_NAME, pipelineA.toString(), 10000);
++            DeadLetterQueueWriter writer = DeadLetterQueueFactory.getWriter(PIPELINE_NAME, pipelineA.toString(), 10000, Duration.ofSeconds(1));
+             assertTrue(writer.isOpen());
+-            DeadLetterQueueWriter writer2 = DeadLetterQueueFactory.getWriter(PIPELINE_NAME, pipelineA.toString(), 10000);
++            DeadLetterQueueWriter writer2 = DeadLetterQueueFactory.getWriter(PIPELINE_NAME, pipelineA.toString(), 10000, Duration.ofSeconds(1));
+             assertSame(writer, writer2);
+             writer.close();
+         } finally {
+@@ -61,11 +62,11 @@ public void testSameBeforeRelease() throws IOException {
+     public void testOpenableAfterRelease() throws IOException {
+         try {
+             Path pipelineA = dir.resolve(PIPELINE_NAME);
+-            DeadLetterQueueWriter writer = DeadLetterQueueFactory.getWriter(PIPELINE_NAME, pipelineA.toString(), 10000);
++            DeadLetterQueueWriter writer = DeadLetterQueueFactory.getWriter(PIPELINE_NAME, pipelineA.toString(), 10000, Duration.ofSeconds(1));
+             assertTrue(writer.isOpen());
+             writer.close();
+             DeadLetterQueueFactory.release(PIPELINE_NAME);
+-            writer = DeadLetterQueueFactory.getWriter(PIPELINE_NAME, pipelineA.toString(), 10000);
++            writer = DeadLetterQueueFactory.getWriter(PIPELINE_NAME, pipelineA.toString(), 10000, Duration.ofSeconds(1));
+             assertTrue(writer.isOpen());
+             writer.close();
+         }finally{
+diff --git a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
+index 55994aca146..cc64c047215 100644
+--- a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
++++ b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
+@@ -20,6 +20,7 @@
+ package org.logstash.common.io;
+ 
+ 
++import org.junit.Assert;
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+@@ -31,10 +32,15 @@
+ 
+ import java.io.IOException;
+ import java.nio.file.Path;
++import java.time.Duration;
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.Random;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
+ 
++import static junit.framework.TestCase.fail;
+ import static org.hamcrest.CoreMatchers.equalTo;
+ import static org.hamcrest.CoreMatchers.is;
+ import static org.hamcrest.CoreMatchers.nullValue;
+@@ -45,6 +51,8 @@
+ public class DeadLetterQueueReaderTest {
+     private Path dir;
+ 
++    private static final int PAD_FOR_BLOCK_SIZE_EVENT = 32490;
++
+     @Rule
+     public TemporaryFolder temporaryFolder = new TemporaryFolder();
+ 
+@@ -127,7 +135,7 @@ public void testRereadFinalBlock() throws Exception {
+         event.setField("message", generateMessageContent(32500));
+         long startTime = System.currentTimeMillis();
+         int messageSize = 0;
+-        try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, 10 * 1024 * 1024, 1_000_000_000)) {
++        try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, 10 * 1024 * 1024, 1_000_000_000, Duration.ofSeconds(1))) {
+             for (int i = 0; i < 2; i++) {
+                 DLQEntry entry = new DLQEntry(event, "", "", "", new Timestamp(startTime++));
+                 messageSize += entry.serialize().length;
+@@ -177,7 +185,7 @@ private void writeSegmentSizeEntries(int count) throws IOException {
+         int size = templateEntry.serialize().length + RecordIOWriter.RECORD_HEADER_SIZE + VERSION_SIZE;
+         DeadLetterQueueWriter writeManager = null;
+         try {
+-            writeManager = new DeadLetterQueueWriter(dir, size, 10000000);
++            writeManager = new DeadLetterQueueWriter(dir, size, 10_000_000, Duration.ofSeconds(1));
+             for (int i = 1; i <= count; i++) {
+                 writeManager.writeEntry(new DLQEntry(event, "1", "1", String.valueOf(i)));
+             }
+@@ -216,7 +224,7 @@ public void testBlockBoundary() throws Exception {
+         event.setField("T", new String(field));
+         Timestamp timestamp = new Timestamp();
+ 
+-        try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, 10 * 1024 * 1024, 1_000_000_000)) {
++        try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, 10 * 1024 * 1024, 1_000_000_000, Duration.ofSeconds(1))) {
+             for (int i = 0; i < 2; i++) {
+                 DLQEntry entry = new DLQEntry(event, "", "", "", timestamp);
+                 assertThat(entry.serialize().length + RecordIOWriter.RECORD_HEADER_SIZE, is(BLOCK_SIZE));
+@@ -239,7 +247,7 @@ public void testBlockBoundaryMultiple() throws Exception {
+         event.setField("message", new String(field));
+         long startTime = System.currentTimeMillis();
+         int messageSize = 0;
+-        try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, 10 * 1024 * 1024, 1_000_000_000)) {
++        try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, 10 * 1024 * 1024, 1_000_000_000, Duration.ofSeconds(1))) {
+             for (int i = 1; i <= 5; i++) {
+                 DLQEntry entry = new DLQEntry(event, "", "", "", new Timestamp(startTime++));
+                 messageSize += entry.serialize().length;
+@@ -256,15 +264,140 @@ public void testBlockBoundaryMultiple() throws Exception {
+         }
+     }
+ 
++    @Test
++    public void testFlushAfterWriterClose() throws Exception {
++        Event event = new Event();
++        event.setField("T", generateMessageContent(PAD_FOR_BLOCK_SIZE_EVENT/8));
++        Timestamp timestamp = new Timestamp();
++
++        try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, BLOCK_SIZE, 1_000_000_000, Duration.ofSeconds(1))) {
++            for (int i = 0; i < 6; i++) {
++                DLQEntry entry = new DLQEntry(event, "", "", Integer.toString(i), timestamp);
++                writeManager.writeEntry(entry);
++            }
++        }
++        try (DeadLetterQueueReader readManager = new DeadLetterQueueReader(dir)) {
++            for (int i = 0; i < 6;i++) {
++                DLQEntry entry = readManager.pollEntry(100);
++                assertThat(entry.getReason(), is(String.valueOf(i)));
++            }
++        }
++    }
++
++    @Test
++    public void testFlushAfterSegmentComplete() throws Exception {
++        Event event = new Event();
++        final int EVENTS_BEFORE_FLUSH = randomBetween(1, 32);
++        event.setField("T", generateMessageContent(PAD_FOR_BLOCK_SIZE_EVENT));
++        Timestamp timestamp = new Timestamp();
++
++        try (DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, BLOCK_SIZE * EVENTS_BEFORE_FLUSH, 1_000_000_000, Duration.ofHours(1))) {
++            for (int i = 1; i < EVENTS_BEFORE_FLUSH; i++) {
++                DLQEntry entry = new DLQEntry(event, "", "", Integer.toString(i), timestamp);
++                writeManager.writeEntry(entry);
++            }
++
++            try (DeadLetterQueueReader readManager = new DeadLetterQueueReader(dir)) {
++                for (int i = 1; i < EVENTS_BEFORE_FLUSH; i++) {
++                    DLQEntry entry = readManager.pollEntry(100);
++                    assertThat(entry, is(nullValue()));
++                }
++            }
++
++            writeManager.writeEntry(new DLQEntry(event, "", "", "flush event", timestamp));
++
++            try (DeadLetterQueueReader readManager = new DeadLetterQueueReader(dir)) {
++                for (int i = 1; i < EVENTS_BEFORE_FLUSH; i++) {
++                    DLQEntry entry = readManager.pollEntry(100);
++                    assertThat(entry.getReason(), is(String.valueOf(i)));
++                }
++            }
++        }
++    }
++
++    @Test
++    public void testMultiFlushAfterSegmentComplete() throws Exception {
++        Event event = new Event();
++        final int eventsInSegment = randomBetween(1, 32);
++        // Write enough events to not quite complete a second segment.
++        final int totalEventsToWrite = (2 * eventsInSegment) - 1;
++        event.setField("T", generateMessageContent(PAD_FOR_BLOCK_SIZE_EVENT));
++        Timestamp timestamp = new Timestamp();
++
++        try (DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, BLOCK_SIZE * eventsInSegment, 1_000_000_000, Duration.ofHours(1))) {
++            for (int i = 1; i < totalEventsToWrite; i++) {
++                DLQEntry entry = new DLQEntry(event, "", "", Integer.toString(i), timestamp);
++                writeManager.writeEntry(entry);
++            }
++
++            try (DeadLetterQueueReader readManager = new DeadLetterQueueReader(dir)) {
++
++                for (int i = 1; i < eventsInSegment; i++) {
++                    DLQEntry entry = readManager.pollEntry(100);
++                    assertThat(entry.getReason(), is(String.valueOf(i)));
++                }
++
++
++                for (int i = eventsInSegment + 1; i < totalEventsToWrite; i++) {
++                    DLQEntry entry = readManager.pollEntry(100);
++                    assertThat(entry, is(nullValue()));
++                }
++            }
++
++            writeManager.writeEntry(new DLQEntry(event, "", "", "flush event", timestamp));
++
++            try (DeadLetterQueueReader readManager = new DeadLetterQueueReader(dir)) {
++                for (int i = 1; i < totalEventsToWrite; i++) {
++                    DLQEntry entry = readManager.pollEntry(100);
++                    assertThat(entry.getReason(), is(String.valueOf(i)));
++                }
++            }
++        }
++    }
++
++    @Test
++    public void testFlushAfterDelay() throws Exception {
++        Event event = new Event();
++        int eventsPerBlock = randomBetween(1,16);
++        int eventsToWrite = eventsPerBlock - 1;
++        event.setField("T", generateMessageContent(PAD_FOR_BLOCK_SIZE_EVENT/eventsPerBlock));
++        Timestamp timestamp = new Timestamp();
++
++        System.out.println("events per block= " + eventsPerBlock);
++
++        try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, BLOCK_SIZE, 1_000_000_000, Duration.ofSeconds(1))) {
++            for (int i = 1; i < eventsToWrite; i++) {
++                DLQEntry entry = new DLQEntry(event, "", "", Integer.toString(i), timestamp);
++                writeManager.writeEntry(entry);
++            }
++
++            try (DeadLetterQueueReader readManager = new DeadLetterQueueReader(dir)) {
++                for (int i = 1; i < eventsToWrite; i++) {
++                    DLQEntry entry = readManager.pollEntry(100);
++                    assertThat(entry, is(nullValue()));
++                }
++            }
++
++            Thread.sleep(2000);
++
++            try (DeadLetterQueueReader readManager = new DeadLetterQueueReader(dir)) {
++                for (int i = 1; i < eventsToWrite; i++) {
++                    DLQEntry entry = readManager.pollEntry(100);
++                    assertThat(entry.getReason(), is(String.valueOf(i)));
++                }
++            }
++
++        }
++    }
++
+     // This test tests for a single event that ends on a block and segment boundary
+     @Test
+     public void testBlockAndSegmentBoundary() throws Exception {
+-        final int PAD_FOR_BLOCK_SIZE_EVENT = 32490;
+         Event event = new Event();
+         event.setField("T", generateMessageContent(PAD_FOR_BLOCK_SIZE_EVENT));
+         Timestamp timestamp = new Timestamp();
+ 
+-        try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, BLOCK_SIZE, 1_000_000_000)) {
++        try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, BLOCK_SIZE, 1_000_000_000, Duration.ofSeconds(1))) {
+             for (int i = 0; i < 2; i++) {
+                 DLQEntry entry = new DLQEntry(event, "", "", "", timestamp);
+                 assertThat(entry.serialize().length + RecordIOWriter.RECORD_HEADER_SIZE, is(BLOCK_SIZE));
+@@ -285,7 +418,7 @@ public void testWriteReadRandomEventSize() throws Exception {
+         int maxEventSize = BLOCK_SIZE * 2;
+         long startTime = System.currentTimeMillis();
+ 
+-        try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, 10 * 1024 * 1024, 1_000_000_000L)) {
++        try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, 10 * 1024 * 1024, 1_000_000_000, Duration.ofSeconds(1))) {
+             for (int i = 0; i < eventCount; i++) {
+                 event.setField("message", generateMessageContent((int)(Math.random() * (maxEventSize))));
+                 DLQEntry entry = new DLQEntry(event, "", "", String.valueOf(i), new Timestamp(startTime++));
+@@ -332,6 +465,63 @@ public void testWriteStopBigWriteSeekByTimestamp() throws Exception {
+                           String.valueOf(FIRST_WRITE_EVENT_COUNT));
+     }
+ 
++    /**
++     * Tests concurrently reading and writing from the DLQ.
++     * @throws Exception On Failure
++     */
++    @Test
++    public void testConcurrentWriteReadRandomEventSize() throws Exception {
++        final ExecutorService exec = Executors.newSingleThreadExecutor();
++        try {
++            final int maxEventSize = BLOCK_SIZE * 2;
++            final int eventCount = 3000;
++            exec.submit(() -> {
++                final Event event = new Event();
++                long startTime = System.currentTimeMillis();
++                try (DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, (long) (10 * 1024 * 1024), 1_000_000_000L, Duration.ofSeconds(10))) {
++                    for (int i = 0; i < eventCount; i++) {
++                        event.setField(
++                                "message",
++                                generateMessageContent((int) (Math.random() * (maxEventSize)))
++                        );
++                        writeManager.writeEntry(
++                                new DLQEntry(
++                                        event, "", "", String.valueOf(i),
++                                        new Timestamp(startTime++)
++                                )
++                        );
++                    }
++                } catch (final IOException ex) {
++                    throw new IllegalStateException(ex);
++                }
++            });
++
++            int i = 0;
++            try (DeadLetterQueueReader readManager = new DeadLetterQueueReader(dir)) {
++                while(i < eventCount) {
++                    DLQEntry entry = readManager.pollEntry(10_000L);
++                    if (entry != null){
++                        assertThat(entry.getReason(), is(String.valueOf(i)));
++                        i++;
++                    }
++                }
++            } catch (Exception e){
++                throw new IllegalArgumentException("Failed to process entry number" + i, e);
++            }
++        } finally {
++            exec.shutdown();
++            if (!exec.awaitTermination(2L, TimeUnit.MINUTES)) {
++                Assert.fail("Failed to shut down record writer");
++            }
++        }
++    }
++
++
++    private int randomBetween(int from, int to){
++        Random r = new Random();
++        return r.nextInt((to - from) + 1) + from;
++    }
++
+     private String generateMessageContent(int size) {
+         char[] valid = new char[RecordType.values().length + 1];
+         int j = 0;
+@@ -357,7 +547,7 @@ private void seekReadAndVerify(final Timestamp seekTarget, final String expected
+     }
+ 
+     private void writeEntries(final Event event, int offset, final int numberOfEvents, long startTime) throws IOException {
+-        try (DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, 10 * 1024 * 1024, 10_000_000)) {
++        try (DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, 10 * 1024 * 1024, 10_000_000, Duration.ofSeconds(1))) {
+             for (int i = offset; i <= offset + numberOfEvents; i++) {
+                 DLQEntry entry = new DLQEntry(event, "foo", "bar", String.valueOf(i), new Timestamp(startTime++));
+                 writeManager.writeEntry(entry);
+diff --git a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueWriterTest.java b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueWriterTest.java
+index 61bd9a68197..fdb1e0fc3a7 100644
+--- a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueWriterTest.java
++++ b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueWriterTest.java
+@@ -25,7 +25,10 @@
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.StandardOpenOption;
++import java.time.Duration;
+ import java.util.stream.Stream;
++
++import org.hamcrest.CoreMatchers;
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+@@ -33,13 +36,16 @@
+ import org.logstash.DLQEntry;
+ import org.logstash.Event;
+ import org.logstash.LockException;
++import org.logstash.Timestamp;
+ 
+ import static junit.framework.TestCase.assertFalse;
+ import static org.hamcrest.CoreMatchers.is;
+ import static org.hamcrest.CoreMatchers.not;
+ import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.core.IsNull.nullValue;
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
++import static org.logstash.common.io.RecordIOWriter.BLOCK_SIZE;
+ import static org.logstash.common.io.RecordIOWriter.RECORD_HEADER_SIZE;
+ import static org.logstash.common.io.RecordIOWriter.VERSION_SIZE;
+ 
+@@ -59,7 +65,7 @@ public void setUp() throws Exception {
+     @Test
+     public void testLockFileManagement() throws Exception {
+         Path lockFile = dir.resolve(".lock");
+-        DeadLetterQueueWriter writer = new DeadLetterQueueWriter(dir, 1000, 1000000);
++        DeadLetterQueueWriter writer = new DeadLetterQueueWriter(dir, 1000, 1_000_000, Duration.ofSeconds(1));
+         assertTrue(Files.exists(lockFile));
+         writer.close();
+         assertFalse(Files.exists(lockFile));
+@@ -67,9 +73,9 @@ public void testLockFileManagement() throws Exception {
+ 
+     @Test
+     public void testFileLocking() throws Exception {
+-        DeadLetterQueueWriter writer = new DeadLetterQueueWriter(dir, 1000, 1000000);
++        DeadLetterQueueWriter writer = new DeadLetterQueueWriter(dir, 1000, 1_000_000, Duration.ofSeconds(1));
+         try {
+-            new DeadLetterQueueWriter(dir, 1000, 100000);
++            new DeadLetterQueueWriter(dir, 1000, 100000, Duration.ofSeconds(1));
+             fail();
+         } catch (LockException e) {
+         } finally {
+@@ -81,7 +87,7 @@ public void testFileLocking() throws Exception {
+     public void testUncleanCloseOfPreviousWriter() throws Exception {
+         Path lockFilePath = dir.resolve(".lock");
+         boolean created = lockFilePath.toFile().createNewFile();
+-        DeadLetterQueueWriter writer = new DeadLetterQueueWriter(dir, 1000, 1000000);
++        DeadLetterQueueWriter writer = new DeadLetterQueueWriter(dir, 1000, 1_000_000, Duration.ofSeconds(1));
+ 
+         FileChannel channel = FileChannel.open(lockFilePath, StandardOpenOption.WRITE);
+         try {
+@@ -96,7 +102,7 @@ public void testUncleanCloseOfPreviousWriter() throws Exception {
+ 
+     @Test
+     public void testWrite() throws Exception {
+-        DeadLetterQueueWriter writer = new DeadLetterQueueWriter(dir, 1000, 1000000);
++        DeadLetterQueueWriter writer = new DeadLetterQueueWriter(dir, 1000, 1_000_000, Duration.ofSeconds(1));
+         DLQEntry entry = new DLQEntry(new Event(), "type", "id", "reason");
+         writer.writeEntry(entry);
+         writer.close();
+@@ -109,9 +115,9 @@ public void testDoesNotWriteMessagesAlreadyRoutedThroughDLQ() throws Exception {
+         DLQEntry entry = new DLQEntry(new Event(), "type", "id", "reason");
+         DLQEntry dlqEntry = new DLQEntry(dlqEvent, "type", "id", "reason");
+ 
+-        try (DeadLetterQueueWriter writer = new DeadLetterQueueWriter(dir, 1000, 1000000);) {
++        try (DeadLetterQueueWriter writer = new DeadLetterQueueWriter(dir, 1000, 1_000_000, Duration.ofSeconds(1));) {
+             writer.writeEntry(entry);
+-            long dlqLengthAfterEvent  = dlqLength();
++            long dlqLengthAfterEvent = dlqLength();
+ 
+             assertThat(dlqLengthAfterEvent, is(not(EMPTY_DLQ)));
+             writer.writeEntry(dlqEntry);
+@@ -124,25 +130,76 @@ public void testDoesNotWriteBeyondLimit() throws Exception {
+         DLQEntry entry = new DLQEntry(new Event(), "type", "id", "reason");
+ 
+         int payloadLength = RECORD_HEADER_SIZE + VERSION_SIZE + entry.serialize().length;
+-        final int MESSAGE_COUNT= 5;
++        final int MESSAGE_COUNT = 5;
+         long MAX_QUEUE_LENGTH = payloadLength * MESSAGE_COUNT;
+-        DeadLetterQueueWriter writer = null;
+ 
+-        try{
+-            writer = new DeadLetterQueueWriter(dir, payloadLength, MAX_QUEUE_LENGTH);
++
++        try (DeadLetterQueueWriter writer = new DeadLetterQueueWriter(dir, payloadLength, MAX_QUEUE_LENGTH, Duration.ofSeconds(1))) {
++
+             for (int i = 0; i < MESSAGE_COUNT; i++)
+                 writer.writeEntry(entry);
+ 
++            // Sleep to allow flush to happen
++            Thread.sleep(2000);
+             assertThat(dlqLength(), is(MAX_QUEUE_LENGTH));
+             writer.writeEntry(entry);
++            Thread.sleep(2000);
+             assertThat(dlqLength(), is(MAX_QUEUE_LENGTH));
+-        } finally {
+-            if (writer != null) {
+-                writer.close();
++        }
++    }
++
++    @Test
++    public void testSlowFlush() throws Exception {
++        try (DeadLetterQueueWriter writer = new DeadLetterQueueWriter(dir, 1000, 1_000_000, Duration.ofSeconds(1))) {
++            DLQEntry entry = new DLQEntry(new Event(), "type", "id", "1");
++            writer.writeEntry(entry);
++            entry = new DLQEntry(new Event(), "type", "id", "2");
++            // Sleep to allow flush to happen\
++            Thread.sleep(2000);
++            writer.writeEntry(entry);
++            Thread.sleep(2000);
++            // Do not close here - make sure that the slow write is processed
++
++            try (DeadLetterQueueReader reader = new DeadLetterQueueReader(dir)) {
++                assertThat(reader.pollEntry(100).getReason(), is("1"));
++                assertThat(reader.pollEntry(100).getReason(), is("2"));
+             }
+         }
+     }
+ 
++
++    @Test
++    public void testNotFlushed() throws Exception {
++        try (DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, BLOCK_SIZE, 1_000_000_000, Duration.ofSeconds(5))) {
++            for (int i = 0; i < 4; i++) {
++                DLQEntry entry = new DLQEntry(new Event(), "type", "id", "1");
++                writeManager.writeEntry(entry);
++            }
++
++            // Allow for time for scheduled flush check
++            Thread.sleep(1000);
++
++            try (DeadLetterQueueReader readManager = new DeadLetterQueueReader(dir)) {
++                for (int i = 0; i < 4; i++) {
++                    DLQEntry entry = readManager.pollEntry(100);
++                    assertThat(entry, is(CoreMatchers.nullValue()));
++                }
++            }
++        }
++    }
++
++
++    @Test
++    public void testCloseFlush() throws Exception {
++        try (DeadLetterQueueWriter writer = new DeadLetterQueueWriter(dir, 1000, 1_000_000, Duration.ofHours(1))) {
++            DLQEntry entry = new DLQEntry(new Event(), "type", "id", "1");
++            writer.writeEntry(entry);
++        }
++        try (DeadLetterQueueReader reader = new DeadLetterQueueReader(dir)) {
++            assertThat(reader.pollEntry(100).getReason(), is("1"));
++        }
++    }
++
+     private long dlqLength() throws IOException {
+         try(final Stream<Path> files = Files.list(dir)) {
+             return files.filter(p -> p.toString().endsWith(".log"))
+diff --git a/logstash-core/src/test/java/org/logstash/common/io/RecordIOReaderTest.java b/logstash-core/src/test/java/org/logstash/common/io/RecordIOReaderTest.java
+index e8e46d50a49..c5d0141ee0d 100644
+--- a/logstash-core/src/test/java/org/logstash/common/io/RecordIOReaderTest.java
++++ b/logstash-core/src/test/java/org/logstash/common/io/RecordIOReaderTest.java
+@@ -13,6 +13,7 @@
+ import java.nio.file.StandardOpenOption;
+ import java.util.Arrays;
+ import java.util.Comparator;
++import java.util.OptionalInt;
+ import java.util.function.Function;
+ 
+ import static org.hamcrest.CoreMatchers.equalTo;
+@@ -154,6 +155,39 @@ private void writeSeekAndVerify(final int eventCount, final int expectedSize) th
+         }
+     }
+ 
++    @Test
++    public void testObviouslyInvalidSegment() throws Exception {
++        assertThat(RecordIOReader.validNonEmptySegment(file), is(false));
++    }
++
++    @Test
++    public void testPartiallyWrittenSegment() throws Exception {
++        try(RecordIOWriter writer = new RecordIOWriter(file)) {
++            writer.writeRecordHeader(
++                    new RecordHeader(RecordType.COMPLETE, 100, OptionalInt.empty(), 0));
++        }
++        assertThat(RecordIOReader.validNonEmptySegment(file), is(false));
++    }
++
++    @Test
++    public void testEmptySegment() throws Exception {
++        try(RecordIOWriter writer = new RecordIOWriter(file)){
++            // Do nothing. Creating a new writer is the same behaviour as starting and closing
++            // This line avoids a compiler warning.
++            writer.toString();
++        }
++        assertThat(RecordIOReader.validNonEmptySegment(file), is(false));
++    }
++
++    @Test
++    public void testValidSegment() throws Exception {
++        try(RecordIOWriter writer = new RecordIOWriter(file)){
++            writer.writeEvent(new byte[]{ 72, 101, 108, 108, 111});
++        }
++
++        assertThat(RecordIOReader.validNonEmptySegment(file), is(true));
++    }
++
+     @Test
+     public void testReadWhileWriteAcrossBoundary() throws Exception {
+         char[] tooBig = fillArray( BLOCK_SIZE/4);
+diff --git a/qa/integration/build.gradle b/qa/integration/build.gradle
+index dfc39b9b6ec..662abb13d3e 100644
+--- a/qa/integration/build.gradle
++++ b/qa/integration/build.gradle
+@@ -27,4 +27,13 @@ task integrationTests(type: Test) {
+   inputs.files fileTree("${projectDir}/specs")
+   systemProperty 'logstash.core.root.dir', projectDir.absolutePath
+   include '/org/logstash/integration/RSpecTests.class'
++
++  outputs.upToDateWhen {
++    if (project.hasProperty('integrationTests.rerun')) {
++      println "Rerunning Integration Tests"
++      return false
++    } else {
++      return true
++    }
++  }
+ }
+diff --git a/qa/integration/specs/dlq_spec.rb b/qa/integration/specs/dlq_spec.rb
+index 1b4db43c8de..c057ba5162c 100644
+--- a/qa/integration/specs/dlq_spec.rb
++++ b/qa/integration/specs/dlq_spec.rb
+@@ -4,6 +4,14 @@
+ require_relative '../framework/helpers'
+ require "logstash/devutils/rspec/spec_helper"
+ 
++def generate_message(number)
++  message = {}
++  number.times do |i|
++    message["field#{i}"] = "value#{i}"
++  end
++  message.to_json
++end
++
+ describe "Test Dead Letter Queue" do
+ 
+   before(:all) {
+@@ -29,8 +37,7 @@
+   let(:dlq_config) {
+       {
+           "dead_letter_queue.enable" => true,
+-          "path.dead_letter_queue" => dlq_dir,
+-          "log.level" => "debug"
++          "path.dead_letter_queue" => dlq_dir
+       }
+   }
+   let!(:config_yaml) { dlq_config.to_yaml }
+@@ -68,18 +75,20 @@
+     let!(:pipelines_yaml_file) { ::File.join(settings_dir, "pipelines.yml") }
+ 
+     before :each do
++      puts pipelines_yaml
+       IO.write(pipelines_yaml_file, pipelines_yaml)
+-      logstash_service.spawn_logstash("--path.settings", settings_dir, "--log.level=debug")
++      logstash_service.spawn_logstash("--path.settings", settings_dir)
+     end
+ 
+     context 'with multiple pipelines' do
++      let(:message) { generate_message(100)}
+       let(:pipelines) {[
+           {
+               "pipeline.id" => "test",
+               "pipeline.workers" => 1,
+               "dead_letter_queue.enable" => true,
+               "pipeline.batch.size" => 1,
+-              "config.string" => "input { generator { message => '{\"test\":\"one\"}' codec => \"json\" count => 1000 } } filter { mutate { add_field => { \"geoip\" => \"somewhere\" } } } output { elasticsearch {} }"
++              "config.string" => "input { generator { message => '#{message}' codec => \"json\" count => 1000 } } filter { mutate { add_field => { \"geoip\" => \"somewhere\" } } } output { elasticsearch {} }"
+           },
+           {
+               "pipeline.id" => "test2",
+@@ -94,6 +103,7 @@
+     end
+ 
+     context 'with a single pipeline' do
++      let(:message) { generate_message(100)}
+       let(:pipelines) {[
+         {
+             "pipeline.id" => "main",
+@@ -101,7 +111,7 @@
+             "dead_letter_queue.enable" => true,
+             "pipeline.batch.size" => 1,
+             "config.string" => "
+-                input { generator{ message => '{\"test\":\"one\"}' codec => \"json\" count => 1000 }
++                input { generator{ message => '#{message}' codec => \"json\" count => 1000 }
+                         dead_letter_queue { path => \"#{dlq_dir}\" commit_offsets => true }
+                 }
+                 filter {
+@@ -117,7 +127,6 @@
+   end
+ 
+   context 'using logstash.yml and separate config file' do
+-    skip("This test fails Jenkins CI, tracked in https://github.com/elastic/logstash/issues/10275")
+     let(:generator_config_file) { config_to_temp_file(@fixture.config("root",{ :dlq_dir => dlq_dir })) }
+ 
+     before :each do

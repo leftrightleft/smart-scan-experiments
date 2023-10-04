@@ -1,0 +1,302 @@
+diff --git a/config/pipelines.yml b/config/pipelines.yml
+index 5ea696462f5..210e6a3d383 100644
+--- a/config/pipelines.yml
++++ b/config/pipelines.yml
+@@ -75,3 +75,9 @@
+ #   Default is path.data/dead_letter_queue
+ #
+ #   path.dead_letter_queue:
++
++
++ - pipeline.id: test
++   config.string: "input { generator {} } filter { drop { id => 'sleep1' } } output { stdout { id => 'sleep1' } }"
++ - pipeline.id: another_test
++   config.string: "input { generator {} } filter { drop { id => 'sleep1' } } output { stdout { id => 'toto' } }"
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java b/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
+index 612865c8f57..04377a4e077 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
+@@ -309,7 +309,7 @@ private Dataset compile() {
+             if (outputNodes.isEmpty()) {
+                 return Dataset.IDENTITY;
+             } else {
+-                return DatasetCompiler.terminalDataset(outputNodes.stream().map(
++                return DatasetCompiler.terminalDataset(pipelineIR.uniqueHash(), outputNodes.stream().map(
+                     leaf -> outputDataset(leaf, flatten(Collections.emptyList(), leaf))
+                 ).collect(Collectors.toList()));
+             }
+@@ -327,7 +327,7 @@ private Dataset filterDataset(final Vertex vertex, final Collection<Dataset> dat
+ 
+             if (!plugins.containsKey(vertexId)) {
+                 final ComputeStepSyntaxElement<Dataset> prepared =
+-                        DatasetCompiler.filterDataset(flatten(datasets, vertex),
++                        DatasetCompiler.filterDataset(vertexId, flatten(datasets, vertex),
+                                                       filters.get(vertexId));
+                 LOGGER.debug("Compiled filter\n {} \n into \n {}", vertex, prepared);
+ 
+@@ -349,7 +349,7 @@ private Dataset outputDataset(final Vertex vertex, final Collection<Dataset> dat
+ 
+             if (!plugins.containsKey(vertexId)) {
+                 final ComputeStepSyntaxElement<Dataset> prepared =
+-                        DatasetCompiler.outputDataset(flatten(datasets, vertex),
++                        DatasetCompiler.outputDataset(vertexId, flatten(datasets, vertex),
+                                                       outputs.get(vertexId),
+                                                      outputs.size() == 1);
+                 LOGGER.debug("Compiled output\n {} \n into \n {}", vertex, prepared);
+@@ -369,21 +369,22 @@ private Dataset outputDataset(final Vertex vertex, final Collection<Dataset> dat
+          */
+         private SplitDataset split(final Collection<Dataset> datasets,
+             final EventCondition condition, final Vertex vertex) {
+-            final String key = vertex.getId();
+-            SplitDataset conditional = iffs.get(key);
++            final String vertexId = vertex.getId();
++            SplitDataset conditional = iffs.get(vertexId);
++
+             if (conditional == null) {
+                 final Collection<Dataset> dependencies = flatten(datasets, vertex);
+-                conditional = iffs.get(key);
++                conditional = iffs.get(vertexId);
+                 // Check that compiling the dependencies did not already instantiate the conditional
+                 // by requiring its else branch.
+                 if (conditional == null) {
+                     final ComputeStepSyntaxElement<SplitDataset> prepared =
+-                        DatasetCompiler.splitDataset(dependencies, condition);
++                        DatasetCompiler.splitDataset(vertexId, dependencies, condition);
+                     LOGGER.debug(
+                         "Compiled conditional\n {} \n into \n {}", vertex, prepared
+                     );
+                     conditional = prepared.instantiate();
+-                    iffs.put(key, conditional);
++                    iffs.put(vertexId, conditional);
+                 }
+ 
+             }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/ComputeStepSyntaxElement.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/ComputeStepSyntaxElement.java
+index 33d3b14b487..79c2371e6ea 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/ComputeStepSyntaxElement.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/ComputeStepSyntaxElement.java
+@@ -32,9 +32,12 @@ public final class ComputeStepSyntaxElement<T extends Dataset> {
+     private static final ISimpleCompiler COMPILER = new SimpleCompiler();
+ 
+     /**
+-     * Cache of runtime compiled classes to prevent duplicate classes being compiled.
++     * Global cache of runtime compiled classes to prevent duplicate classes being compiled.
++     * The key is a String uniquely identifying a ComputeStepSyntaxElement such as the
++     * associated vertex ID which is unique across a single pipeline but remains the same
++     * across workers threads own {@link Dataset CompiledExecution}
+      */
+-    private static final Map<ComputeStepSyntaxElement<?>, Class<? extends Dataset>> CLASS_CACHE
++    private static final Map<String, Class<? extends Dataset>> CLASS_CACHE
+         = new HashMap<>();
+ 
+     /**
+@@ -49,14 +52,28 @@ public final class ComputeStepSyntaxElement<T extends Dataset> {
+ 
+     private final Class<T> type;
+ 
++    /**
++     * Unique ID within a pipeline but should be identical across workers
++     * {@link Dataset CompiledExecution}
++     */
++    private String id;
++
+     public static <T extends Dataset> ComputeStepSyntaxElement<T> create(
+-        final Iterable<MethodSyntaxElement> methods, final ClassFields fields,
+-        final Class<T> interfce) {
+-        return new ComputeStepSyntaxElement<>(methods, fields, interfce);
++        final String id,
++        final Iterable<MethodSyntaxElement> methods,
++        final ClassFields fields,
++        final Class<T> interfce)
++    {
++        return new ComputeStepSyntaxElement<>(id, methods, fields, interfce);
+     }
+ 
+-    private ComputeStepSyntaxElement(final Iterable<MethodSyntaxElement> methods,
+-        final ClassFields fields, final Class<T> interfce) {
++    private ComputeStepSyntaxElement(
++        final String id,
++        final Iterable<MethodSyntaxElement> methods,
++        final ClassFields fields,
++        final Class<T> interfce)
++    {
++        this.id = id;
+         this.methods = methods;
+         this.fields = fields;
+         type = interfce;
+@@ -69,8 +86,8 @@ public T instantiate() {
+         synchronized (COMPILER) {
+             try {
+                 final Class<? extends Dataset> clazz;
+-                if (CLASS_CACHE.containsKey(this)) {
+-                    clazz = CLASS_CACHE.get(this);
++                if (CLASS_CACHE.containsKey(id)) {
++                    clazz = CLASS_CACHE.get(id);
+                 } else {
+                     final String name = String.format("CompiledDataset%d", CLASS_CACHE.size());
+                     final String code = generateCode(name);
+@@ -85,7 +102,7 @@ public T instantiate() {
+                     clazz = (Class<T>) COMPILER.getClassLoader().loadClass(
+                         String.format("org.logstash.generated.%s", name)
+                     );
+-                    CLASS_CACHE.put(this, clazz);
++                    CLASS_CACHE.put(id, clazz);
+                 }
+                 return (T) clazz.<T>getConstructor(Map.class).newInstance(ctorArguments());
+             } catch (final CompileException | ClassNotFoundException | IOException
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
+index 28717e9832c..49721cc170a 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
+@@ -33,8 +33,11 @@ private DatasetCompiler() {
+         // Utility Class
+     }
+ 
+-    public static ComputeStepSyntaxElement<SplitDataset> splitDataset(final Collection<Dataset> parents,
+-        final EventCondition condition) {
++    public static ComputeStepSyntaxElement<SplitDataset> splitDataset(
++        final String vertexId,
++        final Collection<Dataset> parents,
++        final EventCondition condition)
++    {
+         final ClassFields fields = new ClassFields();
+         final ValueSyntaxElement ifData = fields.add(new ArrayList<>());
+         final ValueSyntaxElement elseData = fields.add(new ArrayList<>());
+@@ -73,19 +76,27 @@ public static ComputeStepSyntaxElement<SplitDataset> splitDataset(final Collecti
+             );
+         }
+         return ComputeStepSyntaxElement.create(
+-            Arrays.asList(compute.compute(), compute.clear(), MethodSyntaxElement.right(right)),
+-            compute.fields(), SplitDataset.class
++            vertexId,
++            Arrays.asList(compute.compute(),
++            compute.clear(),
++            MethodSyntaxElement.right(right)),
++            compute.fields(),
++            SplitDataset.class
+         );
+     }
+ 
+     /**
+      * Compiles a {@link Dataset} representing a filter plugin without flush behaviour.
++     * @param vertexId {@link String} associated vertex ID
+      * @param parents Parent {@link Dataset} to aggregate for this filter
+      * @param plugin Filter Plugin
+      * @return Dataset representing the filter plugin
+      */
+-    public static ComputeStepSyntaxElement<Dataset> filterDataset(final Collection<Dataset> parents,
+-        final AbstractFilterDelegatorExt plugin) {
++    public static ComputeStepSyntaxElement<Dataset> filterDataset(
++        final String vertexId,
++        final Collection<Dataset> parents,
++        final AbstractFilterDelegatorExt plugin)
++    {
+         final ClassFields fields = new ClassFields();
+         final ValueSyntaxElement outputBuffer = fields.add(new ArrayList<>());
+         final Closure clear = Closure.wrap();
+@@ -104,7 +115,7 @@ public static ComputeStepSyntaxElement<Dataset> filterDataset(final Collection<D
+                 parentFields, inputBufferField
+             );
+         }
+-        return prepare(withOutputBuffering(compute, clear, outputBuffer, fields));
++        return prepare(vertexId, withOutputBuffering(compute, clear, outputBuffer, fields));
+     }
+ 
+     /**
+@@ -113,17 +124,18 @@ public static ComputeStepSyntaxElement<Dataset> filterDataset(final Collection<D
+      * trivial dataset that does not invoke any computation whatsoever.</p>
+      * {@link Dataset#compute(RubyArray, boolean, boolean)} is always
+      * {@link Collections#emptyList()}.
++     * @param id String {@link String} unique id for this {@link Dataset}
+      * @param parents Parent {@link Dataset} to sum and terminate
+      * @return Dataset representing the sum of given parent {@link Dataset}
+      */
+-    public static Dataset terminalDataset(final Collection<Dataset> parents) {
++    public static Dataset terminalDataset(final String id, final Collection<Dataset> parents) {
+         final int count = parents.size();
+         final Dataset result;
+         if (count > 1) {
+             final ClassFields fields = new ClassFields();
+             final Collection<ValueSyntaxElement> parentFields =
+                 parents.stream().map(fields::add).collect(Collectors.toList());
+-            result = compileOutput(
++            result = compileOutput(id,
+                 Closure.wrap(
+                     parentFields.stream().map(DatasetCompiler::computeDataset)
+                         .toArray(MethodLevelSyntaxElement[]::new)
+@@ -152,12 +164,15 @@ public static Dataset terminalDataset(final Collection<Dataset> parents) {
+      * {@link DynamicMethod#call(org.jruby.runtime.ThreadContext, IRubyObject, org.jruby.RubyModule, String, IRubyObject[], Block)}
+      * using an {@code IRubyObject[]} field that is repopulated with the current Event array on
+      * every call to {@code compute}.
++     * @param vertexId {@link String} associated vertex ID
+      * @param parents Parent Datasets
+      * @param output Output Plugin (of Ruby type OutputDelegator)
+      * @param terminal Set to true if this output is the only output in the pipeline
+      * @return Output Dataset
+      */
+-    public static ComputeStepSyntaxElement<Dataset> outputDataset(final Collection<Dataset> parents,
++    public static ComputeStepSyntaxElement<Dataset> outputDataset(
++        final String vertexId,
++        final Collection<Dataset> parents,
+         final AbstractOutputDelegatorExt output, final boolean terminal) {
+         final ClassFields fields = new ClassFields();
+         final Closure clearSyntax;
+@@ -184,7 +199,7 @@ public static ComputeStepSyntaxElement<Dataset> outputDataset(final Collection<D
+                 parentFields, inputBuffer
+             );
+         }
+-        return compileOutput(computeSyntax, clearSyntax, fields);
++        return compileOutput(vertexId, computeSyntax, clearSyntax, fields);
+     }
+ 
+     private static ValueSyntaxElement invokeOutput(final ValueSyntaxElement output,
+@@ -222,9 +237,9 @@ private static Closure conditionalLoop(final VariableDefinition event,
+      * @param compute Method definitions for {@code compute} and {@code clear}
+      * @return Dataset Instance
+      */
+-    private static ComputeStepSyntaxElement<Dataset> prepare(final DatasetCompiler.ComputeAndClear compute) {
++    private static ComputeStepSyntaxElement<Dataset> prepare(final String vertexId, final DatasetCompiler.ComputeAndClear compute) {
+         return ComputeStepSyntaxElement.create(
+-            Arrays.asList(compute.compute(), compute.clear()), compute.fields(), Dataset.class
++            vertexId, Arrays.asList(compute.compute(), compute.clear()), compute.fields(), Dataset.class
+         );
+     }
+ 
+@@ -312,10 +327,14 @@ private static RubyHash flushOpts(final boolean fin) {
+         return res;
+     }
+ 
+-    private static ComputeStepSyntaxElement<Dataset> compileOutput(final Closure syntax,
+-        final Closure clearSyntax, final ClassFields fields) {
++    private static ComputeStepSyntaxElement<Dataset> compileOutput(
++        final String vertexId,
++        final Closure syntax,
++        final Closure clearSyntax,
++        final ClassFields fields)
++    {
+         return prepare(
+-            computeAndClear(syntax.add(MethodLevelSyntaxElement.RETURN_NULL), clearSyntax, fields)
++            vertexId, computeAndClear(syntax.add(MethodLevelSyntaxElement.RETURN_NULL), clearSyntax, fields)
+         );
+     }
+ 
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java b/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java
+index 23124545669..18ac8e4d7b2 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java
+@@ -22,6 +22,7 @@ public final class DatasetCompilerTest {
+     public void compilesOutputDataset() {
+         assertThat(
+             DatasetCompiler.outputDataset(
++                "foo",
+                 Collections.emptyList(),
+                 PipelineTestUtil.buildOutput(events -> {}),
+                 true
+@@ -34,6 +35,7 @@ public void compilesOutputDataset() {
+     public void compilesSplitDataset() {
+         final FieldReference key = FieldReference.from("foo");
+         final SplitDataset left = DatasetCompiler.splitDataset(
++            "bar",
+             Collections.emptyList(), event -> event.getEvent().includes(key)
+         ).instantiate();
+         final Event trueEvent = new Event();

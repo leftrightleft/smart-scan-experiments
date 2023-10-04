@@ -1,0 +1,195 @@
+diff --git a/.gitignore b/.gitignore
+index a1952a06fc7..0bf92be54e3 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -32,4 +32,8 @@ qa/.vm_ssh_config
+ qa/.vagrant
+ qa/acceptance/.vagrant
+ qa/Gemfile.lock
+-
++*.ipr
++*.iws
++*.iml
++.gradle
++.idea
+diff --git a/logstash-core/lib/logstash/api/modules/logging.rb b/logstash-core/lib/logstash/api/modules/logging.rb
+new file mode 100644
+index 00000000000..d18edd4e8d5
+--- /dev/null
++++ b/logstash-core/lib/logstash/api/modules/logging.rb
+@@ -0,0 +1,52 @@
++# encoding: utf-8
++#
++java_import org.apache.logging.log4j.core.LoggerContext
++
++module LogStash
++  module Api
++    module Modules
++      class Logging < ::LogStash::Api::Modules::Base
++        # retrieve logging specific parameters from the provided settings
++        #
++        # return any unused configurations
++        def handle_logging(settings)
++          Hash[settings.map do |key, level|
++            if key.start_with?("logger.")
++              _, path = key.split("logger.")
++              LogStash::Logging::Logger::configure_logging(level, path)
++              nil
++            else
++              [key, level]
++            end
++          end]
++        end
++
++        put "/" do
++          begin
++            request.body.rewind
++            req_body = LogStash::Json.load(request.body.read)
++            remaining = handle_logging(req_body)
++            unless remaining.empty?
++              raise ArgumentError, I18n.t("logstash.web_api.logging.unrecognized_option", :option => remaining.keys.first)
++            end
++            respond_with({"acknowledged" => true})
++          rescue ArgumentError => e
++            status 400
++            respond_with({"error" => e.message})
++          end
++        end
++
++        get "/" do
++          context = LogStash::Logging::Logger::get_logging_context
++          if context.nil?
++            status 500
++            respond_with({"error" => "Logstash loggers were not initialized properly"})
++          else
++            loggers = context.getLoggers.map { |lgr| [lgr.getName, lgr.getLevel.name] }.sort
++            respond_with({"loggers" => Hash[loggers]})
++          end
++        end
++      end
++    end
++  end
++end
+diff --git a/logstash-core/lib/logstash/api/rack_app.rb b/logstash-core/lib/logstash/api/rack_app.rb
+index ff9a0c81c18..19e5bc2b932 100644
+--- a/logstash-core/lib/logstash/api/rack_app.rb
++++ b/logstash-core/lib/logstash/api/rack_app.rb
+@@ -5,6 +5,7 @@
+ require "logstash/api/modules/node_stats"
+ require "logstash/api/modules/plugins"
+ require "logstash/api/modules/root"
++require "logstash/api/modules/logging"
+ require "logstash/api/modules/stats"
+ 
+ module LogStash
+@@ -103,7 +104,8 @@ def self.rack_namespaces(agent)
+           "/_node" => LogStash::Api::Modules::Node,
+           "/_stats" => LogStash::Api::Modules::Stats,
+           "/_node/stats" => LogStash::Api::Modules::NodeStats,
+-          "/_node/plugins" => LogStash::Api::Modules::Plugins
++          "/_node/plugins" => LogStash::Api::Modules::Plugins,
++          "/_node/logging" => LogStash::Api::Modules::Logging
+         }
+       end
+     end
+diff --git a/logstash-core/lib/logstash/logging/logger.rb b/logstash-core/lib/logstash/logging/logger.rb
+index d43d06a18fb..8acac62ff1a 100644
+--- a/logstash-core/lib/logstash/logging/logger.rb
++++ b/logstash-core/lib/logstash/logging/logger.rb
+@@ -6,6 +6,8 @@ class Logger
+       java_import org.apache.logging.log4j.Level
+       java_import org.apache.logging.log4j.LogManager
+       java_import org.apache.logging.log4j.core.config.Configurator
++      @@config_mutex = Mutex.new
++      @@logging_context = nil
+ 
+       def initialize(name)
+         @logger = LogManager.getLogger(name)
+@@ -59,13 +61,22 @@ def trace(message, data = {})
+         @logger.trace(message, data)
+       end
+ 
+-      # Point logging at a specific path.
+       def self.configure_logging(level, path = LogManager::ROOT_LOGGER_NAME)
+-        Configurator.setLevel(path, Level.toLevel(level))
+-      end # def configure_logging
++        @@config_mutex.synchronize { Configurator.setLevel(path, Level.valueOf(level)) }
++      rescue Exception => e
++        raise ArgumentError, "invalid level[#{level}] for logger[#{path}]"
++      end
+ 
+       def self.initialize(config_location)
+-        Configurator.initialize(nil, config_location)
++        @@config_mutex.synchronize do
++          if @@logging_context.nil?
++            @@logging_context = Configurator.initialize(nil, config_location)
++          end
++        end
++      end
++
++      def self.get_logging_context
++        return @@logging_context
+       end
+     end
+   end
+diff --git a/logstash-core/locales/en.yml b/logstash-core/locales/en.yml
+index 3e8343c3f2a..8a2b9b47a15 100644
+--- a/logstash-core/locales/en.yml
++++ b/logstash-core/locales/en.yml
+@@ -83,6 +83,9 @@ en:
+           Hot threads at %{time}, busiestThreads=%{top_count}:
+         thread_title: |-
+           %{percent_of_cpu_time} % of cpu usage, state: %{thread_state}, thread name: '%{thread_name}'
++      logging:
++        unrecognized_option: |-
++          unrecognized option [%{option}]
+     runner:
+       short-help: |-
+         usage:
+diff --git a/logstash-core/spec/api/lib/api/logging_spec.rb b/logstash-core/spec/api/lib/api/logging_spec.rb
+new file mode 100644
+index 00000000000..214a2ad69f2
+--- /dev/null
++++ b/logstash-core/spec/api/lib/api/logging_spec.rb
+@@ -0,0 +1,41 @@
++# encoding: utf-8
++require_relative "../../spec_helper"
++require "sinatra"
++require "logstash/api/modules/logging"
++require "logstash/json"
++
++describe LogStash::Api::Modules::Logging do
++  include_context "api setup"
++
++  describe "#logging" do
++
++    context "when setting a logger's log level" do
++      before(:all) do
++        @runner = LogStashRunner.new
++        @runner.start
++      end
++
++      after(:all) do
++        @runner.stop
++      end
++
++      it "should return a positive acknowledgement on success" do
++        put '/', '{"logger.logstash": "ERROR"}'
++        payload = LogStash::Json.load(last_response.body)
++        expect(payload['acknowledged']).to eq(true)
++      end
++
++      it "should throw error when level is invalid" do
++        put '/', '{"logger.logstash": "invalid"}'
++        payload = LogStash::Json.load(last_response.body)
++        expect(payload['error']).to eq("invalid level[invalid] for logger[logstash]")
++      end
++
++      it "should throw error when key logger is invalid" do
++        put '/', '{"invalid" : "ERROR"}'
++        payload = LogStash::Json.load(last_response.body)
++        expect(payload['error']).to eq("unrecognized option [invalid]")
++      end
++    end
++  end
++end

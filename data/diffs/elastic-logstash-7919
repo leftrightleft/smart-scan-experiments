@@ -1,0 +1,477 @@
+diff --git a/logstash-core/lib/logstash/filter_delegator.rb b/logstash-core/lib/logstash/filter_delegator.rb
+index c71fd20affe..9cd1b92d7f7 100644
+--- a/logstash-core/lib/logstash/filter_delegator.rb
++++ b/logstash-core/lib/logstash/filter_delegator.rb
+@@ -26,6 +26,9 @@ def initialize(logger, klass, metric, execution_context, plugin_args)
+       @filter.execution_context = execution_context
+ 
+       @metric_events = namespaced_metric.namespace(:events)
++      @metric_events_in = @metric_events.counter(:in)
++      @metric_events_out = @metric_events.counter(:out)
++      @metric_events_time = @metric_events.counter(:duration_in_millis)
+       namespaced_metric.gauge(:name, config_name)
+ 
+       # Not all the filters will do bufferings
+@@ -37,17 +40,17 @@ def config_name
+     end
+ 
+     def multi_filter(events)
+-      @metric_events.increment(:in, events.size)
++      @metric_events_in.increment(events.size)
+ 
+-      clock = @metric_events.time(:duration_in_millis)
++      start_time = java.lang.System.current_time_millis
+       new_events = @filter.multi_filter(events)
+-      clock.stop
++      @metric_events_time.increment(java.lang.System.current_time_millis - start_time)
+ 
+       # There is no guarantee in the context of filter
+       # that EVENTS_IN == EVENTS_OUT, see the aggregates and
+       # the split filter
+       c = new_events.count { |event| !event.cancelled? }
+-      @metric_events.increment(:out, c) if c > 0
++      @metric_events_out.increment(c) if c > 0
+       new_events
+     end
+ 
+@@ -60,7 +63,7 @@ def define_flush_method
+ 
+         # Filter plugins that does buffering or spooling of events like the
+         # `Logstash-filter-aggregates` can return `NIL` and will flush on the next flush ticks.
+-        @metric_events.increment(:out, new_events.size) if new_events && new_events.size > 0
++        @metric_events_out.increment(new_events.size) if new_events && new_events.size > 0
+         new_events
+       end
+     end
+diff --git a/logstash-core/lib/logstash/instrument/collector.rb b/logstash-core/lib/logstash/instrument/collector.rb
+index 08e72599f3d..4971695a2c9 100644
+--- a/logstash-core/lib/logstash/instrument/collector.rb
++++ b/logstash-core/lib/logstash/instrument/collector.rb
+@@ -33,11 +33,7 @@ def initialize
+     #
+     def push(namespaces_path, key, type, *metric_type_params)
+       begin
+-        metric = @metric_store.fetch_or_store(namespaces_path, key) do
+-          LogStash::Instrument::MetricType.create(type, namespaces_path, key)
+-        end
+-
+-        metric.execute(*metric_type_params)
++        get(namespaces_path, key, type).execute(*metric_type_params)
+       rescue MetricStore::NamespacesExpectedError => e
+         logger.error("Collector: Cannot record metric", :exception => e)
+       rescue NameError => e
+@@ -51,6 +47,12 @@ def push(namespaces_path, key, type, *metric_type_params)
+       end
+     end
+ 
++    def get(namespaces_path, key, type)
++      @metric_store.fetch_or_store(namespaces_path, key) do
++        LogStash::Instrument::MetricType.create(type, namespaces_path, key)
++      end
++    end
++
+     # Snapshot the current Metric Store and return it immediately,
+     # This is useful if you want to get access to the current metric store without
+     # waiting for a periodic call.
+diff --git a/logstash-core/lib/logstash/instrument/namespaced_metric.rb b/logstash-core/lib/logstash/instrument/namespaced_metric.rb
+index 1f056bd0735..40afa45424a 100644
+--- a/logstash-core/lib/logstash/instrument/namespaced_metric.rb
++++ b/logstash-core/lib/logstash/instrument/namespaced_metric.rb
+@@ -43,6 +43,10 @@ def time(key, &block)
+     def collector
+       @metric.collector
+     end
++    
++    def counter(key)
++      collector.get(@namespace_name, key, :counter)
++    end
+ 
+     def namespace(name)
+       NamespacedMetric.new(metric, namespace_name + Array(name))
+diff --git a/logstash-core/lib/logstash/instrument/namespaced_null_metric.rb b/logstash-core/lib/logstash/instrument/namespaced_null_metric.rb
+index c4e8e762c23..1a3b6f9c1d1 100644
+--- a/logstash-core/lib/logstash/instrument/namespaced_null_metric.rb
++++ b/logstash-core/lib/logstash/instrument/namespaced_null_metric.rb
+@@ -44,6 +44,10 @@ def collector
+       @metric.collector
+     end
+ 
++    def counter(_)
++      ::LogStash::Instrument::NullMetric::NullGauge
++    end
++
+     def namespace(name)
+       NamespacedNullMetric.new(metric, namespace_name + Array(name))
+     end
+diff --git a/logstash-core/lib/logstash/instrument/null_metric.rb b/logstash-core/lib/logstash/instrument/null_metric.rb
+index 56bd0feac19..f56028d4580 100644
+--- a/logstash-core/lib/logstash/instrument/null_metric.rb
++++ b/logstash-core/lib/logstash/instrument/null_metric.rb
+@@ -39,6 +39,10 @@ def time(namespace, key)
+       end
+     end
+ 
++    def counter(_)
++      NullGauge
++    end
++
+     def namespace(name)
+       raise MetricNoNamespaceProvided if name.nil? || name.empty?
+       NamespacedNullMetric.new(self, name)
+@@ -49,6 +53,12 @@ def self.validate_key!(key)
+     end
+ 
+     private
++
++    class NullGauge
++      def self.increment(_)
++      end
++    end
++
+     # Null implementation of the internal timer class
+     #
+     # @see LogStash::Instrument::TimedExecution`
+diff --git a/logstash-core/lib/logstash/instrument/wrapped_write_client.rb b/logstash-core/lib/logstash/instrument/wrapped_write_client.rb
+index 5da275c9f29..82f0539e287 100644
+--- a/logstash-core/lib/logstash/instrument/wrapped_write_client.rb
++++ b/logstash-core/lib/logstash/instrument/wrapped_write_client.rb
+@@ -10,7 +10,12 @@ def initialize(write_client, pipeline, metric, plugin)
+       @events_metrics = metric.namespace([:stats, :events])
+       @pipeline_metrics = metric.namespace([:stats, :pipelines, pipeline_id, :events])
+       @plugin_events_metrics = metric.namespace([:stats, :pipelines, pipeline_id, :plugins, plugin_type, plugin.id.to_sym, :events])
+-
++      @events_metrics_counter = @events_metrics.counter(:in)
++      @events_metrics_time = @events_metrics.counter(:queue_push_duration_in_millis)
++      @pipeline_metrics_counter = @pipeline_metrics.counter(:in)
++      @pipeline_metrics_time = @pipeline_metrics.counter(:queue_push_duration_in_millis)
++      @plugin_events_metrics_counter = @plugin_events_metrics.counter(:out)
++      @plugin_events_metrics_time = @plugin_events_metrics.counter(:queue_push_duration_in_millis)
+       define_initial_metrics_values
+     end
+ 
+@@ -19,41 +24,45 @@ def get_new_batch
+     end
+ 
+     def push(event)
+-      record_metric { @write_client.push(event) }
++      increment_counters(1)
++      start_time = java.lang.System.current_time_millis
++      result = @write_client.push(event)
++      report_execution_time(start_time)
++      result
+     end
++
+     alias_method(:<<, :push)
+ 
+     def push_batch(batch)
+-      record_metric(batch.size) { @write_client.push_batch(batch) }
++      increment_counters(batch.size)
++      start_time = java.lang.System.current_time_millis
++      result = @write_client.push_batch(batch)
++      report_execution_time(start_time)
++      result
+     end
+ 
+     private
+-    def record_metric(size = 1)
+-      @events_metrics.increment(:in, size)
+-      @pipeline_metrics.increment(:in, size)
+-      @plugin_events_metrics.increment(:out, size)
+-
+-      clock = @events_metrics.time(:queue_push_duration_in_millis)
+ 
+-      result = yield
+-
+-      # Reuse the same values for all the endpoints to make sure we don't have skew in times.
+-      execution_time = clock.stop
+-
+-      @pipeline_metrics.report_time(:queue_push_duration_in_millis, execution_time)
+-      @plugin_events_metrics.report_time(:queue_push_duration_in_millis, execution_time)
++    def increment_counters(size)
++      @events_metrics_counter.increment(size)
++      @pipeline_metrics_counter.increment(size)
++      @plugin_events_metrics_counter.increment(size)
++    end
+ 
+-      result
++    def report_execution_time(start_time)
++      execution_time = java.lang.System.current_time_millis - start_time
++      @events_metrics_time.increment(execution_time)
++      @pipeline_metrics_time.increment(execution_time)
++      @plugin_events_metrics_time.increment(execution_time)
+     end
+ 
+     def define_initial_metrics_values
+-      @events_metrics.increment(:in, 0)
+-      @pipeline_metrics.increment(:in, 0)
+-      @plugin_events_metrics.increment(:out, 0)
+-
+-      @events_metrics.report_time(:queue_push_duration_in_millis, 0)
+-      @pipeline_metrics.report_time(:queue_push_duration_in_millis, 0)
+-      @plugin_events_metrics.report_time(:queue_push_duration_in_millis, 0)
++      @events_metrics_counter.increment(0)
++      @pipeline_metrics_counter.increment(0)
++      @plugin_events_metrics_counter.increment(0)
++      @events_metrics_time.increment(0)
++      @pipeline_metrics_time.increment(0)
++      @plugin_events_metrics_time.increment(0)
+     end
+   end
+ end end
+diff --git a/logstash-core/lib/logstash/output_delegator.rb b/logstash-core/lib/logstash/output_delegator.rb
+index fa34187c227..dba5fbd013a 100644
+--- a/logstash-core/lib/logstash/output_delegator.rb
++++ b/logstash-core/lib/logstash/output_delegator.rb
+@@ -19,7 +19,9 @@ def initialize(logger, output_class, metric, execution_context, strategy_registr
+     @namespaced_metric = metric.namespace(id.to_sym)
+     @namespaced_metric.gauge(:name, config_name)
+     @metric_events = @namespaced_metric.namespace(:events)
+-
++    @in_counter = @metric_events.counter(:in)
++    @out_counter = @metric_events.counter(:out)
++    @time_metric = @metric_events.counter(:duration_in_millis)
+     @strategy = strategy_registry.
+                   class_for(self.concurrency).
+                   new(@logger, @output_class, @namespaced_metric, execution_context, plugin_args)
+@@ -42,11 +44,11 @@ def register
+   end
+ 
+   def multi_receive(events)
+-    @metric_events.increment(:in, events.length)
+-    clock = @metric_events.time(:duration_in_millis)
++    @in_counter.increment(events.length)
++    start_time = java.lang.System.current_time_millis
+     @strategy.multi_receive(events)
+-    clock.stop
+-    @metric_events.increment(:out, events.length)
++    @time_metric.increment(java.lang.System.current_time_millis - start_time)
++    @out_counter.increment(events.length)
+   end
+ 
+   def do_close
+diff --git a/logstash-core/lib/logstash/util/wrapped_acked_queue.rb b/logstash-core/lib/logstash/util/wrapped_acked_queue.rb
+index 61546f547f5..34eec72ce7f 100644
+--- a/logstash-core/lib/logstash/util/wrapped_acked_queue.rb
++++ b/logstash-core/lib/logstash/util/wrapped_acked_queue.rb
+@@ -205,19 +205,18 @@ def close_batch(batch)
+       end
+ 
+       def start_clock
+-        @inflight_clocks[Thread.current] = [
+-          @event_metric.time(:duration_in_millis),
+-          @pipeline_metric.time(:duration_in_millis)
+-        ]
++        @inflight_clocks[Thread.current] = java.lang.System.current_time_millis
+       end
+ 
+       def stop_clock(batch)
+         unless @inflight_clocks[Thread.current].nil?
+           if batch.size > 0
+-            # onl/y stop (which also records) the metrics if the batch is non-empty.
++            # only stop (which also records) the metrics if the batch is non-empty.
+             # start_clock is now called at empty batch creation and an empty batch could
+             # stay empty all the way down to the close_batch call.
+-            @inflight_clocks[Thread.current].each(&:stop)
++            time_taken = java.lang.System.current_time_millis - @inflight_clocks[Thread.current]
++            @event_metric.report_time(:duration_in_millis, time_taken)
++            @pipeline_metric.report_time(:duration_in_millis, time_taken)
+           end
+           @inflight_clocks.delete(Thread.current)
+         end
+diff --git a/logstash-core/lib/logstash/util/wrapped_synchronous_queue.rb b/logstash-core/lib/logstash/util/wrapped_synchronous_queue.rb
+index 706149f3499..4641a317945 100644
+--- a/logstash-core/lib/logstash/util/wrapped_synchronous_queue.rb
++++ b/logstash-core/lib/logstash/util/wrapped_synchronous_queue.rb
+@@ -71,11 +71,17 @@ def set_batch_dimensions(batch_size, wait_for)
+ 
+       def set_events_metric(metric)
+         @event_metric = metric
++        @event_metric_out = @event_metric.counter(:out)
++        @event_metric_filtered = @event_metric.counter(:filtered)
++        @event_metric_time = @event_metric.counter(:duration_in_millis)
+         define_initial_metrics_values(@event_metric)
+       end
+ 
+       def set_pipeline_metric(metric)
+         @pipeline_metric = metric
++        @pipeline_metric_out = @pipeline_metric.counter(:out)
++        @pipeline_metric_filtered = @pipeline_metric.counter(:filtered)
++        @pipeline_metric_time = @pipeline_metric.counter(:duration_in_millis)
+         define_initial_metrics_values(@pipeline_metric)
+       end
+ 
+@@ -138,10 +144,7 @@ def close_batch(batch)
+       end
+ 
+       def start_clock
+-        @inflight_clocks[Thread.current] = [
+-          @event_metric.time(:duration_in_millis),
+-          @pipeline_metric.time(:duration_in_millis)
+-        ]
++        @inflight_clocks[Thread.current] = java.lang.System.current_time_millis
+       end
+ 
+       def stop_clock(batch)
+@@ -150,20 +153,22 @@ def stop_clock(batch)
+             # only stop (which also records) the metrics if the batch is non-empty.
+             # start_clock is now called at empty batch creation and an empty batch could
+             # stay empty all the way down to the close_batch call.
+-            @inflight_clocks[Thread.current].each(&:stop)
++            time_taken = java.lang.System.current_time_millis - @inflight_clocks[Thread.current]
++            @event_metric_time.increment(time_taken)
++            @pipeline_metric_time.increment(time_taken)
+           end
+           @inflight_clocks.delete(Thread.current)
+         end
+       end
+ 
+       def add_filtered_metrics(batch)
+-        @event_metric.increment(:filtered, batch.filtered_size)
+-        @pipeline_metric.increment(:filtered, batch.filtered_size)
++        @event_metric_filtered.increment(batch.filtered_size)
++        @pipeline_metric_filtered.increment(batch.filtered_size)
+       end
+ 
+       def add_output_metrics(batch)
+-        @event_metric.increment(:out, batch.filtered_size)
+-        @pipeline_metric.increment(:out, batch.filtered_size)
++        @event_metric_out.increment(batch.filtered_size)
++        @pipeline_metric_out.increment(batch.filtered_size)
+       end
+     end
+ 
+diff --git a/logstash-core/spec/logstash/filter_delegator_spec.rb b/logstash-core/spec/logstash/filter_delegator_spec.rb
+index 7a073b622fc..b64ac834e4a 100644
+--- a/logstash-core/spec/logstash/filter_delegator_spec.rb
++++ b/logstash-core/spec/logstash/filter_delegator_spec.rb
+@@ -7,6 +7,12 @@
+ require "support/shared_contexts"
+ 
+ describe LogStash::FilterDelegator do
++
++  class MockGauge
++    def increment(_)
++    end
++  end
++
+   include_context "execution_context"
+   
+   let(:logger) { double(:logger) }
+@@ -15,12 +21,18 @@
+     { "host" => "127.0.0.1", "id" => filter_id }
+   end
+   let(:collector) { [] }
++  let(:counter_in) { MockGauge.new }
++  let(:counter_out) { MockGauge.new }
++  let(:counter_time) { MockGauge.new }
+   let(:metric) { LogStash::Instrument::NamespacedNullMetric.new(collector, :null) }
+   let(:events) { [LogStash::Event.new, LogStash::Event.new] }
+ 
+   before :each do
+     allow(pipeline).to receive(:id).and_return(pipeline_id)
+     allow(metric).to receive(:namespace).with(anything).and_return(metric)
++    allow(metric).to receive(:counter).with(:in).and_return(counter_in)
++    allow(metric).to receive(:counter).with(:out).and_return(counter_out)
++    allow(metric).to receive(:counter).with(:duration_in_millis).and_return(counter_time)
+   end
+ 
+   let(:plugin_klass) do
+@@ -60,7 +72,7 @@ def filter(event)
+     context "when the flush return events" do
+       it "increments the out" do
+         subject.multi_filter([LogStash::Event.new])
+-        expect(metric).to receive(:increment).with(:out, 1)
++        expect(counter_out).to receive(:increment).with(1)
+         subject.flush({})
+       end
+     end
+@@ -78,12 +90,12 @@ def filter(event)
+       end
+ 
+       it "has incremented :in" do
+-        expect(metric).to receive(:increment).with(:in, events.size)
++        expect(counter_in).to receive(:increment).with(events.size)
+         subject.multi_filter(events)
+       end
+ 
+       it "has not incremented :out" do
+-        expect(metric).not_to receive(:increment).with(:out, anything)
++        expect(counter_out).not_to receive(:increment).with(anything)
+         subject.multi_filter(events)
+       end
+     end
+@@ -109,8 +121,8 @@ def filter(event)
+       end
+ 
+       it "increments the in/out of the metric" do
+-        expect(metric).to receive(:increment).with(:in, events.size)
+-        expect(metric).to receive(:increment).with(:out, events.size * 2)
++        expect(counter_in).to receive(:increment).with(events.size)
++        expect(counter_out).to receive(:increment).with(events.size * 2)
+ 
+         subject.multi_filter(events)
+       end
+@@ -138,8 +150,8 @@ def filter(event)
+     end
+ 
+     it "increments the in/out of the metric" do
+-      expect(metric).to receive(:increment).with(:in, events.size)
+-      expect(metric).to receive(:increment).with(:out, events.size)
++      expect(counter_in).to receive(:increment).with(events.size)
++      expect(counter_out).to receive(:increment).with(events.size)
+ 
+       subject.multi_filter(events)
+     end
+diff --git a/logstash-core/spec/logstash/output_delegator_spec.rb b/logstash-core/spec/logstash/output_delegator_spec.rb
+index 2235cb047c9..5c009996e38 100644
+--- a/logstash-core/spec/logstash/output_delegator_spec.rb
++++ b/logstash-core/spec/logstash/output_delegator_spec.rb
+@@ -5,10 +5,19 @@
+ require "support/shared_contexts"
+ 
+ describe LogStash::OutputDelegator do
++
++  class MockGauge
++    def increment(_)
++    end
++  end
++
+   let(:logger) { double("logger") }
+   let(:events) { 7.times.map { LogStash::Event.new }}
+   let(:plugin_args) { {"id" => "foo", "arg1" => "val1"} }
+   let(:collector) { [] }
++  let(:counter_in) { MockGauge.new }
++  let(:counter_out) { MockGauge.new }
++  let(:counter_time) { MockGauge.new }
+   let(:metric) { LogStash::Instrument::NamespacedNullMetric.new(collector, :null) }
+ 
+   include_context "execution_context"
+@@ -23,6 +32,9 @@
+     before(:each) do
+       # use the same metric instance
+       allow(metric).to receive(:namespace).with(any_args).and_return(metric)
++      allow(metric).to receive(:counter).with(:in).and_return(counter_in)
++      allow(metric).to receive(:counter).with(:out).and_return(counter_out)
++      allow(metric).to receive(:counter).with(:duration_in_millis).and_return(counter_time)
+ 
+       allow(out_klass).to receive(:new).with(any_args).and_return(out_inst)
+       allow(out_klass).to receive(:name).and_return("example")
+@@ -58,15 +70,13 @@
+       end
+ 
+       it "should increment the number of events received" do
+-        expect(subject.metric_events).to receive(:increment).with(:in, events.length)
+-        expect(subject.metric_events).to receive(:increment).with(:out, events.length)
++        expect(counter_in).to receive(:increment).with(events.length)
++        expect(counter_out).to receive(:increment).with(events.length)
+         subject.multi_receive(events)
+       end
+ 
+       it "should record the `duration_in_millis`" do
+-        clock = spy("clock")
+-        expect(subject.metric_events).to receive(:time).with(:duration_in_millis).and_return(clock)
+-        expect(clock).to receive(:stop)
++        expect(counter_time).to receive(:increment).with(Integer)
+         subject.multi_receive(events)
+       end
+     end

@@ -1,0 +1,2509 @@
+diff --git a/bin/setup.bat b/bin/setup.bat
+index 6d336f0b945..11b403dd8cf 100644
+--- a/bin/setup.bat
++++ b/bin/setup.bat
+@@ -72,15 +72,14 @@ REM setup_vendored_jruby()
+ set JRUBY_BIN="%LS_HOME%\vendor\jruby\bin\jruby"
+ if exist "%JRUBY_BIN%" (
+   set VENDORED_JRUBY=1
+-goto finally
++  goto finally
+ ) else (
+-goto missing_jruby
++  goto missing_jruby
+ )
+ 
+ :missing_java_home
+ echo JAVA_HOME environment variable must be set!
+ exit /b
+-echo Done
+ 
+ :missing_jruby
+ echo Unable to find JRuby.
+diff --git a/docs/static/setting-up-logstash.asciidoc b/docs/static/setting-up-logstash.asciidoc
+index 89b3be76a6f..0e6cb3d688b 100644
+--- a/docs/static/setting-up-logstash.asciidoc
++++ b/docs/static/setting-up-logstash.asciidoc
+@@ -154,8 +154,8 @@ pipeline, and _settings files_, which specify options that control Logstash star
+ ==== Pipeline Configuration Files
+ 
+ You create pipeline configuration files when you define the stages of your Logstash processing pipeline. On deb and
+-rpm, you place the pipeline configuration files in the `/etc/logstash/conf.d` directory. Logstash tries to load all
+-files in the `/etc/logstash/conf.d directory`, so don't store any non-config files or backup files in this directory.
++rpm, you place the pipeline configuration files in the `/etc/logstash/conf.d` directory. Logstash tries to load only
++files with `.conf` extension in the `/etc/logstash/conf.d directory` and ignores all other files.
+ 
+ See <<configuration>> for more info.
+ 
+diff --git a/logstash-core/lib/logstash/api/commands/hot_threads_reporter.rb b/logstash-core/lib/logstash/api/commands/hot_threads_reporter.rb
+index 69a417cdb73..e0a8c3453d8 100644
+--- a/logstash-core/lib/logstash/api/commands/hot_threads_reporter.rb
++++ b/logstash-core/lib/logstash/api/commands/hot_threads_reporter.rb
+@@ -1,4 +1,5 @@
+ # encoding: utf-8
++java_import 'org.logstash.instrument.reports.ThreadsReport'
+ 
+ class HotThreadsReport
+   STRING_SEPARATOR_LENGTH = 80.freeze
+@@ -7,8 +8,7 @@ class HotThreadsReport
+   def initialize(cmd, options)
+     @cmd = cmd
+     filter = { :stacktrace_size => options.fetch(:stacktrace_size, HOT_THREADS_STACK_TRACES_SIZE_DEFAULT) }
+-    jr_dump = JRMonitor.threads.generate(filter)
+-    @thread_dump = ::LogStash::Util::ThreadDump.new(options.merge(:dump => jr_dump))
++    @thread_dump = ::LogStash::Util::ThreadDump.new(options.merge(:dump => ThreadsReport.generate(filter)))
+   end
+ 
+   def to_s
+diff --git a/logstash-core/lib/logstash/bootstrap_check/default_config.rb b/logstash-core/lib/logstash/bootstrap_check/default_config.rb
+index 8331c861fc7..7cc5602263c 100644
+--- a/logstash-core/lib/logstash/bootstrap_check/default_config.rb
++++ b/logstash-core/lib/logstash/bootstrap_check/default_config.rb
+@@ -4,14 +4,20 @@
+ module LogStash module BootstrapCheck
+   class DefaultConfig
+     def self.check(settings)
+-      if settings.get("config.string").nil? && settings.get("path.config").nil?
+-        raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.missing-configuration")
+-      end
+ 
+       if settings.get("config.string") && settings.get("path.config")
+         raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.config-string-path-exclusive")
+       end
+ 
++      # Check for attempted usage of both modules (in either the YAML file or the command line)
++      # in conjunction with either -e or -f and disallow (for now?)
++      if (settings.get("config.string") || settings.get("path.config")) && (settings.get("modules.cli") != [] || settings.get("modules") != [])
++        raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.config-module-exclusive")
++      # Check for the absence of any (modules in YAML or cmdline, or -e or -f) 
++      elsif (settings.get("modules.cli") == [] && settings.get("modules") == []) && (settings.get("config.string").nil? && settings.get("path.config").nil?)
++        raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.missing-configuration")
++      end
++
+       if settings.get("config.reload.automatic") && settings.get("path.config").nil?
+         # there's nothing to reload
+         raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.reload-without-config-path")
+diff --git a/logstash-core/lib/logstash/config/source/local.rb b/logstash-core/lib/logstash/config/source/local.rb
+index b64e0a04ece..c3477d9f09a 100644
+--- a/logstash-core/lib/logstash/config/source/local.rb
++++ b/logstash-core/lib/logstash/config/source/local.rb
+@@ -37,7 +37,11 @@ def read
+         config_parts = []
+         encoding_issue_files = []
+ 
+-        get_files.each do |file|
++        if logger.debug?
++          logger.debug("Skipping the following files while reading config since they don't match the specified glob pattern", :files => get_unmatched_files)
++        end
++
++        get_matched_files.each do |file|
+           next unless ::File.file?(file) # skip directory
+ 
+           logger.debug("Reading config file", :config_file => file)
+@@ -78,7 +82,7 @@ def normalize_path(path)
+         ::File.expand_path(path)
+       end
+ 
+-      def get_files
++      def get_matched_files
+         Dir.glob(path).sort
+       end
+ 
+@@ -90,6 +94,13 @@ def path
+         end
+       end
+ 
++      def get_unmatched_files
++        # transform "/var/lib/*.conf" => /var/lib/*
++        t = File.split(@path)
++        all_files = Dir.glob(File.join(t.first, "*")).sort
++        all_files - get_matched_files
++      end
++
+       def valid_encoding?(content)
+         content.ascii_only? && content.valid_encoding?
+       end
+diff --git a/logstash-core/lib/logstash/config/source/modules.rb b/logstash-core/lib/logstash/config/source/modules.rb
+new file mode 100644
+index 00000000000..2b74982c130
+--- /dev/null
++++ b/logstash-core/lib/logstash/config/source/modules.rb
+@@ -0,0 +1,46 @@
++# encoding: utf-8
++require "logstash/config/source/base"
++require "logstash/config/pipeline_config"
++require "logstash/util/loggable"
++require "logstash/errors"
++
++module LogStash module Config module Source
++  class Modules < Base
++    include LogStash::Util::Loggable
++    def pipeline_configs
++      pipelines = []
++      plugin_modules = LogStash::PLUGIN_REGISTRY.plugins_with_type(:modules)
++
++      modules_array = @settings.get("modules.cli").empty? ? @settings.get("modules") : @settings.get("modules.cli")
++      logger.debug("Configured modules", :modules_array => modules_array.to_s)
++      module_names = []
++      # modules_array.each {|module_hash| module_names << module_hash["name"]}
++      module_names = modules_array.collect {|module_hash| module_hash["name"]}
++      if module_names.length > module_names.uniq.length
++        duplicate_modules = module_names.group_by(&:to_s).select { |_,v| v.size > 1 }.keys
++        raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.modules-must-be-unique", :duplicate_modules => duplicate_modules)
++      end
++      ### Here is where we can force the modules_array to use only [0] for 5.5, and leave
++      ### a warning/error message to that effect.
++      modules_array.each do |module_hash|
++        begin
++          current_module = plugin_modules.find { |allmodules| allmodules.module_name == module_hash["name"] }
++          alt_name = "module-#{module_hash["name"]}"
++          pipeline_id = alt_name
++          config_string = current_module.config_string(module_hash)
++          logger.debug("Config string for module", :config_string => config_string, :module => module_hash["name"])
++          config_part = org.logstash.common.SourceWithMetadata.new("module", alt_name, config_string)
++          pipelines << PipelineConfig.new(self, pipeline_id.to_sym, config_part, @settings)
++        rescue => e
++          raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.parse-failed", :error => e.message)
++        end
++      end
++      pipelines
++    end
++
++    def match?
++      # will fill this later
++      true
++    end
++  end 
++end end end
+\ No newline at end of file
+diff --git a/logstash-core/lib/logstash/config/source_loader.rb b/logstash-core/lib/logstash/config/source_loader.rb
+index 84983c2bd52..abcfd2f5d11 100644
+--- a/logstash-core/lib/logstash/config/source_loader.rb
++++ b/logstash-core/lib/logstash/config/source_loader.rb
+@@ -1,5 +1,6 @@
+ # encoding: utf-8
+ require "logstash/config/source/local"
++require "logstash/config/source/modules"
+ require "logstash/errors"
+ require "thread"
+ require "set"
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 0eb7e34df9e..44da34a3cc8 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -20,6 +20,8 @@ module Environment
+     Setting::NullableString.new("path.config", nil, false),
+  Setting::WritableDirectory.new("path.data", ::File.join(LogStash::Environment::LOGSTASH_HOME, "data")),
+     Setting::NullableString.new("config.string", nil, false),
++                    Setting.new("modules.cli", Array, []),
++                    Setting.new("modules", Array, []),
+            Setting::Boolean.new("config.test_and_exit", false),
+            Setting::Boolean.new("config.reload.automatic", false),
+            Setting::Numeric.new("config.reload.interval", 3), # in seconds
+diff --git a/logstash-core/lib/logstash/instrument/periodic_poller/jvm.rb b/logstash-core/lib/logstash/instrument/periodic_poller/jvm.rb
+index e7c716f6633..60b325879e8 100644
+--- a/logstash-core/lib/logstash/instrument/periodic_poller/jvm.rb
++++ b/logstash-core/lib/logstash/instrument/periodic_poller/jvm.rb
+@@ -2,18 +2,19 @@
+ require "logstash/instrument/periodic_poller/base"
+ require "logstash/instrument/periodic_poller/load_average"
+ require "logstash/environment"
+-require "jrmonitor"
+ require "set"
+ 
++java_import 'com.sun.management.UnixOperatingSystemMXBean'
+ java_import 'java.lang.management.ManagementFactory'
+ java_import 'java.lang.management.OperatingSystemMXBean'
+ java_import 'java.lang.management.GarbageCollectorMXBean'
+ java_import 'java.lang.management.RuntimeMXBean'
+-java_import 'com.sun.management.UnixOperatingSystemMXBean'
+ java_import 'javax.management.MBeanServer'
+ java_import 'javax.management.ObjectName'
+ java_import 'javax.management.AttributeList'
+ java_import 'javax.naming.directory.Attribute'
++java_import 'org.logstash.instrument.reports.MemoryReport'
++java_import 'org.logstash.instrument.reports.ProcessReport'
+ 
+ 
+ module LogStash module Instrument module PeriodicPoller
+@@ -50,7 +51,7 @@ def initialize(metric, options = {})
+     end
+ 
+     def collect
+-      raw = JRMonitor.memory.generate
++      raw = MemoryReport.generate
+       collect_jvm_metrics(raw)
+       collect_pools_metrics(raw)
+       collect_threads_metrics
+@@ -81,11 +82,10 @@ def collect_threads_metrics
+     end
+ 
+     def collect_process_metrics
+-      process_metrics = JRMonitor.process.generate
++      process_metrics = ProcessReport.generate
+ 
+       path = [:jvm, :process]
+ 
+-
+       open_fds = process_metrics["open_file_descriptors"]
+       if @peak_open_fds.nil? || open_fds > @peak_open_fds
+         @peak_open_fds = open_fds
+diff --git a/logstash-core/lib/logstash/modules.rb b/logstash-core/lib/logstash/modules.rb
+new file mode 100644
+index 00000000000..19ef45a10ff
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules.rb
+@@ -0,0 +1,44 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++require "erb"
++
++class LogStash::Modules
++  include LogStash::Util::Loggable
++
++  attr_reader :module_name
++  def initialize(name, directory)
++    @module_name = name
++    @directory = directory  
++  end
++
++  def template
++    ::File.join(@directory, "logstash/#{@module_name}.conf.erb")
++  end
++
++  class ModuleConfig
++
++    def initialize(template, settings)
++      @template = template
++      @settings = settings
++    end
++
++    def setting(value, default)
++      @settings.fetch(value, default)
++    end
++
++    def render
++      # process the template and settings
++      # send back as a string with no newlines (the '>' part)
++      renderer = ERB.new(File.read(@template), 3, '>')
++      renderer.result(binding)
++    end
++  end
++
++  def config_string(settings = {})
++    # settings should be the subset from the YAML file with a structure like
++    # {"name" => "plugin name", "k1" => "v1", "k2" => "v2"}, etc.
++    ModuleConfig.new(template, settings).render
++  end
++
++end # class LogStash::Modules
+\ No newline at end of file
+diff --git a/logstash-core/lib/logstash/modules_cli_parser.rb b/logstash-core/lib/logstash/modules_cli_parser.rb
+new file mode 100644
+index 00000000000..1fdad9b3e18
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules_cli_parser.rb
+@@ -0,0 +1,76 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++require "logstash/errors"
++
++class LogStash::ModulesCLIParser
++  include LogStash::Util::Loggable
++
++  attr_reader :output
++  def initialize(module_names, module_variables)
++    @output = []
++    # The #compact here catches instances when module_variables may be nil or 
++    # [nil] and sets it to []
++    parse_it(module_names, Array(module_variables).compact)
++  end
++
++  def parse_modules(module_list)
++    parsed_modules = []
++    module_list.each do |module_value|
++      # Calling --modules but not filling it results in [nil], so skip that.
++      next if module_value.nil?
++      # Catch if --modules was launched empty but an option/flag (-something) 
++      # follows immediately after
++      if module_value.start_with?('-')
++        raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.modules-empty-value", :modules => module_names)
++      end
++      parsed_modules.concat module_value.split(',')
++    end
++    parsed_modules
++  end
++
++  def get_kv(module_name, unparsed)
++    # Ensure that there is at least 1 equals sign in our variable string
++    if unparsed.split('=').length >= 2
++      # This hackery is to catch the possibility of an equals (`=`) sign 
++      # in a passphrase, which might result in an incomplete key.  The 
++      # portion before the first `=` should always be the key, leaving 
++      # the rest to be the value
++      values = unparsed.split('=')
++      k = values.shift
++      return k,values.join('=')
++    else
++      raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.modules-variables-malformed", :rawvar => (module_name + '.' + unparsed))
++    end
++  end
++
++  def name_splitter(unparsed)
++    # It must have at least `modulename.var.PLUGINTYPE.PLUGINNAME.VARNAME`
++    if unparsed.split('.').length >= 5
++      elements = unparsed.split('.')
++      module_name = elements.shift
++      return module_name,elements.join('.')
++    else
++      raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.modules-variables-malformed", :rawvar => unparsed)
++    end 
++  end
++
++  def parse_vars(module_name, vars_list)
++    module_hash = {"name" => module_name}
++    vars_list.each do |unparsed|
++      extracted_name, modvar = name_splitter(unparsed)
++      next if extracted_name != module_name
++      k, v = get_kv(extracted_name, modvar)
++      module_hash[k] = v 
++    end
++    module_hash
++  end
++  
++  def parse_it(module_list, module_variable_list)
++    if module_list.is_a?(Array)
++      parse_modules(module_list).each do |module_name| 
++        @output << parse_vars(module_name, module_variable_list)
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/logstash-core/lib/logstash/plugins/registry.rb b/logstash-core/lib/logstash/plugins/registry.rb
+index 7def8c4f3d5..d751c32f8cb 100644
+--- a/logstash-core/lib/logstash/plugins/registry.rb
++++ b/logstash-core/lib/logstash/plugins/registry.rb
+@@ -3,6 +3,7 @@
+ require "logstash/util/loggable"
+ require "logstash/plugin"
+ require "logstash/plugins/hooks_registry"
++require "logstash/modules"
+ 
+ module LogStash module Plugins
+   class Registry
+diff --git a/logstash-core/lib/logstash/runner.rb b/logstash-core/lib/logstash/runner.rb
+index 9f073e30696..b5352f6b01d 100644
+--- a/logstash-core/lib/logstash/runner.rb
++++ b/logstash-core/lib/logstash/runner.rb
+@@ -9,6 +9,7 @@
+ require "logstash/namespace"
+ require "logstash-core/logstash-core"
+ require "logstash/environment"
++require "logstash/modules_cli_parser"
+ 
+ LogStash::Environment.load_locale!
+ 
+@@ -61,6 +62,17 @@ class LogStash::Runner < Clamp::StrictCommand
+     :default => LogStash::SETTINGS.get_default("config.string"),
+     :attribute_name => "config.string"
+ 
++  # Module settings
++  option ["--modules"], "MODULES",
++    I18n.t("logstash.runner.flag.modules"),
++    :multivalued => true,
++    :attribute_name => "modules_list"
++
++  option ["-M", "--modules.variable"], "MODULES_VARIABLE", 
++    I18n.t("logstash.runner.flag.modules_variable"),
++    :multivalued => true,
++    :attribute_name => "modules_variable_list"
++
+   # Pipeline settings
+   option ["-w", "--pipeline.workers"], "COUNT",
+     I18n.t("logstash.runner.flag.pipeline-workers"),
+@@ -175,6 +187,7 @@ def initialize(*args)
+     # Default we check local sources: `-e`, `-f` and the logstash.yml options.
+     @source_loader = LogStash::Config::SourceLoader.new(@settings)
+     @source_loader.add_source(LogStash::Config::Source::Local.new(@settings))
++    @source_loader.add_source(LogStash::Config::Source::Modules.new(@settings))
+ 
+     super(*args)
+   end
+@@ -248,6 +261,10 @@ def execute
+ 
+     return start_shell(setting("interactive"), binding) if setting("interactive")
+ 
++    module_parser = LogStash::ModulesCLIParser.new(@modules_list, @modules_variable_list)
++    # Now populate Setting for modules.list with our parsed array.
++    @settings.set("modules.cli", module_parser.output)
++
+     begin
+       @bootstrap_checks.each { |bootstrap| bootstrap.check(@settings) }
+     rescue LogStash::BootstrapCheckError => e
+diff --git a/logstash-core/lib/logstash/util/thread_dump.rb b/logstash-core/lib/logstash/util/thread_dump.rb
+index 11d1a8da066..800e6c06b29 100644
+--- a/logstash-core/lib/logstash/util/thread_dump.rb
++++ b/logstash-core/lib/logstash/util/thread_dump.rb
+@@ -1,4 +1,6 @@
+ # encoding: utf-8
++java_import 'org.logstash.instrument.reports.ThreadsReport'
++
+ module LogStash
+   module Util
+     class ThreadDump
+@@ -10,7 +12,7 @@ class ThreadDump
+ 
+       def initialize(options={})
+         @options   = options
+-        @dump = options.fetch(:dump, JRMonitor.threads.generate({}))
++        @dump = options.fetch(:dump, ThreadsReport.generate({}))
+         @top_count = options.fetch(:threads, THREADS_COUNT_DEFAULT)
+         @ignore    = options.fetch(:ignore_idle_threads, IGNORE_IDLE_THREADS_DEFAULT)
+       end
+diff --git a/logstash-core/locales/en.yml b/logstash-core/locales/en.yml
+index e1ae825c358..f96fd449b1f 100644
+--- a/logstash-core/locales/en.yml
++++ b/logstash-core/locales/en.yml
+@@ -85,6 +85,18 @@ en:
+       logging:
+         unrecognized_option: |-
+           unrecognized option [%{option}]
++    modules:
++      configuration:
++        parse-failed: |-
++          Failed to parse the module configuration: [%{error}]
++        modules-must-be-unique: >-
++          Only a single instance of any module can be run at a time. List of 
++          modules specified: %{duplicate_modules}
++        modules-empty-value: >-
++          Empty value provided for --modules
++        modules-variables-malformed: >-
++          Failed to parse module variable %{rawvar}.  Must be in -M
++          "MODULE_NAME.var.PLUGIN_TYPE.PLUGIN_NAME.VARIABLE_NAME=VALUE" format
+     runner:
+       short-help: |-
+         usage:
+@@ -100,6 +112,9 @@ en:
+         the '-f yourlogstash.conf' flag?
+       config-string-path-exclusive:
+         Settings 'path.config' (-f) and 'config.string' (-e) can't be used simultaneously.
++      config-module-exclusive: >-
++        Settings 'path.config' (-f) or 'config.string' (-e) can't be used in conjunction with
++        (--modules) or the "modules:" block in the logstash.yml file.
+       reload-without-config-path: >-
+         Configuration reloading also requires passing a configuration path with '-f yourlogstash.conf'
+       locked-data-path: >-
+@@ -185,6 +200,24 @@ en:
+           "%{default_output}"
+           If you wish to use both defaults, please use
+           the empty string for the '-e' flag.
++        modules: |+
++          Load Logstash modules.
++          Modules can be defined using multiple instances 
++          '--modules module1 --modules module2', 
++             or comma-separated syntax 
++          '--modules=module1,module2' 
++          Cannot be used in conjunction with '-e' or '-f'
++          Use of '--modules' will override modules declared
++          in the 'logstash.yml' file.
++        modules_variable: |+
++          Load variables for module template.
++          Multiple instances of '-M' or 
++          '--modules.variable' are supported.
++          Ignored if '--modules' flag is not used.
++          Should be in the format of 
++          '-M "MODULE_NAME.var.PLUGIN_TYPE.PLUGIN_NAME.VARIABLE_NAME=VALUE"'
++          as in 
++          '-M "example.var.filter.mutate.fieldname=fieldvalue"'
+         configtest: |+
+           Check configuration for valid syntax and then exit.
+         http_host: Web API binding host
+diff --git a/logstash-core/logstash-core.gemspec b/logstash-core/logstash-core.gemspec
+index 9b49728d2b6..2aee9a33797 100644
+--- a/logstash-core/logstash-core.gemspec
++++ b/logstash-core/logstash-core.gemspec
+@@ -33,7 +33,6 @@ Gem::Specification.new do |gem|
+   gem.add_runtime_dependency 'puma', '~> 2.16'
+   gem.add_runtime_dependency "jruby-openssl", "0.9.16" # >= 0.9.13 Required to support TLSv1.2
+   gem.add_runtime_dependency "chronic_duration", "0.10.6"
+-  gem.add_runtime_dependency "jrmonitor", '~> 0.4.2'
+ 
+   # TODO(sissel): Treetop 1.5.x doesn't seem to work well, but I haven't
+   # investigated what the cause might be. -Jordan
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/io/AbstractByteBufferPageIO.java b/logstash-core/src/main/java/org/logstash/ackedqueue/io/AbstractByteBufferPageIO.java
+index 32f350dfb15..0f543beee00 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/io/AbstractByteBufferPageIO.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/io/AbstractByteBufferPageIO.java
+@@ -12,7 +12,6 @@
+ public abstract class AbstractByteBufferPageIO implements PageIO {
+ 
+     public class PageIOInvalidElementException extends IOException {
+-        public PageIOInvalidElementException() { super(); }
+         public PageIOInvalidElementException(String message) { super(message); }
+     }
+ 
+@@ -25,10 +24,8 @@ public class PageIOInvalidVersionException extends IOException {
+     public static final int CHECKSUM_SIZE = Integer.BYTES;
+     public static final int LENGTH_SIZE = Integer.BYTES;
+     public static final int SEQNUM_SIZE = Long.BYTES;
+-    public static final int MIN_RECORD_SIZE = SEQNUM_SIZE + CHECKSUM_SIZE;
+     public static final int HEADER_SIZE = 1;     // version byte
+     public static final int MIN_CAPACITY = VERSION_SIZE + SEQNUM_SIZE + LENGTH_SIZE + 1 + CHECKSUM_SIZE; // header overhead plus elements overhead to hold a single 1 byte element
+-    public static final List<byte[]> EMPTY_READ = new ArrayList<>(0);
+ 
+     public static final boolean VERIFY_CHECKSUM = true;
+     public static final boolean STRICT_CAPACITY = true;
+@@ -37,12 +34,12 @@ public class PageIOInvalidVersionException extends IOException {
+ 
+     protected int capacity; // page capacity is an int per the ByteBuffer class.
+     protected final int pageNum;
+-    protected final List<Integer> offsetMap; // has to be extendable
+     protected long minSeqNum; // TODO: to make minSeqNum final we have to pass in the minSeqNum in the constructor and not set it on first write
+     protected int elementCount;
+     protected int head; // head is the write position and is an int per ByteBuffer class position
+     protected byte version;
+     private CRC32 checkSummer;
++    private final List<Integer> offsetMap; // has to be extendable
+ 
+     public AbstractByteBufferPageIO(int pageNum, int capacity) {
+         this.minSeqNum = 0;
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/monitors/HotThreadsMonitor.java b/logstash-core/src/main/java/org/logstash/instrument/monitors/HotThreadsMonitor.java
+new file mode 100644
+index 00000000000..2ea76fc58c6
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/instrument/monitors/HotThreadsMonitor.java
+@@ -0,0 +1,199 @@
++package org.logstash.instrument.monitors;
++
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++import java.lang.management.ManagementFactory;
++import java.lang.management.ThreadInfo;
++import java.lang.management.ThreadMXBean;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Comparator;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.stream.Collectors;
++
++/**
++ * Hot threads monitoring class. This class pulls information out of the JVM #
++ * provided beans and lest the different consumers query it.
++ * Created by purbon on 12/12/15.
++ */
++public class HotThreadsMonitor {
++
++    private static final String ORDERED_BY = "ordered_by";
++    private static final String STACKTRACE_SIZE = "stacktrace_size";
++    private final Logger logger = LogManager.getLogger(HotThreadsMonitor.class);
++
++    /**
++     * Placeholder for a given thread report
++     */
++    public static class ThreadReport {
++
++        private static final String CPU_TIME = "cpu.time";
++        private static final String BLOCKED_COUNT = "blocked.count";
++        private static final String BLOCKED_TIME = "blocked.time";
++        private static final String WAITED_COUNT = "waited.count";
++        private static final String WAITED_TIME = "waited.time";
++        private static final String THREAD_NAME = "thread.name";
++        private static final String THREAD_STATE = "thread.state";
++        private static final String THREAD_STACKTRACE = "thread.stacktrace";
++
++        private Map<String, Object> map = new HashMap<>();
++
++        ThreadReport(ThreadInfo info, long cpuTime) {
++            map.put(CPU_TIME, cpuTime);
++            map.put(BLOCKED_COUNT, info.getBlockedCount());
++            map.put(BLOCKED_TIME, info.getBlockedTime());
++            map.put(WAITED_COUNT, info.getWaitedCount());
++            map.put(WAITED_TIME, info.getWaitedTime());
++            map.put(THREAD_NAME, info.getThreadName());
++            map.put(THREAD_STATE, info.getThreadState().name().toLowerCase());
++            map.put(THREAD_STACKTRACE, stackTraceAsString(info.getStackTrace()));
++        }
++
++        private List<String> stackTraceAsString(StackTraceElement [] elements) {
++            return Arrays.stream(elements)
++                            .map(StackTraceElement::toString)
++                            .collect(Collectors.toList());
++        }
++
++        public Map<String, Object> toMap() {
++            return map;
++        }
++
++        public String getThreadState() {
++            return (String) map.get(THREAD_STATE);
++        }
++
++        public String getThreadName() {
++            return (String) map.get(THREAD_NAME);
++        }
++
++        @Override
++        public String toString() {
++            StringBuilder sb = new StringBuilder();
++            int i = 0;
++            for (Map.Entry<String, Object> mapEntry: map.entrySet()) {
++                if (i > 0) {
++                    sb.append(",");
++                }
++                sb.append(String.format("%s,%s", mapEntry.getKey(), mapEntry.getValue()));
++                i++;
++            }
++            return sb.toString();
++        }
++
++        Long getWaitedTime() {
++            return (Long)map.get(WAITED_TIME);
++        }
++
++        Long getBlockedTime() {
++            return (Long)map.get(BLOCKED_TIME);
++        }
++
++        Long getCpuTime() {
++            return (Long) map.get(CPU_TIME);
++        }
++    }
++
++    private List<String> VALID_ORDER_BY = new ArrayList<>();
++
++    public HotThreadsMonitor() {
++        VALID_ORDER_BY.add("cpu");
++        VALID_ORDER_BY.add("wait");
++        VALID_ORDER_BY.add("block");
++    }
++
++    /**
++     * Return the current hot threads information as provided by the JVM
++     *
++     * @return A list of ThreadReport including all selected threads
++     */
++    public List<ThreadReport> detect() {
++        Map<String, String> options = new HashMap<String, String>();
++        options.put(ORDERED_BY, "cpu");
++        return detect(options);
++    }
++
++    /**
++     * Return the current hot threads information as provided by the JVM
++     *
++     * @param options Map of options to narrow this method functionality:
++     *                Keys: ordered_by - can be "cpu", "wait" or "block"
++     *                      stacktrace_size - max depth of stack trace
++     * @return A list of ThreadReport including all selected threads
++     */
++    public List<ThreadReport> detect(Map<String, String> options) {
++        String type = "cpu";
++        if (options.containsKey(ORDERED_BY)) {
++            type = options.get(ORDERED_BY);
++            if (!isValidSortOrder(type))
++                throw new IllegalArgumentException("Invalid sort order");
++        }
++
++        Integer threadInfoMaxDepth = 3;
++        if (options.containsKey(STACKTRACE_SIZE)) {
++            threadInfoMaxDepth = Integer.valueOf(options.get(STACKTRACE_SIZE));
++        }
++
++        ThreadMXBean threadMXBean = ManagementFactory.getThreadMXBean();
++        enableCpuTime(threadMXBean);
++
++        Map<Long, ThreadReport> reports = new HashMap<>();
++
++        for (long threadId : threadMXBean.getAllThreadIds()) {
++            if (Thread.currentThread().getId() == threadId) {
++                continue;
++            }
++
++            long cpuTime = threadMXBean.getThreadCpuTime(threadId);
++            if (cpuTime == -1) {
++                continue;
++            }
++            ThreadInfo info = threadMXBean.getThreadInfo(threadId, threadInfoMaxDepth);
++            if (info != null) {
++                /*
++                 * Thread ID must exist and be alive, otherwise the threads just
++                 * died in the meanwhile and could be ignored.
++                 */
++                reports.put(threadId, new ThreadReport(info, cpuTime));
++            }
++        }
++        return sort(new ArrayList<>(reports.values()), type);
++     }
++
++    private List<ThreadReport> sort(List<ThreadReport> reports, final String type) {
++        reports.sort(comparatorForOrderType(type));
++        return reports;
++    }
++
++    private Comparator<ThreadReport> comparatorForOrderType(final String type){
++        if ("block".equals(type)){
++            return Comparator.comparingLong(ThreadReport::getBlockedTime).reversed();
++        } else if ("wait".equals(type)) {
++            return Comparator.comparingLong(ThreadReport::getWaitedTime).reversed();
++        } else{
++            return Comparator.comparingLong(ThreadReport::getCpuTime).reversed();
++        }
++    }
++
++    private boolean isValidSortOrder(String type) {
++        return VALID_ORDER_BY.indexOf(type.toLowerCase()) != -1;
++    }
++
++
++    private void enableCpuTime(ThreadMXBean threadMXBean) {
++        try {
++            if (threadMXBean.isThreadCpuTimeSupported()) {
++                if (!threadMXBean.isThreadCpuTimeEnabled()) {
++                    threadMXBean.setThreadCpuTimeEnabled(true);
++                }
++            }
++        } catch (SecurityException ex) {
++            // This should not happen - the security manager should not be enabled.
++            logger.debug("Cannot enable Thread Cpu Time", ex);
++        }
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/monitors/MemoryMonitor.java b/logstash-core/src/main/java/org/logstash/instrument/monitors/MemoryMonitor.java
+new file mode 100644
+index 00000000000..baa9d272a86
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/instrument/monitors/MemoryMonitor.java
+@@ -0,0 +1,80 @@
++package org.logstash.instrument.monitors;
++
++import java.lang.management.ManagementFactory;
++import java.lang.management.MemoryPoolMXBean;
++import java.lang.management.MemoryType;
++import java.lang.management.MemoryUsage;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * Based on code created by purbon on 13/12/15.
++ */
++public class MemoryMonitor {
++
++    public enum Type {
++        All, Heap, NonHeap
++    }
++
++    public static class Report {
++
++        private static final String USAGE_INIT = "usage.init";
++        private static final String USAGE_COMMITTED = "usage.committed";
++        private static final String USAGE_USED = "usage.used";
++        private static final String USAGE_MAX = "usage.max";
++        private static final String PEAK_INIT = "peak.init";
++        private static final String PEAK_COMMITTED = "peak.committed";
++        private static final String PEAK_USED = "peak.used";
++        private static final String PEAK_MAX = "peak.max";
++
++        private Map<String, Map<String, Object>> heapMap = new HashMap<>();
++        private Map<String, Map<String, Object>> nonHeapMap = new HashMap<>();
++
++        private Report() {}
++
++        public Map<String, Map<String, Object>> getHeap() {
++            return heapMap;
++        }
++
++        public Map<String, Map<String, Object>> getNonHeap() {
++            return nonHeapMap;
++        }
++
++        void addMemoryBeanInfo(MemoryPoolMXBean bean){
++            Map<String, Map<String, Object>> memoryMap = bean.getType().equals(MemoryType.HEAP) ? heapMap : nonHeapMap;
++            Map<String, Object> beanMap = memoryMap.computeIfAbsent(bean.getName(), k -> new HashMap<>());
++            addUsage(beanMap, bean.getUsage());
++            addPeak(beanMap, bean.getPeakUsage());
++        }
++
++        private void addUsage(Map<String, Object> map, MemoryUsage usage){
++            map.put(USAGE_INIT, usage.getInit());
++            map.put(USAGE_COMMITTED, usage.getCommitted());
++            map.put(USAGE_USED, usage.getUsed());
++            map.put(USAGE_MAX, usage.getMax());
++        }
++
++        private void addPeak(Map<String, Object> map, MemoryUsage peak){
++            map.put(PEAK_INIT, peak.getInit());
++            map.put(PEAK_COMMITTED, peak.getCommitted());
++            map.put(PEAK_USED, peak.getUsed());
++            map.put(PEAK_MAX, peak.getMax());
++        }
++     }
++
++     public Report detect(Type selectType){
++        List<MemoryPoolMXBean> beans = ManagementFactory.getMemoryPoolMXBeans();
++        Report report = new Report();
++
++        beans.stream().filter(bean -> (selectType.equals(Type.All))
++                                       || !filterPool(bean.getType(), selectType))
++                      .forEach(report::addMemoryBeanInfo);
++        return report;
++    }
++
++    private boolean filterPool(MemoryType type, Type selectType) {
++       return ((selectType.equals(Type.NonHeap) && type.equals(MemoryType.HEAP))
++               || (selectType.equals(Type.Heap) && type.equals(MemoryType.NON_HEAP)));
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/monitors/ProcessMonitor.java b/logstash-core/src/main/java/org/logstash/instrument/monitors/ProcessMonitor.java
+new file mode 100644
+index 00000000000..ab7dfb7c234
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/instrument/monitors/ProcessMonitor.java
+@@ -0,0 +1,81 @@
++package org.logstash.instrument.monitors;
++
++import com.sun.management.UnixOperatingSystemMXBean;
++
++import javax.management.MBeanServer;
++import java.lang.management.ManagementFactory;
++import java.lang.management.OperatingSystemMXBean;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Objects;
++
++/**
++ * Created by andrewvc on 5/12/16.
++ */
++public class ProcessMonitor {
++    private static final OperatingSystemMXBean osMxBean = ManagementFactory.getOperatingSystemMXBean();
++    private static final MBeanServer platformMxBean = ManagementFactory.getPlatformMBeanServer();
++
++    public static class Report {
++        private long memTotalVirtualInBytes = -1;
++        private short cpuSystemPercent = -4;
++        private short cpuProcessPercent = -3;
++        private long cpuMillisTotal = -1;
++        private boolean isUnix;
++        private long openFds = -1;
++        private long maxFds = -1;
++
++        private Map<String, Object> map = new HashMap<>();
++
++        Report() {
++            this.isUnix = osMxBean instanceof UnixOperatingSystemMXBean;
++            // Defaults are -1
++            if (this.isUnix) {
++                UnixOperatingSystemMXBean unixOsBean = (UnixOperatingSystemMXBean) osMxBean;;
++
++                this.openFds = unixOsBean.getOpenFileDescriptorCount();
++                this.maxFds =  unixOsBean.getMaxFileDescriptorCount();
++
++                this.cpuMillisTotal = unixOsBean.getProcessCpuTime();
++                this.cpuProcessPercent = scaleLoadToPercent(unixOsBean.getProcessCpuLoad());
++                this.cpuSystemPercent = scaleLoadToPercent(unixOsBean.getSystemCpuLoad());
++
++                this.memTotalVirtualInBytes = unixOsBean.getCommittedVirtualMemorySize();
++            }
++        }
++
++        public Map<String, Object> toMap() {
++            map.put("open_file_descriptors", this.openFds);
++            map.put("max_file_descriptors", this.maxFds);
++            map.put("is_unix", this.isUnix);
++
++            Map<String, Object> cpuMap = new HashMap<>();
++            map.put("cpu", cpuMap);
++            cpuMap.put("total_in_millis", this.cpuMillisTotal);
++            cpuMap.put("process_percent", this.cpuProcessPercent);
++            cpuMap.put("system_percent", this.cpuSystemPercent);
++
++            Map<String, Object> memoryMap = new HashMap<>();
++            map.put("mem", memoryMap);
++            memoryMap.put("total_virtual_in_bytes", this.memTotalVirtualInBytes);
++
++            return map;
++        }
++
++        private short scaleLoadToPercent(double load) {
++            if (osMxBean instanceof UnixOperatingSystemMXBean) {
++                if (load >= 0) {
++                    return (short) (load * 100);
++                } else {
++                    return -1;
++                }
++            } else {
++                return -1;
++            }
++        }
++    }
++
++    public Report detect() {
++        return new Report();
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/monitors/SystemMonitor.java b/logstash-core/src/main/java/org/logstash/instrument/monitors/SystemMonitor.java
+new file mode 100644
+index 00000000000..57456c3721d
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/instrument/monitors/SystemMonitor.java
+@@ -0,0 +1,39 @@
++package org.logstash.instrument.monitors;
++
++import java.lang.management.ManagementFactory;
++import java.lang.management.OperatingSystemMXBean;
++import java.util.HashMap;
++import java.util.Map;
++
++/**
++ * System information as returned by the different JVM's MxBeans
++ * Created by purbon on 13/12/15.
++ */
++public class SystemMonitor {
++
++    public static class Report {
++
++        private static final String OS_NAME = "os.name";
++        private static final String OS_VERSION = "os.version";
++        private static final String OS_ARCH = "os.arch";
++        private static final String SYSTEM_AVAILABLE_PROCESSORS = "system.available_processors";
++        private static final String SYSTEM_LOAD_AVERAGE = "system.load_average";
++        private Map<String, Object> map = new HashMap<>();
++
++        Report(OperatingSystemMXBean osBean) {
++            map.put(OS_NAME, osBean.getName());
++            map.put(OS_VERSION, osBean.getVersion());
++            map.put(OS_ARCH, osBean.getArch());
++            map.put(SYSTEM_AVAILABLE_PROCESSORS, osBean.getAvailableProcessors());
++            map.put(SYSTEM_LOAD_AVERAGE, osBean.getSystemLoadAverage());
++        }
++
++        public Map<String, Object> toMap() {
++            return map;
++        }
++    }
++
++    public Report detect() {
++        return new Report(ManagementFactory.getOperatingSystemMXBean());
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/reports/MemoryReport.java b/logstash-core/src/main/java/org/logstash/instrument/reports/MemoryReport.java
+new file mode 100644
+index 00000000000..01cf5afdead
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/instrument/reports/MemoryReport.java
+@@ -0,0 +1,33 @@
++package org.logstash.instrument.reports;
++
++import org.jruby.*;
++import org.jruby.runtime.builtin.IRubyObject;
++import org.logstash.instrument.monitors.MemoryMonitor;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++public class MemoryReport {
++
++    private static final String NON_HEAP = "non_heap";
++    private static final String HEAP = "heap";
++
++    /**
++     * Build a report with current Memory information
++     * @return
++     */
++    public static Map<String, Map<String, Map<String, Object>>> generate() {
++        MemoryMonitor.Report report = generateReport(MemoryMonitor.Type.All);
++        Map<String, Map<String, Map<String, Object>>> container = new HashMap<>();
++        container.put(HEAP, report.getHeap());
++        container.put(NON_HEAP, report.getNonHeap());
++        return container;
++    }
++
++    private static MemoryMonitor.Report generateReport(MemoryMonitor.Type type) {
++        return new MemoryMonitor().detect(type);
++    }
++}
++
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/reports/ProcessReport.java b/logstash-core/src/main/java/org/logstash/instrument/reports/ProcessReport.java
+new file mode 100644
+index 00000000000..c618341fe5b
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/instrument/reports/ProcessReport.java
+@@ -0,0 +1,17 @@
++package org.logstash.instrument.reports;
++
++import org.logstash.instrument.monitors.ProcessMonitor;
++
++import java.util.Map;
++
++public class ProcessReport {
++    private ProcessReport() { }
++
++    /**
++     * Build a report with current Process information
++     * @return a Map with the current process report
++     */
++    public static Map<String, Object> generate() {
++        return new ProcessMonitor().detect().toMap();
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/reports/SystemReport.java b/logstash-core/src/main/java/org/logstash/instrument/reports/SystemReport.java
+new file mode 100644
+index 00000000000..3c401f2c6e2
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/instrument/reports/SystemReport.java
+@@ -0,0 +1,21 @@
++package org.logstash.instrument.reports;
++
++
++import org.logstash.instrument.monitors.SystemMonitor;
++
++import java.util.Map;
++
++/**
++ * Created by purbon on 12/12/15.
++ */
++ public class SystemReport {
++
++    /**
++     * Build a report with current System information
++     * @return a Map with the current system report
++     */
++    public static Map<String, Object> generate() {
++        return new SystemMonitor().detect().toMap();
++    }
++}
++
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/reports/ThreadsReport.java b/logstash-core/src/main/java/org/logstash/instrument/reports/ThreadsReport.java
+new file mode 100644
+index 00000000000..3c07adaa945
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/instrument/reports/ThreadsReport.java
+@@ -0,0 +1,45 @@
++package org.logstash.instrument.reports;
++
++import org.logstash.instrument.monitors.HotThreadsMonitor;
++
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.stream.Collectors;
++
++/**
++ * A ThreadsReport object used to hold the hot threads information
++ * Created by purbon on 12/12/15.
++ */
++public class ThreadsReport {
++
++
++    /**
++     * Generate a report with current Thread information
++     * @param options Map of options to narrow this method functionality:
++     *                Keys: ordered_by - can be "cpu", "wait" or "block"
++     *                      stacktrace_size - max depth of stack trace
++     * @return A Map containing hot threads information
++     */
++    public static Map<String, Object> generate(Map<String, String> options) {
++        HotThreadsMonitor reporter = new HotThreadsMonitor();
++        List<HotThreadsMonitor.ThreadReport> reports = reporter.detect(options);
++        return reports
++                .stream()
++                .collect(Collectors
++                    .toMap(HotThreadsMonitor.ThreadReport::getThreadName,
++                           HotThreadsMonitor.ThreadReport::toMap));
++    }
++
++
++    /**
++     * Generate a report with current Thread information
++     * @return A Map containing the hot threads information
++     */
++    public static Map<String, Object> generate() {
++        Map<String, String> options = new HashMap<>();
++        options.put("order_by", "cpu");
++        return generate(options);
++    }
++}
++
+diff --git a/logstash-core/src/test/java/org/logstash/ackedqueue/QueueTest.java b/logstash-core/src/test/java/org/logstash/ackedqueue/QueueTest.java
+index f7bd516ffbd..3a585678c27 100644
+--- a/logstash-core/src/test/java/org/logstash/ackedqueue/QueueTest.java
++++ b/logstash-core/src/test/java/org/logstash/ackedqueue/QueueTest.java
+@@ -14,6 +14,7 @@
+ import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
++import org.junit.After;
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+@@ -23,130 +24,140 @@
+ import static org.hamcrest.CoreMatchers.equalTo;
+ import static org.hamcrest.CoreMatchers.is;
+ import static org.hamcrest.CoreMatchers.notNullValue;
++import static org.hamcrest.CoreMatchers.nullValue;
+ import static org.hamcrest.MatcherAssert.assertThat;
+ import static org.junit.Assert.fail;
+ 
+ public class QueueTest {
+-    @Rule public TemporaryFolder temporaryFolder = new TemporaryFolder();
++
++    @Rule
++    public TemporaryFolder temporaryFolder = new TemporaryFolder();
++
++    private ExecutorService executor;
+ 
+     private String dataPath;
+ 
+     @Before
+     public void setUp() throws Exception {
+         dataPath = temporaryFolder.newFolder("data").getPath();
++        executor = Executors.newSingleThreadExecutor();
++    }
++
++    @After
++    public void tearDown() throws Exception {
++        executor.shutdownNow();
++        if (!executor.awaitTermination(2L, TimeUnit.MINUTES)) {
++            throw new IllegalStateException("Failed to shut down Executor");
++        }
+     }
+ 
+     @Test
+     public void newQueue() throws IOException {
+-        Queue q = new TestQueue(TestSettings.volatileQueueSettings(10));
+-        q.open();
+-
+-        assertThat(q.nonBlockReadBatch(1), is(equalTo(null)));
++        try (Queue q = new TestQueue(TestSettings.volatileQueueSettings(10))) {
++            q.open();
+ 
+-        q.close();
++            assertThat(q.nonBlockReadBatch(1), nullValue());
++        }
+     }
+ 
+     @Test
+     public void singleWriteRead() throws IOException {
+-        Queue q = new TestQueue(TestSettings.volatileQueueSettings(100));
+-        q.open();
+-
+-        Queueable element = new StringElement("foobarbaz");
+-        q.write(element);
++        try (Queue q = new TestQueue(TestSettings.volatileQueueSettings(100))) {
++            q.open();
+ 
+-        Batch b = q.nonBlockReadBatch(1);
++            Queueable element = new StringElement("foobarbaz");
++            q.write(element);
+ 
+-        assertThat(b.getElements().size(), is(equalTo(1)));
+-        assertThat(b.getElements().get(0).toString(), is(equalTo(element.toString())));
+-        assertThat(q.nonBlockReadBatch(1), is(equalTo(null)));
++            Batch b = q.nonBlockReadBatch(1);
+ 
+-        q.close();
++            assertThat(b.getElements().size(), is(1));
++            assertThat(b.getElements().get(0).toString(), is(element.toString()));
++            assertThat(q.nonBlockReadBatch(1), nullValue());
++        }
+     }
+ 
+     @Test
+     public void singleWriteMultiRead() throws IOException {
+-        Queue q = new TestQueue(TestSettings.volatileQueueSettings(100));
+-        q.open();
+-
+-        Queueable element = new StringElement("foobarbaz");
+-        q.write(element);
++        try (Queue q = new TestQueue(TestSettings.volatileQueueSettings(100))) {
++            q.open();
+ 
+-        Batch b = q.nonBlockReadBatch(2);
++            Queueable element = new StringElement("foobarbaz");
++            q.write(element);
+ 
+-        assertThat(b.getElements().size(), is(equalTo(1)));
+-        assertThat(b.getElements().get(0).toString(), is(equalTo(element.toString())));
+-        assertThat(q.nonBlockReadBatch(2), is(equalTo(null)));
++            Batch b = q.nonBlockReadBatch(2);
+ 
+-        q.close();
++            assertThat(b.getElements().size(), is(1));
++            assertThat(b.getElements().get(0).toString(), is(element.toString()));
++            assertThat(q.nonBlockReadBatch(2), nullValue());
++        }
+     }
+ 
+     @Test
+     public void multiWriteSamePage() throws IOException {
+-        Queue q = new TestQueue(TestSettings.volatileQueueSettings(100));
+-        q.open();
+-
+-        List<Queueable> elements = Arrays.asList(new StringElement("foobarbaz1"), new StringElement("foobarbaz2"), new StringElement("foobarbaz3"));
+-
+-        for (Queueable e : elements) {
+-            q.write(e);
+-        }
+-
+-        Batch b = q.nonBlockReadBatch(2);
++        try (Queue q = new TestQueue(TestSettings.volatileQueueSettings(100))) {
++            q.open();
++            List<Queueable> elements = Arrays
++                .asList(new StringElement("foobarbaz1"), new StringElement("foobarbaz2"),
++                    new StringElement("foobarbaz3")
++                );
++            for (Queueable e : elements) {
++                q.write(e);
++            }
+ 
+-        assertThat(b.getElements().size(), is(equalTo(2)));
+-        assertThat(b.getElements().get(0).toString(), is(equalTo(elements.get(0).toString())));
+-        assertThat(b.getElements().get(1).toString(), is(equalTo(elements.get(1).toString())));
++            Batch b = q.nonBlockReadBatch(2);
+ 
+-        b = q.nonBlockReadBatch(2);
++            assertThat(b.getElements().size(), is(2));
++            assertThat(b.getElements().get(0).toString(), is(elements.get(0).toString()));
++            assertThat(b.getElements().get(1).toString(), is(elements.get(1).toString()));
+ 
+-        assertThat(b.getElements().size(), is(equalTo(1)));
+-        assertThat(b.getElements().get(0).toString(), is(equalTo(elements.get(2).toString())));
++            b = q.nonBlockReadBatch(2);
+ 
+-        q.close();
++            assertThat(b.getElements().size(), is(1));
++            assertThat(b.getElements().get(0).toString(), is(elements.get(2).toString()));
++        }
+     }
+ 
+     @Test
+     public void writeMultiPage() throws IOException {
+         List<Queueable> elements = Arrays.asList(new StringElement("foobarbaz1"), new StringElement("foobarbaz2"), new StringElement("foobarbaz3"), new StringElement("foobarbaz4"));
+         int singleElementCapacity = ByteBufferPageIO.HEADER_SIZE + ByteBufferPageIO._persistedByteCount(elements.get(0).serialize().length);
++        try (TestQueue q = new TestQueue(
++            TestSettings.volatileQueueSettings(2 * singleElementCapacity))) {
++            q.open();
+ 
+-        TestQueue q = new TestQueue(TestSettings.volatileQueueSettings(2 * singleElementCapacity));
+-        q.open();
+-
+-        for (Queueable e : elements) {
+-            q.write(e);
+-        }
+-
+-        // total of 2 pages: 1 head and 1 tail
+-        assertThat(q.getTailPages().size(), is(equalTo(1)));
++            for (Queueable e : elements) {
++                q.write(e);
++            }
+ 
+-        assertThat(q.getTailPages().get(0).isFullyRead(), is(equalTo(false)));
+-        assertThat(q.getTailPages().get(0).isFullyAcked(), is(equalTo(false)));
+-        assertThat(q.getHeadPage().isFullyRead(), is(equalTo(false)));
+-        assertThat(q.getHeadPage().isFullyAcked(), is(equalTo(false)));
++            // total of 2 pages: 1 head and 1 tail
++            assertThat(q.getTailPages().size(), is(1));
+ 
+-        Batch b = q.nonBlockReadBatch(10);
+-        assertThat(b.getElements().size(), is(equalTo(2)));
++            assertThat(q.getTailPages().get(0).isFullyRead(), is(false));
++            assertThat(q.getTailPages().get(0).isFullyAcked(), is(false));
++            assertThat(q.getHeadPage().isFullyRead(), is(false));
++            assertThat(q.getHeadPage().isFullyAcked(), is(false));
+ 
+-        assertThat(q.getTailPages().size(), is(equalTo(1)));
++            Batch b = q.nonBlockReadBatch(10);
++            assertThat(b.getElements().size(), is(2));
+ 
+-        assertThat(q.getTailPages().get(0).isFullyRead(), is(equalTo(true)));
+-        assertThat(q.getTailPages().get(0).isFullyAcked(), is(equalTo(false)));
+-        assertThat(q.getHeadPage().isFullyRead(), is(equalTo(false)));
+-        assertThat(q.getHeadPage().isFullyAcked(), is(equalTo(false)));
++            assertThat(q.getTailPages().size(), is(1));
+ 
+-        b = q.nonBlockReadBatch(10);
+-        assertThat(b.getElements().size(), is(equalTo(2)));
++            assertThat(q.getTailPages().get(0).isFullyRead(), is(true));
++            assertThat(q.getTailPages().get(0).isFullyAcked(), is(false));
++            assertThat(q.getHeadPage().isFullyRead(), is(false));
++            assertThat(q.getHeadPage().isFullyAcked(), is(false));
+ 
+-        assertThat(q.getTailPages().get(0).isFullyRead(), is(equalTo(true)));
+-        assertThat(q.getTailPages().get(0).isFullyAcked(), is(equalTo(false)));
+-        assertThat(q.getHeadPage().isFullyRead(), is(equalTo(true)));
+-        assertThat(q.getHeadPage().isFullyAcked(), is(equalTo(false)));
++            b = q.nonBlockReadBatch(10);
++            assertThat(b.getElements().size(), is(2));
+ 
+-        b = q.nonBlockReadBatch(10);
+-        assertThat(b, is(equalTo(null)));
++            assertThat(q.getTailPages().get(0).isFullyRead(), is(true));
++            assertThat(q.getTailPages().get(0).isFullyAcked(), is(false));
++            assertThat(q.getHeadPage().isFullyRead(), is(true));
++            assertThat(q.getHeadPage().isFullyAcked(), is(false));
+ 
+-        q.close();
++            b = q.nonBlockReadBatch(10);
++            assertThat(b, nullValue());
++        }
+     }
+ 
+ 
+@@ -154,42 +165,41 @@ public void writeMultiPage() throws IOException {
+     public void writeMultiPageWithInOrderAcking() throws IOException {
+         List<Queueable> elements = Arrays.asList(new StringElement("foobarbaz1"), new StringElement("foobarbaz2"), new StringElement("foobarbaz3"), new StringElement("foobarbaz4"));
+         int singleElementCapacity = ByteBufferPageIO.HEADER_SIZE + ByteBufferPageIO._persistedByteCount(elements.get(0).serialize().length);
++        try (TestQueue q = new TestQueue(
++            TestSettings.volatileQueueSettings(2 * singleElementCapacity))) {
++            q.open();
+ 
+-        TestQueue q = new TestQueue(TestSettings.volatileQueueSettings(2 * singleElementCapacity));
+-        q.open();
+-
+-        for (Queueable e : elements) {
+-            q.write(e);
+-        }
+-
+-        Batch b = q.nonBlockReadBatch(10);
++            for (Queueable e : elements) {
++                q.write(e);
++            }
+ 
+-        assertThat(b.getElements().size(), is(equalTo(2)));
+-        assertThat(q.getTailPages().size(), is(equalTo(1)));
++            Batch b = q.nonBlockReadBatch(10);
+ 
+-        // lets keep a ref to that tail page before acking
+-        TailPage tailPage = q.getTailPages().get(0);
++            assertThat(b.getElements().size(), is(2));
++            assertThat(q.getTailPages().size(), is(1));
+ 
+-        assertThat(tailPage.isFullyRead(), is(equalTo(true)));
++            // lets keep a ref to that tail page before acking
++            TailPage tailPage = q.getTailPages().get(0);
+ 
+-        // ack first batch which includes all elements from tailPages
+-        b.close();
++            assertThat(tailPage.isFullyRead(), is(true));
+ 
+-        assertThat(q.getTailPages().size(), is(equalTo(0)));
+-        assertThat(tailPage.isFullyRead(), is(equalTo(true)));
+-        assertThat(tailPage.isFullyAcked(), is(equalTo(true)));
++            // ack first batch which includes all elements from tailPages
++            b.close();
+ 
+-        b = q.nonBlockReadBatch(10);
++            assertThat(q.getTailPages().size(), is(0));
++            assertThat(tailPage.isFullyRead(), is(true));
++            assertThat(tailPage.isFullyAcked(), is(true));
+ 
+-        assertThat(b.getElements().size(), is(equalTo(2)));
+-        assertThat(q.getHeadPage().isFullyRead(), is(equalTo(true)));
+-        assertThat(q.getHeadPage().isFullyAcked(), is(equalTo(false)));
++            b = q.nonBlockReadBatch(10);
+ 
+-        b.close();
++            assertThat(b.getElements().size(), is(2));
++            assertThat(q.getHeadPage().isFullyRead(), is(true));
++            assertThat(q.getHeadPage().isFullyAcked(), is(false));
+ 
+-        assertThat(q.getHeadPage().isFullyAcked(), is(equalTo(true)));
++            b.close();
+ 
+-        q.close();
++            assertThat(q.getHeadPage().isFullyAcked(), is(true));
++        }
+     }
+ 
+     @Test
+@@ -202,83 +212,82 @@ public void writeMultiPageWithInOrderAckingCheckpoints() throws IOException {
+             TestSettings.volatileQueueSettings(2 * singleElementCapacity)
+         ).checkpointMaxWrites(1024) // arbitrary high enough threshold so that it's not reached (default for TestSettings is 1)
+         .build();
+-        TestQueue q = new TestQueue(settings);
+-        q.open();
+-
+-        assertThat(q.getHeadPage().getPageNum(), is(equalTo(0)));
+-        Checkpoint c = q.getCheckpointIO().read("checkpoint.head");
+-        assertThat(c.getPageNum(), is(equalTo(0)));
+-        assertThat(c.getElementCount(), is(equalTo(0)));
+-        assertThat(c.getMinSeqNum(), is(equalTo(0L)));
+-        assertThat(c.getFirstUnackedSeqNum(), is(equalTo(0L)));
+-        assertThat(c.getFirstUnackedPageNum(), is(equalTo(0)));
+-
+-        for (Queueable e : elements1) {
+-            q.write(e);
+-        }
++        try (TestQueue q = new TestQueue(settings)) {
++            q.open();
+ 
+-        c = q.getCheckpointIO().read("checkpoint.head");
+-        assertThat(c.getPageNum(), is(equalTo(0)));
+-        assertThat(c.getElementCount(), is(equalTo(0)));
+-        assertThat(c.getMinSeqNum(), is(equalTo(0L)));
+-        assertThat(c.getFirstUnackedSeqNum(), is(equalTo(0L)));
+-        assertThat(c.getFirstUnackedPageNum(), is(equalTo(0)));
+-
+-//        assertThat(elements1.get(1).getSeqNum(), is(equalTo(2L)));
+-        q.ensurePersistedUpto(2);
+-
+-        c = q.getCheckpointIO().read("checkpoint.head");
+-        assertThat(c.getPageNum(), is(equalTo(0)));
+-        assertThat(c.getElementCount(), is(equalTo(2)));
+-        assertThat(c.getMinSeqNum(), is(equalTo(1L)));
+-        assertThat(c.getFirstUnackedSeqNum(), is(equalTo(1L)));
+-        assertThat(c.getFirstUnackedPageNum(), is(equalTo(0)));
+-
+-        for (Queueable e : elements2) {
+-            q.write(e);
+-        }
++            assertThat(q.getHeadPage().getPageNum(), is(0));
++            Checkpoint c = q.getCheckpointIO().read("checkpoint.head");
++            assertThat(c.getPageNum(), is(0));
++            assertThat(c.getElementCount(), is(0));
++            assertThat(c.getMinSeqNum(), is(0L));
++            assertThat(c.getFirstUnackedSeqNum(), is(0L));
++            assertThat(c.getFirstUnackedPageNum(), is(0));
+ 
+-        c = q.getCheckpointIO().read("checkpoint.head");
+-        assertThat(c.getPageNum(), is(equalTo(1)));
+-        assertThat(c.getElementCount(), is(equalTo(0)));
+-        assertThat(c.getMinSeqNum(), is(equalTo(0L)));
+-        assertThat(c.getFirstUnackedSeqNum(), is(equalTo(0L)));
+-        assertThat(c.getFirstUnackedPageNum(), is(equalTo(0)));
+-
+-        c = q.getCheckpointIO().read("checkpoint.0");
+-        assertThat(c.getPageNum(), is(equalTo(0)));
+-        assertThat(c.getElementCount(), is(equalTo(2)));
+-        assertThat(c.getMinSeqNum(), is(equalTo(1L)));
+-        assertThat(c.getFirstUnackedSeqNum(), is(equalTo(1L)));
+-
+-        Batch b = q.nonBlockReadBatch(10);
+-        b.close();
+-
+-        try {
+-            q.getCheckpointIO().read("checkpoint.0");
+-            fail("expected NoSuchFileException thrown");
+-        } catch (NoSuchFileException e) {
+-            // nothing
+-        }
++            for (Queueable e : elements1) {
++                q.write(e);
++            }
+ 
+-        c = q.getCheckpointIO().read("checkpoint.head");
+-        assertThat(c.getPageNum(), is(equalTo(1)));
+-        assertThat(c.getElementCount(), is(equalTo(2)));
+-        assertThat(c.getMinSeqNum(), is(equalTo(3L)));
+-        assertThat(c.getFirstUnackedSeqNum(), is(equalTo(3L)));
+-        assertThat(c.getFirstUnackedPageNum(), is(equalTo(1)));
++            c = q.getCheckpointIO().read("checkpoint.head");
++            assertThat(c.getPageNum(), is(0));
++            assertThat(c.getElementCount(), is(0));
++            assertThat(c.getMinSeqNum(), is(0L));
++            assertThat(c.getFirstUnackedSeqNum(), is(0L));
++            assertThat(c.getFirstUnackedPageNum(), is(0));
+ 
+-        b = q.nonBlockReadBatch(10);
+-        b.close();
++        //  assertThat(elements1.get(1).getSeqNum(), is(2L));
++            q.ensurePersistedUpto(2);
+ 
+-        c = q.getCheckpointIO().read("checkpoint.head");
+-        assertThat(c.getPageNum(), is(equalTo(1)));
+-        assertThat(c.getElementCount(), is(equalTo(2)));
+-        assertThat(c.getMinSeqNum(), is(equalTo(3L)));
+-        assertThat(c.getFirstUnackedSeqNum(), is(equalTo(5L)));
+-        assertThat(c.getFirstUnackedPageNum(), is(equalTo(1)));
++            c = q.getCheckpointIO().read("checkpoint.head");
++            assertThat(c.getPageNum(), is(0));
++            assertThat(c.getElementCount(), is(2));
++            assertThat(c.getMinSeqNum(), is(1L));
++            assertThat(c.getFirstUnackedSeqNum(), is(1L));
++            assertThat(c.getFirstUnackedPageNum(), is(0));
+ 
+-        q.close();
++            for (Queueable e : elements2) {
++                q.write(e);
++            }
++
++            c = q.getCheckpointIO().read("checkpoint.head");
++            assertThat(c.getPageNum(), is(1));
++            assertThat(c.getElementCount(), is(0));
++            assertThat(c.getMinSeqNum(), is(0L));
++            assertThat(c.getFirstUnackedSeqNum(), is(0L));
++            assertThat(c.getFirstUnackedPageNum(), is(0));
++
++            c = q.getCheckpointIO().read("checkpoint.0");
++            assertThat(c.getPageNum(), is(0));
++            assertThat(c.getElementCount(), is(2));
++            assertThat(c.getMinSeqNum(), is(1L));
++            assertThat(c.getFirstUnackedSeqNum(), is(1L));
++
++            Batch b = q.nonBlockReadBatch(10);
++            b.close();
++
++            try {
++                q.getCheckpointIO().read("checkpoint.0");
++                fail("expected NoSuchFileException thrown");
++            } catch (NoSuchFileException e) {
++                // nothing
++            }
++
++            c = q.getCheckpointIO().read("checkpoint.head");
++            assertThat(c.getPageNum(), is(1));
++            assertThat(c.getElementCount(), is(2));
++            assertThat(c.getMinSeqNum(), is(3L));
++            assertThat(c.getFirstUnackedSeqNum(), is(3L));
++            assertThat(c.getFirstUnackedPageNum(), is(1));
++
++            b = q.nonBlockReadBatch(10);
++            b.close();
++
++            c = q.getCheckpointIO().read("checkpoint.head");
++            assertThat(c.getPageNum(), is(1));
++            assertThat(c.getElementCount(), is(2));
++            assertThat(c.getMinSeqNum(), is(3L));
++            assertThat(c.getFirstUnackedSeqNum(), is(5L));
++            assertThat(c.getFirstUnackedPageNum(), is(1));
++        }
+     }
+ 
+     @Test
+@@ -296,32 +305,31 @@ public void randomAcking() throws IOException {
+                 elements.add(new StringElement(String.format("%0" + digits + "d", i)));
+             }
+             int singleElementCapacity = ByteBufferPageIO.HEADER_SIZE + ByteBufferPageIO._persistedByteCount(elements.get(0).serialize().length);
+-
+-            TestQueue q = new TestQueue(TestSettings.volatileQueueSettings(singleElementCapacity));
+-            q.open();
+-
+-            for (Queueable e : elements) {
+-                q.write(e);
+-            }
+-
+-            assertThat(q.getTailPages().size(), is(equalTo(page_count - 1)));
+-
+-            // first read all elements
+-            List<Batch> batches = new ArrayList<>();
+-            for (Batch b = q.nonBlockReadBatch(1); b != null; b = q.nonBlockReadBatch(1)) {
+-                batches.add(b);
+-            }
+-            assertThat(batches.size(), is(equalTo(page_count)));
+-
+-            // then ack randomly
+-            Collections.shuffle(batches);
+-            for (Batch b : batches) {
+-                b.close();
++            try (TestQueue q = new TestQueue(
++                TestSettings.volatileQueueSettings(singleElementCapacity))) {
++                q.open();
++
++                for (Queueable e : elements) {
++                    q.write(e);
++                }
++
++                assertThat(q.getTailPages().size(), is(page_count - 1));
++
++                // first read all elements
++                List<Batch> batches = new ArrayList<>();
++                for (Batch b = q.nonBlockReadBatch(1); b != null; b = q.nonBlockReadBatch(1)) {
++                    batches.add(b);
++                }
++                assertThat(batches.size(), is(page_count));
++
++                // then ack randomly
++                Collections.shuffle(batches);
++                for (Batch b : batches) {
++                    b.close();
++                }
++                
++                assertThat(q.getTailPages().size(), is(0));
+             }
+-
+-            assertThat(q.getTailPages().size(), is(equalTo(0)));
+-
+-            q.close();
+         }
+     }
+ 
+@@ -334,47 +342,38 @@ public void reachMaxUnread() throws IOException, InterruptedException, Execution
+             TestSettings.volatileQueueSettings(singleElementCapacity)
+         ).maxUnread(2) // 2 so we know the first write should not block and the second should
+         .build();
+-        TestQueue q = new TestQueue(settings);
+-        q.open();
+-
++        try (TestQueue q = new TestQueue(settings)) {
++            q.open();
++            
++            long seqNum = q.write(element);
++            assertThat(seqNum, is(1L));
++            assertThat(q.isFull(), is(false));
+ 
+-        long seqNum = q.write(element);
+-        assertThat(seqNum, is(equalTo(1L)));
+-        assertThat(q.isFull(), is(false));
++            int ELEMENT_COUNT = 1000;
++            for (int i = 0; i < ELEMENT_COUNT; i++) {
+ 
+-        int ELEMENT_COUNT = 1000;
+-        for (int i = 0; i < ELEMENT_COUNT; i++) {
++                // we expect the next write call to block so let's wrap it in a Future
++                Future<Long> future = executor.submit(() -> q.write(element));
+ 
+-            // we expect the next write call to block so let's wrap it in a Future
+-            Callable<Long> write = () -> {
+-                return q.write(element);
+-            };
++                while (!q.isFull()) {
++                    // spin wait until data is written and write blocks
++                    Thread.sleep(1);
++                }
++                assertThat(q.unreadCount, is(2L));
++                assertThat(future.isDone(), is(false));
+ 
+-            ExecutorService executor = Executors.newFixedThreadPool(1);
+-            Future<Long> future = executor.submit(write);
++                // read one element, which will unblock the last write
++                Batch b = q.nonBlockReadBatch(1);
++                assertThat(b.getElements().size(), is(1));
+ 
+-            while (!q.isFull()) {
+-                // spin wait until data is written and write blocks
+-                Thread.sleep(1);
++                // future result is the blocked write seqNum for the second element
++                assertThat(future.get(), is(2L + i));
++                assertThat(q.isFull(), is(false));
+             }
+-            assertThat(q.unreadCount, is(equalTo(2L)));
+-            assertThat(future.isDone(), is(false));
+ 
+-            // read one element, which will unblock the last write
+-            Batch b = q.nonBlockReadBatch(1);
+-            assertThat(b.getElements().size(), is(equalTo(1)));
+-
+-            // future result is the blocked write seqNum for the second element
+-            assertThat(future.get(), is(equalTo(2L + i)));
+-            assertThat(q.isFull(), is(false));
+-
+-            executor.shutdown();
++            // since we did not ack and pages hold a single item
++            assertThat(q.getTailPages().size(), is(ELEMENT_COUNT));
+         }
+-
+-        // since we did not ack and pages hold a single item
+-        assertThat(q.getTailPages().size(), is(equalTo(ELEMENT_COUNT)));
+-
+-        q.close();
+     }
+ 
+     @Test
+@@ -386,51 +385,44 @@ public void reachMaxUnreadWithAcking() throws IOException, InterruptedException,
+             TestSettings.volatileQueueSettings(256) // 256 is arbitrary, large enough to hold a few elements
+         ).maxUnread(2)
+         .build(); // 2 so we know the first write should not block and the second should
+-        TestQueue q = new TestQueue(settings);
+-        q.open();
+-
+-        // perform first non-blocking write
+-        long seqNum = q.write(element);
++        try (TestQueue q = new TestQueue(settings)) {
++            q.open();
+ 
+-        assertThat(seqNum, is(equalTo(1L)));
+-        assertThat(q.isFull(), is(false));
++            // perform first non-blocking write
++            long seqNum = q.write(element);
+ 
+-        int ELEMENT_COUNT = 1000;
+-        for (int i = 0; i < ELEMENT_COUNT; i++) {
++            assertThat(seqNum, is(1L));
++            assertThat(q.isFull(), is(false));
+ 
+-            // we expect this next write call to block so let's wrap it in a Future
+-            Callable<Long> write = () -> {
+-                return q.write(element);
+-            };
++            int ELEMENT_COUNT = 1000;
++            for (int i = 0; i < ELEMENT_COUNT; i++) {
+ 
+-            ExecutorService executor = Executors.newFixedThreadPool(1);
+-            Future<Long> future = executor.submit(write);
++                // we expect this next write call to block so let's wrap it in a Future
++                Future<Long> future = executor.submit(() -> q.write(element));
+ 
+-            // spin wait until data is written and write blocks
+-            while (!q.isFull()) { Thread.sleep(1); }
++                // spin wait until data is written and write blocks
++                while (!q.isFull()) {
++                    Thread.sleep(1);
++                }
++                // read one element, which will unblock the last write
++                Batch b = q.nonBlockReadBatch(1);
++                assertThat(b, notNullValue());
++                assertThat(b.getElements().size(), is(1));
++                b.close();
+ 
+-            // read one element, which will unblock the last write
+-            Batch b = q.nonBlockReadBatch(1);
+-            assertThat(b, is(notNullValue()));
+-            assertThat(b.getElements().size(), is(equalTo(1)));
+-            b.close();
++                // future result is the blocked write seqNum for the second element
++                assertThat(future.get(), is(2L + i));
++                assertThat(q.isFull(), is(false));
++            }
+ 
+-            // future result is the blocked write seqNum for the second element
+-            assertThat(future.get(), is(equalTo(2L + i)));
+-            assertThat(q.isFull(), is(false));
++            // all batches are acked, no tail pages should exist
++            assertThat(q.getTailPages().size(), is(0));
+ 
+-            executor.shutdown();
++            // the last read unblocked the last write so some elements (1 unread and maybe some acked) should be in the head page
++            assertThat(q.getHeadPage().getElementCount() > 0L, is(true));
++            assertThat(q.getHeadPage().unreadCount(), is(1L));
++            assertThat(q.unreadCount, is(1L));
+         }
+-
+-        // all batches are acked, no tail pages should exist
+-        assertThat(q.getTailPages().size(), is(equalTo(0)));
+-
+-        // the last read unblocked the last write so some elements (1 unread and maybe some acked) should be in the head page
+-        assertThat(q.getHeadPage().getElementCount() > 0L, is(true));
+-        assertThat(q.getHeadPage().unreadCount(), is(equalTo(1L)));
+-        assertThat(q.unreadCount, is(equalTo(1L)));
+-
+-        q.close();
+     }
+ 
+     @Test(timeout = 5000)
+@@ -441,31 +433,23 @@ public void reachMaxSizeTest() throws IOException, InterruptedException, Executi
+ 
+         // allow 10 elements per page but only 100 events in total
+         Settings settings = TestSettings.volatileQueueSettings(singleElementCapacity * 10, singleElementCapacity * 100);
++        try (TestQueue q = new TestQueue(settings)) {
++            q.open();
+ 
+-        TestQueue q = new TestQueue(settings);
+-        q.open();
+-
+-        int ELEMENT_COUNT = 90; // should be able to write 99 events before getting full
+-        for (int i = 0; i < ELEMENT_COUNT; i++) {
+-            long seqNum = q.write(element);
+-        }
+-
+-        assertThat(q.isFull(), is(false));
+-
+-        // we expect this next write call to block so let's wrap it in a Future
+-        Callable<Long> write = () -> {
+-            return q.write(element);
+-        };
+-
+-        ExecutorService executor = Executors.newFixedThreadPool(1);
+-        Future<Long> future = executor.submit(write);
+-
+-        while (!q.isFull()) { Thread.sleep(10); }
++            int ELEMENT_COUNT = 90; // should be able to write 99 events before getting full
++            for (int i = 0; i < ELEMENT_COUNT; i++) {
++                q.write(element);
++            }
+ 
+-        assertThat(q.isFull(), is(true));
++            assertThat(q.isFull(), is(false));
+ 
+-        executor.shutdown();
+-        q.close();
++            // we expect this next write call to block so let's wrap it in a Future
++            executor.submit(() -> q.write(element));
++            while (!q.isFull()) {
++                Thread.sleep(10);
++            }
++            assertThat(q.isFull(), is(true));
++        }
+     }
+ 
+     @Test(timeout = 5000)
+@@ -477,7 +461,6 @@ public void ackingMakesQueueNotFullAgainTest() throws IOException, InterruptedEx
+ 
+         // allow 10 elements per page but only 100 events in total
+         Settings settings = TestSettings.volatileQueueSettings(singleElementCapacity * 10, singleElementCapacity * 100);
+-        ExecutorService executor = Executors.newFixedThreadPool(1);
+         try (TestQueue q = new TestQueue(settings)) {
+             q.open();
+             // should be able to write 90 events (9 pages) before getting full
+@@ -488,8 +471,7 @@ public void ackingMakesQueueNotFullAgainTest() throws IOException, InterruptedEx
+             assertThat(q.isFull(), is(false));
+             
+             // we expect this next write call to block so let's wrap it in a Future
+-            Callable<Long> write = () -> q.write(element);
+-            Future<Long> future = executor.submit(write);
++            Future<Long> future = executor.submit(() -> q.write(element));
+             assertThat(future.isDone(), is(false));
+             
+             while (!q.isFull()) {
+@@ -504,9 +486,6 @@ public void ackingMakesQueueNotFullAgainTest() throws IOException, InterruptedEx
+             assertThat(q.isFull(), is(false));
+             
+             assertThat(future.get(), is(ELEMENT_COUNT + 1));
+-        } finally {
+-            executor.shutdownNow();
+-            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+         }
+     }
+ 
+@@ -518,39 +497,33 @@ public void resumeWriteOnNoLongerFullQueueTest() throws IOException, Interrupted
+ 
+         // allow 10 elements per page but only 100 events in total
+         Settings settings = TestSettings.volatileQueueSettings(singleElementCapacity * 10, singleElementCapacity * 100);
++        try (TestQueue q = new TestQueue(settings)) {
++            q.open();
++            int ELEMENT_COUNT =
++                90; // should be able to write 90 events (9 pages) before getting full
++            for (int i = 0; i < ELEMENT_COUNT; i++) { 
++                q.write(element);
++            }
+ 
+-        TestQueue q = new TestQueue(settings);
+-        q.open();
+-
+-        int ELEMENT_COUNT = 90; // should be able to write 90 events (9 pages) before getting full
+-        for (int i = 0; i < ELEMENT_COUNT; i++) {
+-            long seqNum = q.write(element);
+-        }
+-
+-        assertThat(q.isFull(), is(false));
+-
+-        // read 1 page (10 events) here while not full yet so that the read will not singal the not full state
+-        // we want the batch closing below to signal the not full state
+-        Batch b = q.readBatch(10);
+-
+-        // we expect this next write call to block so let's wrap it in a Future
+-        Callable<Long> write = () -> {
+-            return q.write(element);
+-        };
+-        ExecutorService executor = Executors.newFixedThreadPool(1);
+-        Future<Long> future = executor.submit(write);
+-        assertThat(future.isDone(), is(false));
++            assertThat(q.isFull(), is(false));
+ 
+-        while (!q.isFull()) { Thread.sleep(10); }
+-        assertThat(q.isFull(), is(true));
+-        assertThat(future.isDone(), is(false));
++            // read 1 page (10 events) here while not full yet so that the read will not singal the not full state
++            // we want the batch closing below to signal the not full state
++            Batch b = q.readBatch(10);
+ 
+-        b.close();  // purge 1 page
++            // we expect this next write call to block so let's wrap it in a Future
++            Future<Long> future = executor.submit(() -> q.write(element));
++            assertThat(future.isDone(), is(false));
++            while (!q.isFull()) {
++                Thread.sleep(10);
++            }
++            assertThat(q.isFull(), is(true));
++            assertThat(future.isDone(), is(false));
+ 
+-        assertThat(future.get(), is(equalTo(ELEMENT_COUNT + 1L)));
++            b.close();  // purge 1 page
+ 
+-        executor.shutdown();
+-        q.close();
++            assertThat(future.get(), is(ELEMENT_COUNT + 1L));
++        }
+     }
+ 
+     @Test(timeout = 5000)
+@@ -562,177 +535,173 @@ public void queueStillFullAfterPartialPageAckTest() throws IOException, Interrup
+ 
+         // allow 10 elements per page but only 100 events in total
+         Settings settings = TestSettings.volatileQueueSettings(singleElementCapacity * 10, singleElementCapacity * 100);
++        try (TestQueue q = new TestQueue(settings)) {
++            q.open();
+ 
+-        TestQueue q = new TestQueue(settings);
+-        q.open();
+-
+-        int ELEMENT_COUNT = 90; // should be able to write 99 events before getting full
+-        for (int i = 0; i < ELEMENT_COUNT; i++) {
+-            long seqNum = q.write(element);
+-        }
+-
+-        assertThat(q.isFull(), is(false));
+-
+-        // we expect this next write call to block so let's wrap it in a Future
+-        Callable<Long> write = () -> {
+-            return q.write(element);
+-        };
+-
+-        ExecutorService executor = Executors.newFixedThreadPool(1);
+-        Future<Long> future = executor.submit(write);
+-
+-        while (!q.isFull()) { Thread.sleep(10); }
++            int ELEMENT_COUNT = 90; // should be able to write 99 events before getting full
++            for (int i = 0; i < ELEMENT_COUNT; i++) {
++                q.write(element);
++            }
+ 
+-        assertThat(q.isFull(), is(true));
++            assertThat(q.isFull(), is(false));
+ 
+-        Batch b = q.readBatch(9); // read 90% of page (9 events)
+-        b.close();  // this should not purge a page
++            // we expect this next write call to block so let's wrap it in a Future
++            executor.submit(() -> q.write(element));
++            while (!q.isFull()) {
++                Thread.sleep(10);
++            }
++            assertThat(q.isFull(), is(true));
+ 
+-        assertThat(q.isFull(), is(true)); // queue should still be full
++            Batch b = q.readBatch(9); // read 90% of page (9 events)
++            b.close();  // this should not purge a page
+ 
+-        executor.shutdown();
+-        q.close();
++            assertThat(q.isFull(), is(true)); // queue should still be full
++        }
+     }
+ 
+     @Test
+     public void testAckedCount() throws IOException {
+         Settings settings = TestSettings.persistedQueueSettings(100, dataPath);
+-        Queue q = new Queue(settings);
+-        q.open();
+-
+-        Queueable element1 = new StringElement("foobarbaz");
+-        Queueable element2 = new StringElement("wowza");
+-        Queueable element3 = new StringElement("third");
+-        long firstSeqNum = q.write(element1);
+-
+-        Batch b = q.nonBlockReadBatch(1);
+-        assertThat(b.getElements().size(), is(equalTo(1)));
+-
+-        q.close();
++        Batch b;
++        Queueable element1;
++        Queueable element2;
++        Queueable element3;
++        long firstSeqNum;
++        try(Queue q = new Queue(settings)) {
++            q.open();
+ 
+-        q = new Queue(settings);
+-        q.open();
++            element1 = new StringElement("foobarbaz");
++            element2 = new StringElement("wowza");
++            element3 = new StringElement("third");
++            firstSeqNum = q.write(element1);
++            b = q.nonBlockReadBatch(1);
++            assertThat(b.getElements().size(), is(1));
++        }
+ 
+-        long secondSeqNum = q.write(element2);
+-        long thirdSeqNum = q.write(element3);
++        long secondSeqNum;
++        long thirdSeqNum;
++        try(Queue q = new Queue(settings)){
++            q.open();
+ 
+-        b = q.nonBlockReadBatch(1);
+-        assertThat(b.getElements().size(), is(equalTo(1)));
+-        assertThat(b.getElements().get(0), is(equalTo(element1)));
++            secondSeqNum = q.write(element2);
++            thirdSeqNum = q.write(element3);
+ 
+-        b = q.nonBlockReadBatch(2);
+-        assertThat(b.getElements().size(), is(equalTo(2)));
+-        assertThat(b.getElements().get(0), is(equalTo(element2)));
+-        assertThat(b.getElements().get(1), is(equalTo(element3)));
++            b = q.nonBlockReadBatch(1);
++            assertThat(b.getElements().size(), is(1));
++            assertThat(b.getElements().get(0), is(element1));
+ 
+-        q.ack(Collections.singletonList(firstSeqNum));
+-        q.close();
++            b = q.nonBlockReadBatch(2);
++            assertThat(b.getElements().size(), is(2));
++            assertThat(b.getElements().get(0), is(element2));
++            assertThat(b.getElements().get(1), is(element3));
+ 
+-        q = new Queue(settings);
+-        q.open();
++            q.ack(Collections.singletonList(firstSeqNum));
++        }
+ 
+-        b = q.nonBlockReadBatch(2);
+-        assertThat(b.getElements().size(), is(equalTo(2)));
++        try(Queue q = new Queue(settings)) {
++            q.open();
+ 
+-        q.ack(Arrays.asList(secondSeqNum, thirdSeqNum));
++            b = q.nonBlockReadBatch(2);
++            assertThat(b.getElements().size(), is(2));
+ 
+-        assertThat(q.getAckedCount(), equalTo(0L));
+-        assertThat(q.getUnackedCount(), equalTo(0L));
++            q.ack(Arrays.asList(secondSeqNum, thirdSeqNum));
+ 
+-        q.close();
++            assertThat(q.getAckedCount(), equalTo(0L));
++            assertThat(q.getUnackedCount(), equalTo(0L));
++        }
+     }
+ 
+     @Test(timeout = 5000)
+     public void concurrentWritesTest() throws IOException, InterruptedException, ExecutionException {
+ 
++        final int WRITER_COUNT = 5;
++
++        final ExecutorService executorService = Executors.newFixedThreadPool(WRITER_COUNT);
+         // very small pages to maximize page creation
+         Settings settings = TestSettings.volatileQueueSettings(100);
++        try (TestQueue q = new TestQueue(settings)) {
++            q.open();
+ 
+-        TestQueue q = new TestQueue(settings);
+-        q.open();
++            int ELEMENT_COUNT = 10000;
++            AtomicInteger element_num = new AtomicInteger(0);
+ 
+-        int ELEMENT_COUNT = 10000;
+-        int WRITER_COUNT = 5;
+-        AtomicInteger element_num = new AtomicInteger(0);
++            // we expect this next write call to block so let's wrap it in a Future
++            Callable<Integer> writer = () -> {
++                for (int i = 0; i < ELEMENT_COUNT; i++) {
++                    int n = element_num.getAndIncrement();
++                    q.write(new StringElement("" + n));
++                }
++                return ELEMENT_COUNT;
++            };
+ 
+-        // we expect this next write call to block so let's wrap it in a Future
+-        Callable<Integer> writer = () -> {
+-            for (int i = 0; i < ELEMENT_COUNT; i++) {
+-                int n = element_num.getAndIncrement();
+-                q.write(new StringElement("" + n));
++            List<Future<Integer>> futures = new ArrayList<>();
++            for (int i = 0; i < WRITER_COUNT; i++) {
++                futures.add(executorService.submit(writer));
+             }
+-            return ELEMENT_COUNT;
+-        };
+ 
+-        List<Future<Integer>> futures = new ArrayList<>();
+-        ExecutorService executor = Executors.newFixedThreadPool(WRITER_COUNT);
+-        for  (int i = 0; i < WRITER_COUNT; i++) {
+-            futures.add(executor.submit(writer));
+-        }
++            int BATCH_SIZE = 10;
++            int read_count = 0;
+ 
+-        int BATCH_SIZE = 10;
+-        int read_count = 0;
++            while (read_count < ELEMENT_COUNT * WRITER_COUNT) {
++                Batch b = q.readBatch(BATCH_SIZE);
++                read_count += b.size();
++                b.close();
++            }
+ 
+-        while (read_count < ELEMENT_COUNT * WRITER_COUNT) {
+-            Batch b = q.readBatch(BATCH_SIZE);
+-            read_count += b.size();
+-            b.close();
+-        }
++            for (Future<Integer> future : futures) {
++                int result = future.get();
++                assertThat(result, is(ELEMENT_COUNT));
++            }
+ 
+-        for (Future<Integer> future : futures) {
+-            int result = future.get();
+-            assertThat(result, is(equalTo(ELEMENT_COUNT)));
++            assertThat(q.getTailPages().isEmpty(), is(true));
++            assertThat(q.isFullyAcked(), is(true));
++        } finally {
++            executorService.shutdownNow();
++            executorService.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+         }
+-
+-        assertThat(q.getTailPages().isEmpty(), is(true));
+-        assertThat(q.isFullyAcked(), is(true));
+-
+-        executor.shutdown();
+-        q.close();
+     }
+ 
+     @Test
+     public void fullyAckedHeadPageBeheadingTest() throws IOException {
+         Queueable element = new StringElement("foobarbaz1");
+         int singleElementCapacity = ByteBufferPageIO.HEADER_SIZE + ByteBufferPageIO._persistedByteCount(element.serialize().length);
++        try (TestQueue q = new TestQueue(
++            TestSettings.volatileQueueSettings(2 * singleElementCapacity))) {
++            q.open();
+ 
+-        TestQueue q = new TestQueue(TestSettings.volatileQueueSettings(2 * singleElementCapacity));
+-        q.open();
+-
+-        Batch b;
+-        q.write(element);
+-        b = q.nonBlockReadBatch(1);
+-        assertThat(b.getElements().size(), is(equalTo(1)));
+-        b.close();
+-
+-        q.write(element);
+-        b = q.nonBlockReadBatch(1);
+-        assertThat(b.getElements().size(), is(equalTo(1)));
+-        b.close();
++            Batch b;
++            q.write(element);
++            b = q.nonBlockReadBatch(1);
++            assertThat(b.getElements().size(), is(1));
++            b.close();
+ 
+-        // head page should be full and fully acked
+-        assertThat(q.getHeadPage().isFullyAcked(), is(true));
+-        assertThat(q.getHeadPage().hasSpace(element.serialize().length), is(false));
+-        assertThat(q.isFullyAcked(), is(true));
++            q.write(element);
++            b = q.nonBlockReadBatch(1);
++            assertThat(b.getElements().size(), is(1));
++            b.close();
+ 
+-        // write extra element to trigger beheading
+-        q.write(element);
++            // head page should be full and fully acked
++            assertThat(q.getHeadPage().isFullyAcked(), is(true));
++            assertThat(q.getHeadPage().hasSpace(element.serialize().length), is(false));
++            assertThat(q.isFullyAcked(), is(true));
+ 
+-        // since head page was fully acked it should not have created a new tail page
++            // write extra element to trigger beheading
++            q.write(element);
+ 
+-        assertThat(q.getTailPages().isEmpty(), is(true));
+-        assertThat(q.getHeadPage().getPageNum(), is(equalTo(1)));
+-        assertThat(q.firstUnackedPageNum(), is(equalTo(1)));
+-        assertThat(q.isFullyAcked(), is(false));
++            // since head page was fully acked it should not have created a new tail page
+ 
+-        q.close();
++            assertThat(q.getTailPages().isEmpty(), is(true));
++            assertThat(q.getHeadPage().getPageNum(), is(1));
++            assertThat(q.firstUnackedPageNum(), is(1));
++            assertThat(q.isFullyAcked(), is(false));
++        }
+     }
+ 
+     @Test
+     public void getsPersistedByteSizeCorrectlyForUnopened() throws Exception {
+         Settings settings = TestSettings.persistedQueueSettings(100, dataPath);
+         try (Queue q = new Queue(settings)) {
+-            assertThat(q.getPersistedByteSize(), is(equalTo(0L)));
++            assertThat(q.getPersistedByteSize(), is(0L));
+         }
+     }
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/instruments/monitors/HotThreadMonitorTest.java b/logstash-core/src/test/java/org/logstash/instruments/monitors/HotThreadMonitorTest.java
+new file mode 100644
+index 00000000000..44913f74e36
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/instruments/monitors/HotThreadMonitorTest.java
+@@ -0,0 +1,98 @@
++package org.logstash.instruments.monitors;
++
++
++import org.junit.Test;
++import org.logstash.instrument.monitors.HotThreadsMonitor;
++
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import static org.hamcrest.CoreMatchers.*;
++import static org.hamcrest.MatcherAssert.assertThat;
++
++
++public class HotThreadMonitorTest {
++
++    @Test
++    public void testThreadsReportsGenerated(){
++        assertThat(new HotThreadsMonitor().detect().size() > 0, is(true));
++    }
++
++    @Test
++    public void testAllThreadsHaveCpuTime(){
++        new HotThreadsMonitor().detect().forEach(x -> assertThat(x.toMap().keySet(), hasItem("cpu.time")));
++    }
++
++    @Test
++    public void testAllThreadsHaveThreadState(){
++        new HotThreadsMonitor().detect().forEach(x -> assertThat(x.toMap().keySet(), hasItem("thread.state")));
++    }
++
++    @Test
++    public void testAllThreadsHaveBlockedInformation(){
++        new HotThreadsMonitor().detect().forEach(x -> assertThat(x.toMap().keySet(), hasItems("blocked.count", "blocked.time")));
++    }
++
++    @Test
++    public void testAllThreadsHaveWaitedInformation(){
++        new HotThreadsMonitor().detect().forEach(x -> assertThat(x.toMap().keySet(), hasItems("waited.count", "waited.time")));
++    }
++
++    @Test
++    public void testAllThreadsHaveStackTraces(){
++        new HotThreadsMonitor().detect().forEach(tr -> assertThat(tr.toMap().keySet(), hasItem("thread.stacktrace")));
++    }
++
++    @Test
++    public void testStackTraceSizeOption(){
++        final String testStackSize = "4";
++        Map<String, String> options = new HashMap<>();
++        options.put("stacktrace_size", testStackSize);
++        new HotThreadsMonitor().detect(options).stream().filter(tr -> !tr.getThreadName().equals("Signal Dispatcher") &&
++                                                                      !tr.getThreadName().equals("Reference Handler"))
++                                                        .forEach(tr -> {
++            List stackTrace = (List)tr.toMap().get("thread.stacktrace");
++            assertThat(stackTrace.size(), is(Integer.valueOf(testStackSize)));
++        });
++    }
++
++    @Test
++    public void testOptionsOrderingCpu(){
++        Map<String, String> options = new HashMap<>();
++        options.put("ordered_by", "cpu");
++        // Using single element array to circumvent lambda expectation of 'effective final'
++        final long[] lastCpuTime = {Long.MAX_VALUE};
++        new HotThreadsMonitor().detect(options).forEach(tr -> {
++            Long cpuTime = (Long)tr.toMap().get("cpu.time");
++            assertThat(lastCpuTime[0] >= cpuTime, is(true));
++            lastCpuTime[0] = cpuTime;
++        });
++    }
++
++    @Test
++    public void testOptionsOrderingWait(){
++        Map<String, String> options = new HashMap<>();
++        options.put("ordered_by", "wait");
++        // Using single element array to circumvent lambda expectation of 'effectively final'
++        final long[] lastWaitTime = {Long.MAX_VALUE};
++        new HotThreadsMonitor().detect(options).forEach(tr -> {
++            Long waitTime = (Long)tr.toMap().get("waited.time");
++            assertThat(lastWaitTime[0] >= waitTime, is(true));
++            lastWaitTime[0] = waitTime;
++        });
++    }
++
++    @Test
++    public void testOptionsOrderingBlocked(){
++        Map<String, String> options = new HashMap<>();
++        options.put("ordered_by", "block");
++        // Using single element array to circumvent lambda expectation of 'effectively final'
++        final long[] lastBlockedTime = {Long.MAX_VALUE};
++        new HotThreadsMonitor().detect(options).forEach(tr -> {
++            Long blockedTime = (Long)tr.toMap().get("blocked.time");
++            assertThat(lastBlockedTime[0] >= blockedTime, is(true));
++            lastBlockedTime[0] = blockedTime;
++        });
++    }
++}
+diff --git a/logstash-core/src/test/java/org/logstash/instruments/monitors/MemoryMonitorTest.java b/logstash-core/src/test/java/org/logstash/instruments/monitors/MemoryMonitorTest.java
+new file mode 100644
+index 00000000000..417a1e07104
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/instruments/monitors/MemoryMonitorTest.java
+@@ -0,0 +1,45 @@
++package org.logstash.instruments.monitors;
++
++import org.junit.Test;
++import org.logstash.instrument.monitors.MemoryMonitor;
++
++import java.util.Map;
++
++import static org.hamcrest.CoreMatchers.hasItem;
++import static org.hamcrest.CoreMatchers.hasItems;
++import static org.hamcrest.CoreMatchers.notNullValue;
++import static org.hamcrest.MatcherAssert.assertThat;
++
++
++public class MemoryMonitorTest {
++
++    @Test
++    public void testEachHeapSpaceRepresented() {
++        Map<String, Map<String, Object>> heap = new MemoryMonitor().detect(MemoryMonitor.Type.All).getHeap();
++        assertThat(heap, notNullValue());
++        assertThat(heap.keySet(), hasItems("PS Survivor Space", "PS Old Gen", "PS Eden Space"));
++    }
++
++    @Test
++    public void testAllStatsAreAvailableForHeap(){
++        testAllStatsAreAvailable(new MemoryMonitor().detect(MemoryMonitor.Type.All).getHeap());
++    }
++
++    @Test
++    public void testAllStatsAreAvailableForNonHeap(){
++        testAllStatsAreAvailable(new MemoryMonitor().detect(MemoryMonitor.Type.All).getNonHeap());
++    }
++
++    private void testAllStatsAreAvailable(Map<String, Map<String, Object>> stats){
++        String[] types = {"usage", "peak"};
++        String[] subtypes = {"used", "max", "committed", "init"};
++        for (Map<String, Object> spaceMap: stats.values()){
++            for (String type : types) {
++                for (String subtype : subtypes){
++                    String key = String.format("%s.%s", type, subtype);
++                    assertThat(key + " is missing", spaceMap.keySet(), hasItem(key));
++                }
++            }
++        }
++    }
++}
+diff --git a/logstash-core/src/test/java/org/logstash/instruments/monitors/ProcessMonitorTest.java b/logstash-core/src/test/java/org/logstash/instruments/monitors/ProcessMonitorTest.java
+new file mode 100644
+index 00000000000..65a08773951
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/instruments/monitors/ProcessMonitorTest.java
+@@ -0,0 +1,39 @@
++package org.logstash.instruments.monitors;
++
++import org.junit.Test;
++import org.logstash.instrument.monitors.ProcessMonitor;
++
++import java.util.Map;
++
++import static org.hamcrest.CoreMatchers.instanceOf;
++import static org.hamcrest.CoreMatchers.is;
++import static org.hamcrest.MatcherAssert.assertThat;
++
++public class ProcessMonitorTest {
++
++
++    @Test
++    public void testReportFDStats(){
++        Map<String, Object> processStats = new ProcessMonitor().detect().toMap();
++        assertThat("open_file_descriptors", (Long)processStats.get("open_file_descriptors") > 0L, is(true));
++        assertThat("max_file_descriptors", (Long)processStats.get("max_file_descriptors") > 0L, is(true));
++    }
++
++    @Test
++    public void testReportCpuStats(){
++        Map<String, Object> processStats = new ProcessMonitor().detect().toMap();
++        assertThat("cpu", processStats.get("cpu"), instanceOf(Map.class));
++        Map cpuStats = ((Map)processStats.get("cpu"));
++        assertThat("cpu.process_percent", (Short)cpuStats.get("process_percent") >= 0, is(true));
++        assertThat("cpu.system_percent", (Short)cpuStats.get("system_percent") >= -1, is(true));
++        assertThat("cpu.total_in_millis", (Long)cpuStats.get("total_in_millis") > 0L, is(true));
++    }
++
++    @Test
++    public void testReportMemStats() {
++        Map<String, Object> processStats = new ProcessMonitor().detect().toMap();
++        assertThat("mem", processStats.get("mem"), instanceOf(Map.class));
++        Map memStats = ((Map)processStats.get("mem"));
++        assertThat("mem.total_virtual_in_bytes", (Long)memStats.get("total_virtual_in_bytes") >= 0L, is(true));
++    }
++}
+diff --git a/logstash-core/src/test/java/org/logstash/instruments/monitors/SystemMonitorTest.java b/logstash-core/src/test/java/org/logstash/instruments/monitors/SystemMonitorTest.java
+new file mode 100644
+index 00000000000..54059a5e061
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/instruments/monitors/SystemMonitorTest.java
+@@ -0,0 +1,23 @@
++package org.logstash.instruments.monitors;
++
++import org.junit.Test;
++import org.logstash.instrument.monitors.SystemMonitor;
++
++import java.util.Map;
++
++import static org.hamcrest.CoreMatchers.*;
++import static org.hamcrest.MatcherAssert.assertThat;
++
++
++public class SystemMonitorTest {
++
++    @Test
++    public void systemMonitorTest(){
++        Map<String, Object> map = new SystemMonitor().detect().toMap();
++        assertThat("system.load_average is missing", (Double)map.get("system.load_average") > 0, is(true));
++        assertThat("system.available_processors is missing ", ((Integer)map.get("system.available_processors")) > 0, is(true));
++        assertThat("os.version is missing", map.get("os.version"), allOf(notNullValue(), instanceOf(String.class)));
++        assertThat("os.arch is missing", map.get("os.arch"), allOf(notNullValue(), instanceOf(String.class)));
++        assertThat("os.name is missing", map.get("os.name"), allOf(notNullValue(), instanceOf(String.class)));
++    }
++}
+diff --git a/pkg/centos/after-install.sh b/pkg/centos/after-install.sh
+index ac226fd84b2..499192ccdd3 100644
+--- a/pkg/centos/after-install.sh
++++ b/pkg/centos/after-install.sh
+@@ -2,7 +2,7 @@ chown -R logstash:logstash /usr/share/logstash
+ chown -R logstash /var/log/logstash
+ chown logstash:logstash /var/lib/logstash
+ sed -i \
+-  -e 's|# path.config:|path.config: /etc/logstash/conf.d|' \
++  -e 's|# path.config:|path.config: /etc/logstash/conf.d/*.conf|' \
+   -e 's|# path.logs:|path.logs: /var/log/logstash|' \
+   -e 's|# path.data:|path.data: /var/lib/logstash|' \
+   /etc/logstash/logstash.yml
+diff --git a/pkg/debian/after-install.sh b/pkg/debian/after-install.sh
+index 8a2f0767997..8db1bf65c05 100644
+--- a/pkg/debian/after-install.sh
++++ b/pkg/debian/after-install.sh
+@@ -5,7 +5,7 @@ chown -R logstash /var/log/logstash
+ chown logstash:logstash /var/lib/logstash
+ chmod 755 /etc/logstash
+ sed -i \
+-  -e 's|# path.config:|path.config: /etc/logstash/conf.d|' \
++  -e 's|# path.config:|path.config: /etc/logstash/conf.d/*.conf|' \
+   -e 's|# path.logs:|path.logs: /var/log/logstash|' \
+   -e 's|# path.data:|path.data: /var/lib/logstash|' \
+   /etc/logstash/logstash.yml
+diff --git a/pkg/ubuntu/after-install.sh b/pkg/ubuntu/after-install.sh
+index 8c521d50a59..82dc54178da 100644
+--- a/pkg/ubuntu/after-install.sh
++++ b/pkg/ubuntu/after-install.sh
+@@ -4,7 +4,7 @@ chown -R logstash:logstash /usr/share/logstash
+ chown -R logstash /var/log/logstash
+ chown logstash:logstash /var/lib/logstash
+ sed -i \
+-  -e 's|# path.config:|path.config: /etc/logstash/conf.d|' \
++  -e 's|# path.config:|path.config: /etc/logstash/conf.d/*.conf|' \
+   -e 's|# path.logs:|path.logs: /var/log/logstash|' \
+   -e 's|# path.data:|path.data: /var/lib/logstash|' \
+   /etc/logstash/logstash.yml
+diff --git a/qa/integration/services/kafka_service.rb b/qa/integration/services/kafka_service.rb
+index b7846e084f9..4b687eca49d 100644
+--- a/qa/integration/services/kafka_service.rb
++++ b/qa/integration/services/kafka_service.rb
+@@ -3,14 +3,14 @@
+ 
+ class KafkaService < Service
+   def initialize(settings)
+-    @kafka_image = Docker::Image.build_from_dir(File.expand_path("../kafka_dockerized", __FILE__))
+-                     .insert_local(
+-                       'localPath' => File.join(TestSettings::FIXTURES_DIR, "how_sample.input"),
+-                       'outputPath' => '/')
+     super("kafka", settings)
+   end
+ 
+   def setup
++    @kafka_image = Docker::Image.build_from_dir(File.expand_path("../kafka_dockerized", __FILE__))
++                     .insert_local(
++                       'localPath' => File.join(TestSettings::FIXTURES_DIR, "how_sample.input"),
++                       'outputPath' => '/')
+     @kafka_container = Docker::Container.create(:Image => @kafka_image.id,
+                                                 :HostConfig => {
+                                                   :PortBindings => {

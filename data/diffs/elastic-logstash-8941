@@ -1,0 +1,223 @@
+diff --git a/build.gradle b/build.gradle
+index f1f008e0d0d..9547b4c5f22 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -16,6 +16,7 @@ apply plugin: 'de.undercouch.download'
+ import de.undercouch.gradle.tasks.download.Download
+ import de.undercouch.gradle.tasks.download.Verify
+ import org.logstash.gradle.ExecLogOutputStream
++import org.logstash.gradle.RubyGradleUtils
+ import org.yaml.snakeyaml.Yaml
+ 
+ allprojects {
+@@ -102,6 +103,8 @@ clean {
+ 
+ task bootstrap {}
+ 
++RubyGradleUtils rubyGradleUtils = new RubyGradleUtils(buildDir, projectDir)
++
+ project(":logstash-core") {
+   ["rubyTests", "test"].each { tsk ->
+     tasks.getByPath(":logstash-core:" + tsk).configure {
+@@ -140,10 +143,7 @@ task downloadAndInstallJRuby(dependsOn: verifyFile, type: Copy) {
+ def jrubyBin = "${projectDir}/vendor/jruby/bin/jruby" +
+   (System.getProperty("os.name").startsWith("Windows") ? '.bat' : '')
+ 
+-def rakeBin = "${projectDir}/vendor/jruby/bin/rake"
+-
+-task installTestGems(dependsOn: downloadAndInstallJRuby, type: Exec) {
+-  workingDir projectDir
++task installTestGems(dependsOn: downloadAndInstallJRuby) {
+   inputs.files file("${projectDir}/Gemfile.template")
+   inputs.files fileTree("${projectDir}/rakelib")
+   inputs.files file("${projectDir}/versions.yml")
+@@ -151,16 +151,12 @@ task installTestGems(dependsOn: downloadAndInstallJRuby, type: Exec) {
+   outputs.files file("${projectDir}/Gemfile.lock")
+   outputs.files fileTree("${projectDir}/vendor/bundle/gems")
+   outputs.files fileTree("${projectDir}/vendor/jruby")
+-  // Override z_rubycheck.rb because we execute the vendored JRuby and don't have to guard against
+-  // any Ruby environment leaking into the build
+-  environment "USE_RUBY", "1"
+-  standardOutput = new ExecLogOutputStream(System.out)
+-  errorOutput =  new ExecLogOutputStream(System.err)
+-  commandLine jrubyBin, rakeBin, "test:install-core"
++  doLast {
++    rubyGradleUtils.rake('test:install-core')
++  }
+ }
+ 
+-task assembleTarDistribution(dependsOn: downloadAndInstallJRuby, type: Exec) {
+-  workingDir projectDir
++task assembleTarDistribution(dependsOn: downloadAndInstallJRuby) {
+   inputs.files fileTree("${projectDir}/rakelib")
+   inputs.files fileTree("${projectDir}/bin")
+   inputs.files fileTree("${projectDir}/config")
+@@ -170,13 +166,12 @@ task assembleTarDistribution(dependsOn: downloadAndInstallJRuby, type: Exec) {
+   inputs.files fileTree("${projectDir}/logstash-core/lib")
+   inputs.files fileTree("${projectDir}/logstash-core/src")
+   outputs.files file("${buildDir}/logstash-${project.version}.tar.gz")
+-  standardOutput = new ExecLogOutputStream(System.out)
+-  errorOutput =  new ExecLogOutputStream(System.err)
+-  commandLine jrubyBin, rakeBin, "artifact:tar"
++  doLast {
++    rubyGradleUtils.rake('artifact:tar')
++  }
+ }
+ 
+-task assembleZipDistribution(dependsOn: downloadAndInstallJRuby, type: Exec) {
+-  workingDir projectDir
++task assembleZipDistribution(dependsOn: downloadAndInstallJRuby) {
+   inputs.files fileTree("${projectDir}/rakelib")
+   inputs.files fileTree("${projectDir}/bin")
+   inputs.files fileTree("${projectDir}/config")
+@@ -185,10 +180,10 @@ task assembleZipDistribution(dependsOn: downloadAndInstallJRuby, type: Exec) {
+   inputs.files fileTree("${projectDir}/logstash-core-plugin-api")
+   inputs.files fileTree("${projectDir}/logstash-core/lib")
+   inputs.files fileTree("${projectDir}/logstash-core/src")
+-  outputs.files file("${buildDir}/logstash-${project.version}.tar.gz")
+-  standardOutput = new ExecLogOutputStream(System.out)
+-  errorOutput =  new ExecLogOutputStream(System.err)
+-  commandLine jrubyBin, rakeBin, "artifact:zip"
++  outputs.files file("${buildDir}/logstash-${project.version}.zip")
++  doLast {
++    rubyGradleUtils.rake('artifact:zip')
++  }
+ }
+ 
+ def logstashBuildDir = "${buildDir}/logstash-${project.version}-SNAPSHOT"
+diff --git a/buildSrc/build.gradle b/buildSrc/build.gradle
+index 21cb3515562..09e6d42ded9 100644
+--- a/buildSrc/build.gradle
++++ b/buildSrc/build.gradle
+@@ -1,3 +1,12 @@
+-group = 'org.logstash'
+-
+ apply plugin: 'java'
++apply plugin: 'groovy'
++
++group = 'org.logstash.gradle'
++
++repositories {
++  mavenCentral()
++}
++
++dependencies {
++  compile group: 'org.jruby', name: 'jruby-complete', version: '9.1.13.0'
++}
+diff --git a/buildSrc/src/main/groovy/org/logstash/gradle/RubyGradleUtils.groovy b/buildSrc/src/main/groovy/org/logstash/gradle/RubyGradleUtils.groovy
+new file mode 100644
+index 00000000000..651d936a3d9
+--- /dev/null
++++ b/buildSrc/src/main/groovy/org/logstash/gradle/RubyGradleUtils.groovy
+@@ -0,0 +1,54 @@
++package org.logstash.gradle
++
++import org.jruby.Ruby
++import org.jruby.embed.ScriptingContainer
++
++final class RubyGradleUtils {
++
++  private final File buildDir
++
++  private final File projectDir
++
++  RubyGradleUtils(File buildDir, File projectDir) {
++    this.buildDir = buildDir
++    this.projectDir = projectDir
++  }
++
++  /**
++   * Executes RSpec for a given plugin.
++   * @param plugin Plugin to run specs for
++   * @param args CLI arguments to pass to rspec
++   */
++  void rake(String task) {
++    executeJruby { ScriptingContainer jruby ->
++      jruby.currentDirectory = projectDir
++      jruby.runScriptlet("require 'rake'")
++      jruby.runScriptlet(
++        "rake = Rake.application\n" +
++          "rake.init\n" +
++          "rake.load_rakefile\n" +
++          "rake['${task}'].invoke"
++      )
++    }
++  }
++
++  /**
++   * Executes Closure using a fresh JRuby environment, safely tearing it down afterwards.
++   * @param block Closure to run
++   */
++  Object executeJruby(Closure<?> block) {
++    def jruby = new ScriptingContainer()
++    def env = jruby.environment
++    def gemDir = "${projectDir}/bundle/jruby/2.3.0".toString()
++    env.put "USE_RUBY", "1"
++    env.put "GEM_HOME", gemDir
++    env.put "GEM_SPEC_CACHE", "${buildDir}/cache".toString()
++    env.put "GEM_PATH", gemDir
++    try {
++      return block(jruby)
++    } finally {
++      jruby.terminate()
++      Ruby.clearGlobalRuntime()
++    }
++  }
++}
+diff --git a/ci/acceptance_tests.sh b/ci/acceptance_tests.sh
+index e158ad9ff81..85cc36a1a77 100755
+--- a/ci/acceptance_tests.sh
++++ b/ci/acceptance_tests.sh
+@@ -5,6 +5,7 @@ set -e
+ # uses at least 1g of memory, If we don't do this we can get OOM issues when
+ # installing gems. See https://github.com/elastic/logstash/issues/5179
+ export JRUBY_OPTS="-J-Xmx1g"
++export GRADLE_OPTS="-Xmx2g"
+ 
+ SELECTED_TEST_SUITE=$1
+ 
+diff --git a/ci/ci_docs.sh b/ci/ci_docs.sh
+index c098614b7f1..63660ce3281 100755
+--- a/ci/ci_docs.sh
++++ b/ci/ci_docs.sh
+@@ -2,6 +2,7 @@
+ set -e
+ 
+ export JRUBY_OPTS="-J-Xmx2g"
++export GRADLE_OPTS="-Xmx2g"
+ 
+ rake bootstrap
+ # needed to workaround `group => :development`
+diff --git a/ci/integration_tests.sh b/ci/integration_tests.sh
+index 5d2c55d9fff..c970df2b80b 100755
+--- a/ci/integration_tests.sh
++++ b/ci/integration_tests.sh
+@@ -5,6 +5,7 @@
+ # uses at least 1g of memory, If we don't do this we can get OOM issues when
+ # installing gems. See https://github.com/elastic/logstash/issues/5179
+ export JRUBY_OPTS="-J-Xmx1g"
++export GRADLE_OPTS="-Xmx2g"
+ 
+ export SPEC_OPTS="--order rand --format documentation"
+ export CI=true
+@@ -14,7 +15,7 @@ if [[ $1 = "setup" ]]; then
+  exit 0
+ 
+ elif [[ $1 == "split" ]]; then
+-    cd qa/integration 
++    cd qa/integration
+     glob1=(specs/*spec.rb)
+     glob2=(specs/**/*spec.rb)
+     all_specs=("${glob1[@]}" "${glob2[@]}")
+diff --git a/ci/unit_tests.sh b/ci/unit_tests.sh
+index c73f7ae94e8..9e69b2b7763 100755
+--- a/ci/unit_tests.sh
++++ b/ci/unit_tests.sh
+@@ -5,6 +5,7 @@
+ # uses at least 1g of memory, If we don't do this we can get OOM issues when
+ # installing gems. See https://github.com/elastic/logstash/issues/5179
+ export JRUBY_OPTS="-J-Xmx1g"
++export GRADLE_OPTS="-Xmx2g"
+ 
+ export SPEC_OPTS="--order rand --format documentation"
+ export CI=true

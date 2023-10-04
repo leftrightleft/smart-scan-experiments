@@ -1,0 +1,165 @@
+diff --git a/Gemfile.lock b/Gemfile.lock
+index 41620284c40..de784bf24c1 100644
+--- a/Gemfile.lock
++++ b/Gemfile.lock
+@@ -2,10 +2,14 @@ GEM
+   remote: http://rubygems.org/
+   specs:
+     awesome_print (0.3.2)
++    bson (1.3.0)
+     bson (1.3.0-java)
+     bunny (0.6.0)
+     daemons (1.1.2)
++    eventmachine (0.12.10)
+     eventmachine (0.12.10-java)
++    ffi (0.6.3)
++      rake (>= 0.8.7)
+     ffi (0.6.3-java)
+     filewatch (0.2.5)
+       ffi
+@@ -17,6 +21,7 @@ GEM
+     jls-grok (0.4.7)
+       ffi (>= 0.6.3)
+     jruby-elasticsearch (0.0.7)
++    json (1.5.1)
+     json (1.5.1-java)
+     mizuno (0.4.0)
+       rack (>= 1.0.0)
+@@ -40,6 +45,7 @@ GEM
+ 
+ PLATFORMS
+   java
++  ruby
+ 
+ DEPENDENCIES
+   awesome_print
+diff --git a/lib/logstash/filters/grep.rb b/lib/logstash/filters/grep.rb
+index 194802c97b6..dad12c103fd 100644
+--- a/lib/logstash/filters/grep.rb
++++ b/lib/logstash/filters/grep.rb
+@@ -16,6 +16,10 @@ class LogStash::Filters::Grep < LogStash::Filters::Base
+   # through.
+   config :negate, :validate => :boolean, :default => false
+ 
++  # Drop messages in case of no match
++  # If this is set to false, no messages will be dropped/cancelled at all
++  config :drop, :validate => :boolean, :default => true
++
+   # A hash of matches of field => value
+   config :match, :validate => :hash, :default => {}
+ 
+@@ -30,7 +34,7 @@ def register
+       # TODO(sissel): 
+     @match.merge(@config).each do |field, pattern|
+       # Skip known config names
+-      next if ["add_tag", "add_field", "type", "negate", "match"].include?(field)
++      next if ["add_tag", "add_field", "type", "negate", "drop", "match"].include?(field)
+ 
+       re = Regexp.new(pattern)
+       @patterns[field] << re
+@@ -87,13 +91,15 @@ def filter(event)
+       else
+         @logger.debug("match block failed " \
+                       "(#{match_count}/#{match_want} matches)")
+-        event.cancel
++        event.cancel if @drop
+       end # match["match"].each
+     end # config.each
+ 
+     if not matched || event.cancelled?
+-      @logger.debug("grep: dropping event, no matches")
+-      event.cancel
++      if @drop
++        @logger.debug("grep: dropping event, no matches")
++        event.cancel
++      end
+       return
+     end
+ 
+diff --git a/lib/logstash/outputs/mailer.rb b/lib/logstash/outputs/mailer.rb
+new file mode 100644
+index 00000000000..2ef9e22a369
+--- /dev/null
++++ b/lib/logstash/outputs/mailer.rb
+@@ -0,0 +1,81 @@
++require "logstash/outputs/base"
++require "logstash/namespace"
++require "net/smtp"
++
++# Mailer output. Sends a mail of each log line that comes with the configured tags
++# Supports only simple SMTP without auth or SSL
++# Default conf should work with local MTA setup
++#
++# Config example:
++#
++# filter {
++#   grep {
++#     type => "syslog" # for logs of type "syslog"
++#     match => [ "@message" , "(not responding, still trying|Lost connection to the server )" ] # contain not responding, still trying OR Lost connection to the server
++#     add_tag => [ "mailer" ]
++#     drop => false
++#     add_field => [ "subject", "Storage Timeout" ]
++#   }
++#   grep {
++#     type => "syslog" # for logs of type "syslog"
++#     match => [ "@message" , "(?=vendor)(?!execution expired)" ] # contain vendor AND NOT execution expired
++#     add_tag => [ "mailer" ]
++#     drop => false
++#     add_field => [ "subject", "Application _Unknown Errors_" ]
++#   }
++#   grep {
++#     type => "syslog" # for logs of type "syslog"
++#     match => [ "@message" , "execution expired" ] # contain vendor AND execution expired
++#     match => [ "@message" , "vendor" ]
++#     add_tag => [ "mailer" ]
++#     drop => false
++#     add_field => [ "subject", "Application _Execution Expired_" ]
++#   }
++# }
++# output {
++#   mailer {
++#     tags => "mailer"
++#     from => "logstash@localhost"
++#     to => [ "oper@localhost" ]
++#   }
++# #  elasticsearch {
++# #    host => "localhost"
++# #    cluster => "MyCluster"
++# #  }
++# }
++class LogStash::Outputs::Mailer < LogStash::Outputs::Base
++
++  config_name "mailer"
++
++  config :subject, :validate => :string, :default => "Logstash notification"
++
++  config :from, :validate => :string, :default => "root@localhost"
++
++  config :to, :validate => :array, :default => [ "root@localhost" ]
++
++  config :server, :validate => :string, :default => "localhost"
++
++  config :port, :validate => :number, :default => 25
++
++  config :tags, :validate => :array, :default => []
++
++  public
++  def register
++    # nothing to do
++  end # def register
++
++  public
++  def receive(event)
++    if !@tags.empty?
++      if (event.tags & @tags).size == 0
++        return
++      else
++	@logger.debug("#{event.to_s} ! Sending mail...")
++        @subject = event.fields["subject"] ||= @subject
++        Net::SMTP.start(@server, @port) do |smtp|
++          smtp.send_message "Subject: #{@subject}\n\n #{event.to_s}", @from, @to
++        end
++      end
++    end
++  end #def receive
++end # class LogStash::Outputs::Mailer

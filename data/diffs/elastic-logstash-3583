@@ -1,0 +1,323 @@
+diff --git a/lib/bootstrap/bundler.rb b/lib/bootstrap/bundler.rb
+index 23944d347fe..b8865b4f8ec 100644
+--- a/lib/bootstrap/bundler.rb
++++ b/lib/bootstrap/bundler.rb
+@@ -80,7 +80,7 @@ def invoke!(options = {})
+       LogStash::Bundler.patch!
+ 
+       # force Rubygems sources to our Gemfile sources
+-      ::Gem.sources = options[:rubygems_source] if options[:rubygems_source]
++      ::Gem.sources = ::Gem::SourceList.from(options[:rubygems_source]) if options[:rubygems_source]
+ 
+       ::Bundler.settings[:path] = LogStash::Environment::BUNDLE_DIR
+       ::Bundler.settings[:gemfile] = LogStash::Environment::GEMFILE_PATH
+diff --git a/lib/pluginmanager/install.rb b/lib/pluginmanager/install.rb
+index bbc486ab236..543e8d67356 100644
+--- a/lib/pluginmanager/install.rb
++++ b/lib/pluginmanager/install.rb
+@@ -45,12 +45,20 @@ def validate_cli_options!
+   # Check if the specified gems contains
+   # the logstash `metadata`
+   def verify_remote!(gems)
++    options = { :rubygems_source => gemfile.gemset.sources }
+     gems.each do |plugin, version|
+       puts("Validating #{[plugin, version].compact.join("-")}")
+-      signal_error("Installation aborted, verification failed for #{plugin} #{version}") unless LogStash::PluginManager.logstash_plugin?(plugin, version)
++      next if validate_plugin(plugin, version, options)
++      signal_error("Installation aborted, verification failed for #{plugin} #{version}")
+     end
+   end
+ 
++  def validate_plugin(plugin, version, options)
++    LogStash::PluginManager.logstash_plugin?(plugin, version, options)
++  rescue SocketError
++    false
++  end
++
+   def plugins_development_gems
+     # Get currently defined gems and their dev dependencies
+     specs = []
+diff --git a/lib/pluginmanager/update.rb b/lib/pluginmanager/update.rb
+index 3fc8b6b12a7..ab974df7abe 100644
+--- a/lib/pluginmanager/update.rb
++++ b/lib/pluginmanager/update.rb
+@@ -8,6 +8,7 @@ class LogStash::PluginManager::Update < LogStash::PluginManager::Command
+   REJECTED_OPTIONS = [:path, :git, :github]
+ 
+   parameter "[PLUGIN] ...", "Plugin name(s) to upgrade to latest version", :attribute_name => :plugins_arg
++  option "--[no-]verify", :flag, "verify plugin validity before installation", :default => true
+ 
+   def execute
+     local_gems = gemfile.locally_installed_gems
+@@ -21,7 +22,6 @@ def execute
+ 
+       warn_local_gems(plugins_with_path)
+     end
+-
+     update_gems!
+   end
+ 
+@@ -44,7 +44,7 @@ def update_gems!
+     filtered_plugins = plugins.map { |plugin| gemfile.find(plugin) }
+       .compact
+       .reject { |plugin| REJECTED_OPTIONS.any? { |key| plugin.options.has_key?(key) } }
+-      .select { |plugin| validates_version(plugin.name) }
++      .select { |plugin| (verify? ? validates_version(plugin.name) : true) }
+       .each   { |plugin| gemfile.update(plugin.name) }
+ 
+     # force a disk sync before running bundler
+@@ -54,9 +54,8 @@ def update_gems!
+ 
+     # any errors will be logged to $stderr by invoke!
+     # Bundler cannot update and clean gems in one operation so we have to call the CLI twice.
+-    output = LogStash::Bundler.invoke!(:update => plugins)
++    output = LogStash::Bundler.invoke!(:update => plugins, :rubygems_source => gemfile.gemset.sources)
+     output = LogStash::Bundler.invoke!(:clean => true)
+-
+     display_updated_plugins(previous_gem_specs_map)
+   rescue => exception
+     gemfile.restore!
+diff --git a/lib/pluginmanager/util.rb b/lib/pluginmanager/util.rb
+index 78bb7d38926..149ff6256d4 100644
+--- a/lib/pluginmanager/util.rb
++++ b/lib/pluginmanager/util.rb
+@@ -2,12 +2,18 @@
+ require "rubygems/package"
+ 
+ module LogStash::PluginManager
++
++  class ValidationError < StandardError; end
++
+   # check for valid logstash plugin gem name & version or .gem file, logs errors to $stdout
+   # uses Rubygems API and will remotely validated agains the current Gem.sources
+   # @param plugin [String] plugin name or .gem file path
+   # @param version [String] gem version requirement string
++  # @param [Hash] options the options used to setup external components
++  # @option options [Array<String>] :rubygems_source Gem sources to lookup for the verification
+   # @return [Boolean] true if valid logstash plugin gem name & version or a .gem file
+-  def self.logstash_plugin?(plugin, version = nil)
++  def self.logstash_plugin?(plugin, version = nil, options={})
++
+     if plugin_file?(plugin)
+       begin
+         return logstash_plugin_gem_spec?(plugin_file_spec(plugin))
+@@ -18,6 +24,7 @@ def self.logstash_plugin?(plugin, version = nil)
+       end
+     else
+       dep = Gem::Dependency.new(plugin, version || Gem::Requirement.default)
++      Gem.sources = Gem::SourceList.from(options[:rubygems_source]) if options[:rubygems_source]
+       specs, errors = Gem::SpecFetcher.fetcher.spec_for_dependency(dep)
+ 
+       # dump errors
+@@ -46,6 +53,7 @@ def self.fetch_latest_version_info(plugin, options={})
+     require "gems"
+     exclude_prereleases =  options.fetch(:pre, false)
+     versions = Gems.versions(plugin)
++    raise ValidationError.new("Something went wrong with the validation. You can skip the validation with the --no-verify option") if !versions.is_a?(Array) || versions.empty?
+     versions = versions.select { |version| !version["prerelease"] } if !exclude_prereleases
+     versions.first
+   end
+diff --git a/spec/plugin_manager/install_spec.rb b/spec/plugin_manager/install_spec.rb
+new file mode 100644
+index 00000000000..40eb3dfe408
+--- /dev/null
++++ b/spec/plugin_manager/install_spec.rb
+@@ -0,0 +1,28 @@
++# encoding: utf-8
++require 'spec_helper'
++require 'pluginmanager/main'
++
++describe LogStash::PluginManager::Install do
++  let(:cmd) { LogStash::PluginManager::Install.new("install") }
++
++  before(:each) do
++    expect(cmd).to receive(:validate_cli_options!).and_return(nil)
++  end
++
++  context "when validating plugins" do
++    let(:sources) { ["https://rubygems.org", "http://localhost:9292"] }
++
++    before(:each) do
++      expect(cmd).to receive(:plugins_gems).and_return([["dummy", nil]])
++      expect(cmd).to receive(:install_gems_list!).and_return(nil)
++      expect(cmd).to receive(:remove_unused_locally_installed_gems!).and_return(nil)
++      cmd.verify = true
++    end
++
++    it "should load all the sources defined in the Gemfile" do
++      expect(cmd.gemfile.gemset).to receive(:sources).and_return(sources)
++      expect(LogStash::PluginManager).to receive(:logstash_plugin?).with("dummy", nil, {:rubygems_source => sources}).and_return(true)
++      cmd.execute
++    end
++  end
++end
+diff --git a/spec/plugin_manager/update_spec.rb b/spec/plugin_manager/update_spec.rb
+new file mode 100644
+index 00000000000..7891f311ccd
+--- /dev/null
++++ b/spec/plugin_manager/update_spec.rb
+@@ -0,0 +1,39 @@
++# encoding: utf-8
++require 'spec_helper'
++require 'pluginmanager/main'
++
++describe LogStash::PluginManager::Update do
++  let(:cmd)     { LogStash::PluginManager::Update.new("update") }
++  let(:sources) { cmd.gemfile.gemset.sources }
++
++  before(:each) do
++    expect(cmd).to receive(:find_latest_gem_specs).and_return({})
++    expect(cmd).to receive(:warn_local_gems).and_return(nil)
++    expect(cmd).to receive(:display_updated_plugins).and_return(nil)
++    expect_any_instance_of(LogStash::Bundler).to receive(:invoke!).with(:clean => true)
++  end
++
++  it "pass all gem sources to the bundle update command" do
++    sources = cmd.gemfile.gemset.sources
++    expect_any_instance_of(LogStash::Bundler).to receive(:invoke!).with(:update => [], :rubygems_source => sources)
++    cmd.execute
++  end
++
++  context "when skipping validation" do
++    let(:cmd)    { LogStash::PluginManager::Update.new("update") }
++    let(:plugin) { OpenStruct.new(:name => "dummy", :options => {} ) }
++
++    before(:each) do
++      expect(cmd.gemfile).to receive(:find).with(plugin).and_return(plugin)
++      expect(cmd.gemfile).to receive(:save).and_return(nil)
++      expect(cmd).to receive(:plugins_to_update).and_return([plugin])
++      expect_any_instance_of(LogStash::Bundler).to receive(:invoke!).with(:update => [plugin], :rubygems_source => sources).and_return(nil)
++    end
++
++    it "skips version verification when ask for it" do
++      cmd.verify = false
++      expect(cmd).to_not receive(:validates_version)
++      cmd.execute
++    end
++  end
++end
+diff --git a/spec/plugin_manager/util_spec.rb b/spec/plugin_manager/util_spec.rb
+new file mode 100644
+index 00000000000..10824e56adc
+--- /dev/null
++++ b/spec/plugin_manager/util_spec.rb
+@@ -0,0 +1,71 @@
++#encoding: utf-8
++require 'spec_helper'
++require 'pluginmanager/util'
++require 'gems'
++
++describe LogStash::PluginManager do
++
++  describe "fetching plugin information" do
++    let(:plugin_name) { "logstash-output-elasticsearch" }
++
++    let(:version_data) do
++      [ { "authors"=>"Elastic", "built_at"=>"2015-08-11T00:00:00.000Z", "description"=>"Output events to elasticsearch",
++          "downloads_count"=>1638, "metadata"=>{"logstash_group"=>"output", "logstash_plugin"=>"true"}, "number"=>"2.0.0.pre",
++          "summary"=>"Logstash Output to Elasticsearch", "platform"=>"java", "ruby_version"=>">= 0", "prerelease"=>true,
++          "licenses"=>["apache-2.0"], "requirements"=>[], "sha"=>"194b27099c13605a882a3669e2363fdecccaab1de48dd44b0cda648dd5516799"},
++      { "authors"=>"Elastic", "built_at"=>"2015-08-10T00:00:00.000Z", "description"=>"Output events to elasticsearch",
++        "downloads_count"=>1638, "metadata"=>{"logstash_group"=>"output", "logstash_plugin"=>"true"}, "number"=>"1.0.7",
++        "summary"=>"Logstash Output to Elasticsearch", "platform"=>"java", "ruby_version"=>">= 0", "prerelease"=>false,
++        "licenses"=>["apache-2.0"], "requirements"=>[], "sha"=>"194b27099c13605a882a3669e2363fdecccaab1de48dd44b0cda648dd5516799"},
++      { "authors"=>"Elastic", "built_at"=>"2015-08-09T00:00:00.000Z", "description"=>"Output events to elasticsearch",
++        "downloads_count"=>1638, "metadata"=>{"logstash_group"=>"output", "logstash_plugin"=>"true"}, "number"=>"1.0.4",
++        "summary"=>"Logstash Output to Elasticsearch", "platform"=>"java", "ruby_version"=>">= 0", "prerelease"=>false,
++        "licenses"=>["apache-2.0"], "requirements"=>[], "sha"=>"194b27099c13605a882a3669e2363fdecccaab1de48dd44b0cda648dd5516799"} ]
++    end
++
++    before(:each) do
++      allow(Gems).to receive(:versions).with(plugin_name).and_return(version_data)
++    end
++
++    context "fetch plugin info" do
++      it "should search for the last version infomation non prerelease" do
++        version_info = LogStash::PluginManager.fetch_latest_version_info(plugin_name)
++        expect(version_info["number"]).to eq("1.0.7")
++      end
++
++
++      it "should search for the last version infomation with prerelease" do
++        version_info = LogStash::PluginManager.fetch_latest_version_info(plugin_name, :pre => true)
++        expect(version_info["number"]).to eq("2.0.0.pre")
++      end
++    end
++  end
++
++  describe "a logstash_plugin validation" do
++    let(:plugin)  { "foo" }
++    let(:version) { "9.0.0.0" }
++
++    let(:sources) { ["http://source.01", "http://source.02"] }
++    let(:options) { {:rubygems_source => sources} }
++
++    let(:gemset)  { double("gemset") }
++    let(:gemfile) { double("gemfile") }
++    let(:dep)     { double("dep") }
++    let(:fetcher) { double("fetcher") }
++
++    before(:each) do
++      allow(gemfile).to  receive(:gemset).and_return(gemset)
++      allow(gemset).to   receive(:sources).and_return(sources)
++      expect(fetcher).to receive(:spec_for_dependency).and_return([[],[]])
++    end
++
++    it "should load all available sources" do
++      expect(subject).to receive(:plugin_file?).and_return(false)
++      expect(Gem::Dependency).to receive(:new).and_return(dep)
++      expect(Gem::SpecFetcher).to receive(:fetcher).and_return(fetcher)
++
++      subject.logstash_plugin?(plugin, version, options)
++      expect(Gem.sources.map { |source| source }).to eq(sources)
++    end
++  end
++end
+diff --git a/spec/pluginmanager/util_spec.rb b/spec/pluginmanager/util_spec.rb
+deleted file mode 100644
+index 6a14beeb950..00000000000
+--- a/spec/pluginmanager/util_spec.rb
++++ /dev/null
+@@ -1,42 +0,0 @@
+-# encoding: utf-8
+-require "spec_helper"
+-require "pluginmanager/util"
+-require "gems"
+-
+-describe LogStash::PluginManager do
+-
+-  let(:plugin_name) { "logstash-output-elasticsearch" }
+-
+-  let(:version_data) do
+-    [ { "authors"=>"Elastic", "built_at"=>"2015-08-11T00:00:00.000Z", "description"=>"Output events to elasticsearch",
+-        "downloads_count"=>1638, "metadata"=>{"logstash_group"=>"output", "logstash_plugin"=>"true"}, "number"=>"2.0.0.pre",
+-        "summary"=>"Logstash Output to Elasticsearch", "platform"=>"java", "ruby_version"=>">= 0", "prerelease"=>true,
+-        "licenses"=>["apache-2.0"], "requirements"=>[], "sha"=>"194b27099c13605a882a3669e2363fdecccaab1de48dd44b0cda648dd5516799"},
+-    { "authors"=>"Elastic", "built_at"=>"2015-08-10T00:00:00.000Z", "description"=>"Output events to elasticsearch",
+-      "downloads_count"=>1638, "metadata"=>{"logstash_group"=>"output", "logstash_plugin"=>"true"}, "number"=>"1.0.7",
+-      "summary"=>"Logstash Output to Elasticsearch", "platform"=>"java", "ruby_version"=>">= 0", "prerelease"=>false,
+-      "licenses"=>["apache-2.0"], "requirements"=>[], "sha"=>"194b27099c13605a882a3669e2363fdecccaab1de48dd44b0cda648dd5516799"},
+-    { "authors"=>"Elastic", "built_at"=>"2015-08-09T00:00:00.000Z", "description"=>"Output events to elasticsearch",
+-      "downloads_count"=>1638, "metadata"=>{"logstash_group"=>"output", "logstash_plugin"=>"true"}, "number"=>"1.0.4",
+-      "summary"=>"Logstash Output to Elasticsearch", "platform"=>"java", "ruby_version"=>">= 0", "prerelease"=>false,
+-      "licenses"=>["apache-2.0"], "requirements"=>[], "sha"=>"194b27099c13605a882a3669e2363fdecccaab1de48dd44b0cda648dd5516799"} ]
+-  end
+-
+-  before(:each) do
+-    allow(Gems).to receive(:versions).with(plugin_name).and_return(version_data)
+-  end
+-
+-  context "fetch plugin info" do
+-
+-    it "should search for the last version infomation non prerelease" do
+-      version_info = LogStash::PluginManager.fetch_latest_version_info(plugin_name)
+-      expect(version_info["number"]).to eq("1.0.7")
+-    end
+-
+-
+-    it "should search for the last version infomation with prerelease" do
+-      version_info = LogStash::PluginManager.fetch_latest_version_info(plugin_name, :pre => true)
+-      expect(version_info["number"]).to eq("2.0.0.pre")
+-    end
+-  end
+-end

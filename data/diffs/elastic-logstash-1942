@@ -1,0 +1,177 @@
+diff --git a/rakelib/artifacts.rake b/rakelib/artifacts.rake
+index d8f4965b316..ef30e0f3890 100644
+--- a/rakelib/artifacts.rake
++++ b/rakelib/artifacts.rake
+@@ -4,21 +4,51 @@ end
+ 
+ namespace "artifact" do
+   require "logstash/environment"
+-  package_files = [
+-    "LICENSE",
+-    "CHANGELOG",
+-    "CONTRIBUTORS",
+-    "{bin,lib,spec,locales}/{,**/*}",
+-    "patterns/**/*",
+-    "vendor/??*/**/*",
+-    File.join(LogStash::Environment.gem_home.gsub(Dir.pwd + "/", ""), "{gems,specifications}/**/*"),
+-    "Rakefile",
+-    "rakelib/*",
+-  ]
++  def package_files
++    [
++      "LICENSE",
++      "CHANGELOG",
++      "CONTRIBUTORS",
++      "{bin,lib,spec,locales}/{,**/*}",
++      "patterns/**/*",
++      "vendor/??*/**/*",
++      File.join(LogStash::Environment.gem_home.gsub(Dir.pwd + "/", ""), "{gems,specifications}/**/*"),
++      "Rakefile",
++      "rakelib/*",
++    ]
++  end
++
++  def exclude_globs
++    return @exclude_globs if @exclude_globs
++    @exclude_globs = []
++    #gitignore = File.join(File.dirname(__FILE__), "..", ".gitignore")
++    #if File.exists?(gitignore)
++      #@exclude_globs += File.read(gitignore).split("\n")
++    #end
++    @exclude_globs << "spec/reports/**/*"
++    @exclude_globs << "**/*.gem"
++    @exclude_globs << "**/test/files/slow-xpath.xml"
++    return @exclude_globs
++  end
++
++  def excludes
++    return @excludes if @excludes
++    @excludes = exclude_globs.collect { |g| Rake::FileList[g] }.flatten
++  end
++
++  def exclude?(path)
++    excludes.any? { |ex| path == ex || (File.directory?(ex) && path =~ /^#{ex}\//) }
++  end
++
++  def files
++    return @files if @files
++    @files = package_files.collect do |glob|
++      Rake::FileList[glob].reject { |path| exclude?(path) }
++    end.flatten.uniq
++  end
+   
+   desc "Build a tar.gz of logstash with all dependencies"
+-  task "tar" => ["vendor:elasticsearch", "vendor:collectd", "vendor:jruby", "vendor:gems"] do
+-    Rake::Task["dependency:archive-tar-minitar"].invoke
++  task "tar" => ["bootstrap"] do
+     require "zlib"
+     require "archive/tar/minitar"
+     require "logstash/version"
+@@ -26,17 +56,15 @@ namespace "artifact" do
+     tarfile = File.new(tarpath, "wb")
+     gz = Zlib::GzipWriter.new(tarfile, Zlib::BEST_COMPRESSION)
+     tar = Archive::Tar::Minitar::Output.new(gz)
+-    package_files.each do |glob|
+-      Rake::FileList[glob].each do |path|
+-        Archive::Tar::Minitar.pack_file(path, tar)
+-      end
++    files.each do |path|
++      Archive::Tar::Minitar.pack_file(path, tar)
+     end
+     tar.close
+     gz.close
+     puts "Complete: #{tarpath}"
+   end
+ 
+-  def package(platform, version, package_files)
++  def package(platform, version)
+     Rake::Task["dependency:fpm"].invoke
+     require "fpm/errors" # TODO(sissel): fix this in fpm
+     require "fpm/package/dir"
+@@ -44,10 +72,9 @@ namespace "artifact" do
+ 
+     dir = FPM::Package::Dir.new
+ 
+-    package_files.each do |glob|
+-      Rake::FileList[glob].each do |path|
+-        dir.input("#{path}=/opt/logstash/#{path}")
+-      end
++    files.each do |path|
++      next if File.directory?(path)
++      dir.input("#{path}=/opt/logstash/#{path}")
+     end
+ 
+     basedir = File.join(File.dirname(__FILE__), "..")
+@@ -137,13 +164,13 @@ namespace "artifact" do
+   end # def package
+ 
+   desc "Build an RPM of logstash with all dependencies"
+-  task "rpm" => ["vendor:elasticsearch", "vendor:collectd", "vendor:jruby", "vendor:gems"] do
+-    package("centos", "5", package_files)
++  task "rpm" => ["bootstrap"] do
++    package("centos", "5")
+   end
+ 
+   desc "Build an RPM of logstash with all dependencies"
+-  task "deb" do
+-    package("ubuntu", "12.04", package_files)
++  task "deb" => ["bootstrap"] do
++    package("ubuntu", "12.04")
+   end
+ end
+ 
+diff --git a/rakelib/dependency.rake b/rakelib/dependency.rake
+index c66c22f69cc..601f9a10aeb 100644
+--- a/rakelib/dependency.rake
++++ b/rakelib/dependency.rake
+@@ -1,15 +1,8 @@
+ 
+ namespace "dependency" do
+   task "bundler" do
+-    begin
+-      # Special handling because "gem 'bundler', '>=1.3.5'" will fail if
+-      # bundler is already loaded.
+-      require "bundler/cli"
+-    rescue LoadError
+-      Rake::Task["gem:require"].invoke("bundler", ">= 1.3.5", ENV["GEM_HOME"])
+-      require "bundler/cli"
+-    end
+-    require_relative "bundler_patch"
++    Rake::Task["gem:require"].invoke("bundler", ">= 1.3.5", ENV["GEM_HOME"])
++    #require_relative "bundler_patch"
+   end
+ 
+   task "rbx-stdlib" do
+diff --git a/rakelib/test.rake b/rakelib/test.rake
+index 1801f45d17e..b8edfa026f2 100644
+--- a/rakelib/test.rake
++++ b/rakelib/test.rake
+@@ -1,13 +1,13 @@
+ 
+ namespace "test" do
+-  task "default" => [ "vendor:all" ] do
++  task "default" => [ "bootstrap" ] do
+     require "logstash/environment"
+     LogStash::Environment.set_gem_paths!
+     require 'rspec/core'
+     RSpec::Core::Runner.run(Rake::FileList["spec/**/*.rb"])
+   end
+ 
+-  task "fail-fast" => [ "vendor:all" ] do
++  task "fail-fast" => [ "bootstrap" ] do
+     require "logstash/environment"
+     LogStash::Environment.set_gem_paths!
+     require 'rspec/core'
+diff --git a/rakelib/vendor.rake b/rakelib/vendor.rake
+index 86d7144a0a2..18e85a99769 100644
+--- a/rakelib/vendor.rake
++++ b/rakelib/vendor.rake
+@@ -225,7 +225,7 @@ namespace "vendor" do
+         jruby = File.join("vendor", "jruby", "bin", "jruby")
+         cmd = [jruby,  bundler, "install", "--gemfile=tools/Gemfile", "--path", LogStash::Environment::BUNDLE_DIR, "--standalone", "--clean", "--without", "development", "--jobs", "4"]
+         system(*cmd)
+-        raise $! unless $?.success?
++        raise RuntimeError, $!.to_s unless $?.success?
+         break
+       rescue Gem::RemoteFetcher::FetchError => e
+         puts e.message

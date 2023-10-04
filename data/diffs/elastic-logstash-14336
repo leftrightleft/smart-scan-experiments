@@ -1,0 +1,454 @@
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueReader.java b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueReader.java
+index d0357255eea..387ca5c0d33 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueReader.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueReader.java
+@@ -39,6 +39,8 @@
+ package org.logstash.common.io;
+ 
+ import java.io.Closeable;
++
++import com.google.common.annotations.VisibleForTesting;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ import org.logstash.DLQEntry;
+@@ -58,10 +60,12 @@
+ import java.nio.file.WatchService;
+ import java.nio.file.attribute.FileTime;
+ import java.util.Comparator;
++import java.util.LongSummaryStatistics;
+ import java.util.NoSuchElementException;
+ import java.util.Optional;
+ import java.util.concurrent.ConcurrentSkipListSet;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.LongAdder;
+ import java.util.stream.Collectors;
+ import java.util.stream.Stream;
+ 
+@@ -78,6 +82,8 @@ public final class DeadLetterQueueReader implements Closeable {
+     private final ConcurrentSkipListSet<Path> segments;
+     private final WatchService watchService;
+     private RecordIOReader lastConsumedReader;
++    private final LongAdder consumedEvents = new LongAdder();
++    private final LongAdder consumedSegments = new LongAdder();
+ 
+     // config settings
+     private final boolean cleanConsumed;
+@@ -283,7 +289,16 @@ public void markForDelete() {
+ 
+         // delete segment file only after current reader is closed.
+         // closing happens in pollEntryBytes method when it identifies the reader is at end of stream
+-        deleteSegment(lastConsumedSegmentPath);
++        final Optional<Long> deletedEvents = deleteSegment(lastConsumedSegmentPath);
++        if (deletedEvents.isPresent()) {
++            // update consumed metrics
++            consumedEvents.add(deletedEvents.get());
++            consumedSegments.increment();
++        }
++
++        // publish the metrics to the listener
++        segmentCallback.segmentsDeleted(consumedSegments.intValue(), consumedEvents.longValue());
++
+         lastConsumedReader = null;
+     }
+ 
+@@ -344,8 +359,15 @@ private void removeSegmentsBefore(Path validSegment) throws IOException {
+                 .thenComparingInt(DeadLetterQueueUtils::extractSegmentId);
+ 
+         try (final Stream<Path> segmentFiles = listSegmentPaths(queuePath)) {
+-            segmentFiles.filter(p -> fileTimeAndName.compare(p, validSegment) < 0)
+-                  .forEach(this::deleteSegment);
++            LongSummaryStatistics deletionStats = segmentFiles.filter(p -> fileTimeAndName.compare(p, validSegment) < 0)
++                    .map(this::deleteSegment)
++                    .map(o -> o.orElse(0L))
++                    .mapToLong(Long::longValue)
++                    .summaryStatistics();
++
++            // update consumed metrics
++            consumedSegments.add(deletionStats.getCount());
++            consumedEvents.add(deletionStats.getSum());
+         }
+     }
+ 
+@@ -370,13 +392,22 @@ private int compareByFileTimestamp(Path p1, Path p2) {
+         return timestamp1.compareTo(timestamp2);
+     }
+ 
+-    private void deleteSegment(Path segment) {
++    /**
++     * Remove the segment from internal tracking data structures and physically delete the corresponding
++     * file from filesystem.
++     *
++     * @return the number events contained in the removed segment, empty if a problem happened during delete.
++     * */
++    private Optional<Long> deleteSegment(Path segment) {
+         segments.remove(segment);
+         try {
++            long eventsInSegment = DeadLetterQueueUtils.countEventsInSegment(segment);
+             Files.delete(segment);
+             logger.debug("Deleted segment {}", segment);
++            return Optional.of(eventsInSegment);
+         } catch (IOException ex) {
+             logger.warn("Problem occurred in cleaning the segment {} after a repositioning", segment, ex);
++            return Optional.empty();
+         }
+     }
+ 
+@@ -399,6 +430,14 @@ public long getCurrentPosition() {
+         return currentReader.getChannelPosition();
+     }
+ 
++    long getConsumedEvents() {
++        return consumedEvents.longValue();
++    }
++
++    int getConsumedSegments() {
++        return consumedSegments.intValue();
++    }
++
+     @Override
+     public void close() throws IOException {
+         try {
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueUtils.java b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueUtils.java
+index 7e03758d10f..b4ad7087ab0 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueUtils.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueUtils.java
+@@ -18,14 +18,24 @@
+  */
+ package org.logstash.common.io;
+ 
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
+ import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.nio.channels.FileChannel;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.nio.file.StandardOpenOption;
+ import java.util.stream.Collectors;
+ import java.util.stream.Stream;
+ 
++import static org.logstash.common.io.RecordIOWriter.*;
++
+ class DeadLetterQueueUtils {
+ 
++    private static final Logger logger = LogManager.getLogger(DeadLetterQueueUtils.class);
++
+     static int extractSegmentId(Path p) {
+         return Integer.parseInt(p.getFileName().toString().split("\\.log")[0]);
+     }
+@@ -40,4 +50,55 @@ static Stream<Path> listFiles(Path path, String suffix) throws IOException {
+     static Stream<Path> listSegmentPaths(Path path) throws IOException {
+         return listFiles(path, ".log");
+     }
++
++    /**
++     * Count the number of 'c' and 's' records in segment.
++     * An event can't be bigger than the segments so in case of records split across multiple event blocks,
++     * the segment has to contain both the start 's' record, all the middle 'm' up to the end 'e' records.
++     * */
++    @SuppressWarnings("fallthrough")
++    static long countEventsInSegment(Path segment) throws IOException {
++        try (FileChannel channel = FileChannel.open(segment, StandardOpenOption.READ)) {
++            // verify minimal segment size
++            if (channel.size() < VERSION_SIZE + RECORD_HEADER_SIZE) {
++                return 0L;
++            }
++
++            // skip the DLQ version byte
++            channel.position(1);
++            int posInBlock = 0;
++            int currentBlockIdx = 0;
++            long countedEvents = 0;
++            do {
++                ByteBuffer headerBuffer = ByteBuffer.allocate(RECORD_HEADER_SIZE);
++                long startPosition = channel.position();
++                // if record header can't be fully contained in the block, align to the next
++                if (posInBlock + RECORD_HEADER_SIZE + 1 > BLOCK_SIZE) {
++                    channel.position((++currentBlockIdx) * BLOCK_SIZE + VERSION_SIZE);
++                    posInBlock = 0;
++                }
++
++                channel.read(headerBuffer);
++                headerBuffer.flip();
++                RecordHeader recordHeader = RecordHeader.get(headerBuffer);
++                if (recordHeader == null) {
++                    // continue with next record, skipping this
++                    logger.error("Can't decode record header, position {} current post {} current events count {}", startPosition, channel.position(), countedEvents);
++                } else {
++                    switch (recordHeader.getType()) {
++                        case START:
++                        case COMPLETE:
++                            countedEvents++;
++                        case MIDDLE:
++                        case END: {
++                            channel.position(channel.position() + recordHeader.getSize());
++                            posInBlock += RECORD_HEADER_SIZE + recordHeader.getSize();
++                        }
++                    }
++                }
++            } while (channel.position() < channel.size());
++
++            return countedEvents;
++        }
++    }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
+index c2c5dbfa631..1aad80538b9 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
+@@ -40,14 +40,11 @@
+ 
+ import java.io.Closeable;
+ import java.io.IOException;
+-import java.nio.ByteBuffer;
+-import java.nio.channels.FileChannel;
+ import java.nio.channels.FileLock;
+ import java.nio.file.Files;
+ import java.nio.file.NoSuchFileException;
+ import java.nio.file.Path;
+ import java.nio.file.StandardCopyOption;
+-import java.nio.file.StandardOpenOption;
+ import java.time.Clock;
+ import java.time.Duration;
+ import java.time.Instant;
+@@ -366,7 +363,7 @@ private void deleteExpiredSegments() throws IOException {
+      * */
+     private long deleteTailSegment(Path segment, String motivation) throws IOException {
+         try {
+-            long eventsInSegment = countEventsInSegment(segment);
++            long eventsInSegment = DeadLetterQueueUtils.countEventsInSegment(segment);
+             Files.delete(segment);
+             logger.debug("Removed segment file {} due to {}", motivation, segment);
+             return eventsInSegment;
+@@ -377,57 +374,6 @@ private long deleteTailSegment(Path segment, String motivation) throws IOExcepti
+         }
+     }
+ 
+-    /**
+-     * Count the number of 'c' and 's' records in segment.
+-     * An event can't be bigger than the segments so in case of records split across multiple event blocks,
+-     * the segment has to contain both the start 's' record, all the middle 'm' up to the end 'e' records.
+-     * */
+-    @SuppressWarnings("fallthrough")
+-    private long countEventsInSegment(Path segment) throws IOException {
+-        try (FileChannel channel = FileChannel.open(segment, StandardOpenOption.READ)) {
+-            // verify minimal segment size
+-            if (channel.size() < VERSION_SIZE + RECORD_HEADER_SIZE) {
+-                return 0L;
+-            }
+-
+-            // skip the DLQ version byte
+-            channel.position(1);
+-            int posInBlock = 0;
+-            int currentBlockIdx = 0;
+-            long countedEvents = 0;
+-            do {
+-                ByteBuffer headerBuffer = ByteBuffer.allocate(RECORD_HEADER_SIZE);
+-                long startPosition = channel.position();
+-                // if record header can't be fully contained in the block, align to the next
+-                if (posInBlock + RECORD_HEADER_SIZE + 1 > BLOCK_SIZE) {
+-                    channel.position((++currentBlockIdx) * BLOCK_SIZE + VERSION_SIZE);
+-                    posInBlock = 0;
+-                }
+-
+-                channel.read(headerBuffer);
+-                headerBuffer.flip();
+-                RecordHeader recordHeader = RecordHeader.get(headerBuffer);
+-                if (recordHeader == null) {
+-                    // continue with next record, skipping this
+-                    logger.error("Can't decode record header, position {} current post {} current events count {}", startPosition, channel.position(), countedEvents);
+-                } else {
+-                    switch (recordHeader.getType()) {
+-                        case START:
+-                        case COMPLETE:
+-                            countedEvents++;
+-                        case MIDDLE:
+-                        case END: {
+-                            channel.position(channel.position() + recordHeader.getSize());
+-                            posInBlock += RECORD_HEADER_SIZE + recordHeader.getSize();
+-                        }
+-                    }
+-                }
+-            } while (channel.position() < channel.size());
+-
+-            return countedEvents;
+-        }
+-    }
+-
+     private void updateOldestSegmentReference() throws IOException {
+         oldestSegmentPath = listSegmentPaths(this.queuePath).sorted().findFirst();
+         if (!oldestSegmentPath.isPresent()) {
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/SegmentListener.java b/logstash-core/src/main/java/org/logstash/common/io/SegmentListener.java
+index 09206cdd97c..aea62d2c5ec 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/SegmentListener.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/SegmentListener.java
+@@ -1,9 +1,21 @@
+ package org.logstash.common.io;
+ 
+ /**
+- * Callback interface to receive notification when a DLQ segment is completely read and is going to be removed.
++ * Listener interface to receive notification when a DLQ segment is completely read and when are removed.
+  * */
+-@FunctionalInterface
+ public interface SegmentListener {
++    /**
++     * Notifies the listener about the complete consumption of a bunch of segments.
++     * */
+     void segmentCompleted();
++
++    /**
++     * Notifies the listener about the deletion of consumed segments.
++     * It reports the number of deleted segments and number of events contained in those segments.
++     *
++     * @param numberOfSegments the number of deleted segment files.
++     *
++     * @param numberOfEvents total number of events that were present in the deleted segments.
++     * */
++    void segmentsDeleted(int numberOfSegments, long numberOfEvents);
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
+index 183fa4eae56..0374b2ce5d0 100644
+--- a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
++++ b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
+@@ -952,20 +952,28 @@ public void testRestartFromCommitPointRealData() throws IOException, Interrupted
+ 
+     private static class MockSegmentListener implements SegmentListener {
+         boolean notified = false;
++        long events = 0L;
++        int segments = 0;
+ 
+         @Override
+         public void segmentCompleted() {
+             notified = true;
+         }
++
++        @Override
++        public void segmentsDeleted(int numberOfSegments, long numberOfEvents) {
++            events += numberOfEvents;
++            segments += numberOfSegments;
++        }
+     }
+ 
+     @Test
+     public void testReaderWithCleanConsumedIsEnabledDeleteFullyConsumedSegmentsAfterBeingAcknowledged() throws IOException, InterruptedException {
+         final int eventsPerSegment = prepareFilledSegmentFiles(2);
+ 
+-        MockSegmentListener callback = new MockSegmentListener();
++        MockSegmentListener listener = new MockSegmentListener();
+ 
+-        try (DeadLetterQueueReader reader = new DeadLetterQueueReader(dir, true, callback)) {
++        try (DeadLetterQueueReader reader = new DeadLetterQueueReader(dir, true, listener)) {
+             // to reach endOfStream on the first segment, a read more than the size has to be done.
+             for (int i = 0; i < eventsPerSegment + 1; i++) {
+                 reader.pollEntry(1_000);
+@@ -978,15 +986,17 @@ public void testReaderWithCleanConsumedIsEnabledDeleteFullyConsumedSegmentsAfter
+                     .map(Path::toString)
+                     .collect(Collectors.toSet());
+             assertEquals("Only head segment file MUST be present", Set.of("2.log"), segments);
+-            assertTrue("Reader's client must be notified of the segment deletion", callback.notified);
++            assertTrue("Reader's client must be notified of the segment deletion", listener.notified);
++            assertEquals("Must report the deletion of 1 segment", 1, listener.segments);
++            assertEquals("Must report the correct number of deleted events", eventsPerSegment, listener.events);
+         }
+     }
+ 
+     @Test
+-    public void testReaderWithCleanConsumedIsEnabledWhenSetCurrentPositionCleanupTrashedSegments() throws IOException {
++    public void testReaderWithCleanConsumedIsEnabledWhenSetCurrentPositionThenCleanupTrashedSegments() throws IOException {
+         prepareFilledSegmentFiles(2);
+ 
+-        try (DeadLetterQueueReader reader = new DeadLetterQueueReader(dir, true, this::silentCallback)) {
++        try (DeadLetterQueueReader reader = new DeadLetterQueueReader(dir, true, new MockSegmentListener())) {
+             final List<Path> allSegments = listSegmentsSorted(dir);
+             verifySegmentFiles(allSegments, "1.log", "2.log");
+ 
+@@ -996,6 +1006,7 @@ public void testReaderWithCleanConsumedIsEnabledWhenSetCurrentPositionCleanupTra
+             // verify
+             Set<Path> segmentFiles = DeadLetterQueueUtils.listSegmentPaths(dir).collect(Collectors.toSet());
+             assertEquals(Set.of(lastSegmentPath), segmentFiles);
++            assertEquals("Just the 1.log segment should be marked as consumed", 1, reader.getConsumedSegments());
+         }
+     }
+ 
+@@ -1013,12 +1024,10 @@ private List<Path> listSegmentsSorted(Path dir) throws IOException {
+                 .collect(Collectors.toList());
+     }
+ 
+-    private void silentCallback() {}
+-
+ 
+     @Test
+-    public void testReaderCleanMultipleConsumedSegmentsAfterMarkForDelete() throws IOException, InterruptedException {
+-        int eventPerSegment = prepareFilledSegmentFiles(3);
++    public void testReaderCleanMultipleConsumedSegmentsAfterMarkForDeleteAndDontTouchLockOrWriterHeadFiles() throws IOException, InterruptedException {
++        int eventsPerSegment = prepareFilledSegmentFiles(3);
+         // insert also a .lock file, must be the oldest one
+         Path lockFile = Files.createFile(dir.resolve(".lock"));
+         FileTime oneSecondAgo = FileTime.from(Instant.now().minusMillis(1_000));
+@@ -1026,11 +1035,12 @@ public void testReaderCleanMultipleConsumedSegmentsAfterMarkForDelete() throws I
+         // simulate a writer's segment head
+         Files.createFile(dir.resolve("4.log.tmp"));
+ 
+-        try (DeadLetterQueueReader reader = new DeadLetterQueueReader(dir, true, this::silentCallback)) {
++        MockSegmentListener listener = new MockSegmentListener();
++        try (DeadLetterQueueReader reader = new DeadLetterQueueReader(dir, true, listener)) {
+             verifySegmentFiles(listSegmentsSorted(dir), "1.log", "2.log", "3.log");
+ 
+             // consume fully two segments plus one more event to trigger the endOfStream on the second segment
+-            for (int i = 0; i < (2 * eventPerSegment) + 1; i++) {
++            for (int i = 0; i < (2 * eventsPerSegment) + 1; i++) {
+                 reader.pollEntry(100L);
+             }
+ 
+@@ -1040,6 +1050,9 @@ public void testReaderCleanMultipleConsumedSegmentsAfterMarkForDelete() throws I
+ 
+             verifySegmentFiles(listSegmentsSorted(dir), "3.log");
+ 
++            assertEquals("Must report the deletion of 2 segments", 2, listener.segments);
++            assertEquals("Must report the correct number of deleted events", eventsPerSegment * listener.segments, listener.events);
++
+             // verify no other files are removed
+             try (Stream<Path> stream = Files.list(dir)) {
+                 Set<String> files = stream
+@@ -1051,11 +1064,38 @@ public void testReaderCleanMultipleConsumedSegmentsAfterMarkForDelete() throws I
+         }
+     }
+ 
++    @Test
++    public void testReaderDoesntIncrementStatisticsOnDeletionError() throws IOException, InterruptedException {
++        int eventsPerSegment = prepareFilledSegmentFiles(3);
++
++        MockSegmentListener listener = new MockSegmentListener();
++        try (DeadLetterQueueReader reader = new DeadLetterQueueReader(dir, true, listener)) {
++            verifySegmentFiles(listSegmentsSorted(dir), "1.log", "2.log", "3.log");
++
++            // consume fully two segments plus one more event to trigger the endOfStream on the second segment
++            for (int i = 0; i < (2 * eventsPerSegment) + 1; i++) {
++                reader.pollEntry(100L);
++            }
++
++            verifySegmentFiles(listSegmentsSorted(dir), "1.log", "2.log", "3.log");
++
++            // simulate an error in last consumed segment (2.log)
++            Files.delete(dir.resolve("2.log"));
++
++            reader.markForDelete();
++
++            verifySegmentFiles(listSegmentsSorted(dir), "3.log");
++
++            assertEquals("Must report the deletion of 1 segment", 1, listener.segments);
++            assertEquals("Must report the correct number of deleted events", eventsPerSegment * listener.segments, listener.events);
++        }
++    }
++
+     @Test
+     @SuppressWarnings("try")
+     public void testReaderLockProhibitMultipleInstances() throws IOException {
+-        try (DeadLetterQueueReader reader = new DeadLetterQueueReader(dir, true, this::silentCallback)) {
+-            try (DeadLetterQueueReader secondReader = new DeadLetterQueueReader(dir, true, this::silentCallback)) {
++        try (DeadLetterQueueReader reader = new DeadLetterQueueReader(dir, true, new MockSegmentListener())) {
++            try (DeadLetterQueueReader secondReader = new DeadLetterQueueReader(dir, true, new MockSegmentListener())) {
+             } catch (LockException lockException) {
+                 // ok it's expected to happen here
+                 assertThat(lockException.getMessage(), startsWith("Existing `dlg_reader.lock` file"));

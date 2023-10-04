@@ -1,0 +1,327 @@
+diff --git a/tools/ingest-converter/src/main/java/org/logstash/ingest/Convert.java b/tools/ingest-converter/src/main/java/org/logstash/ingest/Convert.java
+new file mode 100644
+index 00000000000..6e931a86ec2
+--- /dev/null
++++ b/tools/ingest-converter/src/main/java/org/logstash/ingest/Convert.java
+@@ -0,0 +1,33 @@
++package org.logstash.ingest;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Paths;
++import javax.script.Invocable;
++import javax.script.ScriptEngine;
++import javax.script.ScriptException;
++
++/**
++ * Ingest Convert DSL to Logstash Date Transpiler.
++ */
++public final class Convert {
++
++    private Convert() {
++        // Utility Wrapper for JS Script.
++    }
++
++    public static void main(final String... args) throws ScriptException, NoSuchMethodException {
++        try {
++            final ScriptEngine engine = JsUtil.engine();
++            Files.write(Paths.get(args[1]), ((String) ((Invocable) engine).invokeFunction(
++                "ingest_convert_to_logstash",
++                new String(
++                    Files.readAllBytes(Paths.get(args[0])), StandardCharsets.UTF_8
++                )
++            )).getBytes(StandardCharsets.UTF_8));
++        } catch (final IOException ex) {
++            throw new IllegalStateException(ex);
++        }
++    }
++}
+diff --git a/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java b/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java
+index 8885b0a71b2..8cd410ab92f 100644
+--- a/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java
++++ b/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java
+@@ -12,7 +12,7 @@ final class JsUtil {
+     /**
+      * Script names used by the converter in correct load order.
+      */
+-    private static final String[] SCRIPTS = {"shared", "date", "grok", "geoip", "pipeline"};
++    private static final String[] SCRIPTS = {"shared", "date", "grok", "geoip", "pipeline", "convert"};
+ 
+     private JsUtil() {
+         // Utility Class
+diff --git a/tools/ingest-converter/src/main/resources/ingest-convert.js b/tools/ingest-converter/src/main/resources/ingest-convert.js
+new file mode 100644
+index 00000000000..6deb699d66e
+--- /dev/null
++++ b/tools/ingest-converter/src/main/resources/ingest-convert.js
+@@ -0,0 +1,30 @@
++var IngestConvert = {
++    has_convert: function (processor) {
++        return !!processor["convert"];
++    },
++    convert_hash: function (processor) {
++        var convert_json = processor["convert"];
++        var mutate_contents = IngestConverter.create_field(
++            IngestConverter.quote_string(IngestConverter.dots_to_square_brackets(convert_json["field"])),
++            IngestConverter.quote_string(convert_json["type"])
++        );
++        return IngestConverter.create_hash("convert", mutate_contents);
++    }
++};
++
++/**
++ * Converts Ingest Convert JSON to LS Date filter.
++ */
++function ingest_convert_to_logstash(json) {
++
++    function map_processor(processor) {
++
++        return IngestConverter.filter_hash(
++            IngestConverter.create_hash(
++                "mutate", IngestConvert.convert_hash(processor)
++            )
++        );
++    }
++
++    return IngestConverter.filters_to_file(JSON.parse(json)["processors"].map(map_processor));
++}
+diff --git a/tools/ingest-converter/src/main/resources/ingest-pipeline.js b/tools/ingest-converter/src/main/resources/ingest-pipeline.js
+index ab475c870a8..1f639b14fdd 100644
+--- a/tools/ingest-converter/src/main/resources/ingest-pipeline.js
++++ b/tools/ingest-converter/src/main/resources/ingest-pipeline.js
+@@ -21,6 +21,11 @@ function ingest_pipeline_to_logstash(json) {
+                 IngestConverter.create_hash("geoip", IngestGeoIp.geoip_hash(processor))
+             )
+         }
++        if (IngestConvert.has_convert(processor)) {
++            filter_blocks.push(
++                IngestConverter.create_hash("mutate", IngestConvert.convert_hash(processor))
++            )
++        }
+         return IngestConverter.join_hash_fields(filter_blocks);
+     }
+ 
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/ConvertTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/ConvertTest.java
+new file mode 100644
+index 00000000000..7a1f04d145a
+--- /dev/null
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/ConvertTest.java
+@@ -0,0 +1,25 @@
++package org.logstash.ingest;
++
++import java.util.Arrays;
++import org.junit.Test;
++
++import static org.hamcrest.CoreMatchers.is;
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.junit.runners.Parameterized.Parameters;
++
++public final class ConvertTest extends IngestTest {
++
++    @Parameters
++    public static Iterable<String> data() {
++        return Arrays.asList("Convert", "DotsInConvertField", "ConvertBoolean", "ConvertString");
++    }
++
++    @Test
++    public void convertsConvertProcessorCorrectly() throws Exception {
++        final String convert = getResultPath(temp);
++        Convert.main(resourcePath(String.format("ingest%s.json", testCase)), convert);
++        assertThat(
++            utf8File(convert), is(utf8File(resourcePath(String.format("logstash%s.conf", testCase))))
++        );
++    }
++}
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/PipelineTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/PipelineTest.java
+index c5aeec717a5..c269062895c 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/PipelineTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/PipelineTest.java
+@@ -18,6 +18,7 @@ public static Iterable<String> data() {
+         GeoIpTest.data().forEach(cases::add);
+         DateTest.data().forEach(cases::add);
+         GrokTest.data().forEach(cases::add);
++        ConvertTest.data().forEach(cases::add);
+         return cases;
+     }
+ 
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestComplexCase1.json b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestComplexCase1.json
+index 2577bb8f47c..0b792cb8582 100644
+--- a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestComplexCase1.json
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestComplexCase1.json
+@@ -24,6 +24,12 @@
+         "field": "client.ip",
+         "target_field": "geo"
+       }
++    },
++    {
++      "convert": {
++        "field" : "bytes",
++        "type": "integer"
++      }
+     }
+   ]
+ }
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestComplexCase2.json b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestComplexCase2.json
+index 83424e612e3..054f6e3fbb2 100644
+--- a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestComplexCase2.json
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestComplexCase2.json
+@@ -30,6 +30,12 @@
+         "field": "source.ip",
+         "target_field": "source.geo"
+       }
++    },
++    {
++      "convert": {
++        "field" : "[client][bytes]",
++        "type": "integer"
++      }
+     }
+   ]
+ }
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestConvert.json b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestConvert.json
+new file mode 100644
+index 00000000000..11b730dcdad
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestConvert.json
+@@ -0,0 +1,10 @@
++{
++    "processors": [
++    {
++        "convert": {
++            "field" : "bytes",
++            "type": "integer"
++        }
++    }
++]
++}
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestConvertBoolean.json b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestConvertBoolean.json
+new file mode 100644
+index 00000000000..3904f5ab88d
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestConvertBoolean.json
+@@ -0,0 +1,10 @@
++{
++  "processors": [
++    {
++      "convert": {
++        "field" : "delete",
++        "type": "boolean"
++      }
++    }
++  ]
++}
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestConvertString.json b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestConvertString.json
+new file mode 100644
+index 00000000000..e61614c5648
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestConvertString.json
+@@ -0,0 +1,10 @@
++{
++  "processors": [
++    {
++      "convert": {
++        "field" : "blah",
++        "type": "string"
++      }
++    }
++  ]
++}
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestDotsInConvertField.json b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestDotsInConvertField.json
+new file mode 100644
+index 00000000000..c8ac73b1b0a
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestDotsInConvertField.json
+@@ -0,0 +1,11 @@
++{
++    "description": "Pipeline to parse Apache logs",
++    "processors": [
++        {
++            "convert": {
++                "field" : "client.bytes",
++                "type": "float"
++            }
++        }
++    ]
++}
+\ No newline at end of file
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashComplexCase1.conf b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashComplexCase1.conf
+index 9fe32af333e..c5cfae694fe 100644
+--- a/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashComplexCase1.conf
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashComplexCase1.conf
+@@ -16,4 +16,9 @@ filter {
+       source => "[client][ip]"
+       target => "geo"
+    }
++   mutate {
++      convert {
++         "bytes" => "integer"
++      }
++   }
+ }
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashComplexCase2.conf b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashComplexCase2.conf
+index 6ba7fd0f16a..e935a2f87c3 100644
+--- a/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashComplexCase2.conf
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashComplexCase2.conf
+@@ -20,4 +20,9 @@ filter {
+       source => "[source][ip]"
+       target => "[source][geo]"
+    }
++   mutate {
++      convert {
++         "[client][bytes]" => "integer"
++      }
++   }
+ }
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashConvert.conf b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashConvert.conf
+new file mode 100644
+index 00000000000..788dc881613
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashConvert.conf
+@@ -0,0 +1,7 @@
++filter {
++   mutate {
++      convert {
++         "bytes" => "integer"
++      }
++   }
++}
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashConvertBoolean.conf b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashConvertBoolean.conf
+new file mode 100644
+index 00000000000..1ace784818e
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashConvertBoolean.conf
+@@ -0,0 +1,7 @@
++filter {
++   mutate {
++      convert {
++         "delete" => "boolean"
++      }
++   }
++}
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashConvertString.conf b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashConvertString.conf
+new file mode 100644
+index 00000000000..c8679e6714c
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashConvertString.conf
+@@ -0,0 +1,7 @@
++filter {
++   mutate {
++      convert {
++         "blah" => "string"
++      }
++   }
++}
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashDotsInConvertField.conf b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashDotsInConvertField.conf
+new file mode 100644
+index 00000000000..75c91f57001
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashDotsInConvertField.conf
+@@ -0,0 +1,7 @@
++filter {
++   mutate {
++      convert {
++         "[client][bytes]" => "float"
++      }
++   }
++}

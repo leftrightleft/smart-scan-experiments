@@ -1,0 +1,1764 @@
+diff --git a/logstash-core/logstash-core.gemspec b/logstash-core/logstash-core.gemspec
+index 1f304fe95fb..b84ddc47299 100644
+--- a/logstash-core/logstash-core.gemspec
++++ b/logstash-core/logstash-core.gemspec
+@@ -75,7 +75,7 @@ Gem::Specification.new do |gem|
+   gem.add_runtime_dependency "manticore", '~> 0.6'
+ 
+   # xpack geoip database service
+-  gem.add_development_dependency 'logstash-filter-geoip', '~> 7.1' # package hierarchy change
++  gem.add_development_dependency 'logstash-filter-geoip', '>= 7.2.1' # breaking change of DatabaseManager
+   gem.add_dependency 'faraday' #(MIT license)
+   gem.add_dependency 'down', '~> 5.2.0' #(MIT license)
+   gem.add_dependency 'tzinfo-data' #(MIT license)
+diff --git a/x-pack/lib/filters/geoip/database_manager.rb b/x-pack/lib/filters/geoip/database_manager.rb
+index 6c14d7303a8..71addb09be1 100644
+--- a/x-pack/lib/filters/geoip/database_manager.rb
++++ b/x-pack/lib/filters/geoip/database_manager.rb
+@@ -13,6 +13,10 @@
+ require "down"
+ require "rufus/scheduler"
+ require "date"
++require "singleton"
++require "concurrent"
++require "thread"
++java_import org.apache.logging.log4j.ThreadContext
+ 
+ # The mission of DatabaseManager is to ensure the plugin running an up-to-date MaxMind database and
+ #   thus users are compliant with EULA.
+@@ -21,7 +25,7 @@
+ #   to keep track of versions and the number of days disconnects to the endpoint.
+ # Once a new database version release, DownloadManager downloads it, and GeoIP Filter uses it on-the-fly.
+ # If the last update timestamp is 25 days ago, a warning message shows in the log;
+-# if it was 30 days ago, the GeoIP Filter should shutdown in order to be compliant.
++# if it was 30 days ago, the GeoIP Filter should stop using EULA database in order to be compliant.
+ # There are online mode and offline mode in DatabaseManager. `online` is for automatic database update
+ #   while `offline` is for static database path provided by users
+ 
+@@ -29,140 +33,210 @@ module LogStash module Filters module Geoip class DatabaseManager
+   extend LogStash::Filters::Geoip::Util
+   include LogStash::Util::Loggable
+   include LogStash::Filters::Geoip::Util
+-
+-  #TODO remove vendor_path
+-  def initialize(geoip, database_path, database_type, vendor_path)
+-    @geoip = geoip
+-    self.class.prepare_cc_db
+-    @mode = database_path.nil? ? :online : :offline
+-    @mode = :disabled # This is a temporary change that turns off the database manager until it is ready for general availability.
+-    @database_type = database_type
+-    @database_path = patch_database_path(database_path)
+-
+-    if @mode == :online
+-      logger.info "By not manually configuring a database path with `database =>`, you accepted and agreed MaxMind EULA. "\
+-                  "For more details please visit https://www.maxmind.com/en/geolite2/eula"
+-
+-      setup
+-      clean_up_database
+-      execute_download_job
+-
+-      # check database update periodically. trigger `call` method
+-      @scheduler = Rufus::Scheduler.new({:max_work_threads => 1})
+-      @scheduler.every('24h', self)
+-    elsif @mode == :disabled
+-      # The plan is to use CC database in Logstash 7.x and enable EULA database in 8
+-    else
+-      logger.info "GeoIP database path is configured manually so the plugin will not check for update. "\
+-                  "Keep in mind that if you are not using the database shipped with this plugin, "\
+-                  "please go to https://www.maxmind.com/en/geolite2/eula and understand the terms and conditions."
+-    end
++  include Singleton
++
++  private
++  def initialize
++    prepare_cc_db
++    cc_city_database_path = get_db_path(CITY, CC)
++    cc_asn_database_path = get_db_path(ASN, CC)
++
++    prepare_metadata
++    city_database_path = @metadata.database_path(CITY)
++    asn_database_path = @metadata.database_path(ASN)
++
++    @triggered = false
++    @trigger_lock = Mutex.new
++    @states = { "#{CITY}" => DatabaseState.new(@metadata.is_eula(CITY),
++                                               Concurrent::Array.new,
++                                               city_database_path,
++                                               cc_city_database_path),
++                "#{ASN}" => DatabaseState.new(@metadata.is_eula(ASN),
++                                              Concurrent::Array.new,
++                                              asn_database_path,
++                                              cc_asn_database_path) }
++
++    @download_manager = DownloadManager.new(@metadata)
+   end
+ 
+-  DEFAULT_DATABASE_FILENAME = %w{
+-    GeoLite2-City.mmdb
+-    GeoLite2-ASN.mmdb
+-  }.map(&:freeze).freeze
+-
+-  public
+-
++  protected
+   # create data dir, path.data, for geoip if it doesn't exist
+   # copy CC databases to data dir
+-  def self.prepare_cc_db
+-    FileUtils::mkdir_p(get_data_dir)
+-    unless ::File.exist?(get_file_path(CITY_DB_NAME)) && ::File.exist?(get_file_path(ASN_DB_NAME))
++  def prepare_cc_db
++    FileUtils::mkdir_p(get_data_dir_path)
++    unless ::File.exist?(get_db_path(CITY, CC)) && ::File.exist?(get_db_path(ASN, CC))
+       cc_database_paths = ::Dir.glob(::File.join(LogStash::Environment::LOGSTASH_HOME, "vendor", "**", "{GeoLite2-ASN,GeoLite2-City}.mmdb"))
+-      FileUtils.cp_r(cc_database_paths, get_data_dir)
++      cc_dir_path = get_dir_path(CC)
++      FileUtils.mkdir_p(cc_dir_path)
++      FileUtils.cp_r(cc_database_paths, cc_dir_path)
+     end
+   end
+ 
++  def prepare_metadata
++    @metadata = DatabaseMetadata.new
++
++    unless @metadata.exist?
++      @metadata.save_metadata(CITY, CC, false)
++      @metadata.save_metadata(ASN, CC, false)
++    end
++
++    # reset md5 to allow re-download when the database directory is deleted manually
++    DB_TYPES.each { |type| @metadata.reset_md5(type) if @metadata.database_path(type).nil? }
++
++    @metadata
++  end
++
++  # notice plugins to use the new database path
++  # update metadata timestamp for those dbs that has no update or a valid update
++  # do daily check and clean up
+   def execute_download_job
+     begin
+-      has_update, new_database_path = @download_manager.fetch_database
+-      @database_path = new_database_path if has_update
+-      @metadata.save_timestamp(@database_path)
+-      has_update
++      pipeline_id = ThreadContext.get("pipeline.id")
++      ThreadContext.put("pipeline.id", nil)
++
++      updated_db = @download_manager.fetch_database
++      updated_db.each do |database_type, valid_download, dirname, new_database_path|
++        if valid_download
++          @metadata.save_metadata(database_type, dirname, true)
++          @states[database_type].is_eula = true
++          @states[database_type].is_expired = false
++          @states[database_type].database_path = new_database_path
++
++          notify_plugins(database_type, :update, new_database_path) do |db_type, ids|
++            logger.info("geoip plugin will use database #{new_database_path}",
++                        :database_type => db_type, :pipeline_ids => ids) unless ids.empty?
++          end
++        end
++      end
++
++      updated_types = updated_db.map { |database_type, valid_download, dirname, new_database_path| database_type }
++      (DB_TYPES - updated_types).each { |unchange_type| @metadata.update_timestamp(unchange_type) }
+     rescue => e
+       logger.error(e.message, error_details(e, logger))
++    ensure
+       check_age
+-      false
++      clean_up_database
++      ThreadContext.put("pipeline.id", pipeline_id)
+     end
+   end
+ 
+-  # scheduler callback
+-  def call(job, time)
+-    logger.debug "scheduler runs database update check"
++  def notify_plugins(database_type, action, *args)
++    plugins = @states[database_type].plugins.dup
++    ids = plugins.map { |plugin| plugin.execution_context.pipeline_id }.sort
++    yield database_type, ids
++    plugins.each { |plugin| plugin.update_filter(action, *args) if plugin }
++  end
+ 
+-    begin
+-      if execute_download_job
+-        @geoip.setup_filter(database_path)
+-        clean_up_database
++  # call expiry action if Logstash use EULA database and fail to touch the endpoint for 30 days in a row
++  def check_age(database_types = DB_TYPES)
++    database_types.map do |database_type|
++      next unless @states[database_type].is_eula
++
++      days_without_update = (::Date.today - ::Time.at(@metadata.check_at(database_type)).to_date).to_i
++
++      case
++      when days_without_update >= 30
++        was_expired = @states[database_type].is_expired
++        @states[database_type].is_expired = true
++        @states[database_type].database_path = nil
++
++        notify_plugins(database_type, :expire) do |db_type, ids|
++          unless was_expired
++            logger.error("The MaxMind database hasn't been updated from last 30 days. Logstash is unable to get newer version from internet. "\
++              "According to EULA, GeoIP plugin needs to stop using MaxMind database in order to be compliant. "\
++              "Please check the network settings and allow Logstash accesses the internet to download the latest database, "\
++              "or switch to offline mode (:database => PATH_TO_YOUR_DATABASE) to use a self-managed database "\
++              "which you can download from https://dev.maxmind.com/geoip/geoip2/geolite2/ ")
++
++            logger.warn("geoip plugin will stop filtering and will tag all events with the '_geoip_expired_database' tag.",
++                        :database_type => db_type, :pipeline_ids => ids)
++          end
++        end
++      when days_without_update >= 25
++        logger.warn("The MaxMind database hasn't been updated for last #{days_without_update} days. "\
++          "Logstash will fail the GeoIP plugin in #{30 - days_without_update} days. "\
++          "Please check the network settings and allow Logstash accesses the internet to download the latest database ")
++      else
++        logger.trace("passed age check", :days_without_update => days_without_update)
+       end
+-    rescue DatabaseExpiryError => e
+-      logger.error(e.message, error_details(e, logger))
+-      @geoip.expire_action
+     end
+   end
+ 
+-  def close
+-    @scheduler.every_jobs.each(&:unschedule) if @scheduler
++  # Clean up directories which are not mentioned in metadata and not CC database
++  def clean_up_database
++    protected_dirnames = (@metadata.dirnames + [CC]).uniq
++    existing_dirnames = ::Dir.children(get_data_dir_path)
++                             .select { |f| ::File.directory? ::File.join(get_data_dir_path, f) }
++
++    (existing_dirnames - protected_dirnames).each do |dirname|
++      dir_path = get_dir_path(dirname)
++      FileUtils.rm_r(dir_path)
++      logger.info("#{dir_path} is deleted")
++    end
+   end
+ 
+-  def database_path
+-    @database_path
++  def trigger_download
++    return if @triggered
++    @trigger_lock.synchronize do
++      return if @triggered
++      execute_download_job
++      # check database update periodically. trigger `call` method
++      @scheduler = Rufus::Scheduler.new({:max_work_threads => 1})
++      @scheduler.every('24h', self)
++      @triggered = true
++    end
+   end
+ 
+-  protected
+-  # return a valid database path or default database path
+-  def patch_database_path(database_path)
+-    return database_path if file_exist?(database_path)
+-    return database_path if database_path = get_file_path("#{DB_PREFIX}#{@database_type}.#{DB_EXT}") and file_exist?(database_path)
+-    raise "You must specify 'database => ...' in your geoip filter (I looked for '#{database_path}')"
+-  end
++  public
+ 
+-  def check_age
+-    return if @metadata.cc?
+-
+-    days_without_update = (::Date.today - ::Time.at(@metadata.updated_at).to_date).to_i
+-
+-    case
+-    when days_without_update >= 30
+-      raise DatabaseExpiryError, "The MaxMind database has been used for more than 30 days. Logstash is unable to get newer version from internet. "\
+-        "According to EULA, GeoIP plugin needs to stop in order to be compliant. "\
+-        "Please check the network settings and allow Logstash accesses the internet to download the latest database, "\
+-        "or configure a database manually (:database => PATH_TO_YOUR_DATABASE) to use a self-managed database which you can download from https://dev.maxmind.com/geoip/geoip2/geolite2/ "
+-    when days_without_update >= 25
+-      logger.warn("The MaxMind database has been used for #{days_without_update} days without update. "\
+-        "Logstash will fail the GeoIP plugin in #{30 - days_without_update} days. "\
+-        "Please check the network settings and allow Logstash accesses the internet to download the latest database ")
+-    else
+-      logger.trace("The MaxMind database hasn't updated", :days_without_update => days_without_update)
+-    end
++  # scheduler callback
++  def call(job, time)
++    logger.debug "scheduler runs database update check"
++    ThreadContext.put("pipeline.id", nil)
++    execute_download_job
+   end
+ 
+-  # Clean up files .mmdb, .tgz which are not mentioned in metadata and not default database
+-  def clean_up_database
+-    if @metadata.exist?
+-      protected_filenames = (@metadata.database_filenames + DEFAULT_DATABASE_FILENAME).uniq
+-      existing_filenames = ::Dir.glob(get_file_path("*.{#{DB_EXT},#{GZ_EXT}}"))
+-                                .map { |path| ::File.basename(path) }
+-
+-      (existing_filenames - protected_filenames).each do |filename|
+-        ::File.delete(get_file_path(filename))
+-        logger.debug("old database #{filename} is deleted")
++  def subscribe_database_path(database_type, database_path, geoip_plugin)
++    if database_path.nil?
++      trigger_download
++
++      logger.info "By not manually configuring a database path with `database =>`, you accepted and agreed MaxMind EULA. "\
++                  "For more details please visit https://www.maxmind.com/en/geolite2/eula" if @states[database_type].is_eula
++
++      @states[database_type].plugins.push(geoip_plugin) unless @states[database_type].plugins.member?(geoip_plugin)
++      @trigger_lock.synchronize do
++        @states[database_type].database_path
+       end
++    else
++      logger.info "GeoIP database path is configured manually so the plugin will not check for update. "\
++                  "Keep in mind that if you are not using the database shipped with this plugin, "\
++                  "please go to https://www.maxmind.com/en/geolite2/eula and understand the terms and conditions."
++      database_path
+     end
+   end
+ 
+-  def setup
+-    @metadata = DatabaseMetadata.new(@database_type)
+-    @metadata.save_timestamp(@database_path) unless @metadata.exist?
+-
+-    @database_path = @metadata.database_path || @database_path
++  def unsubscribe_database_path(database_type, geoip_plugin)
++    @states[database_type].plugins.delete(geoip_plugin) if geoip_plugin
++  end
+ 
+-    @download_manager = DownloadManager.new(@database_type, @metadata)
++  def database_path(database_type)
++    @states[database_type].database_path
+   end
+ 
+-  class DatabaseExpiryError < StandardError
++  class DatabaseState
++    attr_reader :is_eula, :plugins, :database_path, :cc_database_path, :is_expired
++    attr_writer :is_eula, :database_path, :is_expired
++
++    # @param is_eula [Boolean]
++    # @param plugins [Concurrent::Array]
++    # @param database_path [String]
++    # @param cc_database_path [String]
++    def initialize(is_eula, plugins, database_path, cc_database_path)
++      @is_eula = is_eula
++      @plugins = plugins
++      @database_path = database_path
++      @cc_database_path = cc_database_path
++      @is_expired = false
++    end
+   end
+ end end end end
+\ No newline at end of file
+diff --git a/x-pack/lib/filters/geoip/database_metadata.rb b/x-pack/lib/filters/geoip/database_metadata.rb
+index 45bb3ee320e..caa6013b453 100644
+--- a/x-pack/lib/filters/geoip/database_metadata.rb
++++ b/x-pack/lib/filters/geoip/database_metadata.rb
+@@ -11,61 +11,83 @@ module LogStash module Filters module Geoip class DatabaseMetadata
+   include LogStash::Util::Loggable
+   include LogStash::Filters::Geoip::Util
+ 
+-  def initialize(database_type)
+-    @metadata_path = get_file_path("metadata.csv")
+-    @database_type = database_type
++  def initialize
++    @metadata_path = ::File.join(get_data_dir_path, "metadata.csv")
+   end
+ 
+   public
+ 
+-  # csv format: database_type, update_at, gz_md5, md5, filename
+-  def save_timestamp(database_path)
+-    metadata = get_metadata(false)
+-    metadata << [@database_type, Time.now.to_i, md5(get_gz_name(database_path)), md5(database_path),
+-                 ::File.basename(database_path)]
++  # csv format: database_type, check_at, gz_md5, dirname, is_eula
++  def save_metadata(database_type, dirname, is_eula)
++    metadata = get_metadata(database_type, false)
++    metadata << [database_type, Time.now.to_i, md5(get_gz_path(database_type, dirname)),
++                 dirname, is_eula]
++    update(metadata)
++  end
++
++  def update_timestamp(database_type)
++    update_each_row do |row|
++      row[Column::CHECK_AT] = Time.now.to_i if row[Column::DATABASE_TYPE].eql?(database_type)
++      row
++    end
++  end
+ 
++  def reset_md5(database_type)
++    update_each_row do |row|
++      row[Column::GZ_MD5] = ""  if row[Column::DATABASE_TYPE].eql?(database_type)
++      row
++    end
++  end
++
++  def update_each_row(&block)
++    metadata = get_all.map do |row|
++      yield row
++    end
++    update(metadata)
++  end
++
++  def update(metadata)
++    metadata = metadata.sort_by { |row| row[Column::DATABASE_TYPE] }
+     ::CSV.open @metadata_path, 'w' do |csv|
+       metadata.each { |row| csv << row }
+     end
+-
+-    logger.debug("metadata updated", :metadata => metadata)
++    logger.trace("metadata updated", :metadata => metadata)
+   end
+ 
+   def get_all
+     file_exist?(@metadata_path)? ::CSV.read(@metadata_path, headers: false) : Array.new
+   end
+ 
+-  # Give rows of metadata in default database type, or empty array
+-  def get_metadata(match_type = true)
+-    get_all.select { |row| row[Column::DATABASE_TYPE].eql?(@database_type) == match_type }
++  # Give rows of metadata that match/exclude the type
++  def get_metadata(database_type, match = true)
++    get_all.select { |row| row[Column::DATABASE_TYPE].eql?(database_type) == match }
+   end
+ 
+-  # Return database path which has valid md5
+-  def database_path
+-    get_metadata.map { |metadata| [metadata, get_file_path(metadata[Column::FILENAME])] }
+-                .select { |metadata, path| file_exist?(path) && (md5(path) == metadata[Column::MD5]) }
+-                .map { |metadata, path| path }
++  # Return a valid database path
++  def database_path(database_type)
++    get_metadata(database_type).map { |metadata| get_db_path(database_type, metadata[Column::DIRNAME]) }
++                .select { |path| file_exist?(path) }
+                 .last
+   end
+ 
+-  def gz_md5
+-    get_metadata.map { |metadata| metadata[Column::GZ_MD5] }
++  def gz_md5(database_type)
++    get_metadata(database_type).map { |metadata| metadata[Column::GZ_MD5] }
+                 .last || ''
+   end
+ 
+-  def updated_at
+-    (get_metadata.map { |metadata| metadata[Column::UPDATE_AT] }
++  def check_at(database_type)
++    (get_metadata(database_type).map { |metadata| metadata[Column::CHECK_AT] }
+                  .last || 0).to_i
+   end
+ 
+-  def cc?
+-    filename = get_metadata.map { |metadata| metadata[Column::FILENAME] }.last || ''
+-    filename.eql?(CITY_DB_NAME) || filename.eql?(ASN_DB_NAME)
++  def is_eula(database_type)
++    (get_metadata(database_type).map { |metadata| metadata[Column::IS_EULA] }
++                 .last || 'false') == 'true'
+   end
+ 
+-  # Return database related filenames in .mmdb .tgz
+-  def database_filenames
+-    get_all.flat_map { |metadata| [ metadata[Column::FILENAME], get_gz_name(metadata[Column::FILENAME]) ] }
++  # Return all dirname
++  def dirnames
++    get_all.map { |metadata| metadata[Column::DIRNAME] }
+   end
+   
+   def exist?
+@@ -74,10 +96,10 @@ def exist?
+ 
+   class Column
+     DATABASE_TYPE = 0
+-    UPDATE_AT     = 1
++    CHECK_AT      = 1
+     GZ_MD5        = 2
+-    MD5           = 3
+-    FILENAME      = 4
++    DIRNAME       = 3
++    IS_EULA       = 4
+   end
+ 
+ end end end end
+\ No newline at end of file
+diff --git a/x-pack/lib/filters/geoip/download_manager.rb b/x-pack/lib/filters/geoip/download_manager.rb
+index 9d162ff6c38..3ae7c35d853 100644
+--- a/x-pack/lib/filters/geoip/download_manager.rb
++++ b/x-pack/lib/filters/geoip/download_manager.rb
+@@ -18,8 +18,7 @@ module LogStash module Filters module Geoip class DownloadManager
+   include LogStash::Util::Loggable
+   include LogStash::Filters::Geoip::Util
+ 
+-  def initialize(database_type, metadata)
+-    @database_type = database_type
++  def initialize(metadata)
+     @metadata = metadata
+   end
+ 
+@@ -28,75 +27,70 @@ def initialize(database_type, metadata)
+   GEOIP_ENDPOINT = "#{GEOIP_HOST}#{GEOIP_PATH}".freeze
+ 
+   public
+-  # Check available update and download it. Unzip and validate the file.
+-  # return [has_update, new_database_path]
++  # Check available update and download them. Unzip and validate the file.
++  # if the download failed, valid_download return false
++  # return Array of [database_type, valid_download, dirname, new_database_path]
+   def fetch_database
+-    has_update, database_info = check_update
+-
+-    if has_update
+-      new_database_path = unzip download_database(database_info)
+-      assert_database!(new_database_path)
+-      return [true, new_database_path]
+-    end
+-
+-    [false, nil]
+-  end
+-
+-  def database_name
+-    @database_name ||= "#{DB_PREFIX}#{@database_type}"
+-  end
+-
+-  def database_name_ext
+-    @database_name_ext ||= "#{database_name}.#{DB_EXT}"
++    dirname = Time.now.to_i.to_s
++    check_update
++      .map do |database_type, db_info|
++        begin
++          new_zip_path = download_database(database_type, dirname, db_info)
++          new_database_path = unzip(database_type, dirname, new_zip_path)
++          assert_database!(new_database_path)
++          [database_type, true, dirname, new_database_path]
++        rescue => e
++          logger.error(e.message, error_details(e, logger))
++          [database_type, false, nil, nil]
++        end
++      end
+   end
+   
+   private
+-  # Call infra endpoint to get md5 of latest database and verify with metadata
+-  # return [has_update, server db info]
++  # Call infra endpoint to get md5 of latest databases and verify with metadata
++  # return Array of new database information [database_type, db_info]
+   def check_update
+     uuid = get_uuid
+     res = rest_client.get("#{GEOIP_ENDPOINT}?key=#{uuid}&elastic_geoip_service_tos=agree")
+     logger.debug("check update", :endpoint => GEOIP_ENDPOINT, :response => res.status)
+ 
+-    dbs = JSON.parse(res.body)
+-    target_db = dbs.select { |db| db['name'].eql?("#{database_name}.#{GZ_EXT}") }.first
+-    has_update = @metadata.gz_md5 != target_db['md5_hash']
+-    logger.info "new database version detected? #{has_update}"
++    service_resp = JSON.parse(res.body)
+ 
+-    [has_update, target_db]
+-  end
++    updated_db = DB_TYPES.map do |database_type|
++      db_info = service_resp.find { |db| db['name'].eql?("#{GEOLITE}#{database_type}.#{GZ_EXT}") }
++      has_update = @metadata.gz_md5(database_type) != db_info['md5_hash']
++      [database_type, has_update, db_info]
++    end
++    .select { |database_type, has_update, db_info| has_update }
++    .map { |database_type, has_update, db_info| [database_type, db_info] }
+ 
+-  def download_database(server_db)
+-    Stud.try(3.times) do
+-      new_database_zip_path = get_file_path("#{database_name}_#{Time.now.to_i}.#{GZ_EXT}")
+-      Down.download(server_db['url'], destination: new_database_zip_path)
+-      raise "the new download has wrong checksum" if md5(new_database_zip_path) != server_db['md5_hash']
++    logger.info "new database version detected? #{!updated_db.empty?}"
+ 
+-      logger.debug("new database downloaded in ", :path => new_database_zip_path)
+-      new_database_zip_path
+-    end
++    updated_db
+   end
+ 
+-  # extract all files and folders from .tgz to path.data directory
+-  # existing files folders will be replaced
+-  def unzip(zip_path)
+-    new_database_path = zip_path[0...-(GZ_EXT.length)] + DB_EXT
+-    temp_dir = Stud::Temporary.pathname
+-
+-    LogStash::Util::Tar.extract(zip_path, temp_dir)
+-    logger.debug("extract database to ", :path => temp_dir)
++  def download_database(database_type, dirname, db_info)
++    Stud.try(3.times) do
++      FileUtils.mkdir_p(get_dir_path(dirname))
++      zip_path = get_gz_path(database_type, dirname)
+ 
+-    ::Dir.each_child(temp_dir) do |file|
+-      path = ::File.join(temp_dir, file)
++      Down.download(db_info['url'], destination: zip_path)
++      raise "the new download has wrong checksum" if md5(zip_path) != db_info['md5_hash']
+ 
+-      if !::File.directory?(path) && database_name_ext.eql?(file)
+-        FileUtils.cp(path, new_database_path)
+-      else
+-        FileUtils.cp_r(path, get_data_dir)
+-      end
++      logger.debug("new database downloaded in ", :path => zip_path)
++      zip_path
+     end
++  end
+ 
+-    new_database_path
++  # extract all files and folders from .tgz to path.data directory
++  # return dirname [String], new_database_path [String]
++  def unzip(database_type, dirname, zip_path)
++    temp_path = ::File.join(get_dir_path(dirname), database_type)
++    LogStash::Util::Tar.extract(zip_path, temp_path)
++    FileUtils.cp_r(::File.join(temp_path, '.'), get_dir_path(dirname))
++    FileUtils.rm_r(temp_path)
++
++    get_db_path(database_type, dirname)
+   end
+ 
+   # Make sure the path has usable database
+diff --git a/x-pack/lib/filters/geoip/util.rb b/x-pack/lib/filters/geoip/util.rb
+index c17a8953ea8..0c08d71a840 100644
+--- a/x-pack/lib/filters/geoip/util.rb
++++ b/x-pack/lib/filters/geoip/util.rb
+@@ -9,16 +9,29 @@ module LogStash module Filters
+   module Geoip
+     GZ_EXT = 'tgz'.freeze
+     DB_EXT = 'mmdb'.freeze
+-    DB_PREFIX = 'GeoLite2-'.freeze
+-    CITY_DB_NAME = "#{DB_PREFIX}City.#{DB_EXT}"
+-    ASN_DB_NAME = "#{DB_PREFIX}ASN.#{DB_EXT}"
++    GEOLITE = 'GeoLite2-'.freeze
++    CITY = "City".freeze
++    ASN = "ASN".freeze
++    DB_TYPES = [ASN, CITY].freeze
++    CITY_DB_NAME = "#{GEOLITE}#{CITY}.#{DB_EXT}".freeze
++    ASN_DB_NAME = "#{GEOLITE}#{ASN}.#{DB_EXT}".freeze
++    DEFAULT_DB_NAMES = [CITY_DB_NAME, ASN_DB_NAME].freeze
++    CC = "CC".freeze
+ 
+     module Util
+-      def get_file_path(filename)
+-        ::File.join(get_data_dir, filename)
++      def get_db_path(database_type, dirname)
++        ::File.join(get_data_dir_path, dirname, "#{GEOLITE}#{database_type}.#{DB_EXT}")
+       end
+ 
+-      def get_data_dir
++      def get_gz_path(database_type, dirname)
++        ::File.join(get_data_dir_path, dirname, "#{GEOLITE}#{database_type}.#{GZ_EXT}")
++      end
++
++      def get_dir_path(dirname)
++        ::File.join(get_data_dir_path, dirname)
++      end
++
++      def get_data_dir_path
+         ::File.join(LogStash::SETTINGS.get_value("path.data"), "plugins", "filters", "geoip")
+       end
+ 
+@@ -30,11 +43,6 @@ def md5(file_path)
+         file_exist?(file_path) ? Digest::MD5.hexdigest(::File.read(file_path)): ""
+       end
+ 
+-      # replace *.mmdb to *.tgz
+-      def get_gz_name(filename)
+-        filename[0...-(DB_EXT.length)] + GZ_EXT
+-      end
+-
+       def error_details(e, logger)
+         error_details = { :cause => e.cause }
+         error_details[:backtrace] = e.backtrace if logger.debug?
+diff --git a/x-pack/spec/filters/geoip/database_manager_spec.rb b/x-pack/spec/filters/geoip/database_manager_spec.rb
+index a172657222b..852aca3a458 100644
+--- a/x-pack/spec/filters/geoip/database_manager_spec.rb
++++ b/x-pack/spec/filters/geoip/database_manager_spec.rb
+@@ -13,7 +13,7 @@
+     let(:mock_download_manager)  { double("download_manager") }
+     let(:mock_scheduler)  { double("scheduler") }
+     let(:db_manager) do
+-      manager = LogStash::Filters::Geoip::DatabaseManager.new(mock_geoip_plugin, default_city_db_path, "City", get_vendor_path)
++      manager = Class.new(LogStash::Filters::Geoip::DatabaseManager).instance
+       manager.instance_variable_set(:@metadata, mock_metadata)
+       manager.instance_variable_set(:@download_manager, mock_download_manager)
+       manager.instance_variable_set(:@scheduler, mock_scheduler)
+@@ -21,208 +21,265 @@
+     end
+     let(:logger) { double("Logger") }
+ 
+-    before(:each) do
+-      LogStash::Filters::Geoip::DatabaseManager.prepare_cc_db
+-    end
+-
+-    context "patch database" do
+-      it "use input path" do
+-        path = db_manager.send(:patch_database_path, default_asn_db_path)
+-        expect(path).to eq(default_asn_db_path)
+-      end
++    CITY = LogStash::Filters::Geoip::CITY
++    ASN = LogStash::Filters::Geoip::ASN
++    CC = LogStash::Filters::Geoip::CC
+ 
+-      it "use CC license database as default" do
+-        path = db_manager.send(:patch_database_path, "")
+-        expect(path).to eq(default_city_db_path)
+-      end
++    before do
++      stub_const('LogStash::Filters::Geoip::DownloadManager::GEOIP_ENDPOINT', "https://somewhere.dev")
++      allow(mock_geoip_plugin).to receive(:update_filter)
++    end
+ 
+-      it "failed when default database is missing" do
+-        expect(db_manager).to receive(:file_exist?).and_return(false, false)
+-        expect { db_manager.send(:patch_database_path, "") }.to raise_error /I looked for/
+-      end
++    after do
++      delete_file(metadata_path, get_dir_path(second_dirname))
+     end
+ 
+-    context "md5" do
+-      it "return md5 if file exists" do
+-        str = db_manager.send(:md5, default_city_db_path)
+-        expect(str).not_to eq("")
+-        expect(str).not_to be_nil
++    context "initialize" do
++      it "should set the initial state to cc database" do
++        states = db_manager.instance_variable_get(:@states)
++        expect(states[CITY].is_eula).to be_falsey
++        expect(states[CITY].database_path).to eql(states[CITY].cc_database_path)
++        expect(::File.exist?(states[CITY].cc_database_path)).to be_truthy
++        expect(states[ASN].is_eula).to be_falsey
++        expect(states[ASN].database_path).to eql(states[ASN].cc_database_path)
++        expect(::File.exist?(states[ASN].cc_database_path)).to be_truthy
+       end
+ 
+-      it "return empty str if file not exists" do
+-        file = Stud::Temporary.file.path + "/invalid"
+-        str = db_manager.send(:md5, file)
+-        expect(str).to eq("")
+-      end
+-    end
++      context "when metadata exists" do
++        before do
++          copy_cc(get_dir_path(second_dirname))
++          rewrite_temp_metadata(metadata_path, [city2_metadata])
++        end
+ 
+-    context "check age" do
+-      it "should raise error when 30 days has passed" do
+-        expect(mock_metadata).to receive(:updated_at).and_return((Time.now - (60 * 60 * 24 * 33)).to_i)
+-        expect(mock_metadata).to receive(:cc?).and_return(false)
+-        expect{ db_manager.send(:check_age) }.to raise_error /be compliant/
++        it "should use database record in metadata" do
++          states = db_manager.instance_variable_get(:@states)
++          expect(states[CITY].is_eula).to be_truthy
++          expect(states[CITY].database_path).to include second_dirname
++        end
+       end
+ 
+-      it "should give warning after 25 days" do
+-        expect(mock_metadata).to receive(:updated_at).and_return((Time.now - (60 * 60 * 24 * 26)).to_i)
+-        expect(mock_metadata).to receive(:cc?).and_return(false)
+-        expect(mock_geoip_plugin).to receive(:terminate_filter).never
++      context "when metadata exists but database is deleted manually" do
++        let(:db_manager) { Class.new(LogStash::Filters::Geoip::DatabaseManager).instance }
+ 
+-        if db_manager.instance_variable_get(:@mode) != :disabled
+-          expect(LogStash::Filters::Geoip::DatabaseManager).to receive(:logger).at_least(:once).and_return(logger)
+-          expect(logger).to receive(:warn)
+-          expect(logger).to receive(:info)
++        before do
++          rewrite_temp_metadata(metadata_path, [city2_metadata])
+         end
+ 
+-        db_manager.send(:check_age)
++        it "should return nil database path" do
++          states = db_manager.instance_variable_get(:@states)
++          expect(states[CITY].is_eula).to be_truthy
++          expect(states[CITY].database_path).to be_nil
++        end
+       end
+     end
+ 
+     context "execute download job" do
+-      it "should be false if no update" do
+-        original = db_manager.instance_variable_get(:@database_path)
+-        expect(mock_download_manager).to receive(:fetch_database).and_return([false, nil])
+-        allow(mock_metadata).to receive(:save_timestamp)
++      let(:valid_city_fetch) { [CITY, true, second_dirname, second_city_db_path] }
++      let(:valid_asn_fetch) { [ASN, true, second_dirname, second_asn_db_path] }
++      let(:invalid_city_fetch) { [CITY, false, nil, nil] }
++
++      context "plugin is set" do
++        let(:db_manager) do
++          manager = Class.new(LogStash::Filters::Geoip::DatabaseManager).instance
++          manager.instance_variable_set(:@metadata, mock_metadata)
++          manager.instance_variable_set(:@download_manager, mock_download_manager)
++          manager.instance_variable_set(:@scheduler, mock_scheduler)
++          manager.instance_variable_get(:@states)[CITY].plugins.push(mock_geoip_plugin)
++          manager.instance_variable_get(:@states)[CITY].is_eula = true
++          manager.instance_variable_get(:@states)[ASN].plugins.push(mock_geoip_plugin)
++          manager.instance_variable_get(:@states)[ASN].is_eula = true
++          manager
++        end
+ 
+-        expect(db_manager.send(:execute_download_job)).to be_falsey
+-        expect(db_manager.instance_variable_get(:@database_path)).to eq(original)
++        it "should update states when new downloads are valid" do
++          expect(mock_download_manager).to receive(:fetch_database).and_return([valid_city_fetch, valid_asn_fetch])
++          expect(mock_metadata).to receive(:save_metadata).at_least(:twice)
++          allow(mock_geoip_plugin).to receive_message_chain('execution_context.pipeline_id').and_return('pipeline_1', 'pipeline_2')
++          expect(mock_geoip_plugin).to receive(:update_filter).with(:update, instance_of(String)).at_least(:twice)
++          expect(mock_metadata).to receive(:update_timestamp).never
++          expect(db_manager).to receive(:check_age)
++          expect(db_manager).to receive(:clean_up_database)
++
++          db_manager.send(:execute_download_job)
++          expect(db_manager.database_path(CITY)).to match /#{second_dirname}\/#{default_city_db_name}/
++          expect(db_manager.database_path(ASN)).to match /#{second_dirname}\/#{default_asn_db_name}/
++        end
+       end
+ 
+-      it "should return true if update" do
+-        original = db_manager.instance_variable_get(:@database_path)
+-        expect(mock_download_manager).to receive(:fetch_database).and_return([true, "NEW_PATH"])
+-        allow(mock_metadata).to receive(:save_timestamp)
++      it "should update single state when new downloads are partially valid" do
++        expect(mock_download_manager).to receive(:fetch_database).and_return([invalid_city_fetch, valid_asn_fetch])
++        expect(mock_metadata).to receive(:save_metadata).with(ASN, second_dirname, true).at_least(:once)
++        expect(mock_metadata).to receive(:update_timestamp).never
++        expect(db_manager).to receive(:check_age)
++        expect(db_manager).to receive(:clean_up_database)
+ 
+-        expect(db_manager.send(:execute_download_job)).to be_truthy
+-        expect(db_manager.instance_variable_get(:@database_path)).not_to eq(original)
++        db_manager.send(:execute_download_job)
++        expect(db_manager.database_path(CITY)).to match /#{CC}\/#{default_city_db_name}/
++        expect(db_manager.database_path(ASN)).to match /#{second_dirname}\/#{default_asn_db_name}/
+       end
+ 
+-      it "should raise error when 30 days has passed" do
+-        allow(mock_download_manager).to receive(:fetch_database).and_raise("boom")
+-        expect(mock_metadata).to receive(:updated_at).and_return((Time.now - (60 * 60 * 24 * 33)).to_i)
+-        expect(mock_metadata).to receive(:cc?).and_return(false)
++      it "should update single state and single metadata timestamp when one database got update" do
++        expect(mock_download_manager).to receive(:fetch_database).and_return([valid_asn_fetch])
++        expect(mock_metadata).to receive(:save_metadata).with(ASN, second_dirname, true).at_least(:once)
++        expect(mock_metadata).to receive(:update_timestamp).with(CITY).at_least(:once)
++        expect(db_manager).to receive(:check_age)
++        expect(db_manager).to receive(:clean_up_database)
+ 
+-        expect{ db_manager.send(:execute_download_job) }.to raise_error /be compliant/
++        db_manager.send(:execute_download_job)
++        expect(db_manager.database_path(CITY)).to match /#{CC}\/#{default_city_db_name}/
++        expect(db_manager.database_path(ASN)).to match /#{second_dirname}\/#{default_asn_db_name}/
+       end
+ 
++      it "should update metadata timestamp for the unchange (no update)" do
++        expect(mock_download_manager).to receive(:fetch_database).and_return([])
++        expect(mock_metadata).to receive(:save_metadata).never
++        expect(mock_metadata).to receive(:update_timestamp).at_least(:twice)
++        expect(db_manager).to receive(:check_age)
++        expect(db_manager).to receive(:clean_up_database)
+ 
+-      it "should return false when 25 days has passed" do
+-        allow(mock_download_manager).to receive(:fetch_database).and_raise("boom")
++        db_manager.send(:execute_download_job)
++        expect(db_manager.database_path(CITY)).to match /#{CC}\/#{default_city_db_name}/
++        expect(db_manager.database_path(ASN)).to  match /#{CC}\/#{default_asn_db_name}/
++      end
+ 
+-        expect(mock_metadata).to receive(:updated_at).and_return((Time.now - (60 * 60 * 24 * 25)).to_i)
+-        expect(mock_metadata).to receive(:cc?).and_return(false)
++      it "should not update metadata when fetch database throw exception" do
++        expect(mock_download_manager).to receive(:fetch_database).and_raise('boom')
++        expect(db_manager).to receive(:check_age)
++        expect(db_manager).to receive(:clean_up_database)
++        expect(mock_metadata).to receive(:save_metadata).never
+ 
+-        expect(db_manager.send(:execute_download_job)).to be_falsey
++        db_manager.send(:execute_download_job)
+       end
+     end
+ 
+-    context "scheduler call" do
+-      it "should call plugin expiry action when raise error and last update > 30 days" do
+-        allow(mock_download_manager).to receive(:fetch_database).and_raise("boom")
+-        expect(mock_metadata).to receive(:updated_at).and_return((Time.now - (60 * 60 * 24 * 33)).to_i)
+-        expect(mock_metadata).to receive(:cc?).and_return(false)
+-        expect(mock_geoip_plugin).to receive(:expire_action)
+-        db_manager.send(:call, nil, nil)
+-      end
++    context "check age" do
++      context "eula database" do
++        let(:db_manager) do
++          manager = Class.new(LogStash::Filters::Geoip::DatabaseManager).instance
++          manager.instance_variable_set(:@metadata, mock_metadata)
++          manager.instance_variable_set(:@download_manager, mock_download_manager)
++          manager.instance_variable_set(:@scheduler, mock_scheduler)
++          manager.instance_variable_get(:@states)[CITY].plugins.push(mock_geoip_plugin)
++          manager.instance_variable_get(:@states)[CITY].is_eula = true
++          manager.instance_variable_get(:@states)[ASN].plugins.push(mock_geoip_plugin)
++          manager.instance_variable_get(:@states)[ASN].is_eula = true
++          manager
++        end
+ 
+-      it "should not call plugin setup when database is up to date" do
+-        allow(mock_download_manager).to receive(:fetch_database).and_return([false, nil])
+-        expect(mock_metadata).to receive(:save_timestamp)
+-        allow(mock_geoip_plugin).to receive(:setup_filter).never
+-        db_manager.send(:call, nil, nil)
++        it "should give warning after 25 days" do
++          expect(mock_metadata).to receive(:check_at).and_return((Time.now - (60 * 60 * 24 * 26)).to_i).at_least(:twice)
++          expect(mock_geoip_plugin).to receive(:update_filter).never
++          allow(LogStash::Filters::Geoip::DatabaseManager).to receive(:logger).at_least(:once).and_return(logger)
++          expect(logger).to receive(:warn).at_least(:twice)
++
++          db_manager.send(:check_age)
++        end
++
++        it "should log error and update plugin filter when 30 days has passed" do
++          expect(mock_metadata).to receive(:check_at).and_return((Time.now - (60 * 60 * 24 * 33)).to_i).at_least(:twice)
++          allow(mock_geoip_plugin).to receive_message_chain('execution_context.pipeline_id').and_return('pipeline_1', 'pipeline_2')
++          expect(mock_geoip_plugin).to receive(:update_filter).with(:expire).at_least(:twice)
++
++          db_manager.send(:check_age)
++        end
+       end
+ 
+-      it "should call scheduler when has update" do
+-        allow(db_manager).to receive(:execute_download_job).and_return(true)
+-        allow(mock_geoip_plugin).to receive(:setup_filter).once
+-        allow(db_manager).to receive(:clean_up_database).once
+-        db_manager.send(:call, nil, nil)
++      context "cc database" do
++        it "should not give warning after 25 days" do
++          expect(mock_geoip_plugin).to receive(:update_filter).never
++          expect(logger).to receive(:warn).never
++
++          db_manager.send(:check_age)
++        end
++
++        it "should not log error when 30 days has passed" do
++          expect(logger).to receive(:error).never
++          expect(mock_geoip_plugin).to receive(:update_filter).never
++
++          db_manager.send(:check_age)
++        end
+       end
+     end
+ 
+     context "clean up database" do
+-      let(:asn00) { get_file_path("GeoLite2-ASN_000000000.mmdb") }
+-      let(:asn00gz) { get_file_path("GeoLite2-ASN_000000000.tgz") }
+-      let(:city00) { get_file_path("GeoLite2-City_000000000.mmdb") }
+-      let(:city00gz) { get_file_path("GeoLite2-City_000000000.tgz") }
+-      let(:city44) { get_file_path("GeoLite2-City_4444444444.mmdb") }
+-      let(:city44gz) { get_file_path("GeoLite2-City_4444444444.tgz") }
+-
+-      before(:each) do
+-        [asn00, asn00gz, city00, city00gz, city44, city44gz].each { |file_path| ::File.delete(file_path) if ::File.exist?(file_path) }
+-      end
++      let(:dirname) { "0123456789" }
++      let(:dirname2) { "9876543210" }
++      let(:dir_path) { get_dir_path(dirname) }
++      let(:dir_path2) { get_dir_path(dirname2) }
++      let(:asn00) { get_file_path(dirname, default_asn_db_name) }
++      let(:city00) { get_file_path(dirname, default_city_db_name) }
++      let(:asn02) { get_file_path(dirname2, default_asn_db_name) }
++      let(:city02) { get_file_path(dirname2, default_city_db_name) }
+ 
+-      it "should not delete when metadata file doesn't exist" do
+-        expect(mock_metadata).to receive(:exist?).and_return(false)
+-        allow(mock_geoip_plugin).to receive(:database_filenames).never
+ 
+-        db_manager.send(:clean_up_database)
++      before(:each) do
++        FileUtils.mkdir_p [dir_path, dir_path2]
+       end
+ 
+       it "should delete file which is not in metadata" do
+-        [asn00, asn00gz, city00, city00gz, city44, city44gz].each { |file_path| FileUtils.touch(file_path) }
+-        expect(mock_metadata).to receive(:exist?).and_return(true)
+-        expect(mock_metadata).to receive(:database_filenames).and_return(["GeoLite2-City_4444444444.mmdb"])
++        FileUtils.touch [asn00, city00, asn02, city02]
++        expect(mock_metadata).to receive(:dirnames).and_return([dirname])
+ 
+         db_manager.send(:clean_up_database)
+-        [asn00, asn00gz, city00, city00gz, city44gz].each { |file_path| expect(::File.exist?(file_path)).to be_falsey }
+-        [default_city_db_path, default_asn_db_path, city44].each { |file_path| expect(::File.exist?(file_path)).to be_truthy }
+-      end
+ 
+-      it "should keep the default database" do
+-        expect(mock_metadata).to receive(:exist?).and_return(true)
+-        expect(mock_metadata).to receive(:database_filenames).and_return(["GeoLite2-City_4444444444.mmdb"])
+-
+-        db_manager.send(:clean_up_database)
+-        [default_city_db_path, default_asn_db_path].each { |file_path| expect(::File.exist?(file_path)).to be_truthy }
++        [asn02, city02].each { |file_path| expect(::File.exist?(file_path)).to be_falsey }
++        [get_dir_path(CC), asn00, city00].each { |file_path| expect(::File.exist?(file_path)).to be_truthy }
+       end
+     end
+ 
+-    context "setup metadata" do
+-      let(:db_metadata) do
+-        dbm = LogStash::Filters::Geoip::DatabaseMetadata.new("City")
+-        dbm.instance_variable_set(:@metadata_path, Stud::Temporary.file.path)
+-        dbm
+-      end
+-
+-      let(:temp_metadata_path) { db_metadata.instance_variable_get(:@metadata_path) }
+-
+-      before(:each) do
+-        expect(::File.empty?(temp_metadata_path)).to be_truthy
+-        allow(LogStash::Filters::Geoip::DatabaseMetadata).to receive(:new).and_return(db_metadata)
++    context "subscribe database path" do
++      it "should return user input path" do
++        path = db_manager.subscribe_database_path(CITY, default_city_db_path, mock_geoip_plugin)
++        expect(db_manager.instance_variable_get(:@states)[CITY].plugins.size).to eq(0)
++        expect(path).to eq(default_city_db_path)
+       end
+ 
+-      after(:each) do
+-        ::File.delete(second_city_db_path) if ::File.exist?(second_city_db_path)
++      it "should return database path in state if no user input" do
++        expect(db_manager.instance_variable_get(:@states)[CITY].plugins.size).to eq(0)
++        allow(db_manager).to receive(:trigger_download)
++        path = db_manager.subscribe_database_path(CITY, nil, mock_geoip_plugin)
++        expect(db_manager.instance_variable_get(:@states)[CITY].plugins.size).to eq(1)
++        expect(path).to eq(default_city_db_path)
+       end
+ 
+-      it "create metadata when file is missing" do
+-        db_manager.send(:setup)
+-        expect(db_manager.instance_variable_get(:@database_path)).to eql(default_city_db_path)
+-        expect(db_metadata.database_path).to eql(default_city_db_path)
+-        expect(::File.exist?(temp_metadata_path)).to be_truthy
+-        expect(::File.empty?(temp_metadata_path)).to be_falsey
+-      end
++      context "when eula database is expired" do
++        let(:db_manager) do
++          manager = Class.new(LogStash::Filters::Geoip::DatabaseManager).instance
++          manager.instance_variable_set(:@download_manager, mock_download_manager)
++          manager.instance_variable_set(:@scheduler, mock_scheduler)
++          manager
++        end
+ 
+-      it "manager should use database path in metadata" do
+-        write_temp_metadata(temp_metadata_path, city2_metadata)
+-        copy_city_database(second_city_db_name)
+-        expect(db_metadata).to receive(:save_timestamp).never
++        before do
++          rewrite_temp_metadata(metadata_path, [city_expired_metadata])
++        end
+ 
+-        db_manager.send(:setup)
+-        filename = db_manager.instance_variable_get(:@database_path).split('/').last
+-        expect(filename).to match /#{second_city_db_name}/
++        it "should return nil" do
++          allow(mock_download_manager).to receive(:fetch_database).and_raise("boom")
++          expect(db_manager.instance_variable_get(:@states)[CITY].plugins.size).to eq(0)
++          path = db_manager.subscribe_database_path(CITY, nil, mock_geoip_plugin)
++          expect(db_manager.instance_variable_get(:@states)[CITY].plugins.size).to eq(1)
++          expect(path).to be_nil
++        end
+       end
++    end
+ 
+-      it "ignore database_path in metadata if md5 does not match" do
+-        write_temp_metadata(temp_metadata_path, ["City","","","INVALID_MD5",second_city_db_name])
+-        copy_city_database(second_city_db_name)
+-        expect(db_metadata).to receive(:save_timestamp).never
++    context "unsubscribe" do
++      let(:db_manager) do
++        manager = Class.new(LogStash::Filters::Geoip::DatabaseManager).instance
++        manager.instance_variable_set(:@metadata, mock_metadata)
++        manager.instance_variable_set(:@download_manager, mock_download_manager)
++        manager.instance_variable_set(:@scheduler, mock_scheduler)
++        manager.instance_variable_get(:@states)[CITY].plugins.push(mock_geoip_plugin)
++        manager.instance_variable_get(:@states)[CITY].is_eula = true
++        manager
++      end
+ 
+-        db_manager.send(:setup)
+-        filename = db_manager.instance_variable_get(:@database_path).split('/').last
+-        expect(filename).to match /#{default_city_db_name}/
++      it "should remove plugin in state" do
++        db_manager.unsubscribe_database_path(CITY, mock_geoip_plugin)
++        expect(db_manager.instance_variable_get(:@states)[CITY].plugins.size).to eq(0)
+       end
+     end
++
+   end
+ end
+\ No newline at end of file
+diff --git a/x-pack/spec/filters/geoip/database_metadata_spec.rb b/x-pack/spec/filters/geoip/database_metadata_spec.rb
+index 85f093cd8c7..dbb9a3512ae 100644
+--- a/x-pack/spec/filters/geoip/database_metadata_spec.rb
++++ b/x-pack/spec/filters/geoip/database_metadata_spec.rb
+@@ -6,22 +6,20 @@
+ require "filters/geoip/database_metadata"
+ require "filters/geoip/database_manager"
+ require "stud/temporary"
++require "fileutils"
+ 
+ describe LogStash::Filters::Geoip do
+ 
+   describe 'DatabaseMetadata', :aggregate_failures do
++    let(:database_type) { LogStash::Filters::Geoip::CITY }
+     let(:dbm) do
+-      dbm = LogStash::Filters::Geoip::DatabaseMetadata.new("City")
++      dbm = LogStash::Filters::Geoip::DatabaseMetadata.new
+       dbm.instance_variable_set(:@metadata_path, Stud::Temporary.file.path)
+       dbm
+     end
+     let(:temp_metadata_path) { dbm.instance_variable_get(:@metadata_path) }
+     let(:logger) { double("Logger") }
+ 
+-    before(:each) do
+-      LogStash::Filters::Geoip::DatabaseManager.prepare_cc_db
+-    end
+-
+     context "get all" do
+       it "return multiple rows" do
+         write_temp_metadata(temp_metadata_path, city2_metadata)
+@@ -34,65 +32,68 @@
+       it "return metadata" do
+         write_temp_metadata(temp_metadata_path, city2_metadata)
+ 
+-        city = dbm.get_metadata
++        city = dbm.get_metadata(database_type)
+         expect(city.size).to eq(2)
+ 
+-        asn = dbm.get_metadata(false)
++        asn = dbm.get_metadata("ASN")
+         expect(asn.size).to eq(1)
+       end
+ 
+       it "return empty array when file is missing" do
+-        metadata = dbm.get_metadata
++        metadata = dbm.get_metadata(database_type)
+         expect(metadata.size).to eq(0)
+       end
+ 
+       it "return empty array when an empty file exist" do
+         FileUtils.touch(temp_metadata_path)
+ 
+-        metadata = dbm.get_metadata
++        metadata = dbm.get_metadata(database_type)
+         expect(metadata.size).to eq(0)
+       end
+     end
+ 
+     context "save timestamp" do
+-      before do
+-        ::File.open(default_city_gz_path, "w") { |f| f.write "make a non empty file" }
+-      end
+-
+-      after do
+-        delete_file(default_city_gz_path)
+-      end
+-
+       it "write the current time" do
+-        dbm.save_timestamp(default_city_db_path)
++        write_temp_metadata(temp_metadata_path)
++        dbm.save_metadata(database_type, second_dirname, true)
++
++        expect(dbm.get_metadata(database_type).size).to eq(1)
++        expect(dbm.get_all.size).to eq(2)
+ 
+-        metadata = dbm.get_metadata.last
++        metadata = dbm.get_metadata(database_type).last
+         expect(metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::DATABASE_TYPE]).to eq("City")
+-        past = metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::UPDATE_AT]
++        past = metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::CHECK_AT]
+         expect(Time.now.to_i - past.to_i).to be < 100
+-        expect(metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::GZ_MD5]).not_to be_empty
+         expect(metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::GZ_MD5]).to eq(md5(default_city_gz_path))
+-        expect(metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::MD5]).to eq(default_city_db_md5)
+-        expect(metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::FILENAME]).to eq(default_city_db_name)
++        expect(metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::DIRNAME]).to eq(second_dirname)
++        expect(metadata[LogStash::Filters::Geoip::DatabaseMetadata::Column::IS_EULA]).to eq("true")
+       end
+     end
+ 
+     context "database path" do
++      before do
++        copy_cc(get_dir_path("CC"))
++        copy_cc(get_dir_path(second_dirname))
++      end
++
+       it "return the default city database path" do
+         write_temp_metadata(temp_metadata_path)
+ 
+-        expect(dbm.database_path).to eq(default_city_db_path)
++        expect(dbm.database_path(database_type)).to eq(default_city_db_path)
+       end
+ 
+-      it "return the last database path with valid md5" do
+-        write_temp_metadata(temp_metadata_path, city2_metadata)
++      context "when the database exist" do
++        it "return the last database path with valid md5" do
++          write_temp_metadata(temp_metadata_path, city2_metadata)
+ 
+-        expect(dbm.database_path).to eq(default_city_db_path)
++          expect(dbm.database_path(database_type)).to eq(second_city_db_path)
++        end
+       end
+ 
+       context "with ASN database type" do
++        let(:database_type) { "ASN" }
+         let(:dbm) do
+-          dbm = LogStash::Filters::Geoip::DatabaseMetadata.new("ASN")
++          dbm = LogStash::Filters::Geoip::DatabaseMetadata.new
+           dbm.instance_variable_set(:@metadata_path, Stud::Temporary.file.path)
+           dbm
+         end
+@@ -100,13 +101,14 @@
+         it "return the default asn database path" do
+           write_temp_metadata(temp_metadata_path)
+ 
+-          expect(dbm.database_path).to eq(default_asn_db_path)
++          expect(dbm.database_path(database_type)).to eq(default_asn_db_path)
+         end
+       end
+ 
+       context "with invalid database type" do
++        let(:database_type) { "???" }
+         let(:dbm) do
+-          dbm = LogStash::Filters::Geoip::DatabaseMetadata.new("???")
++          dbm = LogStash::Filters::Geoip::DatabaseMetadata.new
+           dbm.instance_variable_set(:@metadata_path, Stud::Temporary.file.path)
+           dbm
+         end
+@@ -114,38 +116,30 @@
+         it "return nil if md5 not matched" do
+           write_temp_metadata(temp_metadata_path)
+ 
+-          expect(dbm.database_path).to be_nil
++          expect(dbm.database_path(database_type)).to be_nil
+         end
+       end
+     end
+ 
+     context "gz md5" do
+       it "should give the last gz md5" do
+-        write_temp_metadata(temp_metadata_path, ["City","","SOME_GZ_MD5","SOME_MD5",second_city_db_name])
+-        expect(dbm.gz_md5).to eq("SOME_GZ_MD5")
++        write_temp_metadata(temp_metadata_path, ["City","","SOME_GZ_MD5","SOME_MD5",second_dirname])
++        expect(dbm.gz_md5(database_type)).to eq("SOME_GZ_MD5")
+       end
+ 
+       it "should give empty string if metadata is empty" do
+-        expect(dbm.gz_md5).to eq("")
++        expect(dbm.gz_md5(database_type)).to eq("")
+       end
+     end
+ 
+     context "updated at" do
+       it "should give the last update timestamp" do
+-        write_temp_metadata(temp_metadata_path, ["City","1611690807","SOME_GZ_MD5","SOME_MD5",second_city_db_name])
+-        expect(dbm.updated_at).to eq(1611690807)
++        write_temp_metadata(temp_metadata_path, ["City","1611690807","SOME_GZ_MD5",second_dirname,true])
++        expect(dbm.check_at(database_type)).to eq(1611690807)
+       end
+ 
+       it "should give 0 if metadata is empty" do
+-        expect(dbm.updated_at).to eq(0)
+-      end
+-    end
+-
+-    context "database filenames" do
+-      it "should give filename in .mmdb .tgz" do
+-        write_temp_metadata(temp_metadata_path)
+-        expect(dbm.database_filenames).to match_array([default_city_db_name, default_asn_db_name,
+-                                                       'GeoLite2-City.tgz', 'GeoLite2-ASN.tgz'])
++        expect(dbm.check_at(database_type)).to eq(0)
+       end
+     end
+ 
+@@ -161,15 +155,69 @@
+       end
+     end
+ 
+-    context "is cc" do
+-      it "should return true if database is CC" do
++    context "is eula" do
++      it "should give boolean false if database is CC" do
+         write_temp_metadata(temp_metadata_path)
+-        expect(dbm.cc?).to be_truthy
++        expect(dbm.is_eula(database_type)).to eq(false)
+       end
+ 
+-      it "should return false if database is EULA" do
+-        write_temp_metadata(temp_metadata_path, ["City","1611690807","SOME_GZ_MD5","SOME_MD5",second_city_db_name])
+-        expect(dbm.cc?).to be_falsey
++      it "should give boolean true if database is EULA" do
++        write_temp_metadata(temp_metadata_path, city2_metadata)
++        expect(dbm.is_eula(database_type)).to eq(true)
++      end
++    end
++
++    context "update timestamp" do
++      it "should update timestamp only for database type" do
++        write_temp_metadata(temp_metadata_path)
++        original = dbm.get_all
++        sleep(2)
++
++        dbm.update_timestamp(database_type)
++        updated = dbm.get_all
++
++        original.size.times do |i|
++          expect(original[i][LogStash::Filters::Geoip::DatabaseMetadata::Column::DATABASE_TYPE]).
++            to(eq(updated[i][LogStash::Filters::Geoip::DatabaseMetadata::Column::DATABASE_TYPE]))
++          expect(original[i][LogStash::Filters::Geoip::DatabaseMetadata::Column::GZ_MD5])
++            .to(eq(updated[i][LogStash::Filters::Geoip::DatabaseMetadata::Column::GZ_MD5]))
++          expect(original[i][LogStash::Filters::Geoip::DatabaseMetadata::Column::DIRNAME])
++            .to(eq(updated[i][LogStash::Filters::Geoip::DatabaseMetadata::Column::DIRNAME]))
++          expect(original[i][LogStash::Filters::Geoip::DatabaseMetadata::Column::IS_EULA])
++            .to(eq(updated[i][LogStash::Filters::Geoip::DatabaseMetadata::Column::IS_EULA]))
++        end
++
++        # ASN
++        expect(original[0][LogStash::Filters::Geoip::DatabaseMetadata::Column::CHECK_AT])
++          .to(eq(updated[0][LogStash::Filters::Geoip::DatabaseMetadata::Column::CHECK_AT]))
++
++        # City
++        expect(original[1][LogStash::Filters::Geoip::DatabaseMetadata::Column::CHECK_AT])
++          .not_to(eq(updated[1][LogStash::Filters::Geoip::DatabaseMetadata::Column::CHECK_AT]))
++      end
++    end
++
++    context "reset md5" do
++      it "should reset md5 to empty string only" do
++        rewrite_temp_metadata(temp_metadata_path, [ ["ASN","1620246514","SOME MD5","1620246514",true],
++                                                    ["City","1620246514","SOME MD5","1620246514",true] ])
++
++        dbm.reset_md5(database_type)
++        row = dbm.get_metadata(database_type).last
++        expect(row[LogStash::Filters::Geoip::DatabaseMetadata::Column::GZ_MD5]).to be_empty
++        expect(row[LogStash::Filters::Geoip::DatabaseMetadata::Column::DIRNAME]).to eql("1620246514")
++        expect(row[LogStash::Filters::Geoip::DatabaseMetadata::Column::IS_EULA]).to be_truthy
++      end
++    end
++
++    context "dirnames" do
++      it "should reset md5 to empty string only" do
++        write_temp_metadata(temp_metadata_path, city2_metadata)
++        rewrite_temp_metadata(temp_metadata_path, [ ["ASN","1620246514","SOME MD5","CC",true],
++                                                    city2_metadata ])
++
++        dirnames = dbm.dirnames
++        expect(dirnames).to match_array([second_dirname, "CC"])
+       end
+     end
+   end
+diff --git a/x-pack/spec/filters/geoip/download_manager_spec.rb b/x-pack/spec/filters/geoip/download_manager_spec.rb
+index 5242ed41268..2052dc49b36 100644
+--- a/x-pack/spec/filters/geoip/download_manager_spec.rb
++++ b/x-pack/spec/filters/geoip/download_manager_spec.rb
+@@ -12,9 +12,10 @@
+   describe 'DownloadManager', :aggregate_failures do
+     let(:mock_metadata)  { double("database_metadata") }
+     let(:download_manager) do
+-      manager = LogStash::Filters::Geoip::DownloadManager.new( "City", mock_metadata)
++      manager = LogStash::Filters::Geoip::DownloadManager.new(mock_metadata)
+       manager
+     end
++    let(:database_type) { LogStash::Filters::Geoip::CITY }
+     let(:logger) { double("Logger") }
+ 
+     GEOIP_STAGING_HOST = "https://geoip.elastic.dev"
+@@ -22,7 +23,6 @@
+ 
+     before do
+       stub_const('LogStash::Filters::Geoip::DownloadManager::GEOIP_ENDPOINT', GEOIP_STAGING_ENDPOINT)
+-      LogStash::Filters::Geoip::DatabaseManager.prepare_cc_db
+     end
+ 
+     context "rest client" do
+@@ -47,37 +47,34 @@
+         allow(download_manager).to receive_message_chain("rest_client.get").and_return(mock_resp)
+       end
+ 
+-      it "should return has_update and db info when md5 does not match" do
+-        expect(mock_metadata).to receive(:gz_md5).and_return("")
++      it "should return City db info when City md5 does not match" do
++        expect(mock_metadata).to receive(:gz_md5).and_return("8d57aec1958070f01042ac1ecd8ec2ab", "a123a45d67890a2bd02e5edd680f6703c")
+ 
+-        has_update, info = download_manager.send(:check_update)
+-        expect(has_update).to be_truthy
++        updated_db = download_manager.send(:check_update)
++        expect(updated_db.size).to eql(1)
++
++        type, info = updated_db[0]
+         expect(info).to have_key("md5_hash")
+         expect(info).to have_key("name")
+         expect(info).to have_key("provider")
+         expect(info).to have_key("updated")
+         expect(info).to have_key("url")
+-        expect(info["name"]).to include("City")
++        expect(type).to eql(database_type)
+       end
+ 
+-      it "should return false when md5 is the same" do
+-        expect(mock_metadata).to receive(:gz_md5).and_return("89d225ac546310b1e7979502ac9ad11c")
++      it "should return empty array when md5 are the same" do
++        expect(mock_metadata).to receive(:gz_md5).and_return("8d57aec1958070f01042ac1ecd8ec2ab", "a195a73d4651a2bd02e5edd680f6703c")
+ 
+-        has_update, info = download_manager.send(:check_update)
+-        expect(has_update).to be_falsey
++        updated_db = download_manager.send(:check_update)
++        expect(updated_db.size).to eql(0)
+       end
+ 
+-      it "should return true when md5 does not match" do
+-        expect(mock_metadata).to receive(:gz_md5).and_return("bca2a8bad7e5e4013dc17343af52a841")
+-
+-        has_update, info = download_manager.send(:check_update)
+-        expect(has_update).to be_truthy
+-      end
+     end
+ 
+     context "download database" do
+       let(:db_info) do
+         {
++          "age" => 297221,
+           "md5_hash" => md5_hash,
+           "name" => filename,
+           "provider" => "maxmind",
+@@ -87,30 +84,34 @@
+       end
+       let(:md5_hash) { SecureRandom.hex }
+       let(:filename) { "GeoLite2-City.tgz"}
++      let(:dirname) { "0123456789" }
+ 
+       it "should raise error if md5 does not match" do
+         allow(Down).to receive(:download)
+-        expect{ download_manager.send(:download_database, db_info) }.to raise_error /wrong checksum/
++        expect{ download_manager.send(:download_database, database_type, dirname, db_info) }.to raise_error /wrong checksum/
+       end
+ 
+       it "should download file and return zip path" do
+         expect(download_manager).to receive(:md5).and_return(md5_hash)
+ 
+-        path = download_manager.send(:download_database, db_info)
+-        expect(path).to match /GeoLite2-City_\d+\.tgz/
+-        expect(::File.exist?(path)).to be_truthy
+-
+-        delete_file(path)
++        new_zip_path = download_manager.send(:download_database, database_type, dirname, db_info)
++        expect(new_zip_path).to match /GeoLite2-City\.tgz/
++        expect(::File.exist?(new_zip_path)).to be_truthy
+       end
+     end
+ 
+     context "unzip" do
+-      let(:copyright_path) { get_file_path('COPYRIGHT.txt') }
+-      let(:license_path) { get_file_path('LICENSE.txt') }
+-      let(:readme_path) { get_file_path('README.txt') }
+-      let(:folder_path) { get_file_path('inner') }
+-      let(:folder_more_path) { ::File.join(get_file_path('inner'), 'more.txt') }
+-      let(:folder_less_path) { ::File.join(get_file_path('inner'), 'less.txt') }
++      let(:dirname) { Time.now.to_i.to_s }
++      let(:copyright_path) { get_file_path(dirname, 'COPYRIGHT.txt') }
++      let(:license_path) { get_file_path(dirname, 'LICENSE.txt') }
++      let(:readme_path) { get_file_path(dirname, 'README.txt') }
++      let(:folder_path) { get_file_path(dirname, 'inner') }
++      let(:folder_more_path) { ::File.join(folder_path, 'more.txt') }
++      let(:folder_less_path) { ::File.join(folder_path, 'less.txt') }
++
++      before do
++        FileUtils.mkdir_p(get_dir_path(dirname))
++      end
+ 
+       after do
+         file_path = ::File.expand_path("./fixtures/sample.mmdb", ::File.dirname(__FILE__))
+@@ -119,11 +120,11 @@
+       end
+ 
+       it "should extract all files in tarball" do
+-        path = ::File.expand_path("./fixtures/sample.tgz", ::File.dirname(__FILE__))
+-        unzip_db_path = download_manager.send(:unzip, path)
++        zip_path = ::File.expand_path("./fixtures/sample.tgz", ::File.dirname(__FILE__))
++        new_db_path = download_manager.send(:unzip, database_type, dirname, zip_path)
+ 
+-        expect(unzip_db_path).to match /\.mmdb/
+-        expect(::File.exist?(unzip_db_path)).to be_truthy
++        expect(new_db_path).to match /GeoLite2-#{database_type}\.mmdb/
++        expect(::File.exist?(new_db_path)).to be_truthy
+         expect(::File.exist?(copyright_path)).to be_truthy
+         expect(::File.exist?(license_path)).to be_truthy
+         expect(::File.exist?(readme_path)).to be_truthy
+@@ -134,6 +135,10 @@
+     end
+ 
+     context "assert database" do
++      before do
++        copy_cc(get_dir_path("CC"))
++      end
++
+       it "should raise error if file is invalid" do
+         expect{ download_manager.send(:assert_database!, "Gemfile") }.to raise_error /failed to load database/
+       end
+@@ -144,31 +149,38 @@
+     end
+ 
+     context "fetch database" do
+-      it "should be false if no update" do
+-        expect(download_manager).to receive(:check_update).and_return([false, {}])
+-
+-        has_update, new_database_path = download_manager.send(:fetch_database)
+-
+-        expect(has_update).to be_falsey
+-        expect(new_database_path).to be_nil
+-      end
++      it "should return array of db which has valid download" do
++        expect(download_manager).to receive(:check_update).and_return([[LogStash::Filters::Geoip::ASN, {}],
++                                                                       [LogStash::Filters::Geoip::CITY, {}]])
++        allow(download_manager).to receive(:download_database)
++        allow(download_manager).to receive(:unzip).and_return("NEW_DATABASE_PATH")
++        allow(download_manager).to receive(:assert_database!)
+ 
+-      it "should raise error" do
+-        expect(download_manager).to receive(:check_update).and_return([true, {}])
+-        expect(download_manager).to receive(:download_database).and_raise('boom')
++        updated_db = download_manager.send(:fetch_database)
+ 
+-        expect { download_manager.send(:fetch_database) }.to raise_error
++        expect(updated_db.size).to eql(2)
++        asn_type, asn_valid_download, asn_dirname, asn_path = updated_db[0]
++        city_type, city_valid_download, city_dirname, city_path = updated_db[1]
++        expect(asn_valid_download).to be_truthy
++        expect(asn_path).to eql("NEW_DATABASE_PATH")
++        expect(city_valid_download).to be_truthy
++        expect(city_path).to eql("NEW_DATABASE_PATH")
+       end
+ 
+-      it "should be true if got update" do
+-        expect(download_manager).to receive(:check_update).and_return([true, {}])
+-        allow(download_manager).to receive(:download_database)
+-        allow(download_manager).to receive(:unzip)
+-        allow(download_manager).to receive(:assert_database!)
++      it "should return array of db which has invalid download" do
++        expect(download_manager).to receive(:check_update).and_return([[LogStash::Filters::Geoip::ASN, {}],
++                                                                       [LogStash::Filters::Geoip::CITY, {}]])
++        expect(download_manager).to receive(:download_database).and_raise('boom').at_least(:twice)
+ 
+-        has_update, new_database_path = download_manager.send(:fetch_database)
++        updated_db = download_manager.send(:fetch_database)
+ 
+-        expect(has_update).to be_truthy
++        expect(updated_db.size).to eql(2)
++        asn_type, asn_valid_download, asn_path = updated_db[0]
++        city_type, city_valid_download, city_path = updated_db[1]
++        expect(asn_valid_download).to be_falsey
++        expect(asn_path).to be_nil
++        expect(city_valid_download).to be_falsey
++        expect(city_path).to be_nil
+       end
+     end
+ 
+diff --git a/x-pack/spec/filters/geoip/fixtures/normal_resp.json b/x-pack/spec/filters/geoip/fixtures/normal_resp.json
+index 383a32d6427..a4c334aa7b2 100644
+--- a/x-pack/spec/filters/geoip/fixtures/normal_resp.json
++++ b/x-pack/spec/filters/geoip/fixtures/normal_resp.json
+@@ -1,44 +1,26 @@
+ [
+   {
+-    "md5_hash": "bcfc39b5677554e091dbb19cd5cea4b0",
+-    "name": "GeoLite2-ASN.mmdb.gz",
+-    "provider": "maxmind",
+-    "updated": 1615852860,
+-    "url": "https://storage.googleapis.com/elastic-paisano-staging/maxmind/GeoLite2-ASN.mmdb.gz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-staging%40elastic-apps-163815.iam.gserviceaccount.com%2F20210317%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210317T103241Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=ada6463b28177577f4981cbe5f29708d0196ed71cea0bf3c0bf8e9965c8f9fd3d184be852c4e84f24b2896d8043a466039e15b5581ba4fc7aa37a15c85c79999674a0966b28f53b0c5a8b1220b428d3c1e958f20a61e06758426b7308f1ba1966b04a2bf86a5a9f96b88c05753b429574829344d3043de1f7d2b93cade7b57d53ac6d3bcb4e6d11405f6f2e7ff8c25d813e3917177b9438f686f10bc4a006aadc6a7dde2343c9bc0017487684ad64f59bb2d0b7b73b3c817f24c91bd9afd2f36725937c8938def67d5cf6df3a7705bb40098548b55a6777ef2cd8e26c32efaa1bd0474f7f24d5e386d90e87d8a3c3aa63203a78004bccf2ad65cc97b26e94675"
+-  },
+-  {
+-    "md5_hash": "be4e335eb819af148fa4e365f176923d",
++    "age": 297221,
++    "md5_hash": "8d57aec1958070f01042ac1ecd8ec2ab",
+     "name": "GeoLite2-ASN.tgz",
+     "provider": "maxmind",
+-    "updated": 1615939277,
+-    "url": "https://storage.googleapis.com/elastic-paisano-staging/maxmind/GeoLite2-ASN.tgz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-staging%40elastic-apps-163815.iam.gserviceaccount.com%2F20210317%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210317T103241Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=8d8566fdf8167d9874966c16663a76bf8a678083c753fae0397de2eaffdb9f1d19ff36dd28bb2dc3bd9230dab5256a6d08d694574b9c50cae4b8614115ef9d3d638caf29eb18cefd7a7f0154e7baaeab4c565c828a2f050bbdbb8f5a9647d67d0748960b77846674097f76ea0d721cadda9fd99379ee604eba692c9274d238a1a3d56b7c29e236182cf5e91bae63b72d1c9a1ee7c598d7c5156683aa71a9776151bec83cb99f07f75a83483d620960fd97eca4e12c3789d72ac272912df74da1d63572609883157c6d2f115f7ab1be6b3e4503e7dd501946124f1250a299338529b8abc199afe52ff9d38904603b12b674149b85d7597e57502fda05c4b65a75"
++    "updated": 1619740833,
++    "url": "https://storage.googleapis.com/elastic-paisano-production/maxmind/GeoLite2-ASN.tgz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-production%40elastic-apps-163815.iam.gserviceaccount.com%2F20210430%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210430T000140Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=7212ea23f94454c8008bff13f7a54507b7fa88055f88224ba0d2c8f65bf172c6dfd0844f329223f141b0e1a6e68060df2fe2e5bb1c0bb75aefe246535a30710198d351b36cf59bfc42b0217ae7c3d4ae3da307781dcd603db7768070ac755a45596b1ae77739092b2eeb75b30cf82c6631e02ee48caf1268d0268477fa57f0482511b84ef1f10814dd2aaf7888abfe7c264ebb68c6e477fb2510cb00ed9c469e8fd43e1738dc10fb3702b84c452a12919340bd6fbcbdd1bc75e47a2457c25fb082a280ecd8465cd2eaba38e3f3a1786ec16d06d76fbf6a4b7758665dd517a34ffd583a67a95eff7d7c2106243771bb6aa247e735aeb260b7ebc231c2f2d3404f"
+   },
+   {
+-    "md5_hash": "6cd9be41557fd4c6dd0a8609a3f96bbe",
+-    "name": "GeoLite2-City.mmdb.gz",
+-    "provider": "maxmind",
+-    "updated": 1615420855,
+-    "url": "https://storage.googleapis.com/elastic-paisano-staging/maxmind/GeoLite2-City.mmdb.gz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-staging%40elastic-apps-163815.iam.gserviceaccount.com%2F20210317%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210317T103241Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=630106105d8f476a6d4e7de9fd777d8c250391ce1fbc799c7c683efeb39b319e1263948bcd326dc15f3ee0c9578f1fc95e5afe2d6b026dfac00b1fe188961df8ce3a8e5e0d71355fc0ea4d7f957af2ce8bf433210b0224d7175122ce0c1ced64dc39d2db7a979c1d173b72da58441a2358f605b92b71355cf00af4fdaa20943f21827506756b52706daaf780f173fe9f37a41fd7fc5539bbc41e79110fc4b00b37334d37179efa78c0a2ccd20ef6a5faff3baf1b5c2dfb2ef0ebb7ae4ef949f986a3cfbc8df4885476aef4ba6c06012a83418623219b48ee7ff04a41ae2ff2f421fb85fcbc04255df174647d6b9302f15441a783252c7443edfa70ef5f44068a"
+-  },
+-  {
+-    "md5_hash": "89d225ac546310b1e7979502ac9ad11c",
++    "age": 222085,
++    "md5_hash": "a195a73d4651a2bd02e5edd680f6703c",
+     "name": "GeoLite2-City.tgz",
+     "provider": "maxmind",
+-    "updated": 1615939277,
+-    "url": "https://storage.googleapis.com/elastic-paisano-staging/maxmind/GeoLite2-City.tgz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-staging%40elastic-apps-163815.iam.gserviceaccount.com%2F20210317%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210317T103241Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=3f5e84337ef78e8039ed391cddbcc92b0ceb3b946d4a7f60476f0633584cd3324356c9ead4bfc19f1c8776849a26b850c7e388386c5dfa8eccc2afe7e7c21d4c7fdd093cfae5c52899d9df5ffe13db6c29a0558329c8a8aecda058f9778dd23615471023fc77cc514d372d9786cbd256e27818883c1ee4b7edee75c393c89d57e94e58c2be2f9c8ee7354864b53f66d61c917eae296e071f84776e8c358218d890333fd376753a4c0f903581480629bca86d1abf3bc65efc7da30617c4847367d0ae24ba1ce0528feba3c3c3c38ecdd9a8d820d7f1a9141e30578822564c192181a97761858b9e06cc05f7db4143c89c402cbb888dcabc1f6559f4f701b79a7c"
+-  },
+-  {
+-    "md5_hash": "03bef5fb1fdc877304da3391052246dc",
+-    "name": "GeoLite2-Country.mmdb.gz",
+-    "provider": "maxmind",
+-    "updated": 1615420855,
+-    "url": "https://storage.googleapis.com/elastic-paisano-staging/maxmind/GeoLite2-Country.mmdb.gz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-staging%40elastic-apps-163815.iam.gserviceaccount.com%2F20210317%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210317T103241Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=18d3266f09a8b208573fa48ca9c30cf0041b69de4eac1656cafebcf737a9f2637b0be12f9df4dd26c07bc297a4070cd0248f8874d3d03bb3fc992f7110c1c0def845f182dcc6289d5fe4faa97daf98e3bdcd2e37405bae1f04e1b293c556c352a0c574f7a52f0f0ea92bcbfb5a74542be9e651453c79a0df1f7a84f2d48d5e704ee11df9a180f9c4c76a809c6a7edab7e36b4863556d815042b9cf43fe8bb1c60f432fcae56b1779d610e8b1388addc277b0259ac595eee34227fc9884065c7aaf44c8446c4f00849d3f8dad6eba9cc7213bac33ff166dc86c344fd14da736390615bc4d00de5ba007b0b1013f46b7e81b9827d32ae9e20f779a6580f97164f9"
++    "updated": 1619740834,
++    "url": "https://storage.googleapis.com/elastic-paisano-production/maxmind/GeoLite2-City.tgz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-production%40elastic-apps-163815.iam.gserviceaccount.com%2F20210430%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210430T000140Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=9e27f47fe4f9b92a57e0844eb53b44c4ec8948ff85ddc830394261c2b6ddb9a4bd9b9c56df703d362843ed06a4a6ded5558bcc47ffee5edce9e07e47cc945493d7808b05c5e70001308da0750ed6157dddc00e4eea4b90736d1103b3b437d0bed9468f74902c68d62ca4e8460969fd6adc6c1faf227eb08c70943a3079f9f52350a94038a9229e05cdf38fcb3c0a849e4cbf523c74729b04e0a7e5ac51df1b4baaa3202564e550716a1025baedfcf3c57a057ec57f5cfd38be499cd2ebd4621085eefda750ce60dbab611c8c09dae1625505a6f62b6a7a9164345a6b61ba697a9b0c9d6cf436caac64d5b5da2e75e074eaf87694f67b5f72aa8bccff4297e99b"
+   },
+   {
+-    "md5_hash": "c0e76a2e7e0f781028e849c2d389d8a1",
++    "age": 222445,
++    "md5_hash": "8b2092c0fc23e620fe4d801f2feff708",
+     "name": "GeoLite2-Country.tgz",
+     "provider": "maxmind",
+-    "updated": 1615939276,
+-    "url": "https://storage.googleapis.com/elastic-paisano-staging/maxmind/GeoLite2-Country.tgz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-staging%40elastic-apps-163815.iam.gserviceaccount.com%2F20210317%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210317T103241Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=5eaf641191c25f111afed9c569e31a5369733b3723db365b76cfbf93a7b39fd77481fe07f93fc5be2fb9ef987ef6f1c32bcb863d9d2de0e74aeece8ff568c41573c8a465e9ec5301bdc77c75b2ab369f5352f2da3f5262ae889facaf27f1685584ca49fa3bf4556ed0a92b6a4b1f1985f62378c92467d73b0c66fd1ed04cb311b903343249aed6d3ba32d7b80f0be9a08816737016038306886dcffaf141932e5fb06dfe96ff1caf8ed37f6f8128a0bdc6abf9516aeac891a791656d14f4c37b31f4c86d5dba430d92402c78d8b53dcf4ec557f0f8b6c1fb59357ae1aa7f6310289fdf16c094028570431312ea35f2c00f8cd2dcef8b98d2af5ed3ee09a7fefd"
++    "updated": 1619740833,
++    "url": "https://storage.googleapis.com/elastic-paisano-production/maxmind/GeoLite2-Country.tgz?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=elastic-paisano-production%40elastic-apps-163815.iam.gserviceaccount.com%2F20210430%2Fhenk%2Fstorage%2Fgoog4_request&X-Goog-Date=20210430T000140Z&X-Goog-Expires=86400&X-Goog-SignedHeaders=host&X-Goog-Signature=33f24e6a7e4660eaa225668cf8424ec7f2b8219b43fe6c7b446ee91eb907ef17871f3a4dba63796e28916317c0aaa581d384b4eb89c4acd1b3a8eaa44cb6a6fd2e43449ba9edc4e20e5a65dc583a13ed1cddc05072b80f8529939d1300da6540dc044811839dd43b13889c89b9101d1e31fb2d050b2af9bf059ab5d403427f4fd206ef845b7b985c7316a6943873c278000cccc14192576a639a1c5eb714c3673eb6dc286af09be244f3e01f5306bcb20787847d543598a64287657d39a7721f91f0afeb41309221d717515956f773625aaf7a6e3f51e5480f3dda601b0068523c4a84ca75070147b4d95bbce3c40bbe13ec152325ce0ce1ea394174f318bde5"
+   }
+ ]
+\ No newline at end of file
+diff --git a/x-pack/spec/filters/geoip/test_helper.rb b/x-pack/spec/filters/geoip/test_helper.rb
+index a47d19a940d..ecbb28d1317 100644
+--- a/x-pack/spec/filters/geoip/test_helper.rb
++++ b/x-pack/spec/filters/geoip/test_helper.rb
+@@ -6,16 +6,16 @@
+ require "digest"
+ 
+ module GeoipHelper
+-  def get_vendor_path
+-    ::File.expand_path("vendor", ::File.dirname(__FILE__))
++  def get_data_dir_path
++    ::File.join(LogStash::SETTINGS.get_value("path.data"), "plugins", "filters", "geoip")
+   end
+ 
+-  def get_data_dir
+-    ::File.join(LogStash::SETTINGS.get_value("path.data"), "plugins", "filters", "geoip")
++  def get_dir_path(dirname)
++    ::File.join(get_data_dir_path, dirname)
+   end
+ 
+-  def get_file_path(filename)
+-    ::File.join(get_data_dir, filename)
++  def get_file_path(dirname, filename)
++    ::File.join(get_dir_path(dirname), filename)
+   end
+ 
+   def md5(file_path)
+@@ -23,20 +23,19 @@ def md5(file_path)
+   end
+ 
+   def default_city_db_path
+-    get_file_path("GeoLite2-City.mmdb")
++    ::File.join(get_data_dir_path, "CC", default_city_db_name )
+   end
+ 
+   def default_city_gz_path
+-    get_file_path("GeoLite2-City.tgz")
+-
++    ::File.join(get_data_dir_path, "CC", "GeoLite2-City.tgz" )
+   end
+ 
+   def default_asn_db_path
+-    get_file_path("GeoLite2-ASN.mmdb")
++    ::File.join(get_data_dir_path, "CC", default_asn_db_name )
+   end
+ 
+   def metadata_path
+-    get_file_path("metadata.csv")
++    ::File.join(get_data_dir_path, "metadata.csv")
+   end
+ 
+   def default_city_db_name
+@@ -47,39 +46,58 @@ def default_asn_db_name
+     "GeoLite2-ASN.mmdb"
+   end
+ 
+-  def second_city_db_name
+-    "GeoLite2-City_20200220.mmdb"
++  def second_city_db_path
++    ::File.join(get_data_dir_path, second_dirname, default_city_db_name )
+   end
+ 
+-  def second_city_db_path
+-    get_file_path("GeoLite2-City_20200220.mmdb")
++  def second_asn_db_path
++    ::File.join(get_data_dir_path, second_dirname, default_asn_db_name )
++  end
++
++  def second_dirname
++    "20200220"
++  end
++
++  def create_default_city_gz
++    ::File.open(default_city_gz_path, "w") { |f| f.write "make a non empty file" }
+   end
+ 
+   def default_city_db_md5
+     md5(default_city_db_path)
+   end
+ 
+-  def DEFAULT_ASN_DB_MD5
++  def default_asn_db_md5
+     md5(default_asn_db_path)
+   end
+ 
+-
+   def write_temp_metadata(temp_file_path, row = nil)
+     now = Time.now.to_i
+-    city = md5(default_city_db_path)
+-    asn = md5(default_asn_db_path)
++    dirname = "CC"
+ 
+     metadata = []
+-    metadata << ["ASN",now,"",asn,default_asn_db_name]
+-    metadata << ["City",now,"",city,default_city_db_name]
++    metadata << ["ASN",now,"",dirname,false]
++    metadata << ["City",now,"",dirname,false]
+     metadata << row if row
++
++    FileUtils.mkdir_p(::File.dirname(temp_file_path))
++    CSV.open temp_file_path, 'w' do |csv|
++      metadata.each { |row| csv << row }
++    end
++  end
++
++  def rewrite_temp_metadata(temp_file_path, metadata = [])
++    FileUtils.mkdir_p(::File.dirname(temp_file_path))
+     CSV.open temp_file_path, 'w' do |csv|
+       metadata.each { |row| csv << row }
+     end
+   end
+ 
+   def city2_metadata
+-    ["City",Time.now.to_i,"",md5(default_city_db_path),second_city_db_name]
++    ["City",Time.now.to_i,"",second_dirname,true]
++  end
++
++  def city_expired_metadata
++    ["City","1220227200","","1220227200",true]
+   end
+ 
+   def copy_city_database(filename)
+@@ -88,13 +106,20 @@ def copy_city_database(filename)
+   end
+ 
+   def delete_file(*filepaths)
+-    filepaths.map { |filepath| ::File.delete(filepath) if ::File.exist?(filepath) }
++    filepaths.map { |filepath| FileUtils.rm_r(filepath) if ::File.exist?(filepath) }
+   end
+ 
+   def get_metadata_database_name
+     ::File.exist?(metadata_path) ? ::File.read(metadata_path).split(",").last[0..-2] : nil
+   end
+ 
++  def copy_cc(dir_path)
++    cc_database_paths = ::Dir.glob(::File.expand_path(
++      ::File.join("..", "..", "..", "..", "..", "vendor", "**", "{GeoLite2-ASN,GeoLite2-City}.mmdb"),
++      __FILE__))
++    FileUtils.mkdir_p(dir_path)
++    FileUtils.cp_r(cc_database_paths, dir_path)
++  end
+ end
+ 
+ RSpec.configure do |c|

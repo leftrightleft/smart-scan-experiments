@@ -1,0 +1,333 @@
+diff --git a/lib/logstash/outputs/csv.rb b/lib/logstash/outputs/csv.rb
+new file mode 100644
+index 00000000000..d35cb67c093
+--- /dev/null
++++ b/lib/logstash/outputs/csv.rb
+@@ -0,0 +1,55 @@
++require "csv"
++require "logstash/namespace"
++require "logstash/outputs/file"
++
++# CSV output.
++#
++# Write events to disk in CSV or other delimited format
++# Based on the file output, many config values are shared
++# Uses the Ruby csv library internally
++class LogStash::Outputs::CSV < LogStash::Outputs::File
++
++  config_name "csv"
++  milestone 1
++
++  # The field names from the event that should be written to the CSV file.
++  # Fields are written to the CSV in the same order as the array.
++  # If a field does not exist on the event, an empty string will be written.
++  # Supports field reference syntax eg: `fields => ["field1", "[nested][field]"]`.
++  config :fields, :validate => :array, :required => true
++  
++  # Options for CSV output. This is passed directly to the Ruby stdlib to\_csv function. 
++  # Full documentation is available here: [http://ruby-doc.org/stdlib-2.0.0/libdoc/csv/rdoc/index.html].
++  # A typical use case would be to use alternative column or row seperators eg: `csv_options => {"col_sep" => "\t" "row_sep" => "\r\n"}` gives tab seperated data with windows line endings
++  config :csv_options, :validate => :hash, :required => false, :default => Hash.new
++
++  public
++  def register
++    super
++    @csv_options = Hash[@csv_options.map{|(k,v)|[k.to_sym, v]}]
++  end
++
++  public
++  def receive(event)
++    return unless output?(event)
++    path = event.sprintf(@path)
++    fd = open(path)
++    csv_values = @fields.map {|name| get_value(name, event)}
++    fd.write(csv_values.to_csv(@csv_options))
++
++    flush(fd)
++    close_stale_files
++  end #def receive
++
++  private
++  def get_value(name, event)
++    val = event[name]
++    case val
++      when Hash
++        return val.to_json
++      else
++        return val
++    end
++  end
++end # class LogStash::Outputs::CSV
++
+diff --git a/spec/outputs/csv.rb b/spec/outputs/csv.rb
+new file mode 100644
+index 00000000000..29fa719c89a
+--- /dev/null
++++ b/spec/outputs/csv.rb
+@@ -0,0 +1,266 @@
++require "csv"
++require "tempfile"
++require "test_utils"
++require "logstash/outputs/csv"
++
++describe LogStash::Outputs::CSV do
++  extend LogStash::RSpec
++
++  describe "Write a single field to a csv file" do
++    tmpfile = Tempfile.new('logstash-spec-output-csv')
++    config <<-CONFIG
++      input {
++        generator {
++          add_field => ["foo","bar"]
++          count => 1
++        }
++      }
++      output {
++        csv {
++          path => "#{tmpfile.path}"
++          fields => "foo"
++        }
++      }
++    CONFIG
++
++    agent do
++      lines = File.readlines(tmpfile.path)
++      insist {lines.count} == 1
++      insist {lines[0]} == "bar\n"
++    end
++  end
++
++  describe "write multiple fields and lines to a csv file" do
++    tmpfile = Tempfile.new('logstash-spec-output-csv')
++    config <<-CONFIG
++      input {
++        generator {
++          add_field => ["foo", "bar", "baz", "quux"]
++          count => 2
++        }
++      }
++      output {
++        csv {
++          path => "#{tmpfile.path}"
++          fields => ["foo", "baz"]
++        }
++      }
++    CONFIG
++
++    agent do
++      lines = File.readlines(tmpfile.path)
++      insist {lines.count} == 2
++      insist {lines[0]} == "bar,quux\n"
++      insist {lines[1]} == "bar,quux\n"
++    end
++  end
++
++  describe "missing event fields are empty in csv" do
++    tmpfile = Tempfile.new('logstash-spec-output-csv')
++    config <<-CONFIG
++      input {
++        generator {
++          add_field => ["foo","bar", "baz", "quux"]
++          count => 1
++        }
++      }
++      output {
++        csv {
++          path => "#{tmpfile.path}"
++          fields => ["foo", "not_there", "baz"]
++        }
++      }
++    CONFIG
++
++    agent do
++      lines = File.readlines(tmpfile.path)
++      insist {lines.count} == 1
++      insist {lines[0]} == "bar,,quux\n"
++    end
++  end
++
++  describe "commas are quoted properly" do
++    tmpfile = Tempfile.new('logstash-spec-output-csv')
++    config <<-CONFIG
++      input {
++        generator {
++          add_field => ["foo","one,two", "baz", "quux"]
++          count => 1
++        }
++      }
++      output {
++        csv {
++          path => "#{tmpfile.path}"
++          fields => ["foo", "baz"]
++        }
++      }
++    CONFIG
++
++    agent do
++      lines = File.readlines(tmpfile.path)
++      insist {lines.count} == 1
++      insist {lines[0]} == "\"one,two\",quux\n"
++    end
++  end
++
++  describe "new lines are quoted properly" do
++    tmpfile = Tempfile.new('logstash-spec-output-csv')
++    config <<-CONFIG
++      input {
++        generator {
++          add_field => ["foo","one\ntwo", "baz", "quux"]
++          count => 1
++        }
++      }
++      output {
++        csv {
++          path => "#{tmpfile.path}"
++          fields => ["foo", "baz"]
++        }
++      }
++    CONFIG
++
++    agent do
++      lines = CSV.read(tmpfile.path)
++      insist {lines.count} == 1
++      insist {lines[0][0]} == "one\ntwo"
++    end
++  end
++
++  describe "fields that are are objects are written as JSON" do
++    tmpfile = Tempfile.new('logstash-spec-output-csv')
++    config <<-CONFIG
++      input {
++        generator {
++          message => '{"foo":{"one":"two"},"baz": "quux"}'
++          count => 1
++        }
++      }
++      filter {
++        json { source => "message"}
++      }
++      output {
++        csv {
++          path => "#{tmpfile.path}"
++          fields => ["foo", "baz"]
++        }
++      }
++    CONFIG
++
++    agent do
++      lines = CSV.read(tmpfile.path)
++      insist {lines.count} == 1
++      insist {lines[0][0]} == '{"one":"two"}'
++    end
++  end
++
++  describe "can address nested field using field reference syntax" do
++    tmpfile = Tempfile.new('logstash-spec-output-csv')
++    config <<-CONFIG
++      input {
++        generator {
++          message => '{"foo":{"one":"two"},"baz": "quux"}'
++          count => 1
++        }
++      }
++      filter {
++        json { source => "message"}
++      }
++      output {
++        csv {
++          path => "#{tmpfile.path}"
++          fields => ["[foo][one]", "baz"]
++        }
++      }
++    CONFIG
++
++    agent do
++      lines = CSV.read(tmpfile.path)
++      insist {lines.count} == 1
++      insist {lines[0][0]} == "two"
++      insist {lines[0][1]} == "quux"
++    end
++  end
++
++  describe "missing nested field is blank" do
++    tmpfile = Tempfile.new('logstash-spec-output-csv')
++    config <<-CONFIG
++      input {
++        generator {
++          message => '{"foo":{"one":"two"},"baz": "quux"}'
++          count => 1
++        }
++      }
++      filter {
++        json { source => "message"}
++      }
++      output {
++        csv {
++          path => "#{tmpfile.path}"
++          fields => ["[foo][missing]", "baz"]
++        }
++      }
++    CONFIG
++
++    agent do
++      lines = File.readlines(tmpfile.path)
++      insist {lines.count} == 1
++      insist {lines[0]} == ",quux\n"
++    end
++  end
++
++  describe "can choose field seperator" do
++    tmpfile = Tempfile.new('logstash-spec-output-csv')
++    config <<-CONFIG
++      input {
++        generator {
++          message => '{"foo":"one","bar": "two"}'
++          count => 1
++        }
++      }
++      filter {
++        json { source => "message"}
++      }
++      output {
++        csv {
++          path => "#{tmpfile.path}"
++          fields => ["foo", "bar"]
++          csv_options => {"col_sep" => "|"}
++        }
++      }
++    CONFIG
++
++    agent do
++      lines = File.readlines(tmpfile.path)
++      insist {lines.count} == 1
++      insist {lines[0]} == "one|two\n"
++    end
++  end
++  describe "can choose line seperator" do
++    tmpfile = Tempfile.new('logstash-spec-output-csv')
++    config <<-CONFIG
++      input {
++        generator {
++          message => '{"foo":"one","bar": "two"}'
++          count => 2
++        }
++      }
++      filter {
++        json { source => "message"}
++      }
++      output {
++        csv {
++          path => "#{tmpfile.path}"
++          fields => ["foo", "bar"]
++          csv_options => {"col_sep" => "|" "row_sep" => "\t"}
++        }
++      }
++    CONFIG
++
++    agent do
++      lines = File.readlines(tmpfile.path)
++      insist {lines.count} == 1
++      insist {lines[0]} == "one|two\tone|two\t"
++    end
++  end
++end

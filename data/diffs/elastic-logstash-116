@@ -1,0 +1,357 @@
+diff --git a/Gemfile b/Gemfile
+index 5ee06f9abd4..543e0a33efe 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -6,6 +6,7 @@ gem "uuidtools" # for naming amqp queues, License ???
+ 
+ gem "filewatch", "0.3.3"  # for file tailing, BSD License
+ gem "jls-grok", "0.10.5" # for grok filter, BSD License
++gem "aws-sdk" # for AWS access: SNS and S3 log tailing.  Apache 2.0 License
+ gem "jruby-elasticsearch", "0.0.11", :platforms => :jruby # BSD License
+ gem "stomp" # for stomp protocol, Apache 2.0 License
+ gem "json" # Ruby license
+@@ -31,6 +32,11 @@ gem "gelfd", "0.2.0" #inputs/gelf, # License: Apache 2.0
+ gem "ffi-rzmq", "0.9.0"
+ gem "ffi"
+ 
++group :test do
++  gem "mocha"
++  gem "shoulda"
++end
++
+ # ruby-debug is broken in 1.9.x due, at a minimum, the following:
+ #    Installing rbx-require-relative (0.0.5)
+ #    Gem::InstallError: rbx-require-relative requires Ruby version ~> 1.8.7.
+diff --git a/Gemfile.lock b/Gemfile.lock
+index bf163a4de26..ae21cc6c8df 100644
+--- a/Gemfile.lock
++++ b/Gemfile.lock
+@@ -2,6 +2,11 @@ GEM
+   remote: http://rubygems.org/
+   specs:
+     awesome_print (1.0.2)
++    aws-sdk (1.3.5)
++      httparty (~> 0.7)
++      json (~> 1.4)
++      nokogiri (>= 1.4.4)
++      uuidtools (~> 2.1)
+     bouncy-castle-java (1.5.0146.1)
+     bson (1.5.2)
+     bson (1.5.2-java)
+@@ -20,6 +25,9 @@ GEM
+     gelfd (0.2.0)
+     gmetric (0.1.3)
+     haml (3.1.4)
++    httparty (0.8.1)
++      multi_json
++      multi_xml
+     jls-grok (0.10.5)
+       cabin (~> 0.3.0)
+     jruby-elasticsearch (0.0.11)
+@@ -27,19 +35,27 @@ GEM
+       bouncy-castle-java (>= 1.5.0146.1)
+     json (1.6.5)
+     json (1.6.5-java)
++    metaclass (0.0.1)
+     minitest (2.11.1)
+     mizuno (0.5.0)
+       childprocess (>= 0.2.6)
+       choice (>= 0.1.0)
+       ffi (>= 1.0.0)
+       rack (>= 1.0.0)
++    mocha (0.10.4)
++      metaclass (~> 0.0.1)
+     mongo (1.5.2)
+       bson (= 1.5.2)
++    multi_json (1.1.0)
++    multi_xml (0.4.1)
++    nokogiri (1.5.0)
++    nokogiri (1.5.0-java)
+     rack (1.4.1)
+     rack-protection (1.2.0)
+       rack
+     redis (2.2.2)
+     sass (3.1.14)
++    shoulda (2.11.3)
+     sinatra (1.3.2)
+       rack (~> 1.3, >= 1.3.6)
+       rack-protection (~> 1.2)
+@@ -56,6 +72,7 @@ PLATFORMS
+ 
+ DEPENDENCIES
+   awesome_print
++  aws-sdk
+   bunny
+   cabin (= 0.3.8)
+   ffi
+@@ -71,10 +88,12 @@ DEPENDENCIES
+   json
+   minitest
+   mizuno
++  mocha
+   mongo
+   rack
+   redis
+   sass
++  shoulda
+   sinatra
+   statsd-ruby (= 0.3.0)
+   stomp
+diff --git a/lib/logstash/outputs/sns.rb b/lib/logstash/outputs/sns.rb
+new file mode 100644
+index 00000000000..750cb6ba3f9
+--- /dev/null
++++ b/lib/logstash/outputs/sns.rb
+@@ -0,0 +1,75 @@
++require "logstash/outputs/base"
++require "logstash/namespace"
++
++# SNS output.
++#
++# Send events to Amazon's Simple Notification Service, a hosted pub/sub
++# framework.  It supports subscribers of type email, HTTP/S, SMS, and
++# SQS.  See http://aws.amazon.com/sns/ and
++# http://docs.amazonwebservices.com/sns/latest/api/API_Publish.html
++#
++# This plugin looks for the following fields on events it receives:
++#  'sns' => The ARN of the topic this event should be sent to.  Required.
++#  'sns_subject' => The subject line that should be used.  Optional.  "Notice from %{@source}" will be used if not present.
++#  'sns_message' => The message that should be sent.  Optional.  The event's date, source, tags, fields, and message will be used if not present.
++class LogStash::Outputs::Sns < LogStash::Outputs::Base
++  MAX_SUBJECT_SIZE = 100
++  MAX_MESSAGE_SIZE = 8192
++
++  config_name "sns"
++  plugin_status "experimental"
++
++  # Path to YAML file containing a hash of AWS credentials.  Ex:
++  # The path to YAML file containing a hash of the AWS credentials for your
++  # account.  The contents of the file should look like this:
++  # --- 
++  # :access_key_id: "12345"
++  # :secret_access_key: "54321"
++  config :credentials, :validate => :string, :required => true
++
++  # When an ARN for an SNS topic is specified here, the message "Logstash
++  # successfully booted" will be sent to it when this plugin is registered.
++  # Ex: "arn:aws:sns:us-east-1:770975001275:logstash-testing"
++  config :publish_boot_message_arn, :validate => :string
++
++  public
++  def register
++    require "aws-sdk"
++    access_creds = YAML.load_file(@credentials)
++
++    @sns = AWS::SNS.new(access_creds)
++
++    # Try to publish a "Logstash booted" message to the ARN provided to cause an error ASAP if the creds are bad
++    if @publish_boot_message_arn
++      @sns.topics[@publish_boot_message_arn].publish("Logstash successfully booted", :subject => "Logstash booted")
++    end
++  end # def register
++
++  public
++  def receive(event)
++    return unless output?(event)
++
++    arn = Array(event.fields['sns']).first
++    raise "Field 'sns' is required.  Event was #{event.type}, #{event.source}" unless arn
++
++    message = Array(event.fields['sns_message']).first || self.class.format_message(event)
++    subject = Array(event.fields['sns_subject']).first || "Notice from #{event.source}"
++
++    @logger.debug("Sending event to SNS topic #{arn} with subject '#{subject}' and message:")
++    message.split("\n").each { |line| @logger.debug(line) }
++
++    # Look up the topic and publish the message
++    @sns.topics[arn].publish(message, :subject => subject.slice(0, MAX_SUBJECT_SIZE))
++  end # def receive
++
++  public
++  def self.format_message(event)
++    message =  "Date: #{event.timestamp}\n"
++    message << "Source: #{event.source}\n"
++    message << "Tags: #{event.tags.join(', ')}\n"
++    message << "Fields: #{event.fields.inspect}\n"
++    message << "Message: #{event.message}"
++
++    message.slice(0, MAX_MESSAGE_SIZE)
++  end # def format_message
++end # class LogStash::Outputs::Sns
+diff --git a/logstash.gemspec b/logstash.gemspec
+index 0c3d93f4153..92e6ff6acd6 100644
+--- a/logstash.gemspec
++++ b/logstash.gemspec
+@@ -25,7 +25,8 @@ Gem::Specification.new do |spec|
+ 
+   spec.add_dependency "awesome_print" # MIT License
+   spec.add_dependency "bunny" # for amqp support, MIT-style license
+-  spec.add_dependency "cabin", "0.3.1" # for logging. apache 2 license
++  spec.add_dependency "cabin", "0.3.8" # for logging. apache 2 license
++  spec.add_dependency "aws-sdk" # for AWS access: SNS and S3 log tailing.  Apache 2.0 License
+   spec.add_dependency "filewatch", "~> 0.3.3"  # for file tailing, BSD License
+   spec.add_dependency "gelfd", "~> 0.2.0" #inputs/gelf, # License: Apache 2.0
+   spec.add_dependency "gelf" # outputs/gelf, # License: MIT-style
+@@ -48,6 +49,8 @@ Gem::Specification.new do |spec|
+   spec.add_dependency "xmpp4r", "~> 0.5" # outputs/xmpp, # License: As-Is
+ 
+   spec.add_dependency("ffi-rzmq")
++  spec.add_development_dependency 'mocha'
++  spec.add_development_dependency 'shoulda'
+ 
+   spec.files = files
+   spec.require_paths << "lib"
+diff --git a/test/logstash/outputs/sns_test.rb b/test/logstash/outputs/sns_test.rb
+new file mode 100644
+index 00000000000..06263790d56
+--- /dev/null
++++ b/test/logstash/outputs/sns_test.rb
+@@ -0,0 +1,119 @@
++require "test_helper"
++require "logstash/outputs/sns"
++require "aws-sdk"
++
++describe LogStash::Outputs::Sns do
++  before do
++    # Fake SNS object
++    @topic = stub()
++    @topic_collection = stub(:[] => @topic)
++    @sns = stub(:topics => @topic_collection)
++
++    # Some default values for an event
++    @event = LogStash::Event.new
++    @event.timestamp = '2012-02-01T20:37:28.394000Z'
++    @event.source = "file://ip-10-40-211-234/var/log/messages"
++    @event.message = "Feb  1 15:37:27 localhost systemd-logind[384]: New session 265 of user ec2-user."
++
++    # Sample AWS credentials
++    @aws_creds = { :secret_access_key => '54321z', :access_key_id => '12345a' }
++  end
++
++  describe '.register' do
++    before do
++      YAML.stubs(:load_file => @aws_creds)
++      AWS::SNS.stubs(:new => @sns)
++    end
++
++    test 'registers an SNS proxy without publishing a boot message' do
++      sns_output = LogStash::Outputs::Sns.new(
++        'credentials' => ['/fake/file.yml']
++      )
++      @topic_collection.expects(:[]).never
++
++      sns_output.register
++    end
++
++    test 'publishes a boot message when able to create a SNS proxy' do
++      sns_output = LogStash::Outputs::Sns.new(
++        'credentials' => ['/fake/file.yml'],
++        'publish_boot_message_arn' => ['fake_boot_arn']
++      )
++
++      @topic_collection.expects(:[]).with('fake_boot_arn').returns(@topic)
++      @topic.expects(:publish).with(instance_of(String), has_entries(:subject => instance_of(String)))
++
++      sns_output.register
++    end
++  end
++
++  describe '.receive' do
++    before do
++      # Need to have a registered SNS proxy
++      YAML.stubs(:load_file => @aws_creds)
++      AWS::SNS.stubs(:new => @sns)
++
++      @subject = LogStash::Outputs::Sns.new(
++          'credentials' => ['/fake/file.yml']
++        )
++      @subject.register
++
++      @arn = 'fake:arn'
++      @event.fields['sns'] = @arn
++    end
++
++    test 'does not send a message to SNS when an event should not be output' do
++      @subject.stubs(:output? => false)
++      @topic.expects(:publish).never
++
++      @subject.receive(@event)
++    end
++
++    test 'raises an exception when an event with no sns field is received' do
++      @event.fields.delete('sns')
++      @topic.expects(:publish).never
++
++      assert_raises(RuntimeError) { @subject.receive(@event) }
++    end
++
++    test 'uses the sns_subject when one is provided' do
++      @event.fields['sns_subject'] = 'Test subject'
++      @topic.expects(:publish).with(instance_of(String), :subject => 'Test subject')
++
++      @subject.receive(@event)
++    end
++
++    test 'uses the sns_message when one is provided' do
++      @event.fields['sns_message'] = 'Test message'
++      @topic.expects(:publish).with('Test message', has_entries(:subject => instance_of(String)))
++
++      @subject.receive(@event)
++    end
++
++    test 'uses a default message and subject when no sns_message or sns_subject are provided' do
++      @topic.expects(:publish).with(instance_of(String), has_entries(:subject => instance_of(String)))
++
++      @subject.receive(@event)
++    end
++  end
++
++  describe '#format_message' do
++    test 'formats messages with tags and fields correctly' do
++      @event.fields['field1'] = 'val1'
++      @event.fields['field2'] = 'val2'
++      @event.tags << 'tag1' << 'tag2'
++
++      msg = LogStash::Outputs::Sns.format_message(@event)
++      assert msg =~ /field1/
++      assert msg =~ /tag2/
++    end
++
++    test 'truncates messages that are too long' do
++      @event.message = 'hi'*LogStash::Outputs::Sns::MAX_MESSAGE_SIZE
++      msg = LogStash::Outputs::Sns.format_message(@event)
++
++      assert_equal 2 * LogStash::Outputs::Sns::MAX_MESSAGE_SIZE, @event.message.length
++      assert_equal LogStash::Outputs::Sns::MAX_MESSAGE_SIZE, msg.length
++    end
++  end
++end
+diff --git a/test/logstash_test_runner.rb b/test/logstash_test_runner.rb
+index fbd39654a8c..276e03701cd 100644
+--- a/test/logstash_test_runner.rb
++++ b/test/logstash_test_runner.rb
+@@ -21,6 +21,7 @@ def use(path)
+ use "logstash/filters/test_grok"
+ 
+ use "logstash/outputs/test_elasticsearch"
++use "logstash/outputs/sns_test"
+ 
+ skip "logstash/inputs/test_file"
+ skip "logstash/inputs/test_syslog"
+diff --git a/test/test_helper.rb b/test/test_helper.rb
+new file mode 100644
+index 00000000000..3701e0f9d46
+--- /dev/null
++++ b/test/test_helper.rb
+@@ -0,0 +1,11 @@
++require "rubygems"
++require File.join(File.dirname(__FILE__), "logstash", "minitest")
++
++require "logstash/loadlibs"
++require "logstash/testcase"
++require "logstash/agent"
++require "logstash/logging"
++
++require "tmpdir"
++require "mocha"
++require 'shoulda'

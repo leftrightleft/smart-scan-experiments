@@ -1,0 +1,1945 @@
+diff --git a/.ci/matrix-runtime-javas.yml b/.ci/matrix-runtime-javas.yml
+deleted file mode 100644
+index e7381addec4..00000000000
+--- a/.ci/matrix-runtime-javas.yml
++++ /dev/null
+@@ -1,13 +0,0 @@
+-# This file is used as part of a matrix build in Jenkins where the
+-# values below are included as an axis of the matrix.
+-
+-# This axis of the build matrix represents the versions of Java on
+-# which Logstash can be tested against.
+-
+-LS_RUNTIME_JAVA:
+-  - openjdk11
+-  - openjdk17
+-  - adoptopenjdk11
+-  - adoptiumjdk17
+-  - zulu11
+-  - zulu17
+diff --git a/.github/workflows/add-docs-preview-link.yml b/.github/workflows/add-docs-preview-link.yml
+new file mode 100644
+index 00000000000..f24a1367c26
+--- /dev/null
++++ b/.github/workflows/add-docs-preview-link.yml
+@@ -0,0 +1,19 @@
++name: Docs Preview Link
++
++on:
++  pull_request:
++    types: [opened, synchronize]
++    paths: docs/**
++jobs:
++  docs-preview-link:
++    runs-on: ubuntu-latest
++    permissions:
++      pull-requests: write
++    steps:
++    - name: Add Docs Preview link in PR Comment
++      uses: thollander/actions-comment-pull-request@v1
++      with:
++        message: |
++          :page_with_curl: **DOCS PREVIEW** :sparkles: https://logstash_${{ github.event.number }}.docs-preview.app.elstc.co/diff
++          Note: if you get a "404!" please wait until the elasticsearch ci job finishes.
++        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+diff --git a/.github/workflows/pr_backporter.yml b/.github/workflows/pr_backporter.yml
+new file mode 100644
+index 00000000000..6be20238805
+--- /dev/null
++++ b/.github/workflows/pr_backporter.yml
+@@ -0,0 +1,30 @@
++name: Backport PR to another branch
++on:
++  issue_comment:
++
++jobs:
++  pr_commented:
++    # This job only runs for pull request comments
++    name: PR comment
++    if: ${{ github.event.issue.pull_request && startsWith(github.event.comment.body, '@logstashmachine backport') }}
++    runs-on: ubuntu-latest
++    steps:
++      - name: checkout repo content
++        uses: actions/checkout@v2 
++        with:
++          fetch-depth: 0
++          ref: 'main'
++      - run: git config --global user.email "43502315+logstashmachine@users.noreply.github.com"
++      - run: git config --global user.name "logstashmachine"
++      - name: setup python
++        uses: actions/setup-python@v2
++        with:
++          python-version: 3.8
++      - run: |
++          echo "branch=$(echo "${{ github.event.comment.body }}" | cut -d " " -f 3)" >> $GITHUB_ENV
++      - run: |
++          mkdir ~/.elastic && echo ${{ github.token }} >> ~/.elastic/github.token
++      - name: install python dependencies
++        run: pip install requests
++      - name: execute py script # run the run.py to get the latest data
++        run: python devtools/backport ${{ env.branch }} ${{ github.event.issue.number }} --remote=origin --yes
+diff --git a/README.md b/README.md
+index 756ee401ad6..437aa124097 100644
+--- a/README.md
++++ b/README.md
+@@ -44,7 +44,7 @@ Logstash core will continue to exist under this repository and all related issue
+ 
+ ### Prerequisites
+ 
+-* Install JDK version 11. Make sure to set the `JAVA_HOME` environment variable to the path to your JDK installation directory. For example `set JAVA_HOME=<JDK_PATH>`
++* Install JDK version 11 or 17. Make sure to set the `JAVA_HOME` environment variable to the path to your JDK installation directory. For example `set JAVA_HOME=<JDK_PATH>`
+ * Install JRuby 9.2.x It is recommended to use a Ruby version manager such as [RVM](https://rvm.io/) or [rbenv](https://github.com/sstephenson/rbenv).
+ * Install `rake` and `bundler` tool using `gem install rake` and `gem install bundler` respectively.
+ 
+diff --git a/build.gradle b/build.gradle
+index fd28b9984fb..7e4c7a868ad 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -303,11 +303,13 @@ def assemblyDeps = [downloadAndInstallJRuby, assemble] + subprojects.collect {
+   it.tasks.findByName("assemble")
+ }
+ 
++def bundlerVersion = "~> 2"
++
+ tasks.register("installBundler") {
+     dependsOn assemblyDeps
+     outputs.files file("${projectDir}/vendor/bundle/jruby/2.5.0/bin/bundle")
+     doLast {
+-      gem(projectDir, buildDir, "bundler", "= 2.3.6", "${projectDir}/vendor/bundle/jruby/2.5.0")
++      gem(projectDir, buildDir, "bundler", bundlerVersion, "${projectDir}/vendor/bundle/jruby/2.5.0")
+   }
+ }
+ 
+@@ -435,7 +437,7 @@ tasks.register("installIntegrationTestBundler"){
+     dependsOn unpackTarDistribution
+     outputs.files file("${qaBundleBin}")
+   doLast {
+-      gem(projectDir, buildDir, "bundler", "= 2.3.6", qaBundledGemPath)
++      gem(projectDir, buildDir, "bundler", bundlerVersion, qaBundledGemPath)
+   }
+ }
+ 
+diff --git a/ci/logstash_releases.json b/ci/logstash_releases.json
+index 3d5fa851406..8604dde34e2 100644
+--- a/ci/logstash_releases.json
++++ b/ci/logstash_releases.json
+@@ -2,11 +2,11 @@
+   "releases": {
+     "5.x": "5.6.16",
+     "6.x": "6.8.23",
+-    "7.x": "7.17.0",
+-    "8.x": "8.0.0-rc2"
++    "7.x": "7.17.1",
++    "8.x": "8.0.1"
+   },
+   "snapshots": {
+-    "7.x": "7.17.1-SNAPSHOT",
++    "7.x": "7.17.2-SNAPSHOT",
+     "8.x": "8.1.0-SNAPSHOT"
+   }
+ }
+diff --git a/devtools/backport b/devtools/backport
+index 2aa4a6da6f9..ac7e2ff04fc 100755
+--- a/devtools/backport
++++ b/devtools/backport
+@@ -10,14 +10,15 @@ from os.path import expanduser
+ import re
+ from subprocess import check_call, call, check_output
+ import requests
++import json
+ 
+ usage = """
+     Example usage:
+-        ./devtools/backport 5.0 2565 6490604aa0cf7fa61932a90700e6ca988fc8a527
++        ./devtools/backport 7.16 2565 6490604aa0cf7fa61932a90700e6ca988fc8a527
+ 
+     In case of backporting errors, fix them, then run
+         git cherry-pick --continue
+-        ./devtools/backport 5.0 2565 6490604aa0cf7fa61932a90700e6ca988fc8a527 --continue
++        ./devtools/backport 7.16 2565 6490604aa0cf7fa61932a90700e6ca988fc8a527 --continue
+ 
+     This script does the following:
+         * cleanups both from_branch and to_branch (warning: drops local changes)
+@@ -47,7 +48,7 @@ def main():
+                         help="To branch (e.g 7.x)")
+     parser.add_argument("pr_number",
+                         help="The PR number being merged (e.g. 2345)")
+-    parser.add_argument("commit_hashes", metavar="hash", nargs="+",
++    parser.add_argument("commit_hashes", metavar="hash", nargs="*",
+                         help="The commit hashes to cherry pick." +
+                         " You can specify multiple.")
+     parser.add_argument("--yes", action="store_true",
+@@ -68,9 +69,12 @@ def main():
+ 
+     print(args)
+ 
+-    create_pr(args)
++    create_pr(parser, args)
++
++def create_pr(parser, args):
++    info("Checking if GitHub API token is available in `~/.elastic/github.token`")
++    token = get_github_token()
+ 
+-def create_pr(args):
+     tmp_branch = "backport_{}_{}".format(args.pr_number, args.to_branch)
+ 
+     if not vars(args)["continue"]:
+@@ -94,11 +98,27 @@ def create_pr(args):
+         call("git branch -D {} > /dev/null".format(tmp_branch), shell=True)
+         check_call("git checkout -b {}".format(tmp_branch), shell=True)
+ 
+-        commit_hashes = "{}".format(" ").join(args.commit_hashes)
++        if len(args.commit_hashes) == 0:
++            if token:
++                session = github_session(token)
++                base = "https://api.github.com/repos/elastic/logstash"
++                original_pr = session.get(base + "/pulls/" + args.pr_number).json()
++                merge_commit = original_pr['merge_commit_sha']
++                if not merge_commit:
++                    info("Could not auto resolve merge commit - PR isn't merged yet")
++                    return 1
++                info("Merge commit detected from PR: {}".format(merge_commit))
++                commit_hashes = merge_commit
++            else:
++                info("GitHub API token not available. " +
++                     "Please manually specify commit hash(es) argument(s)\n")
++                parser.print_help()
++                return 1
++        else:
++            commit_hashes = "{}".format(" ").join(args.commit_hashes)
++
+         info("Cherry-picking {}".format(commit_hashes))
+-        #if call("git cherry-pick -x {}".format(" ".join(args.commit_hashes)),
+-        if call("git cherry-pick -x {}".format(commit_hashes),
+-                shell=True) != 0:
++        if call("git cherry-pick -x {}".format(commit_hashes), shell=True) != 0:
+             info("Looks like you have cherry-pick errors.")
+             info("Fix them, then run: ")
+             info("    git cherry-pick --continue")
+@@ -128,16 +148,8 @@ def create_pr(args):
+         remote = input("To which remote should I push? (your fork): ")
+ 
+     info("Pushing branch {} to remote {}".format(tmp_branch, remote))
+-    call("git push {} :{} > /dev/null".format(remote, tmp_branch),
+-         shell=True)
+-    check_call("git push --set-upstream {} {}"
+-               .format(remote, tmp_branch), shell=True)
+-
+-    info("Checking if GitHub API token is available in `~/.elastic/github.token`")
+-    try:
+-        token = open(expanduser("~/.elastic/github.token"), "r").read().strip()
+-    except:
+-        token = False
++    call("git push {} :{} > /dev/null".format(remote, tmp_branch), shell=True)
++    check_call("git push --set-upstream {} {}".format(remote, tmp_branch), shell=True)
+ 
+     if not token:
+         info("GitHub API token not available.\n" +
+@@ -147,15 +159,12 @@ def create_pr(args):
+     else:
+         info("Automatically creating a PR for you...")
+ 
++        session = github_session(token)
+         base = "https://api.github.com/repos/elastic/logstash"
+-        session = requests.Session()
+-        session.headers.update({"Authorization": "token " + token})
+-
+         original_pr = session.get(base + "/pulls/" + args.pr_number).json()
+ 
+         # get the github username from the remote where we pushed
+-        remote_url = check_output("git remote get-url {}".format(remote),
+-                                  shell=True)
++        remote_url = check_output("git remote get-url {}".format(remote), shell=True)
+         remote_user = re.search("github.com[:/](.+)/logstash", str(remote_url)).group(1)
+ 
+         # create PR
+@@ -163,7 +172,7 @@ def create_pr(args):
+             title="Backport PR #{} to {}: {}".format(args.pr_number, args.to_branch, original_pr["title"]),
+             head=remote_user + ":" + tmp_branch,
+             base=args.to_branch,
+-            body="Backport PR #{} to {} branch. Original message: \n\n{}"
++            body="**Backport PR #{} to {} branch, original message:**\n\n---\n\n{}"
+             .format(args.pr_number, args.to_branch, original_pr["body"])
+         ))
+         if request.status_code > 299:
+@@ -204,6 +213,18 @@ def get_version(base_dir):
+             #if match:
+             #    return match.group('version')
+ 
++def get_github_token():
++    try:
++        token = open(expanduser("~/.elastic/github.token"), "r").read().strip()
++    except:
++        token = False
++    return token
++
++def github_session(token):
++    session = requests.Session()
++    session.headers.update({"Authorization": "token " + token})
++    return session
++
+ def info(msg):
+     print("\nINFO: {}".format(msg))
+ 
+diff --git a/docs/static/getting-started-with-logstash.asciidoc b/docs/static/getting-started-with-logstash.asciidoc
+index 838491c598c..27010def284 100644
+--- a/docs/static/getting-started-with-logstash.asciidoc
++++ b/docs/static/getting-started-with-logstash.asciidoc
+@@ -18,7 +18,7 @@ include::jvm.asciidoc[]
+ [[installing-logstash]]
+ === Installing Logstash
+ 
+-[float]
++[discrete]
+ [[installing-binary]]
+ === Installing from a Downloaded Binary
+ 
+@@ -45,7 +45,7 @@ that are available under the Apache 2.0 license.
+ 
+ On supported Linux operating systems, you can use a package manager to install Logstash.
+ 
+-[float]
++[discrete]
+ [[package-repositories]]
+ === Installing from Package Repositories
+ 
+@@ -79,7 +79,7 @@ refer to {logstash-ref}/running-logstash-command-line.html[Running Logstash from
+ for more information.
+ --
+ 
+-[float]
++[discrete]
+ ==== APT
+ 
+ ifeval::["{release-state}"=="unreleased"]
+@@ -155,7 +155,7 @@ See {logstash-ref}/running-logstash.html[Running Logstash] for details about man
+ 
+ endif::[]
+ 
+-[float]
++[discrete]
+ ==== YUM
+ 
+ ifeval::["{release-state}"=="unreleased"]
+@@ -226,8 +226,7 @@ See the {logstash-ref}/running-logstash.html[Running Logstash] document for mana
+ 
+ endif::[]
+ 
+-[float]
+-
++[discrete]
+ ==== Docker
+ 
+ Images are available for running Logstash as a Docker container. They are
+diff --git a/docs/static/redirects.asciidoc b/docs/static/redirects.asciidoc
+index b0e9b0e7919..64c624905b6 100644
+--- a/docs/static/redirects.asciidoc
++++ b/docs/static/redirects.asciidoc
+@@ -3,6 +3,8 @@
+ 
+ The following pages have moved or been deleted.
+ 
++// MULTILINE FILTER
++
+ [role="exclude",id="plugins-filters-multiline"]
+ === Multiline filter plugin
+ 
+@@ -28,13 +30,79 @@ If your use case involves reading files that contain multiline entries,
+ {filebeat} offers {filebeat-ref}/filebeat-modules.html[modules] for processing logs
+ from many known apps, such as nginx or apache.
+ 
+-[role="exclude",id="brew"]
+-==== Installation via Homebrew (MacOS)
+ 
+-// legacy anchor to prevent 404.
+-[brew-start]
++// HOMEBREW INSTALL 
++
++[role="exclude",id="brew"]
++=== Homebrew (MacOS) for Logstash
+ 
+ As of Logstash 8.0, Elastic no longer maintains a homebrew cask containing formulae for installing the Elastic-licensed distribution of Logstash.
+ If you want to run the full distribution of Logstash on a Mac, you are encouraged to <<installing-binary,install from a downloaded binary distribution>>.
+ 
+ You can still install the Apache-licensed OSS distribution with homebrew using the formulae maintained by Homebrew.
++
++[role="exclude",id="brew-start"]
++==== Homebrew for Logstash
++
++As of Logstash 8.0, Elastic no longer maintains a Homebrew cask containing formulae for installing the Elastic-licensed distribution of Logstash.
++If you want to run the full distribution of Logstash on a Mac, you are encouraged to <<installing-binary,install from a downloaded binary distribution>>.
++
++
++// UPGRADE FROM OLDER VERSIONS
++
++[role="exclude",id="upgrading-logstash-pqs"]
++=== Upgrading with the Persistent Queue enabled
++
++If you have the persistent queue (PQ) enabled, please read the section that
++applies for your upgrade scenario.
++
++* If you are upgrading from version 6.2.x or earlier, we recommend that you
++<<drain-pq,drain the persistent queue>> before you upgrade.
++
++* If you are upgrading from version 6.3.0 or later, see
++<<upgrading-logstash-pqs-6.3>> for information.
++
++[role="exclude",id="drain-pq"]
++[float]
++==== Drain the Persistent Queue (version 6.2.x and earlier)
++
++The following applies only if you are upgrading from Logstash version 6.2.x or
++earlier with the persistent queue (PQ) enabled.
++
++We strive to maintain backward compatibility within a given major release. 
++Serialization issues in Logstash 6.2.x and earlier required us to break
++that compatibility in version 6.3.0 to ensure correctness of operation. For more
++technical details, please check our tracking github issue for this
++matter, https://github.com/elastic/logstash/issues/9494[#9494].
++
++We strongly recommend that you drain or delete
++the persistent queue before you upgrade from version 6.2.x and earlier.
++
++To drain the queue:
++
++. In the logstash.yml file, set `queue.drain: true`.
++. Restart Logstash for this setting to take effect. 
++. Shutdown Logstash (using CTRL+C or SIGTERM), and wait for the queue to empty.
++
++When the queue is empty:
++
++. Complete the upgrade.
++. Restart Logstash.
++
++We have resolved issues with data incompatibilities for version 6.3 and later. 
++These steps won’t be required for future upgrades.
++
++[float]
++[role="exclude",id="upgrading-logstash-pqs-6.3"]
++==== Upgrading from version 6.3 (and later) with Persistent Queues enabled 
++
++Upgrading Logstash with persistent queues enabled is supported. The persistent
++queue directory is self-contained and can be read by a new Logstash instance
++running the same pipeline. You can safely shut down the original Logstash
++instance, spin up a new instance, and set `path.queue` in the `logstash.yml`
++<<logstash-settings-file,settings file>> to point to the original queue directory.
++You can also use a mounted drive to make this workflow easier.
++
++Keep in mind that only one Logstash instance can write to `path.queue`. You
++cannot have the original instance and the new instance writing to the queue at
++the same time.
+diff --git a/docs/static/running-logstash-windows.asciidoc b/docs/static/running-logstash-windows.asciidoc
+index 12c64811e7e..7a3819c58e6 100644
+--- a/docs/static/running-logstash-windows.asciidoc
++++ b/docs/static/running-logstash-windows.asciidoc
+@@ -9,31 +9,31 @@ Logstash is not started automatically after installation. How to start and stop
+ NOTE: It is recommended to validate your configuration works by running Logstash manually before running Logstash as a service or a scheduled task.
+ 
+ [[running-logstash-windows-validation]]
+-==== Validating JVM Pre-Requisites on Windows
+-After installing a https://www.elastic.co/support/matrix#matrix_jvm[supported JVM], open a https://docs.microsoft.com/en-us/powershell/[PowerShell] session and run the following commands to verify `JAVA_HOME` is set and the Java version:
++==== Validating JVM prerequisites on Windows
++After installing a https://www.elastic.co/support/matrix#matrix_jvm[supported JVM], open a https://docs.microsoft.com/en-us/powershell/[PowerShell] session and run the following commands to verify `LS_JAVA_HOME` is set and the Java version:
+ 
+-===== `Write-Host $env:JAVA_HOME`
++===== `Write-Host $env:LS_JAVA_HOME`
+ ** The output should be pointed to where the JVM software is located, for example:
+ +
+ [source,sh]
+ -----
+-PS C:\> Write-Host $env:JAVA_HOME
++PS C:\> Write-Host $env:LS_JAVA_HOME
+ C:\Program Files\Java\jdk-11.0.3
+ -----
+ 
+-** If `JAVA_HOME` is not set, perform one of the following:
++** If `LS_JAVA_HOME` is not set, perform one of the following:
+ *** Set using the GUI:
+ **** Navigate to the Windows https://docs.microsoft.com/en-us/windows/win32/procthread/environment-variables[Environmental Variables] window
+-**** In the Environmental Variables window, edit JAVA_HOME to point to where the JDK software is located, for example: `C:\Program Files\Java\jdk-11.0.3`
++**** In the Environmental Variables window, edit LS_JAVA_HOME to point to where the JDK software is located, for example: `C:\Program Files\Java\jdk-11.0.3`
+ *** Set using PowerShell:
+ **** In an Administrative PowerShell session, execute the following https://docs.microsoft.com/en-us/windows-server/administration/windows-commands/setx[SETX] commands:
+ +
+ [source,sh]
+ -----
+-PS C:\Windows\system32> SETX /m JAVA_HOME "C:\Program Files\Java\jdk-11.0.3"
++PS C:\Windows\system32> SETX /m LS_JAVA_HOME "C:\Program Files\Java\jdk-11.0.3"
+ PS C:\Windows\system32> SETX /m PATH "$env:PATH;C:\Program Files\Java\jdk-11.0.3\bin;"
+ -----
+-**** Exit PowerShell, then open a new PowerShell session and run `Write-Host $env:JAVA_HOME` to verify
++**** Exit PowerShell, then open a new PowerShell session and run `Write-Host $env:LS_JAVA_HOME` to verify
+ 
+ ===== `Java -version`
+ ** This command produces output similar to the following:
+diff --git a/lib/bootstrap/bundler.rb b/lib/bootstrap/bundler.rb
+index bad9aa772ca..5505117410c 100644
+--- a/lib/bootstrap/bundler.rb
++++ b/lib/bootstrap/bundler.rb
+@@ -15,10 +15,6 @@
+ # specific language governing permissions and limitations
+ # under the License.
+ 
+-require "fileutils"
+-require "stringio"
+-require 'set'
+-
+ module LogStash
+   module Bundler
+     extend self
+@@ -115,6 +111,7 @@ def invoke!(options = {})
+       require "bundler"
+       require "bundler/cli"
+ 
++      require "fileutils"
+       # create Gemfile from template iff it does not exist
+       unless ::File.exists?(Environment::GEMFILE_PATH)
+         FileUtils.copy(
+@@ -213,7 +210,7 @@ def debug?
+ 
+     # @param plugin_names [Array] logstash plugin names that are going to update
+     # @return [Array] gem names that plugins depend on, including logstash plugins
+-    def expand_logstash_mixin_dependencies(plugin_names)
++    def expand_logstash_mixin_dependencies(plugin_names); require 'set'
+       plugin_names = Array(plugin_names) if plugin_names.is_a?(String)
+ 
+       # get gem names in Gemfile.lock. If file doesn't exist, it will be generated
+@@ -268,6 +265,7 @@ def bundler_arguments(options = {})
+         arguments << "update"
+         arguments << expand_logstash_mixin_dependencies(options[:update])
+         arguments << "--local" if options[:local]
++        arguments << "--conservative" if options[:conservative]
+       elsif options[:clean]
+         arguments << "clean"
+       elsif options[:package]
+@@ -299,7 +297,7 @@ def with_env(modifications)
+     # capture any $stdout from the passed block. also trap any exception in that block, in which case the trapped exception will be returned
+     # @param [Proc] the code block to execute
+     # @return [String, Exception] the captured $stdout string and any trapped exception or nil if none
+-    def capture_stdout(&block)
++    def capture_stdout(&block); require 'stringio'
+       old_stdout = $stdout
+       $stdout = StringIO.new("", "w")
+       begin
+diff --git a/lib/bootstrap/environment.rb b/lib/bootstrap/environment.rb
+index c0b9972da14..61101f52cab 100644
+--- a/lib/bootstrap/environment.rb
++++ b/lib/bootstrap/environment.rb
+@@ -76,10 +76,7 @@ def pattern_path(path)
+   end
+ end
+ 
+-# when launched as a script, not require'd, (currently from bin/logstash and bin/logstash-plugin) the first
+-# argument is the path of a Ruby file to require and a LogStash::Runner class is expected to be
+-# defined and exposing the LogStash::Runner#main instance method which will be called with the current ARGV
+-# currently lib/logstash/runner.rb and lib/pluginmanager/main.rb are called using this.
++# when launched as a script, not require'd, (currently from bin/logstash)
+ if $0 == __FILE__
+   bundler_options = {:without => [:build, :development]}
+   ## Check for dev flags - this needs to be done before the runner is invoked to set bundler options
+@@ -89,7 +86,7 @@ def pattern_path(path)
+   LogStash::Bundler.setup!(bundler_options)
+   require_relative "patches/jar_dependencies"
+ 
+-  require ARGV.shift
++  require 'logstash/runner'
+   exit_status = LogStash::Runner.run("bin/logstash", ARGV)
+   exit(exit_status || 0)
+ end
+diff --git a/lib/bootstrap/patches/remote_fetcher.rb b/lib/bootstrap/patches/remote_fetcher.rb
+deleted file mode 100644
+index 7598278dc59..00000000000
+--- a/lib/bootstrap/patches/remote_fetcher.rb
++++ /dev/null
+@@ -1,40 +0,0 @@
+-# Licensed to Elasticsearch B.V. under one or more contributor
+-# license agreements. See the NOTICE file distributed with
+-# this work for additional information regarding copyright
+-# ownership. Elasticsearch B.V. licenses this file to you under
+-# the Apache License, Version 2.0 (the "License"); you may
+-# not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#  http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing,
+-# software distributed under the License is distributed on an
+-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-# KIND, either express or implied.  See the License for the
+-# specific language governing permissions and limitations
+-# under the License.
+-
+-require 'rubygems/remote_fetcher' 
+-
+-class Gem::RemoteFetcher
+-  def api_endpoint(uri)
+-    host = uri.host
+-
+-    begin
+-      res = @dns.getresource "_rubygems._tcp.#{host}",
+-                             Resolv::DNS::Resource::IN::SRV
+-    rescue Resolv::ResolvError, SocketError => e # patch adds SocketError to list of possible exceptions
+-      verbose "Getting SRV record failed: #{e}"
+-      uri
+-    else
+-      target = res.target.to_s.strip
+-
+-      if /\.#{Regexp.quote(host)}\z/ =~ target
+-        return URI.parse "#{uri.scheme}://#{target}#{uri.path}"
+-      end
+-
+-      uri
+-    end
+-  end
+-end
+diff --git a/lib/pluginmanager/install.rb b/lib/pluginmanager/install.rb
+index 1e16c000651..085b6430214 100644
+--- a/lib/pluginmanager/install.rb
++++ b/lib/pluginmanager/install.rb
+@@ -30,6 +30,7 @@ class LogStash::PluginManager::Install < LogStash::PluginManager::Command
+   option "--preserve", :flag, "preserve current gem options", :default => false
+   option "--development", :flag, "install all development dependencies of currently installed plugins", :default => false
+   option "--local", :flag, "force local-only plugin installation. see bin/logstash-plugin package|unpack", :default => false
++  option "--[no-]conservative", :flag, "do a conservative update of plugin's dependencies", :default => true
+ 
+   # the install logic below support installing multiple plugins with each a version specification
+   # but the argument parsing does not support it for now so currently if specifying --version only
+@@ -190,8 +191,9 @@ def update_logstash_mixin_dependencies(install_list)
+ 
+     if unlock_dependencies.any?
+       puts "Updating mixin dependencies #{unlock_dependencies.join(', ')}"
+-      options = {:update => unlock_dependencies, :rubygems_source => gemfile.gemset.sources}
+-      LogStash::Bundler.invoke!(options)
++      LogStash::Bundler.invoke! update: unlock_dependencies,
++                                rubygems_source: gemfile.gemset.sources,
++                                conservative: conservative?
+     end
+ 
+     unlock_dependencies
+diff --git a/lib/pluginmanager/update.rb b/lib/pluginmanager/update.rb
+index f8dbee2422b..ede063a533a 100644
+--- a/lib/pluginmanager/update.rb
++++ b/lib/pluginmanager/update.rb
+@@ -27,6 +27,7 @@ class LogStash::PluginManager::Update < LogStash::PluginManager::Command
+   parameter "[PLUGIN] ...", "Plugin name(s) to upgrade to latest version", :attribute_name => :plugins_arg
+   option "--[no-]verify", :flag, "verify plugin validity before installation", :default => true
+   option "--local", :flag, "force local-only plugin update. see bin/logstash-plugin package|unpack", :default => false
++  option "--[no-]conservative", :flag, "do a conservative update of plugin's dependencies", :default => true
+ 
+   def execute
+     # Turn off any jar dependencies lookup when running with `--local`
+@@ -76,14 +77,14 @@ def update_gems!
+ 
+     puts("Updating #{filtered_plugins.collect(&:name).join(", ")}") unless filtered_plugins.empty?
+ 
++    output = nil
+     # any errors will be logged to $stderr by invoke!
+     # Bundler cannot update and clean gems in one operation so we have to call the CLI twice.
+-    options = {:update => plugins, :rubygems_source => gemfile.gemset.sources}
+-    options[:local] = true if local?
+-    output=nil
+-    # Unfreeze the bundle when updating gems
+-    Bundler.settings.temporary({:frozen => false}) do
+-      output = LogStash::Bundler.invoke!(options)
++    Bundler.settings.temporary(:frozen => false) do # Unfreeze the bundle when updating gems
++      output = LogStash::Bundler.invoke! update: plugins,
++                                         rubygems_source: gemfile.gemset.sources,
++                                         local: local?,
++                                         conservative: conservative?
+       output << LogStash::Bundler.genericize_platform unless output.nil?
+     end
+ 
+diff --git a/lib/pluginmanager/util.rb b/lib/pluginmanager/util.rb
+index 9da3874a028..d41e8169eb5 100644
+--- a/lib/pluginmanager/util.rb
++++ b/lib/pluginmanager/util.rb
+@@ -17,7 +17,6 @@
+ 
+ require "rubygems/package"
+ require "yaml"
+-require_relative "../bootstrap/patches/remote_fetcher"
+ 
+ module LogStash::PluginManager
+ 
+diff --git a/logstash-core/lib/logstash-core/logstash-core.rb b/logstash-core/lib/logstash-core/logstash-core.rb
+index d58bbb0a55d..b3deb9e45af 100644
+--- a/logstash-core/lib/logstash-core/logstash-core.rb
++++ b/logstash-core/lib/logstash-core/logstash-core.rb
+@@ -23,9 +23,8 @@
+ # wrapper.
+ unless $LS_JARS_LOADED
+   jar_path = File.join(File.dirname(File.dirname(__FILE__)), "jars")
+-  $:.unshift jar_path
+-  Dir.glob(jar_path + '/*.jar') do |jar|
+-    require File.basename(jar)
++  Dir.glob("#{jar_path}/*.jar") do |jar|
++    load jar
+   end
+   java_import org.logstash.RubyUtil
+ end
+diff --git a/logstash-core/lib/logstash/api/commands/node.rb b/logstash-core/lib/logstash/api/commands/node.rb
+index 0b7fdaa4f50..cc540699eb1 100644
+--- a/logstash-core/lib/logstash/api/commands/node.rb
++++ b/logstash-core/lib/logstash/api/commands/node.rb
+@@ -38,6 +38,8 @@ def pipelines(options={})
+           pipeline_ids.each_with_object({}) do |pipeline_id, result|
+             result[pipeline_id] = pipeline(pipeline_id, options)
+           end
++        rescue Instrument::MetricStore::MetricNotFound
++          {}
+         end
+ 
+         def pipeline(pipeline_id, options={})
+diff --git a/logstash-core/lib/logstash/api/commands/stats.rb b/logstash-core/lib/logstash/api/commands/stats.rb
+index 9138b955d80..652deec136a 100644
+--- a/logstash-core/lib/logstash/api/commands/stats.rb
++++ b/logstash-core/lib/logstash/api/commands/stats.rb
+@@ -39,6 +39,8 @@ def queue
+           end
+ 
+           {:events_count => total_queued_events}
++        rescue Instrument::MetricStore::MetricNotFound
++          {}
+         end
+ 
+         def jvm
+@@ -74,6 +76,9 @@ def events
+             [:stats, :events],
+             :in, :filtered, :out, :duration_in_millis, :queue_push_duration_in_millis
+           )
++        rescue Instrument::MetricStore::MetricNotFound
++          # if the stats/events metrics have not yet been populated, return an empty map
++          {}
+         end
+ 
+         def pipeline(pipeline_id = nil, opts={})
+diff --git a/logstash-core/lib/logstash/java_pipeline.rb b/logstash-core/lib/logstash/java_pipeline.rb
+index 220a54d1a1a..3ca76e52074 100644
+--- a/logstash-core/lib/logstash/java_pipeline.rb
++++ b/logstash-core/lib/logstash/java_pipeline.rb
+@@ -548,6 +548,10 @@ def inspect
+     }
+   end
+ 
++  def shutdown_requested?
++    @shutdownRequested.get
++  end
++
+   private
+ 
+   def close_plugin_and_ignore(plugin)
+diff --git a/logstash-core/lib/logstash/outputs/base.rb b/logstash-core/lib/logstash/outputs/base.rb
+index ea07f7c2e16..231d19f1e52 100644
+--- a/logstash-core/lib/logstash/outputs/base.rb
++++ b/logstash-core/lib/logstash/outputs/base.rb
+@@ -135,6 +135,10 @@ def execution_context=(context)
+     context
+   end
+ 
++  def pipeline_shutdown_requested?
++    execution_context.pipeline&.shutdown_requested?
++  end
++
+   private
+   def output?(event)
+     # TODO: noop for now, remove this once we delete this call from all plugins
+diff --git a/logstash-core/lib/logstash/runner.rb b/logstash-core/lib/logstash/runner.rb
+index b2d8b3d22af..6c4599b0fd7 100644
+--- a/logstash-core/lib/logstash/runner.rb
++++ b/logstash-core/lib/logstash/runner.rb
+@@ -32,7 +32,6 @@
+ end
+ 
+ require "clamp"
+-require "net/http"
+ 
+ require "logstash-core/logstash-core"
+ require "logstash/environment"
+@@ -50,7 +49,6 @@
+ require "logstash/modules/util"
+ require "logstash/bootstrap_check/default_config"
+ require "logstash/bootstrap_check/persisted_queue_config"
+-require "set"
+ require 'logstash/deprecation_message'
+ 
+ java_import 'org.logstash.FileLockFactory'
+diff --git a/logstash-core/locales/en.yml b/logstash-core/locales/en.yml
+index 4bbae030cfc..fb728f87570 100644
+--- a/logstash-core/locales/en.yml
++++ b/logstash-core/locales/en.yml
+@@ -61,23 +61,6 @@ en:
+         0-1-x: >-
+          Using version 0.1.x %{type} plugin '%{name}'. This plugin isn't well
+          supported by the community and likely has no maintainer.
+-    agent:
+-      sighup: >-
+-        SIGHUP received.
+-      sigint: >-
+-        SIGINT received. Shutting down.
+-      sigterm: >-
+-        SIGTERM received. Shutting down.
+-      slow_shutdown: |-
+-        Received shutdown signal, but pipeline is still waiting for in-flight events
+-        to be processed. Sending another ^C will force quit Logstash, but this may cause
+-        data loss.
+-      forced_sigint: >-
+-        SIGINT received. Terminating immediately..
+-      non_reloadable_config_reload: >-
+-        Unable to reload configuration because it does not support dynamic reloading
+-      non_reloadable_config_register: |-
+-        Logstash is not able to start since configuration auto reloading was enabled but the configuration contains plugins that don't support it. Quitting...
+     web_api:
+       cant_bind_to_port: |-
+         Logstash tried to bind to port %{port}, but the port is already in use. You can specify a new port by launching logstash with the --api.http.port option."
+@@ -158,7 +141,9 @@ en:
+       configtest-flag-information: |-
+         You may be interested in the '--configtest' flag which you can use to validate
+         logstash's configuration before you choose to restart a running system.
+-      configuration:
++      # YAML named reference to the logstash.runner.configuration
++      # so we can later alias it from logstash.agent.configuration
++      configuration: &runner_configuration
+         obsolete: >-
+           The setting `%{name}` in plugin `%{plugin}` is obsolete and is no
+           longer available. %{extra} If you have any questions about this, you
+@@ -414,6 +399,27 @@ en:
+           Running Logstash with the bundled JDK is recommended.
+           The bundled JDK has been verified to work with each specific version of Logstash, and generally provides best performance and reliability.
+           If you have compelling reasons for using your own JDK (organizational-specific compliance requirements, for example), you can configure LS_JAVA_HOME to use that version instead.
++    agent:
++      sighup: >-
++        SIGHUP received.
++      sigint: >-
++        SIGINT received. Shutting down.
++      sigterm: >-
++        SIGTERM received. Shutting down.
++      slow_shutdown: |-
++        Received shutdown signal, but pipeline is still waiting for in-flight events
++        to be processed. Sending another ^C will force quit Logstash, but this may cause
++        data loss.
++      forced_sigint: >-
++        SIGINT received. Terminating immediately..
++      non_reloadable_config_reload: >-
++        Unable to reload configuration because it does not support dynamic reloading
++      non_reloadable_config_register: |-
++        Logstash is not able to start since configuration auto reloading was enabled but the configuration contains plugins that don't support it. Quitting...
++      # LEGACY: many plugins refer to logstash.agent.configuration.*
++      # so we alias the canonical logstash.runner.configuration.*
++      configuration:
++        <<: *runner_configuration
+     settings:
+       deprecation:
+         set: >-
+@@ -424,4 +430,5 @@ en:
+           Code should be updated to query `%{canonical_name}` instead
+         ambiguous: >-
+           Both `%{canonical_name}` and its deprecated alias `%{deprecated_alias}` have been set.
+-          Please only set `%{canonical_name}`
+\ No newline at end of file
++          Please only set `%{canonical_name}`
++
+diff --git a/logstash-core/logstash-core.gemspec b/logstash-core/logstash-core.gemspec
+index 7027bc25cde..8ad77283242 100644
+--- a/logstash-core/logstash-core.gemspec
++++ b/logstash-core/logstash-core.gemspec
+@@ -55,7 +55,7 @@ Gem::Specification.new do |gem|
+   gem.add_runtime_dependency "concurrent-ruby", "~> 1"
+   gem.add_runtime_dependency "rack", '~> 2'
+   gem.add_runtime_dependency "mustermann", '~> 1.0.3'
+-  gem.add_runtime_dependency "sinatra", '~> 2'
++  gem.add_runtime_dependency "sinatra", '~> 2.1.0' # pinned until GH-13777 is resolved
+   gem.add_runtime_dependency 'puma', '~> 5'
+   gem.add_runtime_dependency "jruby-openssl", "~> 0.11"
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/Logstash.java b/logstash-core/src/main/java/org/logstash/Logstash.java
+index 74ed6423af8..eb9c823f397 100644
+--- a/logstash-core/src/main/java/org/logstash/Logstash.java
++++ b/logstash-core/src/main/java/org/logstash/Logstash.java
+@@ -241,10 +241,9 @@ private static RubyInstanceConfig initRubyConfigImpl(@Nullable final Path curren
+      * @return RubyInstanceConfig
+      */
+     private static RubyInstanceConfig buildConfig(final Path home, final String[] args) {
+-        final String[] arguments = new String[args.length + 2];
+-        System.arraycopy(args, 0, arguments, 2, args.length);
++        final String[] arguments = new String[args.length + 1];
++        System.arraycopy(args, 0, arguments, 1, args.length);
+         arguments[0] = safePath(home, "lib", "bootstrap", "environment.rb");
+-        arguments[1] = safePath(home, "logstash-core", "lib", "logstash", "runner.rb");
+         return initRubyConfig(home, arguments);
+     }
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/PqRepair.java b/logstash-core/src/main/java/org/logstash/ackedqueue/PqRepair.java
+index 110145563ba..2a50f62e833 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/PqRepair.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/PqRepair.java
+@@ -63,6 +63,8 @@ public static void repair(final Path path) throws IOException {
+             );
+         }
+ 
++        LOGGER.info("Start repairing queue dir: {}", path.toString());
++
+         deleteTempCheckpoint(path);
+ 
+         final Map<Integer, Path> pageFiles = new HashMap<>();
+@@ -88,6 +90,8 @@ public static void repair(final Path path) throws IOException {
+         fixMissingPages(pageFiles, checkpointFiles);
+         fixZeroSizePages(pageFiles, checkpointFiles);
+         fixMissingCheckpoints(pageFiles, checkpointFiles);
++
++        LOGGER.info("Repair is done");
+     }
+ 
+     private static void deleteTempCheckpoint(final Path root) throws IOException {
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java b/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java
+index 12071554bdd..aba5b273b46 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java
+@@ -244,6 +244,9 @@ private void openPages() throws IOException {
+             }
+         }
+ 
++        // delete zero byte page and recreate checkpoint if corrupted page is detected
++        if ( cleanedUpFullyAckedCorruptedPage(headCheckpoint, pqSizeBytes)) { return; }
++
+         // transform the head page into a tail page only if the headpage is non-empty
+         // in both cases it will be checkpointed to track any changes in the firstUnackedPageNum when reconstructing the tail pages
+ 
+@@ -302,6 +305,35 @@ private void openPages() throws IOException {
+         // TODO: here do directory traversal and cleanup lingering pages? could be a background operations to not delay queue start?
+     }
+ 
++    /**
++     * When the queue is fully acked and zero byte page is found, delete corrupted page and recreate checkpoint head
++     * @param headCheckpoint
++     * @param pqSizeBytes
++     * @return true when corrupted page is found and cleaned
++     * @throws IOException
++     */
++    private boolean cleanedUpFullyAckedCorruptedPage(Checkpoint headCheckpoint, long pqSizeBytes) throws IOException {
++        if (headCheckpoint.isFullyAcked()) {
++            PageIO pageIO = new MmapPageIOV2(headCheckpoint.getPageNum(), this.pageCapacity, this.dirPath);
++            if (pageIO.isCorruptedPage()) {
++                logger.debug("Queue is fully acked. Found zero byte page.{}. Recreate checkpoint.head and delete corrupted page", headCheckpoint.getPageNum());
++
++                this.checkpointIO.purge(checkpointIO.headFileName());
++                pageIO.purge();
++
++                if (headCheckpoint.maxSeqNum() > this.seqNum) {
++                    this.seqNum = headCheckpoint.maxSeqNum();
++                }
++
++                newCheckpointedHeadpage(headCheckpoint.getPageNum() + 1);
++
++                pqSizeBytes += (long) pageIO.getHead();
++                ensureDiskAvailable(this.maxBytes, pqSizeBytes);
++                return true;
++            }
++        }
++        return false;
++    }
+ 
+     /**
+      * delete files for the given page
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/io/MmapPageIOV1.java b/logstash-core/src/main/java/org/logstash/ackedqueue/io/MmapPageIOV1.java
+index 0bf3a009ad6..8cd03c48a57 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/io/MmapPageIOV1.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/io/MmapPageIOV1.java
+@@ -219,6 +219,13 @@ public int getHead() {
+         return this.head;
+     }
+ 
++    @Override
++    public boolean isCorruptedPage() throws IOException {
++        try (RandomAccessFile raf = new RandomAccessFile(this.file, "rw")) {
++            return raf.length() < MmapPageIOV2.MIN_CAPACITY;
++        }
++    }
++
+     private int checksum(byte[] bytes) {
+         checkSummer.reset();
+         checkSummer.update(bytes, 0, bytes.length);
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/io/MmapPageIOV2.java b/logstash-core/src/main/java/org/logstash/ackedqueue/io/MmapPageIOV2.java
+index c68368f9076..8535787f88b 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/io/MmapPageIOV2.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/io/MmapPageIOV2.java
+@@ -271,6 +271,13 @@ public int getHead() {
+         return this.head;
+     }
+ 
++    @Override
++    public boolean isCorruptedPage() throws IOException {
++        try (RandomAccessFile raf = new RandomAccessFile(this.file, "rw")) {
++            return raf.length() < MIN_CAPACITY;
++        }
++    }
++
+     private int checksum(byte[] bytes) {
+         checkSummer.reset();
+         checkSummer.update(bytes, 0, bytes.length);
+@@ -294,7 +301,8 @@ private void mapFile() throws IOException {
+             this.capacity = pageFileCapacity;
+ 
+             if (this.capacity < MIN_CAPACITY) {
+-                throw new IOException(String.format("Page file size is too small to hold elements"));
++                throw new IOException("Page file size is too small to hold elements. " +
++                        "This is potentially a queue corruption problem. Run `pqcheck` and `pqrepair` to repair the queue.");
+             }
+             this.buffer = raf.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, this.capacity);
+         }
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/io/PageIO.java b/logstash-core/src/main/java/org/logstash/ackedqueue/io/PageIO.java
+index 98231e36e05..c44779e63d7 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/io/PageIO.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/io/PageIO.java
+@@ -84,4 +84,7 @@ public interface PageIO extends Closeable {
+ 
+     // @return the data container min sequence number
+     long getMinSeqNum();
++
++    // check if the page size is < minimum size
++    boolean isCorruptedPage() throws IOException;
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/execution/JavaBasePipelineExt.java b/logstash-core/src/main/java/org/logstash/execution/JavaBasePipelineExt.java
+index f860aebbf63..a4fd279b91a 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/JavaBasePipelineExt.java
++++ b/logstash-core/src/main/java/org/logstash/execution/JavaBasePipelineExt.java
+@@ -142,6 +142,11 @@ public RubyArray nonReloadablePlugins(final ThreadContext context) {
+         return result;
+     }
+ 
++    @JRubyMethod(name = "shutdown_requested?")
++    public IRubyObject isShutdownRequested(final ThreadContext context) {
++        throw new IllegalStateException("Pipeline implementation does not provide `shutdown_requested?`, which is a Logstash internal error.");
++    }
++
+     public QueueWriter getQueueWriter(final String inputName) {
+         return new JRubyWrappedWriteClientExt(RubyUtil.RUBY, RubyUtil.WRAPPED_WRITE_CLIENT_CLASS)
+             .initialize(
+diff --git a/logstash-core/src/main/resources/log4j2.properties b/logstash-core/src/main/resources/log4j2.properties
+index 2fa707c6ab3..6e6cbc3e74e 100644
+--- a/logstash-core/src/main/resources/log4j2.properties
++++ b/logstash-core/src/main/resources/log4j2.properties
+@@ -9,3 +9,6 @@ appender.console.layout.pattern = [%-5level] %d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %c
+ rootLogger.level = error
+ rootLogger.appenderRefs = stdout
+ rootLogger.appenderRef.stdout.ref = STDOUT
++
++logger.pqrepair.name = org.logstash.ackedqueue.PqRepair
++logger.pqrepair.level = info
+\ No newline at end of file
+diff --git a/logstash-core/src/test/java/org/logstash/ackedqueue/QueueTest.java b/logstash-core/src/test/java/org/logstash/ackedqueue/QueueTest.java
+index f5f4b892b43..0aa09d878ca 100644
+--- a/logstash-core/src/test/java/org/logstash/ackedqueue/QueueTest.java
++++ b/logstash-core/src/test/java/org/logstash/ackedqueue/QueueTest.java
+@@ -20,6 +20,7 @@
+ 
+ package org.logstash.ackedqueue;
+ 
++import java.io.File;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.nio.channels.FileChannel;
+@@ -40,6 +41,7 @@
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.hamcrest.CoreMatchers;
++import org.hamcrest.Matchers;
+ import org.junit.After;
+ import org.junit.Before;
+ import org.junit.Rule;
+@@ -53,6 +55,7 @@
+ import static org.hamcrest.CoreMatchers.notNullValue;
+ import static org.hamcrest.CoreMatchers.nullValue;
+ import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.greaterThan;
+ import static org.junit.Assert.fail;
+ import static org.logstash.ackedqueue.QueueTestHelpers.computeCapacityForMmapPageIO;
+ 
+@@ -971,6 +974,44 @@ public void testZeroByteFullyAckedPageOnOpen() throws IOException {
+         }
+     }
+ 
++    @Test
++    public void testZeroByteFullyAckedHeadPageOnOpen() throws IOException {
++        Queueable element = new StringElement("0123456789"); // 10 bytes
++        Settings settings = TestSettings.persistedQueueSettings(computeCapacityForMmapPageIO(element), dataPath);
++
++        // the goal here is to recreate a condition where the queue has a head page of size zero with
++        // a checkpoint that indicates it is full acknowledged
++        // see issue #10855
++
++        try(Queue q = new Queue(settings)) {
++            q.open();
++            q.write(element);
++
++            Batch batch = q.readBatch( 1, TimeUnit.SECONDS.toMillis(1));
++            batch.close();
++            assertThat(batch.size(), is(1));
++            assertThat(q.isFullyAcked(), is(true));
++        }
++
++        // now we have a queue state where page 0 is fully acked but not purged
++        // manually truncate page 0 to zero byte to mock corrupted page
++        FileChannel c = new FileOutputStream(Paths.get(dataPath, "page.0").toFile(), true).getChannel();
++        c.truncate(0);
++        c.close();
++
++        try(Queue q = new Queue(settings)) {
++            // here q.open used to crash with:
++            // java.io.IOException: Page file size is too small to hold elements
++            // because head page recover() check integrity of file size
++            q.open();
++
++            // recreated head page and checkpoint
++            File page1 = Paths.get(dataPath, "page.1").toFile();
++            assertThat(page1.exists(), is(true));
++            assertThat(page1.length(), is(greaterThan(0L)));
++        }
++    }
++
+     @Test
+     public void pageCapacityChangeOnExistingQueue() throws IOException {
+         final Queueable element = new StringElement("foobarbaz1");
+diff --git a/logstash-core/src/test/resources/log4j2.properties b/logstash-core/src/test/resources/log4j2.properties
+new file mode 100644
+index 00000000000..49fb75a00c9
+--- /dev/null
++++ b/logstash-core/src/test/resources/log4j2.properties
+@@ -0,0 +1,11 @@
++name=default
++appenders = console
++
++appender.console.type = Console
++appender.console.name = STDOUT
++appender.console.layout.type = PatternLayout
++appender.console.layout.pattern = [%-5level] %d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %c{1} - %msg%n
++
++rootLogger.level = info
++rootLogger.appenderRefs = stdout
++rootLogger.appenderRef.stdout.ref = STDOUT
+diff --git a/pkg/centos/after-install.sh b/pkg/centos/after-install.sh
+index dadf2a26709..9fc1b0f9bc5 100644
+--- a/pkg/centos/after-install.sh
++++ b/pkg/centos/after-install.sh
+@@ -5,7 +5,6 @@ sed -i \
+   -e 's|# path.logs:|path.logs: /var/log/logstash|' \
+   -e 's|# path.data:|path.data: /var/lib/logstash|' \
+   /etc/logstash/logstash.yml
+-/usr/share/logstash/bin/system-install /etc/logstash/startup.options
+ chmod 600 /etc/logstash/startup.options
+ chmod 600 /etc/default/logstash
+ 
+diff --git a/pkg/centos/before-install.sh b/pkg/centos/before-install.sh
+index 78fc0b77d49..e891ce13d30 100644
+--- a/pkg/centos/before-install.sh
++++ b/pkg/centos/before-install.sh
+@@ -8,3 +8,8 @@ if ! getent passwd logstash >/dev/null; then
+   useradd -r -g logstash -d /usr/share/logstash \
+     -s /sbin/nologin -c "logstash" logstash
+ fi
++
++# Handle upgrade: Check if old service unit exists and remove it
++if [ -f /etc/systemd/system/logstash.service ]; then
++  rm -rf /etc/systemd/system/logstash.service || true
++fi
+diff --git a/pkg/debian/after-install.sh b/pkg/debian/after-install.sh
+index 5975f910b81..51ea473b0ee 100644
+--- a/pkg/debian/after-install.sh
++++ b/pkg/debian/after-install.sh
+@@ -8,7 +8,6 @@ sed -i \
+   -e 's|# path.logs:|path.logs: /var/log/logstash|' \
+   -e 's|# path.data:|path.data: /var/lib/logstash|' \
+   /etc/logstash/logstash.yml
+-/usr/share/logstash/bin/system-install /etc/logstash/startup.options
+ chmod 600 /etc/logstash/startup.options
+ chmod 600 /etc/default/logstash
+ 
+diff --git a/pkg/debian/before-install.sh b/pkg/debian/before-install.sh
+index 03cf86125a9..43bc375353e 100644
+--- a/pkg/debian/before-install.sh
++++ b/pkg/debian/before-install.sh
+@@ -10,3 +10,8 @@ if ! getent passwd logstash >/dev/null; then
+   useradd -M -r -g logstash -d /usr/share/logstash \
+     -s /usr/sbin/nologin -c "LogStash Service User" logstash
+ fi
++
++# Handle upgrade: Check if old service unit exists and remove it
++if [ -f /etc/systemd/system/logstash.service ]; then
++  rm -rf /etc/systemd/system/logstash.service || true
++fi
+diff --git a/pkg/service_templates/systemd/lib/systemd/system/logstash.service b/pkg/service_templates/systemd/lib/systemd/system/logstash.service
+new file mode 100644
+index 00000000000..68ff3c4e708
+--- /dev/null
++++ b/pkg/service_templates/systemd/lib/systemd/system/logstash.service
+@@ -0,0 +1,24 @@
++[Unit]
++Description=logstash
++
++[Service]
++Type=simple
++User=logstash
++Group=logstash
++# Load env vars from /etc/default/ and /etc/sysconfig/ if they exist.
++# Prefixing the path with '-' makes it try to load, but if the file doesn't
++# exist, it continues onward.
++EnvironmentFile=-/etc/default/logstash
++EnvironmentFile=-/etc/sysconfig/logstash
++ExecStart=/usr/share/logstash/bin/logstash "--path.settings" "/etc/logstash"
++Restart=always
++WorkingDirectory=/
++Nice=19
++LimitNOFILE=16384
++
++# When stopping, how long to wait before giving up and sending SIGKILL?
++# Keep in mind that SIGKILL on a process can cause data loss.
++TimeoutStopSec=infinity
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/pkg/service_templates/sysv/etc/default/logstash b/pkg/service_templates/sysv/etc/default/logstash
+new file mode 100644
+index 00000000000..325a8a1e597
+--- /dev/null
++++ b/pkg/service_templates/sysv/etc/default/logstash
+@@ -0,0 +1,10 @@
++LS_HOME="/usr/share/logstash"
++LS_SETTINGS_DIR="/etc/logstash"
++LS_PIDFILE="/var/run/logstash.pid"
++LS_USER="logstash"
++LS_GROUP="logstash"
++LS_GC_LOG_FILE="/var/log/logstash/gc.log"
++LS_OPEN_FILES="16384"
++LS_NICE="19"
++SERVICE_NAME="logstash"
++SERVICE_DESCRIPTION="logstash"
+diff --git a/pkg/service_templates/sysv/etc/init.d/logstash b/pkg/service_templates/sysv/etc/init.d/logstash
+new file mode 100755
+index 00000000000..21ae9ed1f01
+--- /dev/null
++++ b/pkg/service_templates/sysv/etc/init.d/logstash
+@@ -0,0 +1,182 @@
++#!/bin/sh
++# Init script for logstash
++# Maintained by 
++# Generated by pleaserun.
++# Implemented based on LSB Core 3.1:
++#   * Sections: 20.2, 20.3
++#
++### BEGIN INIT INFO
++# Provides:          logstash
++# Required-Start:    $remote_fs $syslog
++# Required-Stop:     $remote_fs $syslog
++# Default-Start:     2 3 4 5
++# Default-Stop:      0 1 6
++# Short-Description: 
++# Description:       logstash
++### END INIT INFO
++
++PATH=/sbin:/usr/sbin:/bin:/usr/bin
++export PATH
++
++name=logstash
++program=/usr/share/logstash/bin/logstash
++args=--path.settings\ /etc/logstash
++pidfile="/var/run/$name.pid"
++user="logstash"
++group="logstash"
++chroot="/"
++chdir="/"
++nice="19"
++limit_open_files="16384"
++
++
++# If this is set to 1, then when `stop` is called, if the process has
++# not exited within a reasonable time, SIGKILL will be sent next.
++# The default behavior is to simply log a message "program stop failed; still running"
++KILL_ON_STOP_TIMEOUT=0
++
++# When loading default and sysconfig files, we use `set -a` to make
++# all variables automatically into environment variables.
++set -a
++[ -r /etc/default/logstash ] && . /etc/default/logstash
++[ -r /etc/sysconfig/logstash ] && . /etc/sysconfig/logstash
++set +a
++
++[ -z "$nice" ] && nice=0
++
++trace() {
++  logger -t "/etc/init.d/logstash" "$@"
++}
++
++emit() {
++  trace "$@"
++  echo "$@"
++}
++
++start() {
++
++  # Ensure the log directory is setup correctly.
++  if [ ! -d "/var/log" ]; then 
++    mkdir "/var/log"
++    chown "$user":"$group" "/var/log"
++    chmod 755 "/var/log"
++  fi
++
++
++  # Setup any environmental stuff beforehand
++  ulimit -n ${limit_open_files}
++
++  # Run the program!
++  nice -n "$nice" \
++  chroot --userspec "$user":"$group" "$chroot" sh -c "
++    ulimit -n ${limit_open_files}
++    cd \"$chdir\"
++    exec \"$program\" $args
++  " >> /var/log/logstash-stdout.log 2>> /var/log/logstash-stderr.log &
++
++  # Generate the pidfile from here. If we instead made the forked process
++  # generate it there will be a race condition between the pidfile writing
++  # and a process possibly asking for status.
++  echo $! > $pidfile
++
++  emit "$name started"
++  return 0
++}
++
++stop() {
++  # Try a few times to kill TERM the program
++  if status ; then
++    pid=$(cat "$pidfile")
++    trace "Killing $name (pid $pid) with SIGTERM"
++    kill -TERM $pid
++    # Wait for it to exit.
++    for i in 1 2 3 4 5 ; do
++      trace "Waiting $name (pid $pid) to die..."
++      status || break
++      sleep 1
++    done
++    if status ; then
++      if [ "$KILL_ON_STOP_TIMEOUT" -eq 1 ] ; then
++        trace "Timeout reached. Killing $name (pid $pid) with SIGKILL.  This may result in data loss."
++        kill -KILL $pid
++        emit "$name killed with SIGKILL."
++      else
++        emit "$name stop failed; still running."
++      fi
++    else
++      emit "$name stopped."
++    fi
++  fi
++}
++
++status() {
++  if [ -f "$pidfile" ] ; then
++    pid=$(cat "$pidfile")
++    if ps -p $pid > /dev/null 2> /dev/null ; then
++      # process by this pid is running.
++      # It may not be our pid, but that's what you get with just pidfiles.
++      # TODO(sissel): Check if this process seems to be the same as the one we
++      # expect. It'd be nice to use flock here, but flock uses fork, not exec,
++      # so it makes it quite awkward to use in this case.
++      return 0
++    else
++      return 2 # program is dead but pid file exists
++    fi
++  else
++    return 3 # program is not running
++  fi
++}
++
++force_stop() {
++  if status ; then
++    stop
++    status && kill -KILL $(cat "$pidfile")
++  fi
++}
++
++
++case "$1" in
++  force-start|start|stop|force-stop|restart)
++    trace "Attempting '$1' on logstash"
++    ;;
++esac
++
++case "$1" in
++  force-start)
++    PRESTART=no
++    exec "$0" start
++    ;;
++  start)
++    status
++    code=$?
++    if [ $code -eq 0 ]; then
++      emit "$name is already running"
++      exit $code
++    else
++      start
++      exit $?
++    fi
++    ;;
++  stop) stop ;;
++  force-stop) force_stop ;;
++  status)
++    status
++    code=$?
++    if [ $code -eq 0 ] ; then
++      emit "$name is running"
++    else
++      emit "$name is not running"
++    fi
++    exit $code
++    ;;
++  restart)
++    
++    stop && start
++    ;;
++  *)
++    echo "Usage: $SCRIPTNAME {start|force-start|stop|force-start|force-stop|status|restart}" >&2
++    exit 3
++  ;;
++esac
++
++exit $?
+diff --git a/pkg/ubuntu/after-install.sh b/pkg/ubuntu/after-install.sh
+index 262ebd2243b..c1a22fe8382 100644
+--- a/pkg/ubuntu/after-install.sh
++++ b/pkg/ubuntu/after-install.sh
+@@ -7,6 +7,5 @@ sed -i \
+   -e 's|# path.logs:|path.logs: /var/log/logstash|' \
+   -e 's|# path.data:|path.data: /var/lib/logstash|' \
+   /etc/logstash/logstash.yml
+-/usr/share/logstash/bin/system-install /etc/logstash/startup.options
+ chmod 600 /etc/logstash/startup.options
+ chmod 600 /etc/default/logstash
+diff --git a/pkg/ubuntu/before-install.sh b/pkg/ubuntu/before-install.sh
+index 03cf86125a9..43bc375353e 100644
+--- a/pkg/ubuntu/before-install.sh
++++ b/pkg/ubuntu/before-install.sh
+@@ -10,3 +10,8 @@ if ! getent passwd logstash >/dev/null; then
+   useradd -M -r -g logstash -d /usr/share/logstash \
+     -s /usr/sbin/nologin -c "LogStash Service User" logstash
+ fi
++
++# Handle upgrade: Check if old service unit exists and remove it
++if [ -f /etc/systemd/system/logstash.service ]; then
++  rm -rf /etc/systemd/system/logstash.service || true
++fi
+diff --git a/qa/README.md b/qa/README.md
+index c9ae013002d..c790da6d666 100644
+--- a/qa/README.md
++++ b/qa/README.md
+@@ -1,8 +1,7 @@
+ ## Acceptance test Framework
+ 
+-Welcome to the acceptance test framework for logstash, in this small
+-README we're going to describe it's features and the necessary steps you will need to
+-follow to setup your environment.
++Welcome to the acceptance test framework for Logstash. In this small README we
++describe its features and the steps necessary for setting up your environment.
+ 
+ ### Setup your environment
+ 
+@@ -22,6 +21,7 @@ Is important to notice that the first time you set everything up, or when a
+ new VM is added, there is the need to download the box (this will
+ take a while depending on your internet speed).
+ 
++
+ ### Running Tests
+ 
+ It is possible to run the full suite of the acceptance test with the codebase by 
+@@ -192,10 +192,10 @@ tests, a collection of them using filtering, etc.
+ 
+ Check https://relishapp.com/rspec/rspec-core/v/3-4/docs/command-line for more details, but here is a quick cheat sheet to run them:
+ 
+-# Run the examples that get "is installed" in their description
++#### Run the examples that get "is installed" in their description
+ 
+ *  bundle exec rspec acceptance/spec -e "is installed" 
+ 
+-# Run the example defined at line 11
++#### Run the example defined at line 11
+ 
+ *  bundle exec rspec acceptance/spec/lib/artifact_operation_spec.rb:11
+diff --git a/qa/integration/README.md b/qa/integration/README.md
+index 0993c108687..7f2e931d0c5 100644
+--- a/qa/integration/README.md
++++ b/qa/integration/README.md
+@@ -1,10 +1,29 @@
+ ## Logstash Integration Tests aka RATS
+ 
+-These set of tests are full integration tests as in: they can start LS from a binary, run configs using `-e` and can use any external services like Kafka, ES and S3. This framework is hybrid -- a combination of bash scripts (to mainly setup services), Ruby service files, and RSpec. All test assertions are done in RSpec.
++These test sets are full integration tests. They can: 
+ 
++* start Logstash from a binary, 
++* run configs using `-e`, and 
++* use external services such as Kafka, Elasticsearch, and Beats.
+ 
++This framework is hybrid -- a combination of bash scripts (to mainly setup services), Ruby service files, and RSpec. All test assertions are done in RSpec.
+ 
+-## Running integration tests locally (Mac/Linux)
++## Environment setup
++
++### Directory Layout
++
++* `fixtures`: Specify services to run, Logstash config, and test specific scripts ala `.travis.yml`. You test settings in form of `test_name.yml`. 
++* `services`: This directory has bash scripts that download and bootstrap binaries for services. This is where services like Elasticsearch will be downloaded and run. Service can have 3 files: `<service>_setup.sh`, `<service>_teardown.sh` and `<service>`.rb. The bash scripts deal with downloading and bootstrapping, but the ruby source will trigger them from the test as a shell out (using backticks). The tests are blocked until the setup/teardown completes. For example, Elasticsearch service has `elasticsearch_setup.sh`, `elasticsearch_teardown.sh` and `elasticsearch.rb`. The service name in yml is "elasticsearch".
++* `framework`: Test framework source code.
++* `specs`: Rspec tests that use services and validates stuff
++
++### Setup Java
++
++The integration test scripts use `gradle` to run the tests.
++Gradle requires a valid version of Java either on the system path, or specified using the `JAVA_HOME` environment variable pointing to the location of a valid JDK.
++
++To run integration tests using a different version of Java, set the `BUILD_JAVA_HOME` environment variable to the location of the JDK that you wish to test with.
++## Testing on Mac/Linux
+ 
+ ### Dependencies 
+ * `JRuby`
+@@ -12,34 +31,47 @@ These set of tests are full integration tests as in: they can start LS from a bi
+ * `rake`
+ * `bundler`
+ 
+-From the Logstash root directory:
++### Running integration tests locally (Mac/Linux) 
++Run tests from the Logstash root directory.
++
++* Run all tests: 
++
++  `ci/integration_tests.sh`
++  
++* Run a single test: 
+ 
+-* Run all tests: `ci/integration_tests.sh`
+-* Run a single test: `ci/integration_tests.sh specs/es_output_how_spec.rb`
++  `ci/integration_tests.sh specs/es_output_how_spec.rb`
++  
+ * Debug tests: 
+-```
+-ci/integration_tests.sh setup 
+-cd qa/integration
+-bundle exec rspec specs/es_output_how_spec.rb (single test)
+-bundle exec rspec specs/*  (all tests)
+-```
+-## Running integration tests locally via Docker 
++  ```
++  ci/integration_tests.sh setup 
++  cd qa/integration
++  bundle exec rspec specs/es_output_how_spec.rb (single test)
++  bundle exec rspec specs/*  (all tests)
++  ```
++  
++## Testing with Docker 
+ 
+ ### Dependencies 
+ * `Docker`
+ 
+-From the Logstash root directory:
++### Running integration tests locally using Docker 
++
++Run tests from the Logstash root directory.
+ 
+ * Run all tests:
+-```
+-docker build  -t logstash-integration-tests .
+-docker run -it --rm logstash-integration-tests ci/integration_tests.sh 
+-```
++
++  ```
++  docker build  -t logstash-integration-tests .
++  docker run -it --rm logstash-integration-tests ci/integration_tests.sh 
++  ```
++  
+ * Run a single test: 
+ ```
+ docker build  -t logstash-integration-tests .
+ docker run -it --rm logstash-integration-tests ci/integration_tests.sh specs/es_output_how_spec.rb
+ ``` 
++
+ * Debug tests:
+ ```
+ (Mac/Linux) docker ps --all -q -f status=exited | xargs docker rm  
+@@ -54,24 +86,19 @@ exit
+ docker kill debug
+ docker rm debug
+ ```
+-## Running integration tests locally from Windows
+-
+-The integration tests need to be run from MacOS or Linux.  However, the tests may be run locally within Docker.   
+ 
+-## Docker clean up (Mac/Linux)
++### Docker clean up (Mac/Linux)
+ 
+-! Warning this will remove all images and containers except for the `logstash-base` container !
++WARNING: Docker cleanup removes all images and containers except for the `logstash-base` container!
+ 
+ * `ci/docker_prune.sh`
+ 
+-### Directory Layout
++## Testing on Windows
++
++The integration tests should be run from MacOS or Linux.  However, the tests can be run locally within Docker on Windows.
+ 
+-* `fixtures`: In this dir you will test settings in form of `test_name.yml`. Here you specify services to run, LS config, test specific scripts ala `.travis.yml`
+-* `services`: This dir has bash scripts that download and bootstrap binaries for services. This is where services like ES will be downloaded and run from. Service can have 3 files: `<service>_setup.sh`, `<service>_teardown.sh` and `<service>`.rb. The bash scripts deal with downloading and bootstrapping, but the ruby source will trigger them from the test as a shell out (using backticks). The tests are blocked until the setup/teardown completes. For example, Elasticsearch service has `elasticsearch_setup.sh`, `elasticsearch_teardown.sh` and `elasticsearch.rb`. The service name in yml is "elasticsearch".
+-* `framework`: Test framework source code.
+-* `specs`: Rspec tests that use services and validates stuff
+ 
+-### Adding a new test
++## Adding a new test
+ 
+ 1. Creating a new test -- lets use as example. Call it "test_file_input" which brings up LS to read from a file and assert file contents (file output) were as expected.
+ 2. You'll have to create a yml file in `fixtures` called `test_file_input_spec.yml`. Here you define any external services you need and any LS config.
+diff --git a/rakelib/artifacts.rake b/rakelib/artifacts.rake
+index a11c8da4b39..6ea3aaa1c19 100644
+--- a/rakelib/artifacts.rake
++++ b/rakelib/artifacts.rake
+@@ -25,6 +25,7 @@ namespace "artifact" do
+     PACKAGE_SUFFIX = SNAPSHOT_BUILD ? "-SNAPSHOT" : ""
+   end
+ 
++  ## TODO: Install new service files
+   def package_files
+     [
+       "NOTICE.TXT",
+@@ -553,6 +554,9 @@ namespace "artifact" do
+       dir.input("#{empty}/=/var/log/logstash")
+       dir.input("#{empty}/=/var/lib/logstash")
+       dir.input("#{empty}/=/etc/logstash/conf.d")
++      dir.input("#{empty}/=/lib/systemd/system")
++      dir.input("#{empty}/=/etc/init.d/")
++      dir.input("#{empty}/=/etc/default")
+     end
+ 
+     File.join(basedir, "config", "log4j2.properties").tap do |path|
+@@ -579,6 +583,15 @@ namespace "artifact" do
+     File.join(basedir, "pkg", "pipelines.yml").tap do |path|
+       dir.input("#{path}=/etc/logstash")
+     end
++    File.join(basedir, "pkg", "service_templates", "systemd", "lib", "systemd", "system", "logstash.service").tap do |path|
++      dir.input("#{path}=/lib/systemd/system")
++    end
++    File.join(basedir, "pkg", "service_templates", "sysv", "etc", "init.d", "logstash").tap do |path|
++      dir.input("#{path}=/etc/init.d")
++    end
++    File.join(basedir, "pkg", "service_templates", "sysv", "etc", "default", "logstash").tap do |path|
++      dir.input("#{path}=/etc/default")
++    end
+ 
+     case platform
+       when "redhat", "centos"
+@@ -599,6 +612,9 @@ namespace "artifact" do
+         out.config_files << "/etc/logstash/logstash.yml"
+         out.config_files << "/etc/logstash/logstash-sample.conf"
+         out.config_files << "/etc/logstash/pipelines.yml"
++        out.config_files << "/lib/systemd/system/logstash.service"
++        out.config_files << "/etc/init.d/logstash"
++        out.config_files << "/etc/default/logstash"
+       when "debian", "ubuntu"
+         require "fpm/package/deb"
+ 
+@@ -615,6 +631,9 @@ namespace "artifact" do
+         out.config_files << "/etc/logstash/logstash.yml"
+         out.config_files << "/etc/logstash/logstash-sample.conf"
+         out.config_files << "/etc/logstash/pipelines.yml"
++        out.config_files << "/lib/systemd/system/logstash.service"
++        out.config_files << "/etc/init.d/logstash"
++        out.config_files << "/etc/default/logstash"
+     end
+ 
+     # Packaging install/removal scripts
+diff --git a/rakelib/vendor.rake b/rakelib/vendor.rake
+index c9e08586e38..1860e4e241d 100644
+--- a/rakelib/vendor.rake
++++ b/rakelib/vendor.rake
+@@ -16,10 +16,6 @@
+ # under the License.
+ 
+ namespace "vendor" do
+-  def vendor(*args)
+-    return File.join("vendor", *args)
+-  end
+-
+   task "jruby" do |task, args|
+     system('./gradlew bootstrap') unless File.exists?(File.join("vendor", "jruby"))
+   end # jruby
+@@ -31,15 +27,19 @@ namespace "vendor" do
+   task "gems", [:bundle] do |task, args|
+     require "bootstrap/environment"
+ 
+-    puts("Invoking bundler install...")
+-    output, exception = LogStash::Bundler.invoke!(:install => true)
+-    puts(output)
+-    raise(exception) if exception
++    if File.exists?(LogStash::Environment::LOCKFILE) # gradlew already bootstrap-ed
++      puts("Skipping bundler install...")
++    else
++      puts("Invoking bundler install...")
++      output, exception = LogStash::Bundler.invoke!(:install => true)
++      puts(output)
++      raise(exception) if exception
++    end
+   end # task gems
+   task "all" => "gems"
+ 
+   desc "Clean the vendored files"
+   task :clean do
+-    rm_rf(vendor)
++    rm_rf('vendor')
+   end
+ end
+diff --git a/spec/support/pack/valid-pack/logstash/valid-pack/logstash-input-packtest.gemspec b/spec/support/pack/valid-pack/logstash/valid-pack/logstash-input-packtest.gemspec
+index 78a7a1d48b5..49d8922c074 100644
+--- a/spec/support/pack/valid-pack/logstash/valid-pack/logstash-input-packtest.gemspec
++++ b/spec/support/pack/valid-pack/logstash/valid-pack/logstash-input-packtest.gemspec
+@@ -4,7 +4,6 @@ Gem::Specification.new do |spec|
+   spec.version       = "0.0.1"
+   spec.authors       = ["Elastic"]
+   spec.email         = ["info@elastic.co"]
+-
+   spec.summary       = "a summary"
+   spec.description   = "a description"
+   spec.homepage      = "https://elastic.co"
+diff --git a/spec/support/pack/valid-pack/logstash/valid-pack/logstash-input-packtest_pim-0.0.1.gem b/spec/support/pack/valid-pack/logstash/valid-pack/logstash-input-packtest_pim-0.0.1.gem
+new file mode 100644
+index 00000000000..a7ecc37be95
+Binary files /dev/null and b/spec/support/pack/valid-pack/logstash/valid-pack/logstash-input-packtest_pim-0.0.1.gem differ
+diff --git a/spec/support/pack/valid-pack/logstash/valid-pack/logstash-input-packtest_pim.gemspec b/spec/support/pack/valid-pack/logstash/valid-pack/logstash-input-packtest_pim.gemspec
+new file mode 100644
+index 00000000000..fbb1c92cb4d
+--- /dev/null
++++ b/spec/support/pack/valid-pack/logstash/valid-pack/logstash-input-packtest_pim.gemspec
+@@ -0,0 +1,12 @@
++# coding: utf-8
++Gem::Specification.new do |spec|
++  spec.name                 = "logstash-input-packtest_pim"
++  spec.version              = "0.0.1"
++  spec.authors              = ["Elastic"]
++  spec.email                = ["info@elastic.co"]
++  spec.post_install_message = "Hello from the friendly pack"
++  spec.summary              = "a summary"
++  spec.description          = "a description"
++  spec.homepage             = "https://elastic.co"
++  spec.add_runtime_dependency "logstash-input-packtestdep"
++end
+diff --git a/spec/unit/plugin_manager/gem_installer_spec.rb b/spec/unit/plugin_manager/gem_installer_spec.rb
+index cf57c9c4a22..dd85009dfff 100644
+--- a/spec/unit/plugin_manager/gem_installer_spec.rb
++++ b/spec/unit/plugin_manager/gem_installer_spec.rb
+@@ -46,9 +46,7 @@
+     let(:message) { "Hello from the friendly pack" }
+ 
+     context "when present" do
+-      before do
+-        allow_any_instance_of(::Gem::Specification).to receive(:post_install_message).and_return(message)
+-      end
++      let(:plugin_name) { 'logstash-input-packtest_pim-0.0.1' }
+ 
+       context "when we want the message" do
+         it "display the message" do
+@@ -64,7 +62,7 @@
+     end
+ 
+     context "when not present" do
+-      context "when we want the message" do
++      context "when we don't want the message" do
+         it "doesn't display the message" do
+           expect(LogStash::PluginManager.ui).not_to receive(:info).with(message)
+           subject.install(simple_gem, true, temporary_gem_home)
+diff --git a/spec/unit/plugin_manager/pack_installer/pack_spec.rb b/spec/unit/plugin_manager/pack_installer/pack_spec.rb
+index 617c0adc0de..5467dd2f835 100644
+--- a/spec/unit/plugin_manager/pack_installer/pack_spec.rb
++++ b/spec/unit/plugin_manager/pack_installer/pack_spec.rb
+@@ -29,8 +29,8 @@
+     end
+ 
+     it "returns the plugins" do
+-      expect(subject.plugins.size).to eq(1)
+-      expect(subject.plugins.collect(&:name)).to include("logstash-input-packtest")
++      expect(subject.plugins.size).to eq(2)
++      expect(subject.plugins.collect(&:name)).to include("logstash-input-packtest_pim", "logstash-input-packtest")
+     end
+ 
+     it "returns the dependencies" do
+@@ -39,8 +39,8 @@
+     end
+ 
+     it "returns all the gems" do
+-      expect(subject.gems.size).to eq(2)
+-      expect(subject.gems.collect(&:name)).to include("logstash-input-packtest", "logstash-input-packtestdep")
++      expect(subject.gems.size).to eq(3)
++      expect(subject.gems.collect(&:name)).to include("logstash-input-packtest", "logstash-input-packtest_pim", "logstash-input-packtestdep")
+     end
+   end
+ 
+diff --git a/spec/unit/plugin_manager/update_spec.rb b/spec/unit/plugin_manager/update_spec.rb
+index 2bd719bbc88..e82321a4362 100644
+--- a/spec/unit/plugin_manager/update_spec.rb
++++ b/spec/unit/plugin_manager/update_spec.rb
+@@ -30,7 +30,10 @@
+ 
+   it "pass all gem sources to the bundle update command" do
+     sources = cmd.gemfile.gemset.sources
+-    expect_any_instance_of(LogStash::Bundler).to receive(:invoke!).with(:update => [], :rubygems_source => sources)
++    expect_any_instance_of(LogStash::Bundler).to receive(:invoke!).with(
++        :update => [], :rubygems_source => sources,
++        :conservative => true, :local => false
++    )
+     cmd.execute
+   end
+ 
+@@ -42,7 +45,9 @@
+       expect(cmd.gemfile).to receive(:find).with(plugin).and_return(plugin)
+       expect(cmd.gemfile).to receive(:save).and_return(nil)
+       expect(cmd).to receive(:plugins_to_update).and_return([plugin])
+-      expect_any_instance_of(LogStash::Bundler).to receive(:invoke!).with(:update => [plugin], :rubygems_source => sources).and_return(nil)
++      expect_any_instance_of(LogStash::Bundler).to receive(:invoke!).with(
++          hash_including(:update => [plugin], :rubygems_source => sources)
++      ).and_return(nil)
+     end
+ 
+     it "skips version verification when ask for it" do
+diff --git a/tools/release/bump_plugin_versions.rb b/tools/release/bump_plugin_versions.rb
+index 7fc351dcb3a..ebdfdaa3246 100755
+--- a/tools/release/bump_plugin_versions.rb
++++ b/tools/release/bump_plugin_versions.rb
+@@ -24,7 +24,14 @@
+ 
+ options = {pr: true}
+ OptionParser.new do |opts|
+-  opts.banner = "Usage: bump_plugin_versions.rb base_branch last_release allow_for --[no-]pr"
++  opts.banner = <<~EOBANNER
++   Usage: bump_plugin_versions.rb base_branch last_release allow_for --[no-]pr
++
++   If you have a local lockfile, you can specify "LOCAL" for last_release to
++   use it as your baseline. This allows you to consume patch releases on a
++   minor release after feature freeze and the initial minor updates.
++
++  EOBANNER
+ 
+   opts.on("--[no-]pr", "Create Pull Request") do |v|
+     options[:pr] = v
+@@ -56,12 +63,22 @@ def compute_dependecy(version, allow_for)
+ 
+ puts "Computing #{allow_bump_for} plugin dependency bump from #{base_logstash_version}.."
+ 
+-puts "Fetching lock file for #{base_logstash_version}.."
+-uri = URI.parse("https://raw.githubusercontent.com/elastic/logstash/v#{base_logstash_version}/Gemfile.jruby-2.5.lock.release")
+-result = Net::HTTP.get(uri)
+-if result.match(/404/)
+-  puts "Lock file or git tag for #{base_logstash_version} not found. Aborting"
+-  exit(1)
++if base_logstash_version == "LOCAL"
++  puts "Using local lockfile..."
++  begin
++    result = File.read("Gemfile.jruby-2.5.lock.release")
++  rescue => e
++    puts "Failed to read local lockfile #{e}"
++    exit(1)
++  end
++else
++  puts "Fetching lock file for #{base_logstash_version}.."
++  uri = URI.parse("https://raw.githubusercontent.com/elastic/logstash/v#{base_logstash_version}/Gemfile.jruby-2.5.lock.release")
++  result = Net::HTTP.get(uri)
++  if result.match(/404/)
++    puts "Lock file or git tag for #{base_logstash_version} not found. Aborting"
++    exit(1)
++  end
+ end
+ 
+ base_plugin_versions = {}
+diff --git a/versions.yml b/versions.yml
+index c0ad0732406..4901979c511 100644
+--- a/versions.yml
++++ b/versions.yml
+@@ -7,8 +7,8 @@ logstash-core-plugin-api: 2.1.16
+ bundled_jdk:
+   # for AdoptOpenJDK/OpenJDK jdk-14.0.1+7.1, the revision is 14.0.1 while the build is 7.1
+   vendor: "adoptopenjdk"
+-  revision: 11.0.13
+-  build: 8
++  revision: 11.0.14.1
++  build: 1
+ 
+ # jruby must reference a *released* version of jruby which can be downloaded from the official download url
+ # *and* for which jars artifacts are published for compile-time
+diff --git a/x-pack/lib/filters/geoip/download_manager.rb b/x-pack/lib/filters/geoip/download_manager.rb
+index 38b4e103b49..c3d6fee604a 100644
+--- a/x-pack/lib/filters/geoip/download_manager.rb
++++ b/x-pack/lib/filters/geoip/download_manager.rb
+@@ -118,7 +118,14 @@ def assert_database!(database_path)
+   end
+ 
+   def rest_client
+-    @client ||= Manticore::Client.new(request_timeout: 15, connect_timeout: 5)
++    @client ||= begin
++                  client_options = {
++                    request_timeout: 15,
++                    connect_timeout: 5
++                  }
++                  client_options[:proxy]=ENV['http_proxy'] if ENV.include?('http_proxy')
++                  Manticore::Client.new(client_options)
++                end
+   end
+ 
+   def uuid
+diff --git a/x-pack/spec/filters/geoip/download_manager_spec.rb b/x-pack/spec/filters/geoip/download_manager_spec.rb
+index e02aec6d5e7..af0412b80b3 100644
+--- a/x-pack/spec/filters/geoip/download_manager_spec.rb
++++ b/x-pack/spec/filters/geoip/download_manager_spec.rb
+@@ -39,6 +39,18 @@
+         expect(download_manager).to receive(:service_endpoint).and_return(bad_uri).twice
+         expect { download_manager.send(:check_update) }.to raise_error(LogStash::Filters::Geoip::DownloadManager::BadResponseCodeError, /404/)
+       end
++
++      context "when ENV['http_proxy'] is set" do
++        let(:proxy_url) { 'http://user:pass@example.com:1234' }
++
++        around(:each) { |example| with_environment('http_proxy' => proxy_url, &example) }
++
++        it "initializes the client with the proxy" do
++          expect(::Manticore::Client).to receive(:new).with(a_hash_including(:proxy => proxy_url)).and_call_original
++
++          download_manager.send(:rest_client)
++        end
++      end
+     end
+ 
+     context "check update" do
+diff --git a/x-pack/spec/support/helpers.rb b/x-pack/spec/support/helpers.rb
+index eb26a1262e0..327aad8fcd2 100644
+--- a/x-pack/spec/support/helpers.rb
++++ b/x-pack/spec/support/helpers.rb
+@@ -33,6 +33,32 @@ def apply_settings(settings_values, settings = nil)
+   settings
+ end
+ 
++##
++# yields to the provided block with the ENV modified by
++# the provided overrides. Values given as `nil` will be deleted
++# if present in the base ENV.
++#
++# @param replacement [Hash{String=>[String,nil]}]
++def with_environment(overrides)
++  replacement = ENV.to_hash
++                   .merge(overrides)
++                   .reject { |_,v| v.nil? }
++
++  with_environment!(replacement) { yield }
++end
++
++##
++# yields to the provided block with the ENV replaced
++# @param replacement [Hash{String=>String}]
++def with_environment!(replacement)
++  original = ENV.to_hash.dup.freeze
++  ENV.replace(replacement)
++
++  yield
++ensure
++  ENV.replace(original)
++end
++
+ def start_agent(agent)
+   agent_task = Stud::Task.new do
+     begin

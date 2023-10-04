@@ -1,0 +1,150 @@
+diff --git a/logstash-core/lib/logstash/settings.rb b/logstash-core/lib/logstash/settings.rb
+index 94994dcaa8b..4288d882c31 100644
+--- a/logstash-core/lib/logstash/settings.rb
++++ b/logstash-core/lib/logstash/settings.rb
+@@ -586,6 +586,34 @@ def validate(value)
+         coerce(value)
+       end
+     end
++
++    ##
++    # Instances of `DeprecatedSetting` can be registered, but will fail with helpful guidance when encountering any
++    # configuration that attempts to explicitly set the value. They should be used in the Major version immediately
++    # following a deprecation to assist users who are porting forward configurations.
++    class DeprecatedSetting < Setting
++      def initialize(name, guidance='please remove the setting from your configuration and try again.')
++        super(name, Object)
++        @guidance = guidance
++      end
++
++      def set(value)
++        fail(RuntimeError, "The setting `#{name}` has been deprecated and removed from Logstash; #{@guidance}")
++      end
++
++      def value
++        fail(ArgumentError, "The setting `#{name}` has been deprecated and removed from Logstash")
++      end
++    end
++
++    # Useful when a setting has been renamed but otherwise is semantically identical
++    class DeprecatedAndRenamed < DeprecatedSetting
++      attr_reader :new_name
++      def initialize(name, new_name)
++        super(name, "please update your configuration to use `#{new_name}` instead.")
++        @new_name = new_name
++      end
++    end
+   end
+ 
+ 
+diff --git a/logstash-core/spec/logstash/settings/deprecated_and_renamed_spec.rb b/logstash-core/spec/logstash/settings/deprecated_and_renamed_spec.rb
+new file mode 100644
+index 00000000000..74ce828ee86
+--- /dev/null
++++ b/logstash-core/spec/logstash/settings/deprecated_and_renamed_spec.rb
+@@ -0,0 +1,30 @@
++# encoding: utf-8
++require 'spec_helper'
++require 'logstash/settings'
++
++describe LogStash::Setting::DeprecatedAndRenamed do
++  subject(:setting) { described_class.new("option.deprecated", "option.current") }
++  let(:value) { Object.new }
++
++  describe '#set' do
++    it 'fails with deprecation runtime error and helpful guidance' do
++      expect { setting.set(value) }.to raise_exception do |exception|
++        expect(exception).to be_a_kind_of(RuntimeError)
++        expect(exception.message).to match(/deprecated and removed/)
++        expect(exception.message).to include("option.deprecated")
++        expect(exception.message).to include("option.current")
++      end
++    end
++  end
++
++  describe '#value' do
++    it 'fails with deprecation argument error' do
++      expect { setting.value }.to raise_exception do |exception|
++        expect(exception).to be_a_kind_of(ArgumentError)
++        expect(exception.message).to match(/deprecated and removed/)
++        expect(exception.message).to include("option.deprecated")
++      end
++    end
++  end
++
++end
+\ No newline at end of file
+diff --git a/x-pack/lib/config_management/extension.rb b/x-pack/lib/config_management/extension.rb
+index 06e55feaa02..b98aee93883 100644
+--- a/x-pack/lib/config_management/extension.rb
++++ b/x-pack/lib/config_management/extension.rb
+@@ -34,6 +34,11 @@ def additionals_settings(settings)
+         settings.register(LogStash::Setting::NullableString.new("xpack.management.elasticsearch.ssl.keystore.password"))
+         settings.register(LogStash::Setting::String.new("xpack.management.elasticsearch.ssl.verification_mode", "certificate", true, ["none", "certificate"]))
+         settings.register(LogStash::Setting::Boolean.new("xpack.management.elasticsearch.sniffing", false))
++
++        # These Settings were renamed and deprecated in 6.x timeframe and removed for 7.0; provide guidance to ease transition.
++        settings.register(LogStash::Setting::DeprecatedAndRenamed.new("xpack.management.elasticsearch.url", "xpack.management.elasticsearch.hosts"))
++        settings.register(LogStash::Setting::DeprecatedAndRenamed.new("xpack.management.elasticsearch.ssl.ca", "xpack.management.elasticsearch.ssl.certificate_authority"))
++
+       rescue => e
+         logger.error("Cannot register new settings", :message => e.message, :backtrace => e.backtrace)
+         raise e
+diff --git a/x-pack/lib/monitoring/monitoring.rb b/x-pack/lib/monitoring/monitoring.rb
+index 15e0cef7f54..0975d5386c0 100644
+--- a/x-pack/lib/monitoring/monitoring.rb
++++ b/x-pack/lib/monitoring/monitoring.rb
+@@ -184,6 +184,10 @@ def additionals_settings(settings)
+       settings.register(LogStash::Setting::Boolean.new("xpack.monitoring.collection.pipeline.details.enabled", true))
+       settings.register(LogStash::Setting::Boolean.new("xpack.monitoring.collection.config.enabled", true))
+ 
++      # These Settings were renamed and deprecated in 6.x timeframe and removed for 7.0; provide guidance to ease transition.
++      settings.register(LogStash::Setting::DeprecatedAndRenamed.new("xpack.monitoring.elasticsearch.url",    "xpack.monitoring.elasticsearch.hosts"))
++      settings.register(LogStash::Setting::DeprecatedAndRenamed.new("xpack.monitoring.elasticsearch.ssl.ca", "xpack.monitoring.elasticsearch.ssl.certificate_authority"))
++
+       settings.register(LogStash::Setting::String.new("node.uuid", ""))
+     rescue => e
+       logger.error e.message
+diff --git a/x-pack/spec/config_management/extension_spec.rb b/x-pack/spec/config_management/extension_spec.rb
+index d25a8767205..1ad4e9c0c37 100644
+--- a/x-pack/spec/config_management/extension_spec.rb
++++ b/x-pack/spec/config_management/extension_spec.rb
+@@ -40,6 +40,13 @@
+         "xpack.management.elasticsearch.ssl.keystore.path" => [LogStash::Setting::NullableString, nil],
+         "xpack.management.elasticsearch.ssl.keystore.password" => [LogStash::Setting::NullableString, nil]
+       )
++
++      describe 'deprecated and renamed settings' do
++        define_deprecated_and_renamed_settings(
++            "xpack.management.elasticsearch.url"    => "xpack.management.elasticsearch.hosts",
++            "xpack.management.elasticsearch.ssl.ca" => "xpack.management.elasticsearch.ssl.certificate_authority"
++        )
++      end
+     end
+   end
+ end
+diff --git a/x-pack/spec/support/helpers.rb b/x-pack/spec/support/helpers.rb
+index eb26a1262e0..6e8ba790352 100644
+--- a/x-pack/spec/support/helpers.rb
++++ b/x-pack/spec/support/helpers.rb
+@@ -23,6 +23,20 @@ def define_settings(settings_options)
+   end
+ end
+ 
++def define_deprecated_and_renamed_settings(settings_map)
++  settings_map.each do |deprecated_name, new_name|
++    it "define deprecated-and-renamed stub setting: `#{deprecated_name}` with guidance pointing to use `#{new_name}` instead" do
++      deprecated_setting = settings.get_setting(deprecated_name)
++
++      expect(deprecated_setting).to be_kind_of(LogStash::Setting::DeprecatedAndRenamed)
++      expect(deprecated_setting.name).to eq(deprecated_name)
++      expect(deprecated_setting.new_name).to eq(new_name)
++
++      expect { deprecated_setting.set(true) }.to raise_exception(ArgumentError, /deprecated and removed/)
++    end
++  end
++end
++
+ def apply_settings(settings_values, settings = nil)
+   settings = settings.nil? ? LogStash::SETTINGS.clone : settings
+ 

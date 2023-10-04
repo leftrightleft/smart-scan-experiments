@@ -1,0 +1,229 @@
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/InvalidIRException.java b/logstash-core/src/main/java/org/logstash/config/ir/InvalidIRException.java
+index 7c4a30bf208..5d0ef41fbdd 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/InvalidIRException.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/InvalidIRException.java
+@@ -1,5 +1,7 @@
+ package org.logstash.config.ir;
+ 
++import org.logstash.config.ir.graph.algorithms.TopologicalSort;
++
+ /**
+  * Created by andrewvc on 9/6/16.
+  */
+@@ -7,4 +9,8 @@ public class InvalidIRException extends Exception {
+     public InvalidIRException(String s) {
+         super(s);
+     }
++
++    public InvalidIRException(String s, Exception e) {
++        super(s,e);
++    }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/graph/Graph.java b/logstash-core/src/main/java/org/logstash/config/ir/graph/Graph.java
+index 3901de41378..92bf99de3f4 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/graph/Graph.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/graph/Graph.java
+@@ -6,8 +6,8 @@
+ import org.logstash.config.ir.SourceMetadata;
+ import org.logstash.config.ir.graph.algorithms.BreadthFirst;
+ import org.logstash.config.ir.graph.algorithms.GraphDiff;
++import org.logstash.config.ir.graph.algorithms.TopologicalSort;
+ 
+-import java.lang.reflect.Array;
+ import java.util.*;
+ import java.util.function.BiFunction;
+ import java.util.stream.Collectors;
+@@ -22,6 +22,7 @@ public class Graph implements ISourceComponent, IHashable {
+     private Map<Vertex, Integer> vertexRanks = new HashMap<>();
+     private final Map<Vertex,Set<Edge>> outgoingEdgeLookup = new HashMap<>();
+     private final Map<Vertex,Set<Edge>> incomingEdgeLookup = new HashMap<>();
++    private List<Vertex> sortedVertices;
+ 
+ 
+     public Graph(Collection<Vertex> vertices, Collection<Edge> edges) throws InvalidIRException {
+@@ -238,9 +239,18 @@ public Collection<Edge> threadVertices(boolean bool, Vertex... vertices) throws
+     // in.
+     public void refresh() throws InvalidIRException {
+         this.calculateRanks();
++        this.calculateTopologicalSort();
+         this.validate();
+     }
+ 
++    private void calculateTopologicalSort() throws InvalidIRException {
++        try {
++            this.sortedVertices = TopologicalSort.sortVertices(this);
++        } catch (TopologicalSort.UnexpectedGraphCycleError unexpectedGraphCycleError) {
++            throw new InvalidIRException("Graph is not a dag!", unexpectedGraphCycleError);
++        }
++    }
++
+     private void calculateRanks() {
+         vertexRanks = BreadthFirst.breadthFirst(this.getRoots()).vertexDistances;
+     }
+@@ -311,8 +321,9 @@ public Set<Edge> getEdges() {
+     public String toString() {
+         Stream<Edge> edgesToFormat;
+         try {
+-            edgesToFormat = getSortedEdges().stream();
++            edgesToFormat = sortedEdges();
+         } catch (InvalidIRException e) {
++            // Even if this isn't a valid graph we still need to print it
+             edgesToFormat = edges.stream();
+         }
+ 
+@@ -334,42 +345,13 @@ public Stream<Vertex> isolatedVertices() {
+         return this.getVertices().stream().filter(v -> v.getOutgoingEdges().isEmpty() && v.getIncomingEdges().isEmpty());
+     }
+ 
+-    // Uses Kahn's algorithm to do a topological sort and detect cycles
+-    public List<Vertex> getSortedVertices() throws InvalidIRException {
+-        if (this.edges.size() == 0) return new ArrayList(this.vertices);
+-
+-        List<Vertex> sorted = new ArrayList<>(this.vertices.size());
+-
+-        Deque<Vertex> pending = new LinkedList<>();
+-        pending.addAll(this.getRoots());
+-
+-        Set<Edge> traversedEdges = new HashSet<>();
+-
+-        while (!pending.isEmpty()) {
+-            Vertex currentVertex = pending.removeFirst();
+-            sorted.add(currentVertex);
+-
+-            currentVertex.getOutgoingEdges().forEach(edge -> {
+-                traversedEdges.add(edge);
+-                Vertex toVertex = edge.getTo();
+-                if (toVertex.getIncomingEdges().stream().allMatch(traversedEdges::contains)) {
+-                    pending.add(toVertex);
+-                }
+-            });
+-        }
+-
+-        // Check for cycles
+-        if (this.edges.stream().noneMatch(traversedEdges::contains)) {
+-            throw new InvalidIRException("Graph has cycles, is not a DAG! " + this.edges);
+-        }
+-
+-        return sorted;
++    public List<Vertex> getSortedVertices() {
++        return this.sortedVertices;
+     }
+ 
+-    public List<Edge> getSortedEdges() throws InvalidIRException {
++    public Stream<Edge> sortedEdges() throws InvalidIRException {
+         return getSortedVertices().stream().
+-                flatMap(Vertex::outgoingEdges).
+-                collect(Collectors.toList());
++                flatMap(Vertex::outgoingEdges);
+     }
+ 
+     public List<Vertex> getSortedVerticesBefore(Vertex end) throws InvalidIRException {
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/graph/algorithms/TopologicalSort.java b/logstash-core/src/main/java/org/logstash/config/ir/graph/algorithms/TopologicalSort.java
+new file mode 100644
+index 00000000000..a3fed642594
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/graph/algorithms/TopologicalSort.java
+@@ -0,0 +1,51 @@
++package org.logstash.config.ir.graph.algorithms;
++
++import org.logstash.config.ir.graph.Edge;
++import org.logstash.config.ir.graph.Graph;
++import org.logstash.config.ir.graph.Vertex;
++
++import java.util.*;
++
++/**
++ * Created by andrewvc on 1/7/17.
++ */
++public class TopologicalSort {
++    public static class UnexpectedGraphCycleError extends Exception {
++        UnexpectedGraphCycleError(Graph g) {
++            super("Graph has cycles, is not a DAG! " + g);
++        }
++    }
++
++    // Uses Kahn's algorithm to do a topological sort and detect cycles
++    public static List<Vertex> sortVertices(Graph g) throws UnexpectedGraphCycleError {
++        if (g.getEdges().size() == 0) return new ArrayList<>(g.getVertices());
++
++        List<Vertex> sorted = new ArrayList<>(g.getVertices().size());
++
++        Deque<Vertex> pending = new LinkedList<>();
++        pending.addAll(g.getRoots());
++
++        Set<Edge> traversedEdges = new HashSet<>();
++
++        while (!pending.isEmpty()) {
++            Vertex currentVertex = pending.removeFirst();
++            sorted.add(currentVertex);
++
++            currentVertex.getOutgoingEdges().forEach(edge -> {
++                traversedEdges.add(edge);
++                Vertex toVertex = edge.getTo();
++                if (toVertex.getIncomingEdges().stream().allMatch(traversedEdges::contains)) {
++                    pending.add(toVertex);
++                }
++            });
++        }
++
++        // Check for cycles
++        if (g.edges().noneMatch(traversedEdges::contains)) {
++            throw new UnexpectedGraphCycleError(g);
++        }
++
++        return sorted;
++    }
++
++}
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/graph/algorithms/TopologicalSortTest.java b/logstash-core/src/test/java/org/logstash/config/ir/graph/algorithms/TopologicalSortTest.java
+new file mode 100644
+index 00000000000..be3b556333a
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/config/ir/graph/algorithms/TopologicalSortTest.java
+@@ -0,0 +1,46 @@
++package org.logstash.config.ir.graph.algorithms;
++
++import org.junit.Test;
++import org.logstash.config.ir.InvalidIRException;
++import org.logstash.config.ir.graph.Graph;
++import org.logstash.config.ir.graph.Vertex;
++
++import java.util.Arrays;
++
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.core.AnyOf.anyOf;
++import static org.hamcrest.core.Is.is;
++import static org.logstash.config.ir.IRHelpers.testVertex;
++
++/**
++ * Created by andrewvc on 1/7/17.
++ */
++public class TopologicalSortTest {
++    @Test(expected = InvalidIRException.class)
++    public void testGraphCycleDetection() throws InvalidIRException {
++        Graph g = Graph.empty();
++        Vertex v1 = testVertex();
++        Vertex v2 = testVertex();
++        Vertex v3 = testVertex();
++        g.threadVertices(v1, v2);
++        g.threadVertices(v2, v3);
++        g.threadVertices(v2, v1);
++    }
++
++    @Test
++    public void testSortOrder() throws InvalidIRException, TopologicalSort.UnexpectedGraphCycleError {
++        Graph g = Graph.empty();
++        Vertex v1 = testVertex();
++        Vertex v2 = testVertex();
++        Vertex v3 = testVertex();
++        Vertex v4 = testVertex();
++        g.threadVertices(v3, v1, v2);
++        g.threadVertices(v4, v1, v2);
++        assertThat(TopologicalSort.sortVertices(g),
++                anyOf(
++                        is(Arrays.asList(v3,v4,v1,v2)),
++                        is(Arrays.asList(v4,v3,v1,v2))
++                ));
++    }
++
++}

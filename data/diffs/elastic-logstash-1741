@@ -1,0 +1,615 @@
+diff --git a/docs/asciidoc_index.rb b/docs/asciidoc_index.rb
+new file mode 100644
+index 00000000000..be1b94403f8
+--- /dev/null
++++ b/docs/asciidoc_index.rb
+@@ -0,0 +1,35 @@
++#!/usr/bin/env ruby
++
++require "erb"
++
++if ARGV.size != 2
++  $stderr.puts "No path given to search for plugin docs"
++  $stderr.puts "Usage: #{$0} plugin_doc_dir type"
++  exit 1
++end
++
++
++def plugins(glob)
++  plugins=Hash.new []
++  files = Dir.glob(glob)
++  files.collect { |f| File.basename(f).gsub(".asciidoc", "") }.each {|plugin|
++    first_letter = plugin[0,1]
++    plugins[first_letter] += [plugin]
++  }
++  return Hash[plugins.sort]
++end # def plugins
++
++basedir = ARGV[0]
++type = ARGV[1]
++
++docs = plugins(File.join(basedir, "#{type}/*.asciidoc"))
++template_path = File.join(File.dirname(__FILE__), "index-#{type}.asciidoc.erb")
++template = File.new(template_path).read
++erb = ERB.new(template, nil, "-")
++
++path = "#{basedir}/#{type}.asciidoc"
++
++File.open(path, "w") do |out|
++  html = erb.result(binding)
++  out.puts(html)
++end
+diff --git a/docs/asciidocgen.rb b/docs/asciidocgen.rb
+new file mode 100644
+index 00000000000..ec7cbba5d51
+--- /dev/null
++++ b/docs/asciidocgen.rb
+@@ -0,0 +1,254 @@
++require "rubygems"
++require "erb"
++require "optparse"
++require "kramdown" # markdown parser
++
++$: << Dir.pwd
++$: << File.join(File.dirname(__FILE__), "..", "lib")
++
++require "logstash/config/mixin"
++require "logstash/inputs/base"
++require "logstash/codecs/base"
++require "logstash/filters/base"
++require "logstash/outputs/base"
++require "logstash/version"
++
++class LogStashConfigAsciiDocGenerator
++  COMMENT_RE = /^ *#(?: (.*)| *$)/
++
++  def initialize
++    @rules = {
++      COMMENT_RE => lambda { |m| add_comment(m[1]) },
++      /^ *class.*< *LogStash::(Outputs|Filters|Inputs|Codecs)::(Base|Threadable)/ => \
++        lambda { |m| set_class_description },
++      /^ *config +[^=].*/ => lambda { |m| add_config(m[0]) },
++      /^ *milestone .*/ => lambda { |m| set_milestone(m[0]) },
++      /^ *config_name .*/ => lambda { |m| set_config_name(m[0]) },
++      /^ *flag[( ].*/ => lambda { |m| add_flag(m[0]) },
++      /^ *(class|def|module) / => lambda { |m| clear_comments },
++    }
++
++    if File.exists?("build/contrib_plugins")
++      @contrib_list = File.read("build/contrib_plugins").split("\n")
++    else
++      @contrib_list = []
++    end
++  end
++
++  def parse(string)
++    clear_comments
++    buffer = ""
++    string.split(/\r\n|\n/).each do |line|
++      # Join long lines
++      if line =~ COMMENT_RE
++        # nothing
++      else
++        # Join extended lines
++        if line =~ /(, *$)|(\\$)|(\[ *$)/
++          buffer += line.gsub(/\\$/, "")
++          next
++        end
++      end
++
++      line = buffer + line
++      buffer = ""
++
++      @rules.each do |re, action|
++        m = re.match(line)
++        if m
++          action.call(m)
++        end
++      end # RULES.each
++    end # string.split("\n").each
++  end # def parse
++
++  def set_class_description
++    @class_description = @comments.join("\n")
++    clear_comments
++  end # def set_class_description
++
++  def add_comment(comment)
++    return if comment == "encoding: utf-8"
++    @comments << comment
++  end # def add_comment
++
++  def add_config(code)
++    # I just care about the 'config :name' part
++    code = code.sub(/,.*/, "")
++
++    # call the code, which calls 'config' in this class.
++    # This will let us align comments with config options.
++    name, opts = eval(code)
++
++    # TODO(sissel): This hack is only required until regexp configs
++    # are gone from logstash.
++    name = name.to_s unless name.is_a?(Regexp)
++
++    description = Kramdown::Document.new(@comments.join("\n")).to_kramdown
++    @attributes[name][:description] = description
++    clear_comments
++  end # def add_config
++
++  def add_flag(code)
++    # call the code, which calls 'config' in this class.
++    # This will let us align comments with config options.
++    #p :code => code
++    fixed_code = code.gsub(/ do .*/, "")
++    #p :fixedcode => fixed_code
++    name, description = eval(fixed_code)
++    @flags[name] = description
++    clear_comments
++  end # def add_flag
++
++  def set_config_name(code)
++    name = eval(code)
++    @name = name
++  end # def set_config_name
++
++  def set_milestone(code)
++    @milestone = eval(code)
++  end
++
++  # pretend to be the config DSL and just get the name
++  def config(name, opts={})
++    return name, opts
++  end # def config
++
++  # Pretend to support the flag DSL
++  def flag(*args, &block)
++    name = args.first
++    description = args.last
++    return name, description
++  end # def config
++
++  # pretend to be the config dsl's 'config_name' method
++  def config_name(name)
++    return name
++  end # def config_name
++
++  # pretend to be the config dsl's 'milestone' method
++  def milestone(m)
++    return m
++  end # def milestone
++
++  def clear_comments
++    @comments.clear
++  end # def clear_comments
++
++  def generate(file, settings)
++    @class_description = ""
++    @milestone = ""
++    @comments = []
++    @attributes = Hash.new { |h,k| h[k] = {} }
++    @flags = {}
++
++    # local scoping for the monkeypatch belowg
++    attributes = @attributes
++    # Monkeypatch the 'config' method to capture
++    # Note, this monkeypatch requires us do the config processing
++    # one at a time.
++    #LogStash::Config::Mixin::DSL.instance_eval do
++      #define_method(:config) do |name, opts={}|
++        #p name => opts
++        #attributes[name].merge!(opts)
++      #end
++    #end
++
++    # Loading the file will trigger the config dsl which should
++    # collect all the config settings.
++    load file
++
++    # parse base first
++    parse(File.new(File.join(File.dirname(file), "base.rb"), "r").read)
++
++    # Now parse the real library
++    code = File.new(file).read
++
++    # inputs either inherit from Base or Threadable.
++    if code =~ /\< LogStash::Inputs::Threadable/
++      parse(File.new(File.join(File.dirname(file), "threadable.rb"), "r").read)
++    end
++
++    if code =~ /include LogStash::PluginMixins/
++      mixin = code.gsub(/.*include LogStash::PluginMixins::(\w+)\s.*/m, '\1')
++      mixin.gsub!(/(.)([A-Z])/, '\1_\2')
++      mixin.downcase!
++      parse(File.new(File.join(File.dirname(file), "..", "plugin_mixins", "#{mixin}.rb")).read)
++    end
++
++    parse(code)
++
++    puts "Generating docs for #{file}"
++
++    if @name.nil?
++      $stderr.puts "Missing 'config_name' setting in #{file}?"
++      return nil
++    end
++
++    klass = LogStash::Config::Registry.registry[@name]
++    if klass.ancestors.include?(LogStash::Inputs::Base)
++      section = "input"
++    elsif klass.ancestors.include?(LogStash::Filters::Base)
++      section = "filter"
++    elsif klass.ancestors.include?(LogStash::Outputs::Base)
++      section = "output"
++    elsif klass.ancestors.include?(LogStash::Codecs::Base)
++      section = "codec"
++    end
++
++    template_file = File.join(File.dirname(__FILE__), "plugin-doc.asciidoc.erb")
++    template = ERB.new(File.new(template_file).read, nil, "-")
++
++    is_contrib_plugin = @contrib_list.include?(file)
++
++    # descriptions are assumed to be markdown
++    description = Kramdown::Document.new(@class_description).to_kramdown
++
++    klass.get_config.each do |name, settings|
++      @attributes[name].merge!(settings)
++      default = klass.get_default(name)
++      unless default.nil?
++        @attributes[name][:default] = default
++      end
++    end
++    sorted_attributes = @attributes.sort { |a,b| a.first.to_s <=> b.first.to_s }
++    klassname = LogStash::Config::Registry.registry[@name].to_s
++    name = @name
++
++    synopsis_file = File.join(File.dirname(__FILE__), "plugin-synopsis.asciidoc.erb")
++    synopsis = ERB.new(File.new(synopsis_file).read, nil, "-").result(binding)
++
++    if settings[:output]
++      dir = File.join(settings[:output], section + "s")
++      path = File.join(dir, "#{name}.asciidoc")
++      Dir.mkdir(settings[:output]) if !File.directory?(settings[:output])
++      Dir.mkdir(dir) if !File.directory?(dir)
++      File.open(path, "w") do |out|
++        html = template.result(binding)
++        html.gsub!("%VERSION%", LOGSTASH_VERSION)
++        html.gsub!("%PLUGIN%", @name)
++        out.puts(html)
++      end
++    else
++      puts template.result(binding)
++    end
++  end # def generate
++
++end # class LogStashConfigDocGenerator
++
++if __FILE__ == $0
++  opts = OptionParser.new
++  settings = {}
++  opts.on("-o DIR", "--output DIR",
++          "Directory to output to; optional. If not specified,"\
++          "we write to stdout.") do |val|
++    settings[:output] = val
++  end
++
++  args = opts.parse(ARGV)
++
++  args.each do |arg|
++    gen = LogStashConfigAsciiDocGenerator.new
++    gen.generate(arg, settings)
++  end
++end
+diff --git a/docs/index-codecs.asciidoc.erb b/docs/index-codecs.asciidoc.erb
+new file mode 100644
+index 00000000000..76daec1a95d
+--- /dev/null
++++ b/docs/index-codecs.asciidoc.erb
+@@ -0,0 +1,45 @@
++[[codec-plugins]]
++== Codec plugins
++
++Some docs about Codecs
++
++
++
++Available Codec plugins:
++
++<%-
++full_list=[]
++letters=[]
++docs.each do |doc|
++letter = doc[0]
++letters << letter
++-%>
++<<plugins-codecs-letters-<%= letter %>, <%=letter %>>>
++<%- end -%>
++
++<%-
++cols=3
++rows=(docs.count/cols)+1
++item=0
++r=0
++-%>
++[cols="asciidoc,asciidoc,asciidoc"]
++|=======================================================================
++<%- while r < rows do -%>
++<%- c=0; while c < cols do -%>|<% if letters[item].nil? %>&nbsp; <% else %>[[plugins-codecs-letters-<%=letters[item] %>]] <% end %>
++<%- letter = letters[item];
++arr = docs[letter]
++if ! arr.nil?
++arr.each do |plugin_item|
++full_list << plugin_item
++%>* <<plugins-codecs-<%=plugin_item -%>,<%=plugin_item -%>>>
++<%- end 
++end -%>
++<%- item+=1; c+=1; end; r+=1 end -%>
++|=======================================================================
++
++<%-
++full_list.each do |plugin|
++-%>
++include::codecs/<%=plugin %>.asciidoc[]
++<%- end -%>
+diff --git a/docs/index-filters.asciidoc.erb b/docs/index-filters.asciidoc.erb
+new file mode 100644
+index 00000000000..df3a9f4d761
+--- /dev/null
++++ b/docs/index-filters.asciidoc.erb
+@@ -0,0 +1,45 @@
++[[filter-plugins]]
++== Filter plugins
++
++Some docs about Filter plugins
++
++
++
++Available Filter plugins:
++
++<%-
++full_list=[]
++letters=[]
++docs.each do |doc|
++letter = doc[0]
++letters << letter
++-%>
++<<plugins-filters-letters-<%= letter %>, <%=letter %>>>
++<%- end -%>
++
++<%-
++cols=3
++rows=(docs.count/cols)+1
++item=0
++r=0
++-%>
++[cols="asciidoc,asciidoc,asciidoc"]
++|=======================================================================
++<%- while r < rows do -%>
++<%- c=0; while c < cols do -%>|<% if letters[item].nil? %>&nbsp; <% else %>[[plugins-filters-letters-<%=letters[item] %>]] <% end %>
++<%- letter = letters[item];
++arr = docs[letter]
++if ! arr.nil?
++arr.each do |plugin_item|
++full_list << plugin_item
++%>* <<plugins-filters-<%=plugin_item -%>,<%=plugin_item -%>>>
++<%- end 
++end -%>
++<%- item+=1; c+=1; end; r+=1 end -%>
++|=======================================================================
++
++<%-
++full_list.each do |plugin|
++-%>
++include::filters/<%=plugin %>.asciidoc[]
++<%- end -%>
+diff --git a/docs/index-inputs.asciidoc.erb b/docs/index-inputs.asciidoc.erb
+new file mode 100644
+index 00000000000..9e49f759ece
+--- /dev/null
++++ b/docs/index-inputs.asciidoc.erb
+@@ -0,0 +1,45 @@
++[[input-plugins]]
++== Input plugins
++
++Some docs about inputs
++
++
++
++Available input plugins:
++
++<%-
++full_list=[]
++letters=[]
++docs.each do |doc|
++letter = doc[0]
++letters << letter
++-%>
++<<plugins-inputs-letters-<%= letter %>, <%=letter %>>>
++<%- 
++end
++
++cols=3
++rows=(docs.count/cols)+1
++item=0
++r=0
++-%>
++[cols="asciidoc,asciidoc,asciidoc"]
++|=======================================================================
++<%- while r < rows do -%>
++<%- c=0; while c < cols do -%>|<% if letters[item].nil? %>&nbsp; <% else %>[[plugins-inputs-letters-<%=letters[item] %>]] <% end %>
++<%- letter = letters[item];
++arr = docs[letter]
++if ! arr.nil?
++arr.each do |plugin_item|
++full_list << plugin_item
++%>* <<plugins-inputs-<%=plugin_item -%>,<%=plugin_item -%>>>
++<%- end 
++end -%>
++<%- item+=1; c+=1; end; r+=1 end -%>
++|=======================================================================
++
++<%-
++full_list.each do |plugin|
++-%>
++include::inputs/<%=plugin %>.asciidoc[]
++<%- end -%>
+diff --git a/docs/index-outputs.asciidoc.erb b/docs/index-outputs.asciidoc.erb
+new file mode 100644
+index 00000000000..ee865fe0822
+--- /dev/null
++++ b/docs/index-outputs.asciidoc.erb
+@@ -0,0 +1,43 @@
++[[output-plugins]]
++== Output plugins
++
++Some docs about output plugins
++
++Available output plugins:
++
++<%-
++full_list=[]
++letters=[]
++docs.each do |doc|
++letter = doc[0]
++letters << letter
++-%>
++<<plugins-outputs-letters-<%= letter %>, <%=letter %>>>
++<%- end -%>
++
++<%-
++cols=3
++rows=(docs.count/cols)+1
++item=0
++r=0
++-%>
++[cols="asciidoc,asciidoc,asciidoc"]
++|=======================================================================
++<%- while r < rows do -%>
++<%- c=0; while c < cols do -%>|<% if letters[item].nil? %>&nbsp; <% else %>[[plugins-outputs-letters-<%=letters[item] %>]] <% end %>
++<%- letter = letters[item];
++arr = docs[letter]
++if ! arr.nil?
++arr.each do |plugin_item|
++full_list << plugin_item
++%>* <<plugins-outputs-<%=plugin_item -%>,<%=plugin_item -%>>>
++<%- end 
++end -%>
++<%- item+=1; c+=1; end; r+=1 end -%>
++|=======================================================================
++
++<%-
++full_list.each do |plugin|
++-%>
++include::outputs/<%=plugin %>.asciidoc[]
++<%- end -%>
+diff --git a/docs/plugin-doc.asciidoc.erb b/docs/plugin-doc.asciidoc.erb
+new file mode 100644
+index 00000000000..3860efbf503
+--- /dev/null
++++ b/docs/plugin-doc.asciidoc.erb
+@@ -0,0 +1,52 @@
++<%- plugin_name = name -%>
++[[plugins-<%= section %>s-<%= name %>]]
++=== <%= name %>
++
++
++<%= description %>
++
++==== Synopsis
++
++These are the config options
++
++<%= synopsis -%>
++
++==== Details
++
++<% sorted_attributes.each do |name, config| -%>
++<%
++     if name.is_a?(Regexp)
++       name = "/" + name.to_s.gsub(/^\(\?-mix:/, "").gsub(/\)$/, "") + "/"
++       is_regexp = true
++     else
++       is_regexp = false
++     end
++-%>
++[[plugins-<%= section%>s-<%= plugin_name%>-<%= name%>]]
++===== `<%= name %>` <%= " (DEPRECATED)" if config[:deprecated] %>
++
++<% if config[:required] -%>
++  * This is a required setting.
++<% end -%>
++<% if config[:deprecated] -%>
++  * DEPRECATED WARNING: This config item is deprecated. It may be removed in a further version.
++<% end -%>
++<% if is_regexp -%>
++  * The configuration attribute name here is anything that matches the above regular expression.
++<% end -%>
++<% if config[:validate].is_a?(Symbol) -%>
++  * Value type is <<<%= config[:validate] %>,<%= config[:validate] %>>>
++<% elsif config[:validate].nil? -%>
++  <li> Value type is <<string,string>>
++<% elsif config[:validate].is_a?(Array) -%>
++  * Value can be any of: `<%= config[:validate].join('`, `') %>`
++<% end -%>
++<% if config.include?(:default) -%>
++  * Default value is `<%= config[:default].inspect %>`
++<% else -%>
++  * There is no default value for this setting.
++<% end -%>
++
++<%= config[:description] %>
++
++<% end -%>
+diff --git a/docs/plugin-synopsis.asciidoc.erb b/docs/plugin-synopsis.asciidoc.erb
+new file mode 100644
+index 00000000000..7e1efd89277
+--- /dev/null
++++ b/docs/plugin-synopsis.asciidoc.erb
+@@ -0,0 +1,48 @@
++<%- plugin_name = name -%>
++[source,json]
++--------------------------
++<%= name %> {
++<% sorted_attributes.each do |name, config|
++   next if config[:deprecated]
++   next if !config[:required]
++-%>
++<%= "  " if section == "codec" %>    <%= name %> => ... 
++<% end -%>
++<%= "  " if section == "codec" %>  }
++
++--------------------------
++
++[cols="<,<,<,<m",options="header",]
++|=======================================================================
++|Setting |Input type|Required/optional|Default value
++<% sorted_attributes.each do |name, config|
++   next if config[:deprecated]
++   if config[:validate].is_a?(Array) 
++     annotation = "|string, one of #{config[:validate].inspect}"
++   elsif config[:validate] == :path
++     annotation = "|a valid filesystem path"
++   else
++     annotation = "|<<#{config[:validate]},#{config[:validate]}>>"
++   end
++
++   if name.is_a?(Regexp)
++     name = "/" + name.to_s.gsub(/^\(\?-mix:/, "").gsub(/\)$/, "") + "/"
++   end
++   if config[:required]
++     annotation += "|required"
++   else
++     annotation += "|optional"
++   end
++   if config.include?(:default)
++     if config[:default].is_a?(String)
++       annotation += "|`#{config[:default]}`"
++     else
++       annotation += "|#{config[:default].inspect}"
++     end
++   else 
++     annotation += "|"
++   end
++-%>
++| <<plugins-<%= section %>s-<%=plugin_name%>-<%= name %>>> <%= annotation %>
++<% end -%>
++|=======================================================================

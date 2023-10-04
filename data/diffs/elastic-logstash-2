@@ -1,0 +1,282 @@
+diff --git a/etc/logstash-grep.yaml b/etc/logstash-grep.yaml
+new file mode 100644
+index 00000000000..4574a55afcd
+--- /dev/null
++++ b/etc/logstash-grep.yaml
+@@ -0,0 +1,31 @@
++---
++inputs:
++  linux-syslog:
++  - /var/log/messages
++filters:
++- grok:
++    linux-syslog: # for logs of type 'linux-syslog'
++      patterns:
++      - %{SYSLOGLINE}
++- date:
++    linux-syslog:
++      timestamp: "%b %e %H:%M:%S"
++      timestamp8601: ISO8601
++- grep:
++    linux-syslog:
++      - match:
++          message: test
++        add_fields:
++          nagios_alert: test_alert
++        add_tags:
++          - nagios
++          - test
++      - match:
++          message: (?i)foo.*bar
++          program: test
++        add_fields:
++          nagios_alert: foo_alert
++        add_tags:
++          - nagios
++outputs:
++- stdout:///
+diff --git a/lib/logstash/filters/grep.rb b/lib/logstash/filters/grep.rb
+new file mode 100644
+index 00000000000..0408ca1e389
+--- /dev/null
++++ b/lib/logstash/filters/grep.rb
+@@ -0,0 +1,92 @@
++require "logstash/filters/base"
++
++class LogStash::Filters::Grep < LogStash::Filters::Base
++  def initialize(config = {})
++    super
++
++    @config = config
++  end # def initialize
++
++  def register
++    @config.each do |type, matches|
++      if ! matches.is_a?(Array)
++        @logger.warn("grep: #{type} misconfigured; must be an array")
++        next
++      end
++
++      matches.each_index do |i|
++        match = matches[i]
++        if ! match.member?("match")
++          @logger.warn(["grep: #{type}/#{i}: no 'match' section defined", match])
++          next
++        end
++        match["match"].each do |field, re_str|
++          re = Regexp.new(re_str)
++          @config[type][i]["match"][field] = re
++          @logger.debug(["grep: #{type}/#{i}/#{field}", re_str, re])
++        end
++      end # matches.each
++    end # @config.each
++  end # def register
++
++  def filter(event)
++    config = @config[event.type]
++    if not config
++      @logger.debug("grep: skipping type #{event.type} from #{event.source}")
++      return
++    end
++
++    @logger.debug(["Running grep filter", event, config])
++    matched = false
++    config.each do |match|
++      if ! match["match"]
++        @logging.debug(["Skipping match object, no match key", match])
++        next
++      end
++
++      # For each match object, we have to match everything in order to
++      # apply any fields/tags.
++      match_count = 0
++      match["match"].each do |field, re|
++        next unless event[field]
++
++        event[field].each do |value|
++          next unless re.match(value)
++          @logger.debug("grep matched on field #{field}")
++          match_count += 1
++        end
++      end # match["match"].each
++
++      if match_count == match["match"].length
++        matched = true
++        @logger.debug("matched all fields (#{match_count})")
++
++        if match["add_fields"]
++          match["add_fields"].each do |field, value|
++            event[field] ||= []
++            event[field] << value
++            @logger.debug("grep: adding #{value} to field #{field}")
++          end
++        end # if match["add_fields"]
++
++        if match["add_tags"]
++          match["add_tags"].each do |tag|
++            event.tags << tag
++            @logger.debug("grep: adding tag #{tag}")
++          end
++        end # if match["add_tags"]
++      else
++        @logger.debug("match block failed " \
++                      "(#{match_count}/#{match["match"].length} matches)")
++      end # match["match"].each
++    end # config.each
++
++    if not matched
++      @logger.debug("grep: dropping event, no matches")
++      event.cancel
++      return
++    end
++
++    @logger.debug(["Event after grep filter", event.to_hash])
++  end # def filter
++end # class LogStash::Filters::Grep
+diff --git a/test/logstash/filters/test_grep.rb b/test/logstash/filters/test_grep.rb
+new file mode 100644
+index 00000000000..8bd3abe0934
+--- /dev/null
++++ b/test/logstash/filters/test_grep.rb
+@@ -0,0 +1,131 @@
++$:.unshift File.dirname(__FILE__) + "/../../../lib"
++
++require "test/unit"
++require "logstash"
++require "logstash/filters"
++require "logstash/event"
++
++class TestFilterGrep < Test::Unit::TestCase
++  def setup
++    @filter = LogStash::Filters.from_name("grep", {})
++  end
++
++  def test_name(name)
++    @typename = name
++  end
++
++  def config(cfg)
++    @filter.add_config(@typename, cfg)
++    @filter.register
++  end
++
++  def test_single_match
++    test_name "single_match"
++    config [{"match" => {"str" => "test"}}]
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["str"] = "test: this should not be dropped"
++    @filter.filter(event)
++    assert_equal(false, event.cancelled?)
++  end # def test_single_match
++
++  def test_single_match_drop
++    test_name "single_match_dropp"
++    config [{"match" => {"str" => "test"}}]
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["str"] = "foo: this should be dropped"
++    @filter.filter(event)
++    assert_equal(true, event.cancelled?)
++  end # def test_single_match_drop
++
++  def test_multiple_match
++    test_name "multiple_match"
++    config [{"match" => {"str" => "test", "bar" => "baz"}}]
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["str"] = "test: this should not be dropped"
++    event["bar"] = "foo baz foo"
++    @filter.filter(event)
++    assert_equal(false, event.cancelled?)
++  end # test_multiple_match
++
++  def test_multiple_match_drop
++    test_name "multiple_match_drop"
++    config [{"match" => {"str" => "test", "bar" => "baz"}}]
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["str"] = "test: this should be dropped"
++    event["bar"] = "foo bAz foo"
++    @filter.filter(event)
++    assert_equal(true, event.cancelled?)
++  end # test_multiple_match_drop
++
++  def test_single_match_regexp
++    test_name "single_match_regexp"
++    config [{"match" => {"str" => "(?i)test.*foo"}}]
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["str"] = "TeST regexp match FoO"
++    @filter.filter(event)
++    assert_equal(false, event.cancelled?)
++  end # def test_single_match_regexp
++
++  def test_single_match_regexp_drop
++    test_name "single_match_regexp_drop"
++    config [{"match" => {"str" => "test.*foo"}}]
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["str"] = "TeST regexp match FoO"
++    @filter.filter(event)
++    assert_equal(true, event.cancelled?)
++  end # def test_single_match_regexp_drop
++
++  def test_add_fields
++    test_name "add_fields"
++    config [{"match" => {"str" => "test"},
++             "add_fields" => {"new_field" => "new_value"}},
++           ]
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["str"] = "test"
++    @filter.filter(event)
++    assert_equal(["new_value"], event["new_field"])
++  end # def test_add_fields
++
++  def test_add_fields_multiple_match
++    test_name "add_fields_multiple_match"
++    config [{"match" => {"str" => "test"},
++             "add_fields" => {"new_field" => "new_value"}},
++            {"match" => {"str" => ".*"},
++             "add_fields" => {"new_field" => "new_value_2"}},
++           ]
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["str"] = "test"
++    @filter.filter(event)
++    assert_equal(["new_value", "new_value_2"], event["new_field"])
++  end # def test_add_fields_multiple_match
++
++  def test_add_tags
++    test_name "add_tags"
++    config [{"match" => {"str" => "test"},
++             "add_tags" => ["new_tag"]},
++           ]
++
++    event = LogStash::Event.new
++    event.tags << "tag"
++    event.type = @typename
++    event["str"] = "test"
++    @filter.filter(event)
++    assert_equal(["tag", "new_tag"], event.tags)
++  end # def test_add_tags
++end # TestFilterGrep
+diff --git a/test/run.rb b/test/run.rb
+index d455e4bb48d..db441270b95 100644
+--- a/test/run.rb
++++ b/test/run.rb
+@@ -3,4 +3,5 @@
+ 
+ require "logstash/test_syntax"
+ require "logstash/filters/test_date"
++require "logstash/filters/test_grep"
+ require "logstash/filters/test_multiline"

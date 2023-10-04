@@ -1,0 +1,238 @@
+diff --git a/Gemfile.lock b/Gemfile.lock
+index 6c67c925230..95d4ebfd768 100644
+--- a/Gemfile.lock
++++ b/Gemfile.lock
+@@ -2,10 +2,13 @@ GEM
+   remote: http://rubygems.org/
+   specs:
+     awesome_print (0.4.0)
++    bson (1.3.1)
+     bson (1.3.1-java)
+     bunny (0.6.0)
+     daemons (1.1.3)
++    eventmachine (0.12.10)
+     eventmachine (0.12.10-java)
++    ffi (1.0.9)
+     ffi (1.0.9-java)
+     filewatch (0.2.5)
+       ffi
+@@ -17,6 +20,7 @@ GEM
+     jls-grok (0.4.7)
+       ffi (>= 0.6.3)
+     jruby-elasticsearch (0.0.9)
++    json (1.5.1)
+     json (1.5.1-java)
+     mizuno (0.4.0)
+       rack (>= 1.0.0)
+@@ -41,6 +45,7 @@ GEM
+ 
+ PLATFORMS
+   java
++  ruby
+ 
+ DEPENDENCIES
+   awesome_print
+diff --git a/lib/logstash/filters/gelfify.rb b/lib/logstash/filters/gelfify.rb
+new file mode 100644
+index 00000000000..af48b007707
+--- /dev/null
++++ b/lib/logstash/filters/gelfify.rb
+@@ -0,0 +1,50 @@
++require "logstash/filters/base"
++require "logstash/namespace"
++
++# The GELFify filter parses RFC3164 severity levels to
++# corresponding GELF levels.
++class LogStash::Filters::Gelfify < LogStash::Filters::Base
++
++  config_name "gelfify"
++
++  public
++  def register
++
++    @syslog_level_map  = {
++        0 => 3, # Emergency => FATAL
++        1 => 5, # Alert     => WARN
++        2 => 3, # Critical  => FATAL
++        3 => 4, # Error     => ERROR
++        4 => 5, # Warning   => WARN
++        5 => 6, # Notice    => INFO
++        6 => 6, # Informat. => INFO
++        7 => 7  # Debug     => DEBUG
++    }
++    
++    @logger.debug "Adding GELFify filter to type #{@type}"
++
++  end # def register
++
++  public
++  def filter(event)
++
++    return unless event.type == @type
++    @logger.debug "GELFIFY FILTER: received event of type #{event.type}"
++
++    if event.fields.include?("severity")
++
++        if @syslog_level_map[event.fields["severity"].to_i]
++            @logger.debug "GELFIFY FILTER: Severity level successfully mapped"
++            event.fields["GELF_severity"] = @syslog_level_map[event.fields["severity"].to_i]
++        end
++
++    else
++        @logger.warn "GELFIFY FILTER: No 'severity' field found"
++    end
++
++    if !event.cancelled?
++      filter_matched(event)
++    end
++  end # def filter
++
++end # class LogStash::Filters::Gelfify
+diff --git a/lib/logstash/inputs/syslog.rb b/lib/logstash/inputs/syslog.rb
+index 46fbe9c6bb5..62b35f09af0 100644
+--- a/lib/logstash/inputs/syslog.rb
++++ b/lib/logstash/inputs/syslog.rb
+@@ -22,6 +22,17 @@ class LogStash::Inputs::Syslog < LogStash::Inputs::Base
+   # ports) may require root to use.
+   config :port, :validate => :number, :default => 514
+ 
++  # Use label parsing for severity and facility levels
++  config :use_labels, :validate => :boolean, :default => true
++
++  # Labels for facility levels
++  # This comes from RFC3164.
++  config :facility_labels, :validate => :array, :default => [ "kernel", "user-level", "mail", "system", "security/authorization", "syslogd", "line printer", "network news", "UUCP", "clock", "security/authorization", "FTP", "NTP", "log audit", "log alert", "clock", "local0", "local1", "local2", "local3", "local4", "local5", "local6", "local7" ]
++
++  # Labels for severity levels
++  # This comes from RFC3164.
++  config :severity_labels, :validate => :array, :default => [ "Emergency" , "Alert", "Critical", "Error", "Warning", "Notice", "Informational", "Debug" ]
++
+   public
+   def initialize(params)
+     super
+@@ -185,5 +196,23 @@ def syslog_relay(event, url)
+ 
+       event.source = url
+     end
++
++    # Apply severity and facility metadata if
++    # use_labels => true
++    if @use_labels
++
++        facility_number = event.fields["facility"]
++        severity_number = event.fields["severity"]
++
++        if @facility_labels[facility_number] 
++            event.fields["facility_label"] = @facility_labels[facility_number] 
++        end
++
++        if @severity_labels[severity_number] 
++            event.fields["severity_label"] = @severity_labels[severity_number] 
++        end
++
++    end
++
+   end # def syslog_relay
+ end # class LogStash::Inputs::Syslog
+diff --git a/lib/logstash/outputs/gelf.rb b/lib/logstash/outputs/gelf.rb
+index 8371d74f6b7..9c5d69dc82b 100644
+--- a/lib/logstash/outputs/gelf.rb
++++ b/lib/logstash/outputs/gelf.rb
+@@ -32,11 +32,14 @@ class LogStash::Outputs::Gelf < LogStash::Outputs::Base
+   # "debug", "info", "warn", "error", "fatal", "unknown" (case insensitive).
+   # Single-character versions of these are also valid, "d", "i", "w", "e", "f",
+   # "u"
+-  config :level, :validate => :string, :default => "INFO"
++  config :level, :validate => :array, :default => [ "%{severity}", "INFO" ]
+ 
+   # The GELF facility. Dynamic values like %{foo} are permitted here; this
+   # is useful if you need to use a value from the event as the facility name.
+-  config :facility, :validate => :string, :default => "logstash-gelf"
++  config :facility, :validate => :array, :default => [ "%{facility}" , "logstash-gelf" ]
++
++  # Ship metadata within event object?
++  config :ship_metadata, :validate => :boolean, :default => true
+ 
+   public
+   def register
+@@ -61,6 +64,7 @@ def register
+       "fatal" => 3, "f" => 3,
+       "unknown" => 1, "u" => 1,
+     }
++
+   end # def register
+ 
+   public
+@@ -80,27 +84,57 @@ def receive(event)
+     m["host"] = event.sprintf(@sender)
+     m["file"] = event["@source_path"]
+ 
+-    event.fields.each do |name, value|
+-      next if value == nil
+-      name = "_id" if name == "id"  # "_id" is reserved, so use "__id"
+-      if !value.nil?
+-        if value.is_a?(Array)
+-          # collapse single-element arrays, otherwise leave as array
+-          m["_#{name}"] = (value.length == 1) ? value.first : value
+-        else
+-          # Non array values should be presented as-is
+-          # https://logstash.jira.com/browse/LOGSTASH-113
+-          m["_#{name}"] = value
++    if @ship_metadata
++        event.fields.each do |name, value|
++          next if value == nil
++          name = "_id" if name == "id"  # "_id" is reserved, so use "__id"
++          if !value.nil?
++            if value.is_a?(Array)
++              # collapse single-element arrays, otherwise leave as array
++              m["_#{name}"] = (value.length == 1) ? value.first : value
++            else
++              # Non array values should be presented as-is
++              # https://logstash.jira.com/browse/LOGSTASH-113
++              m["_#{name}"] = value
++            end
++          end
+         end
+-      end
+     end
+ 
+     # Allow 'INFO' 'I' or number. for 'level'
+-    level = event.sprintf(@level.to_s)
+-    m["level"] = (@level_map[level.downcase] || level).to_i
+-    m["facility"] = event.sprintf(@facility)
+     m["timestamp"] = event.unix_timestamp.to_i
+ 
++    # Probe facility array levels
++    if @facility.is_a?(Array)
++        @facility.each do |value|
++            parsed_value = event.sprintf(value)
++            next if parsed_value == nil
++            if !parsed_value.nil?
++                m["facility"] = parsed_value
++                break
++            end
++        end
++    else
++        m["facility"] = event.sprintf(@facility)
++    end
++    
++    # Probe severity array levels
++    level = nil
++    if @level.is_a?(Array)
++        @level.each do |value|
++            parsed_value = event.sprintf(value)
++            next if parsed_value == nil
++            if !parsed_value.nil?
++                level = parsed_value
++                break
++            end
++        end
++    else
++        level = event.sprintf(@level.to_s)
++    end
++
++    m["level"] = (@level_map[level.downcase] || level).to_i
++
+     @logger.debug(["Sending GELF event", m])
+     @gelf.notify!(m)
+   end # def receive

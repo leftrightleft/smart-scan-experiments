@@ -1,0 +1,177 @@
+diff --git a/x-pack/lib/filters/geoip/database_manager.rb b/x-pack/lib/filters/geoip/database_manager.rb
+index 733671f59ba..c14b8b66c2b 100644
+--- a/x-pack/lib/filters/geoip/database_manager.rb
++++ b/x-pack/lib/filters/geoip/database_manager.rb
+@@ -39,7 +39,7 @@ def initialize(geoip, database_path, database_type, vendor_path)
+     @database_path = patch_database_path(database_path)
+ 
+     if @mode == :online
+-      logger.info "By using `online` mode, you accepted and agreed MaxMind EULA. "\
++      logger.info "By not manually configuring a database path with `database =>`, you accepted and agreed MaxMind EULA. "\
+                   "For more details please visit https://www.maxmind.com/en/geolite2/eula"
+ 
+       setup
+@@ -50,9 +50,9 @@ def initialize(geoip, database_path, database_type, vendor_path)
+       @scheduler = Rufus::Scheduler.new({:max_work_threads => 1})
+       @scheduler.every('24h', self)
+     else
+-      logger.info "GeoIP plugin is in offline mode. Logstash points to static database files and will not check for update. "\
++      logger.info "GeoIP database path is configured manually so the plugin will not check for update. "\
+                   "Keep in mind that if you are not using the database shipped with this plugin, "\
+-                  "please go to https://www.maxmind.com/en/geolite2/eula to accept and agree the terms and conditions."
++                  "please go to https://www.maxmind.com/en/geolite2/eula and understand the terms and conditions."
+     end
+   end
+ 
+@@ -80,7 +80,7 @@ def execute_download_job
+       @metadata.save_timestamp(@database_path)
+       has_update
+     rescue => e
+-      logger.error(e.message, :cause => e.cause, :backtrace => e.backtrace)
++      logger.error(e.message, error_details(e, logger))
+       check_age
+       false
+     end
+@@ -96,8 +96,8 @@ def call(job, time)
+         clean_up_database
+       end
+     rescue DatabaseExpiryError => e
+-      logger.error(e.message, :cause => e.cause, :backtrace => e.backtrace)
+-      @geoip.terminate_filter
++      logger.error(e.message, error_details(e, logger))
++      @geoip.expire_action
+     end
+   end
+ 
+@@ -118,20 +118,22 @@ def patch_database_path(database_path)
+   end
+ 
+   def check_age
++    return if @metadata.cc?
++
+     days_without_update = (::Date.today - ::Time.at(@metadata.updated_at).to_date).to_i
+ 
+     case
+     when days_without_update >= 30
+       raise DatabaseExpiryError, "The MaxMind database has been used for more than 30 days. Logstash is unable to get newer version from internet. "\
+-      "According to EULA, GeoIP plugin needs to stop in order to be compliant. "\
+-      "Please check the network settings and allow Logstash accesses the internet to download the latest database, "\
+-      "or switch to offline mode (:database => PATH_TO_YOUR_DATABASE) to use a self-managed database which you can download from https://dev.maxmind.com/geoip/geoip2/geolite2/ "
++        "According to EULA, GeoIP plugin needs to stop in order to be compliant. "\
++        "Please check the network settings and allow Logstash accesses the internet to download the latest database, "\
++        "or configure a database manually (:database => PATH_TO_YOUR_DATABASE) to use a self-managed database which you can download from https://dev.maxmind.com/geoip/geoip2/geolite2/ "
+     when days_without_update >= 25
+       logger.warn("The MaxMind database has been used for #{days_without_update} days without update. "\
+-      "Logstash will stop the GeoIP plugin in #{30 - days_without_update} days. "\
+-      "Please check the network settings and allow Logstash accesses the internet to download the latest database ")
++        "Logstash will fail the GeoIP plugin in #{30 - days_without_update} days. "\
++        "Please check the network settings and allow Logstash accesses the internet to download the latest database ")
+     else
+-      logger.debug("The MaxMind database hasn't updated", :days_without_update => days_without_update)
++      logger.trace("The MaxMind database hasn't updated", :days_without_update => days_without_update)
+     end
+   end
+ 
+diff --git a/x-pack/lib/filters/geoip/database_metadata.rb b/x-pack/lib/filters/geoip/database_metadata.rb
+index 55fe773c232..45bb3ee320e 100644
+--- a/x-pack/lib/filters/geoip/database_metadata.rb
++++ b/x-pack/lib/filters/geoip/database_metadata.rb
+@@ -58,6 +58,11 @@ def updated_at
+                  .last || 0).to_i
+   end
+ 
++  def cc?
++    filename = get_metadata.map { |metadata| metadata[Column::FILENAME] }.last || ''
++    filename.eql?(CITY_DB_NAME) || filename.eql?(ASN_DB_NAME)
++  end
++
+   # Return database related filenames in .mmdb .tgz
+   def database_filenames
+     get_all.flat_map { |metadata| [ metadata[Column::FILENAME], get_gz_name(metadata[Column::FILENAME]) ] }
+diff --git a/x-pack/lib/filters/geoip/util.rb b/x-pack/lib/filters/geoip/util.rb
+index 55f681b861c..c17a8953ea8 100644
+--- a/x-pack/lib/filters/geoip/util.rb
++++ b/x-pack/lib/filters/geoip/util.rb
+@@ -34,6 +34,12 @@ def md5(file_path)
+       def get_gz_name(filename)
+         filename[0...-(DB_EXT.length)] + GZ_EXT
+       end
++
++      def error_details(e, logger)
++        error_details = { :cause => e.cause }
++        error_details[:backtrace] = e.backtrace if logger.debug?
++        error_details
++      end
+     end
+   end
+ end end
+\ No newline at end of file
+diff --git a/x-pack/spec/filters/geoip/database_manager_spec.rb b/x-pack/spec/filters/geoip/database_manager_spec.rb
+index df648e39fa3..2e388086664 100644
+--- a/x-pack/spec/filters/geoip/database_manager_spec.rb
++++ b/x-pack/spec/filters/geoip/database_manager_spec.rb
+@@ -59,11 +59,13 @@
+     context "check age" do
+       it "should raise error when 30 days has passed" do
+         expect(mock_metadata).to receive(:updated_at).and_return((Time.now - (60 * 60 * 24 * 33)).to_i)
++        expect(mock_metadata).to receive(:cc?).and_return(false)
+         expect{ db_manager.send(:check_age) }.to raise_error /be compliant/
+       end
+ 
+       it "should give warning after 25 days" do
+         expect(mock_metadata).to receive(:updated_at).and_return((Time.now - (60 * 60 * 24 * 26)).to_i)
++        expect(mock_metadata).to receive(:cc?).and_return(false)
+         expect(mock_geoip_plugin).to receive(:terminate_filter).never
+         expect(LogStash::Filters::Geoip::DatabaseManager).to receive(:logger).at_least(:once).and_return(logger)
+         expect(logger).to receive(:warn)
+@@ -95,6 +97,7 @@
+       it "should raise error when 30 days has passed" do
+         allow(mock_download_manager).to receive(:fetch_database).and_raise("boom")
+         expect(mock_metadata).to receive(:updated_at).and_return((Time.now - (60 * 60 * 24 * 33)).to_i)
++        expect(mock_metadata).to receive(:cc?).and_return(false)
+ 
+         expect{ db_manager.send(:execute_download_job) }.to raise_error /be compliant/
+       end
+@@ -104,16 +107,18 @@
+         allow(mock_download_manager).to receive(:fetch_database).and_raise("boom")
+ 
+         expect(mock_metadata).to receive(:updated_at).and_return((Time.now - (60 * 60 * 24 * 25)).to_i)
++        expect(mock_metadata).to receive(:cc?).and_return(false)
+ 
+         expect(db_manager.send(:execute_download_job)).to be_falsey
+       end
+     end
+ 
+     context "scheduler call" do
+-      it "should call plugin termination when raise error and last update > 30 days" do
++      it "should call plugin expiry action when raise error and last update > 30 days" do
+         allow(mock_download_manager).to receive(:fetch_database).and_raise("boom")
+         expect(mock_metadata).to receive(:updated_at).and_return((Time.now - (60 * 60 * 24 * 33)).to_i)
+-        expect(mock_geoip_plugin).to receive(:terminate_filter)
++        expect(mock_metadata).to receive(:cc?).and_return(false)
++        expect(mock_geoip_plugin).to receive(:expire_action)
+         db_manager.send(:call, nil, nil)
+       end
+ 
+diff --git a/x-pack/spec/filters/geoip/database_metadata_spec.rb b/x-pack/spec/filters/geoip/database_metadata_spec.rb
+index 41a28ae5e7a..85f093cd8c7 100644
+--- a/x-pack/spec/filters/geoip/database_metadata_spec.rb
++++ b/x-pack/spec/filters/geoip/database_metadata_spec.rb
+@@ -161,5 +161,16 @@
+       end
+     end
+ 
++    context "is cc" do
++      it "should return true if database is CC" do
++        write_temp_metadata(temp_metadata_path)
++        expect(dbm.cc?).to be_truthy
++      end
++
++      it "should return false if database is EULA" do
++        write_temp_metadata(temp_metadata_path, ["City","1611690807","SOME_GZ_MD5","SOME_MD5",second_city_db_name])
++        expect(dbm.cc?).to be_falsey
++      end
++    end
+   end
+ end
+\ No newline at end of file

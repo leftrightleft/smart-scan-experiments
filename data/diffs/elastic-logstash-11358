@@ -1,0 +1,120 @@
+diff --git a/docs/static/settings/configuration-management-settings.asciidoc b/docs/static/settings/configuration-management-settings.asciidoc
+index 14c1db3b009..7842be9d3c5 100644
+--- a/docs/static/settings/configuration-management-settings.asciidoc
++++ b/docs/static/settings/configuration-management-settings.asciidoc
+@@ -54,7 +54,12 @@ If your {es} cluster is protected with basic authentication, these settings
+ provide the username and password that the Logstash instance uses to
+ authenticate for accessing the configuration data. The username you specify here
+ should have the `logstash_admin` role, which provides access to `.logstash-*`
+-indices for managing configurations. 
++indices for managing configurations.
++
++`xpack.management.elasticsearch.proxy`::
++
++Optional setting that allows you to specify a proxy URL if Logstash needs to use a proxy
++to reach your Elasticsearch cluster.
+ 
+ `xpack.management.elasticsearch.ssl.certificate_authority`::
+ 
+diff --git a/docs/static/settings/monitoring-settings.asciidoc b/docs/static/settings/monitoring-settings.asciidoc
+index a7c8828322e..24b9d84cb68 100644
+--- a/docs/static/settings/monitoring-settings.asciidoc
++++ b/docs/static/settings/monitoring-settings.asciidoc
+@@ -40,6 +40,10 @@ If your {es} is protected with basic authentication, these settings provide the
+ username and password that the Logstash instance uses to authenticate for
+ shipping monitoring data.
+ 
++`xpack.monitoring.elasticsearch.proxy`::
++
++Optional setting that allows you to specify a proxy URL if Logstash needs to use a proxy
++to reach your Elasticsearch cluster.
+ 
+ [[monitoring-collection-settings]]
+ ===== Monitoring collection settings
+diff --git a/x-pack/lib/config_management/extension.rb b/x-pack/lib/config_management/extension.rb
+index 06e55feaa02..1d1a721d8a2 100644
+--- a/x-pack/lib/config_management/extension.rb
++++ b/x-pack/lib/config_management/extension.rb
+@@ -27,6 +27,7 @@ def additionals_settings(settings)
+         settings.register(LogStash::Setting::NullableString.new("xpack.management.elasticsearch.username", "logstash_system"))
+         settings.register(LogStash::Setting::NullableString.new("xpack.management.elasticsearch.password"))
+         settings.register(LogStash::Setting::ArrayCoercible.new("xpack.management.elasticsearch.hosts", String, [ "https://localhost:9200" ] ))
++        settings.register(LogStash::Setting::NullableString.new("xpack.management.elasticsearch.proxy"))
+         settings.register(LogStash::Setting::NullableString.new("xpack.management.elasticsearch.ssl.certificate_authority"))
+         settings.register(LogStash::Setting::NullableString.new("xpack.management.elasticsearch.ssl.truststore.path"))
+         settings.register(LogStash::Setting::NullableString.new("xpack.management.elasticsearch.ssl.truststore.password"))
+diff --git a/x-pack/lib/helpers/elasticsearch_options.rb b/x-pack/lib/helpers/elasticsearch_options.rb
+index 0d44678bdce..0f1e1889bc4 100644
+--- a/x-pack/lib/helpers/elasticsearch_options.rb
++++ b/x-pack/lib/helpers/elasticsearch_options.rb
+@@ -6,7 +6,7 @@ module LogStash module Helpers
+   module ElasticsearchOptions
+     extend self
+ 
+-    ES_SETTINGS =%w(ssl.certificate_authority ssl.truststore.path ssl.keystore.path hosts username password)
++    ES_SETTINGS =%w(ssl.certificate_authority ssl.truststore.path ssl.keystore.path hosts username password proxy)
+ 
+     # Retrieve elasticsearch options from either specific settings, or modules if the setting is not there and the
+     # feature supports falling back to modules if the feature is not specified in logstash.yml
+@@ -24,6 +24,7 @@ def es_options_from_settings(feature, settings)
+       opts['password'] = settings.get("xpack.#{feature}.elasticsearch.password")
+       opts['sniffing'] = settings.get("xpack.#{feature}.elasticsearch.sniffing")
+       opts['ssl_certificate_verification'] = settings.get("xpack.#{feature}.elasticsearch.ssl.verification_mode") == 'certificate'
++      opts['proxy'] = settings.get("xpack.#{feature}.elasticsearch.proxy")
+ 
+       if cacert = settings.get("xpack.#{feature}.elasticsearch.ssl.certificate_authority")
+         opts['cacert'] = cacert
+diff --git a/x-pack/lib/monitoring/monitoring.rb b/x-pack/lib/monitoring/monitoring.rb
+index 15e0cef7f54..3ca1e87ea2b 100644
+--- a/x-pack/lib/monitoring/monitoring.rb
++++ b/x-pack/lib/monitoring/monitoring.rb
+@@ -29,6 +29,7 @@ def initialize(node_uuid,
+         @es_hosts = es_settings['hosts']
+         @user = es_settings['user']
+         @password = es_settings['password']
++        @proxy = es_settings['proxy']
+         @ca_path = es_settings['cacert']
+         @truststore_path = es_settings['truststore']
+         @truststore_password = es_settings['truststore_password']
+@@ -38,7 +39,7 @@ def initialize(node_uuid,
+         @ssl_certificate_verification = (es_settings['verification_mode'] == 'certificate')
+       end
+ 
+-      attr_accessor :system_api_version, :es_hosts, :user, :password, :node_uuid
++      attr_accessor :system_api_version, :es_hosts, :user, :password, :node_uuid, :proxy
+       attr_accessor :ca_path, :truststore_path, :truststore_password
+       attr_accessor :keystore_path, :keystore_password, :sniffing, :ssl_certificate_verification
+ 
+@@ -50,6 +51,10 @@ def collection_timeout_interval
+         TimeUnit::SECONDS.convert(@collection_timeout_interval, TimeUnit::NANOSECONDS)
+       end
+ 
++      def proxy?
++        proxy
++      end
++
+       def auth?
+         user && password
+       end
+@@ -174,6 +179,7 @@ def additionals_settings(settings)
+       settings.register(LogStash::Setting::TimeValue.new("xpack.monitoring.collection.timeout_interval", "10m"))
+       settings.register(LogStash::Setting::NullableString.new("xpack.monitoring.elasticsearch.username", "logstash_system"))
+       settings.register(LogStash::Setting::NullableString.new("xpack.monitoring.elasticsearch.password"))
++      settings.register(LogStash::Setting::NullableString.new("xpack.monitoring.elasticsearch.proxy"))
+       settings.register(LogStash::Setting::NullableString.new("xpack.monitoring.elasticsearch.ssl.certificate_authority"))
+       settings.register(LogStash::Setting::NullableString.new("xpack.monitoring.elasticsearch.ssl.truststore.path"))
+       settings.register(LogStash::Setting::NullableString.new("xpack.monitoring.elasticsearch.ssl.truststore.password"))
+diff --git a/x-pack/lib/template.cfg.erb b/x-pack/lib/template.cfg.erb
+index 14761753d5d..08f5b655b03 100644
+--- a/x-pack/lib/template.cfg.erb
++++ b/x-pack/lib/template.cfg.erb
+@@ -18,6 +18,9 @@ output {
+     document_type => "%{[@metadata][document_type]}"
+     index => ""
+     sniffing => <%= sniffing %>
++  <% if proxy? %>
++    proxy => "<%= proxy %>"
++  <% end %>
+   <% if auth? %>
+     user => "<%= user %>"
+     password => "<%= password %>"

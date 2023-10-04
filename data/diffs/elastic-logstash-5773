@@ -1,0 +1,295 @@
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 6d143bb5539..f9b4f046f68 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -21,12 +21,12 @@ module Environment
+             Setting::String.new("config.string", nil, false),
+            Setting::Boolean.new("config.test_and_exit", false),
+            Setting::Boolean.new("config.reload.automatic", false),
+-           Setting::Numeric.new("config.reload.interval", 3),
++           Setting::Numeric.new("config.reload.interval", 3), # in seconds
+            Setting::Boolean.new("metric.collect", true) {|v| v == true }, # metric collection cannot be disabled
+             Setting::String.new("pipeline.id", "main"),
+-           Setting::Numeric.new("pipeline.workers", LogStash::Config::CpuCoreStrategy.maximum),
+-           Setting::Numeric.new("pipeline.output.workers", 1),
+-           Setting::Numeric.new("pipeline.batch.size", 125),
++   Setting::PositiveInteger.new("pipeline.workers", LogStash::Config::CpuCoreStrategy.maximum),
++   Setting::PositiveInteger.new("pipeline.output.workers", 1),
++   Setting::PositiveInteger.new("pipeline.batch.size", 125),
+            Setting::Numeric.new("pipeline.batch.delay", 5), # in milliseconds
+            Setting::Boolean.new("pipeline.unsafe_shutdown", false),
+                     Setting.new("path.plugins", Array, []),
+diff --git a/logstash-core/lib/logstash/runner.rb b/logstash-core/lib/logstash/runner.rb
+index bd85b77b752..fd935678a4e 100644
+--- a/logstash-core/lib/logstash/runner.rb
++++ b/logstash-core/lib/logstash/runner.rb
+@@ -47,17 +47,17 @@ class LogStash::Runner < Clamp::StrictCommand
+   option ["-w", "--pipeline.workers"], "COUNT",
+     I18n.t("logstash.runner.flag.pipeline-workers"),
+     :attribute_name => "pipeline.workers",
+-    :default => LogStash::SETTINGS.get_default("pipeline.workers"), &:to_i
++    :default => LogStash::SETTINGS.get_default("pipeline.workers")
+ 
+   option ["-b", "--pipeline.batch.size"], "SIZE",
+     I18n.t("logstash.runner.flag.pipeline-batch-size"),
+     :attribute_name => "pipeline.batch.size",
+-    :default => LogStash::SETTINGS.get_default("pipeline.batch.size"), &:to_i
++    :default => LogStash::SETTINGS.get_default("pipeline.batch.size")
+ 
+   option ["-u", "--pipeline.batch.delay"], "DELAY_IN_MS",
+     I18n.t("logstash.runner.flag.pipeline-batch-delay"),
+     :attribute_name => "pipeline.batch.delay",
+-    :default => LogStash::SETTINGS.get_default("pipeline.batch.delay"), &:to_i
++    :default => LogStash::SETTINGS.get_default("pipeline.batch.delay")
+ 
+   option ["--pipeline.unsafe_shutdown"], :flag,
+     I18n.t("logstash.runner.flag.unsafe_shutdown"),
+@@ -110,7 +110,7 @@ class LogStash::Runner < Clamp::StrictCommand
+   option ["--config.reload.interval"], "RELOAD_INTERVAL",
+     I18n.t("logstash.runner.flag.reload_interval"),
+     :attribute_name => "config.reload.interval",
+-    :default => LogStash::SETTINGS.get_default("config.reload.interval"), &:to_i
++    :default => LogStash::SETTINGS.get_default("config.reload.interval")
+ 
+   option ["--http.host"], "HTTP_HOST",
+     I18n.t("logstash.runner.flag.http_host"),
+@@ -120,7 +120,7 @@ class LogStash::Runner < Clamp::StrictCommand
+   option ["--http.port"], "HTTP_PORT",
+     I18n.t("logstash.runner.flag.http_port"),
+     :attribute_name => "http.port",
+-    :default => LogStash::SETTINGS.get_default("http.port"), &:to_i
++    :default => LogStash::SETTINGS.get_default("http.port")
+ 
+   option ["--log.format"], "FORMAT",
+     I18n.t("logstash.runner.flag.log_format"),
+diff --git a/logstash-core/lib/logstash/settings.rb b/logstash-core/lib/logstash/settings.rb
+index 1412cfa9ea7..7bd0a68126e 100644
+--- a/logstash-core/lib/logstash/settings.rb
++++ b/logstash-core/lib/logstash/settings.rb
+@@ -176,18 +176,43 @@ def validate(value)
+       end
+     end
+ 
+-    ### Specific settings #####
+-
+-    class Boolean < Setting
+-      def initialize(name, default, strict=true, &validator_proc)
++    class Coercible < Setting
++      def initialize(name, klass, default=nil, strict=true, &validator_proc)
+         @name = name
+-        @klass = Object
++        unless klass.is_a?(Class)
++          raise ArgumentError.new("Setting \"#{@name}\" must be initialized with a class (received #{klass})")
++        end
++        @klass = klass
++        @validator_proc = validator_proc
+         @value = nil
+         @value_is_set = false
+-        @validator_proc = validator_proc
+-        coerced_default = coerce(default)
+-        validate(coerced_default)
+-        @default = coerced_default
++
++        if strict
++          coerced_default = coerce(default)
++          validate(coerced_default)
++          @default = coerced_default
++        else
++          @default = default
++        end
++      end
++
++      def set(value)
++        coerced_value = coerce(value)
++        validate(coerced_value)
++        @value = coerce(coerced_value)
++        @value_is_set = true
++        @value
++      end
++
++      def coerce(value)
++        raise NotImplementedError.new("Please implement #coerce for #{self.class}")
++      end
++    end
++    ### Specific settings #####
++
++    class Boolean < Coercible
++      def initialize(name, default, strict=true, &validator_proc)
++        super(name, Object, default, strict, &validator_proc)
+       end
+ 
+       def coerce(value)
+@@ -200,25 +225,61 @@ def coerce(value)
+           raise ArgumentError.new("could not coerce #{value} into a boolean")
+         end
+       end
++    end
+ 
+-      def set(value)
+-        coerced_value = coerce(value)
+-        validate(coerced_value)
+-        @value = coerce(coerced_value)
+-        @value_is_set = true
+-        @value
++    class Numeric < Coercible
++      def initialize(name, default=nil, strict=true)
++        super(name, ::Numeric, default, strict)
++      end
++
++      def coerce(v)
++        return v if v.is_a?(::Numeric)
++
++        # I hate these "exceptions as control flow" idioms
++        # but Ruby's `"a".to_i => 0` makes it hard to do anything else.
++        coerced_value = (Integer(v) rescue nil) || (Float(v) rescue nil)
++
++        if coerced_value.nil?
++          raise ArgumentError.new("Failed to coerce value to Numeric. Received #{v} (#{v.class})")
++        else
++          coerced_value
++        end
+       end
+     end
+ 
+-    class Numeric < Setting
++    class Integer < Coercible
+       def initialize(name, default=nil, strict=true)
+-        super(name, ::Numeric, default, strict)
++        super(name, ::Integer, default, strict)
++      end
++
++      def coerce(value)
++        return value unless value.is_a?(::String)
++
++        coerced_value = Integer(value) rescue nil
++
++        if coerced_value.nil?
++          raise ArgumentError.new("Failed to coerce value to Integer. Received #{value} (#{value.class})")
++        else
++          coerced_value
++        end
++      end
++    end
++
++    class PositiveInteger < Integer
++      def initialize(name, default=nil, strict=true)
++        super(name, default, strict) do |v|
++          if v > 0
++            true
++          else
++            raise ArgumentError.new("Number must be bigger than 0. Received: #{v}")
++          end
++        end
+       end
+     end
+ 
+-    class Port < Setting
++    class Port < Integer
+       def initialize(name, default=nil, strict=true)
+-        super(name, ::Numeric, default, strict) {|value| value >= 1 && value <= 65535 }
++        super(name, default, strict) {|value| value >= 1 && value <= 65535 }
+       end
+     end
+ 
+@@ -242,7 +303,7 @@ def initialize(name, default=nil, strict=true, possible_strings=[])
+       def validate(value)
+         super(value)
+         unless @possible_strings.empty? || @possible_strings.include?(value)
+-          raise ArgumentError.new("invalid value \"#{value}\". Options are: #{@possible_strings.inspect}")
++          raise ArgumentError.new("Invalid value \"#{value}\". Options are: #{@possible_strings.inspect}")
+         end
+       end
+     end
+diff --git a/logstash-core/spec/logstash/runner_spec.rb b/logstash-core/spec/logstash/runner_spec.rb
+index 7283bf3aa86..ec1d4df755d 100644
+--- a/logstash-core/spec/logstash/runner_spec.rb
++++ b/logstash-core/spec/logstash/runner_spec.rb
+@@ -192,18 +192,25 @@ def run(args); end
+     context "when :pipeline_workers is not defined by the user" do
+       it "should not pass the value to the pipeline" do
+         expect(LogStash::Agent).to receive(:new) do |settings|
+-	  expect(settings.set?("pipeline.workers")).to be(false)
++          expect(settings.set?("pipeline.workers")).to be(false)
+         end
+         args = ["-e", pipeline_string]
+         subject.run("bin/logstash", args)
+       end
+     end
+ 
++    context "when :pipeline_workers flag is passed without a value" do
++      it "should raise an error" do
++        args = ["-e", pipeline_string, "-w"]
++        expect { subject.run("bin/logstash", args) }.to raise_error
++      end
++    end
++
+     context "when :pipeline_workers is defined by the user" do
+       it "should pass the value to the pipeline" do
+         expect(LogStash::Agent).to receive(:new) do |settings|
+-	  expect(settings.set?("pipeline.workers")).to be(true)
+-	  expect(settings.get("pipeline.workers")).to be(2)
++          expect(settings.set?("pipeline.workers")).to be(true)
++          expect(settings.get("pipeline.workers")).to be(2)
+         end
+ 
+         args = ["-w", "2", "-e", pipeline_string]
+diff --git a/logstash-core/spec/logstash/settings/integer_spec.rb b/logstash-core/spec/logstash/settings/integer_spec.rb
+new file mode 100644
+index 00000000000..f7097d96153
+--- /dev/null
++++ b/logstash-core/spec/logstash/settings/integer_spec.rb
+@@ -0,0 +1,20 @@
++# encoding: utf-8
++require "spec_helper"
++require "logstash/settings"
++
++describe LogStash::Setting::Integer do
++  subject { described_class.new("a number", nil, false) }
++  describe "#set" do
++    context "when giving a number which is not an integer" do
++      it "should raise an exception" do
++        expect { subject.set(1.1) }.to raise_error(ArgumentError)
++      end
++    end
++    context "when giving a number which is an integer" do
++      it "should set the number" do
++        expect { subject.set(100) }.to_not raise_error
++        expect(subject.value).to eq(100)
++      end
++    end
++  end
++end
+diff --git a/logstash-core/spec/logstash/settings/numeric_spec.rb b/logstash-core/spec/logstash/settings/numeric_spec.rb
+new file mode 100644
+index 00000000000..cab162fce33
+--- /dev/null
++++ b/logstash-core/spec/logstash/settings/numeric_spec.rb
+@@ -0,0 +1,28 @@
++# encoding: utf-8
++require "spec_helper"
++require "logstash/settings"
++
++describe LogStash::Setting::Numeric do
++  subject { described_class.new("a number", nil, false) }
++  describe "#set" do
++    context "when giving a string which doesn't represent a string" do
++      it "should raise an exception" do
++        expect { subject.set("not-a-number") }.to raise_error(ArgumentError)
++      end
++    end
++    context "when giving a string which represents a " do
++      context "float" do
++        it "should coerce that string to the number" do
++          subject.set("1.1")
++          expect(subject.value).to eq(1.1)
++        end
++      end
++      context "int" do
++        it "should coerce that string to the number" do
++          subject.set("1")
++          expect(subject.value).to eq(1)
++        end
++      end
++    end
++  end
++end

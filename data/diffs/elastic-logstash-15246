@@ -1,0 +1,130 @@
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueUtils.java b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueUtils.java
+index b4ad7087ab0..31e9d564426 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueUtils.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueUtils.java
+@@ -27,6 +27,7 @@
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.StandardOpenOption;
++import java.util.Comparator;
+ import java.util.stream.Collectors;
+ import java.util.stream.Stream;
+ 
+@@ -51,6 +52,11 @@ static Stream<Path> listSegmentPaths(Path path) throws IOException {
+         return listFiles(path, ".log");
+     }
+ 
++    static Stream<Path> listSegmentPathsSortedBySegmentId(Path path) throws IOException {
++        return listSegmentPaths(path)
++                .sorted(Comparator.comparingInt(DeadLetterQueueUtils::extractSegmentId));
++    }
++
+     /**
+      * Count the number of 'c' and 's' records in segment.
+      * An event can't be bigger than the segments so in case of records split across multiple event blocks,
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
+index 40a9ac91753..342c3ce751e 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
+@@ -49,7 +49,6 @@
+ import java.time.Duration;
+ import java.time.Instant;
+ import java.time.temporal.TemporalAmount;
+-import java.util.Comparator;
+ import java.util.Locale;
+ import java.util.Optional;
+ import java.util.concurrent.Executors;
+@@ -71,6 +70,7 @@
+ 
+ import static org.logstash.common.io.DeadLetterQueueUtils.listFiles;
+ import static org.logstash.common.io.DeadLetterQueueUtils.listSegmentPaths;
++import static org.logstash.common.io.DeadLetterQueueUtils.listSegmentPathsSortedBySegmentId;
+ import static org.logstash.common.io.RecordIOReader.SegmentStatus;
+ import static org.logstash.common.io.RecordIOWriter.BLOCK_SIZE;
+ import static org.logstash.common.io.RecordIOWriter.RECORD_HEADER_SIZE;
+@@ -408,9 +408,8 @@ private long deleteTailSegment(Path segment, String motivation) throws IOExcepti
+     // package-private for testing
+     void updateOldestSegmentReference() throws IOException {
+         final Optional<Path> previousOldestSegmentPath = oldestSegmentPath;
+-        oldestSegmentPath = listSegmentPaths(this.queuePath)
++        oldestSegmentPath = listSegmentPathsSortedBySegmentId(this.queuePath)
+                 .filter(p -> p.toFile().length() > 1) // take the files that have content to process
+-                .sorted()
+                 .findFirst();
+         if (!oldestSegmentPath.isPresent()) {
+             oldestSegmentTimestamp = Optional.empty();
+@@ -466,8 +465,7 @@ static Optional<Timestamp> readTimestampOfLastEventInSegment(Path segmentPath) t
+     // package-private for testing
+     void dropTailSegment() throws IOException {
+         // remove oldest segment
+-        final Optional<Path> oldestSegment = listSegmentPaths(queuePath)
+-                .min(Comparator.comparingInt(DeadLetterQueueUtils::extractSegmentId));
++        final Optional<Path> oldestSegment = listSegmentPathsSortedBySegmentId(queuePath).findFirst();
+         if (oldestSegment.isPresent()) {
+             final Path beheadedSegment = oldestSegment.get();
+             deleteTailSegment(beheadedSegment, "dead letter queue size exceeded dead_letter_queue.max_bytes size(" + maxQueueSize + ")");
+diff --git a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueWriterTest.java b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueWriterTest.java
+index 5fc1437fcbe..754c463c3a2 100644
+--- a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueWriterTest.java
++++ b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueWriterTest.java
+@@ -405,6 +405,60 @@ public void testUpdateOldestSegmentReferenceWithDeletedSegment() throws IOExcept
+         }
+     }
+ 
++    @Test
++    public void testUpdateOldestSegmentReferenceWithAllDeletedSegments() throws IOException {
++        try (DeadLetterQueueWriter sut = DeadLetterQueueWriter
++                .newBuilderWithoutFlusher(dir, 10 * MB, 20 * MB)
++                .build()) {
++
++            final byte[] eventBytes = new DLQEntry(new Event(), "", "", "").serialize();
++            final String[] allSegments = {"1.log", "2.log"};
++            for (String segment : allSegments) {
++                try(RecordIOWriter writer = new RecordIOWriter(dir.resolve(segment))){
++                    writer.writeEvent(eventBytes);
++                }
++            }
++
++            // Update with segment files
++            sut.updateOldestSegmentReference();
++            assertEquals("1.log",sut.getOldestSegmentPath().get().getFileName().toString());
++
++            // Delete all segments
++            for (String segment : allSegments) {
++                Files.delete(dir.resolve(segment));
++            }
++
++            // Update with no segment files
++            sut.updateOldestSegmentReference();
++
++            // Verify
++            assertTrue(sut.getOldestSegmentPath().isEmpty());
++        }
++    }
++
++    @Test
++    public void testUpdateOldestSegmentReferenceWithNonLexicographicallySortableFileNames() throws IOException {
++        try (DeadLetterQueueWriter sut = DeadLetterQueueWriter
++                .newBuilderWithoutFlusher(dir, 10 * MB, 20 * MB)
++                .build()) {
++
++            final byte[] eventBytes = new DLQEntry(new Event(), "", "", "").serialize();
++            try(RecordIOWriter writer = new RecordIOWriter(dir.resolve("2.log"))){
++                writer.writeEvent(eventBytes);
++            }
++
++            try(RecordIOWriter writer = new RecordIOWriter(dir.resolve("10.log"))){
++                writer.writeEvent(eventBytes);
++            }
++
++            // Exercise
++            sut.updateOldestSegmentReference();
++
++            // Verify
++            assertEquals("2.log",sut.getOldestSegmentPath().get().getFileName().toString());
++        }
++    }
++
+     @Test
+     public void testReadTimestampOfLastEventInSegment() throws IOException {
+         final Timestamp expectedTimestamp = Timestamp.now();

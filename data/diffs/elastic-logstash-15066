@@ -1,0 +1,182 @@
+diff --git a/build.gradle b/build.gradle
+index 581ef94db8e..eeb69a6ba32 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -290,18 +290,8 @@ def assemblyDeps = [downloadAndInstallJRuby, assemble] + subprojects.collect {
+   it.tasks.findByName("assemble")
+ }
+ 
+-def bundlerVersion = "~> 2"
+-
+-tasks.register("installBundler") {
+-    dependsOn assemblyDeps
+-    outputs.files file("${projectDir}/vendor/bundle/jruby/3.1.0/bin/bundle")
+-    doLast {
+-      gem(projectDir, buildDir, "bundler", bundlerVersion, "${projectDir}/vendor/bundle/jruby/3.1.0")
+-  }
+-}
+-
+ tasks.register("bootstrap") {
+-    dependsOn installBundler
++    dependsOn assemblyDeps
+     doLast {
+       setupJruby(projectDir, buildDir)
+   }
+@@ -417,19 +407,9 @@ tasks.register("unpackTarDistribution", Copy) {
+ 
+ def qaBuildPath = "${buildDir}/qa/integration"
+ def qaVendorPath = "${qaBuildPath}/vendor"
+-def qaBundledGemPath = "${qaVendorPath}/jruby/3.1.0".toString()
+-def qaBundleBin = "${qaBundledGemPath}/bin/bundle"
+-
+-tasks.register("installIntegrationTestBundler"){
+-    dependsOn unpackTarDistribution
+-    outputs.files file("${qaBundleBin}")
+-  doLast {
+-      gem(projectDir, buildDir, "bundler", bundlerVersion, qaBundledGemPath)
+-  }
+-}
+ 
+ tasks.register("installIntegrationTestGems") {
+-  dependsOn installIntegrationTestBundler
++  dependsOn unpackTarDistribution
+   def gemfilePath = file("${projectDir}/qa/integration/Gemfile")
+   inputs.files gemfilePath
+   inputs.files file("${projectDir}/qa/integration/integration_tests.gemspec")
+@@ -439,11 +419,7 @@ tasks.register("installIntegrationTestGems") {
+   outputs.files fileTree("${qaVendorPath}")
+   outputs.files file("${projectDir}/qa/integration/Gemfile.lock")
+   doLast {
+-      bundleWithEnv(
+-        projectDir, buildDir,
+-        qaBuildPath, qaBundleBin, ['install', '--path', qaVendorPath, '--gemfile', gemfilePath],
+-        [ GEM_PATH: qaBundledGemPath, GEM_HOME: qaBundledGemPath ]
+-      )
++      bundleQAGems(projectDir, qaBuildPath)
+   }
+ }
+ 
+diff --git a/lib/bootstrap/bundler.rb b/lib/bootstrap/bundler.rb
+index 0acaa57afa6..60e1d68608e 100644
+--- a/lib/bootstrap/bundler.rb
++++ b/lib/bootstrap/bundler.rb
+@@ -163,7 +163,7 @@ def execute_bundler_with_retry(options)
+           begin
+             execute_bundler(options)
+             break
+-          rescue ::Bundler::SolveFailure => e
++          rescue ::Bundler::VersionConflict => e
+             $stderr.puts("Plugin version conflict, aborting")
+             raise(e)
+           rescue ::Bundler::GemNotFound => e
+diff --git a/rakelib/artifacts.rake b/rakelib/artifacts.rake
+index b8d0e65c947..7a6c54611ab 100644
+--- a/rakelib/artifacts.rake
++++ b/rakelib/artifacts.rake
+@@ -99,11 +99,6 @@ namespace "artifact" do
+     @exclude_paths << 'vendor/**/gems/**/Gemfile.lock'
+     @exclude_paths << 'vendor/**/gems/**/Gemfile'
+ 
+-    # jruby's bundler artifacts
+-    @exclude_paths << 'vendor/jruby/bin/bundle*'
+-    @exclude_paths << 'vendor/jruby/lib/ruby/stdlib/bundler*'
+-    @exclude_paths << 'vendor/jruby/lib/ruby/gems/shared/specifications/default/bundler-*.gemspec'
+-    @exclude_paths << 'vendor/jruby/lib/ruby/gems/shared/gems/bundler-*'
+     @exclude_paths << 'vendor/jruby/lib/ruby/gems/shared/gems/rake-*'
+ 
+     @exclude_paths
+diff --git a/rakelib/plugins_docs_dependencies.rake b/rakelib/plugins_docs_dependencies.rake
+index 4513b757a70..b9ef6224141 100644
+--- a/rakelib/plugins_docs_dependencies.rake
++++ b/rakelib/plugins_docs_dependencies.rake
+@@ -126,6 +126,7 @@ class PluginVersionWorking
+   end
+ 
+   def try_plugin(plugin, successful_dependencies)
++    Bundler::DepProxy.__clear!
+     builder = Bundler::Dsl.new
+     gemfile = LogStash::Gemfile.new(File.new(LogStash::Environment::GEMFILE_PATH, "r+")).load
+     gemfile.update(plugin)
+@@ -135,8 +136,6 @@ class PluginVersionWorking
+     definition.resolve_remotely!
+     from = PLUGIN_METADATA.fetch(plugin, {}).fetch("default-plugins", false) ? :default : :missing
+     extract_versions(definition, successful_dependencies, from)
+-    builder.instance_eval { @sources = [] }
+-    builder.instance_eval { @dependencies = [] }
+   end
+ 
+   def extract_versions(definition, dependencies, from)
+@@ -205,6 +204,14 @@ task :generate_plugins_version do
+         end
+       end
+     end
++    DepProxy.class_eval do
++      # Bundler caches it's dep-proxy objects (which contain Gem::Dependency objects) from all resolutions.
++      # The Hash itself continues to grow between dependency resolutions and hold up a lot of memory, to avoid
++      # the issue we expose a way of clear-ing the cached objects before each plugin resolution.
++      def self.__clear!
++        @proxies.clear
++      end
++    end
+ 
+     Fetcher::CompactIndex.class_eval do
+       alias_method :__bundle_worker, :bundle_worker
+diff --git a/rubyUtils.gradle b/rubyUtils.gradle
+index 09d47398d23..85cc8de6ab8 100644
+--- a/rubyUtils.gradle
++++ b/rubyUtils.gradle
+@@ -46,6 +46,7 @@ import java.nio.file.Paths
+ ext {
+     bundle = this.&bundle
+     bundleWithEnv = this.&bundleWithEnv
++    bundleQAGems = this.&bundleQAGems
+     gem = this.&gem
+     buildGem = this.&buildGem
+     rake = this.&rake
+@@ -87,6 +88,22 @@ void bundleWithEnv(File projectDir, File buildDir, String pwd, String bundleBin,
+     }
+ }
+ 
++void bundleQAGems(File projectDir, String qaBuildPath) {
++    def jruby = new ScriptingContainer()
++    jruby.setLoadPaths(["${projectDir}/vendor/jruby/lib/ruby/stdlib".toString()])
++    try {
++        jruby.currentDirectory = qaBuildPath
++        jruby.runScriptlet("""
++                require "bundler"
++                require "bundler/cli"
++                Bundler::CLI.start(['install', '--path', "${qaBuildPath}/vendor", '--gemfile', "${projectDir}/qa/integration/Gemfile"])
++                """)
++    } finally {
++        jruby.terminate()
++        Ruby.clearGlobalRuntime()
++    }
++}
++
+ /**
+  * Installs a Gem with the given version to the given path.
+  * @param projectDir Gradle projectDir
+@@ -169,7 +186,7 @@ Object executeJruby(File projectDir, File buildDir, Closure<?> /* Object*/ block
+     def jruby = new ScriptingContainer()
+     def env = jruby.environment
+     def gemDir = "${projectDir}/vendor/bundle/jruby/3.1.0".toString()
+-    jruby.setLoadPaths(["${projectDir}/vendor/bundle/jruby/3.1.0/gems/bundler-2.4.14/lib".toString(), "${projectDir}/vendor/jruby/lib/ruby/stdlib".toString()])
++    jruby.setLoadPaths(["${projectDir}/vendor/jruby/lib/ruby/stdlib".toString()])
+     env.put "USE_RUBY", "1"
+     env.put "GEM_HOME", gemDir
+     env.put "GEM_SPEC_CACHE", "${buildDir}/cache".toString()
+diff --git a/spec/unit/bootstrap/bundler_spec.rb b/spec/unit/bootstrap/bundler_spec.rb
+index 2d76ee78c0e..5e6fee05274 100644
+--- a/spec/unit/bootstrap/bundler_spec.rb
++++ b/spec/unit/bootstrap/bundler_spec.rb
+@@ -88,8 +88,8 @@
+ 
+     context 'abort with an exception' do
+       it 'gem conflict' do
+-        allow(::Bundler::CLI).to receive(:start).with(bundler_args) { raise ::Bundler::SolveFailure.new('conflict') }
+-        expect { subject }.to raise_error(::Bundler::SolveFailure)
++        allow(::Bundler::CLI).to receive(:start).with(bundler_args) { raise ::Bundler::VersionConflict.new('conflict') }
++        expect { subject }.to raise_error(::Bundler::VersionConflict)
+       end
+ 
+       it 'gem is not found' do

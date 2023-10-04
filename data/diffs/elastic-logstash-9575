@@ -1,0 +1,405 @@
+diff --git a/build.gradle b/build.gradle
+index 269e759ed6a..7f6c9e3e092 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -385,10 +385,14 @@ if (!oss) {
+       commandLine(['../bin/rspec', '-fd', 'qa/integration'])
+   }
+ 
+-  task runXPackUnitTests(type: Exec, dependsOn: installTestGems) {
+-      workingDir "${projectDir}/x-pack"
+-      standardOutput = new ExecLogOutputStream(System.out)
+-      errorOutput = new ExecLogOutputStream(System.err)
+-      commandLine(['../bin/rspec', 'spec', '-fd'])
++  task runXPackUnitTests(dependsOn: [tasks.getByPath(":logstash-xpack:rubyTests")]) {}
++
++  project(":logstash-xpack") {
++    ["rubyTests", "test"].each { tsk ->
++      tasks.getByPath(":logstash-xpack:" + tsk).configure {
++        dependsOn bootstrap
++      }
++    }
+   }
++
+ }
+diff --git a/logstash-core/lib/logstash/plugins/registry.rb b/logstash-core/lib/logstash/plugins/registry.rb
+index 6840b4a0e25..394d363c442 100644
+--- a/logstash-core/lib/logstash/plugins/registry.rb
++++ b/logstash-core/lib/logstash/plugins/registry.rb
+@@ -101,7 +101,7 @@ def initialize
+       # We need a threadsafe class here because we may perform
+       # get/set operations concurrently despite the fact we don't use
+       # the special atomic methods. That may not be apparent from this file,
+-      # but it is the case that we can call lookups from multiple threads, 
++      # but it is the case that we can call lookups from multiple threads,
+       # when multiple pipelines are in play, and that a lookup may modify the registry.
+       @registry = java.util.concurrent.ConcurrentHashMap.new
+       @hooks = HooksRegistry.new
+@@ -125,7 +125,7 @@ def plugins_with_type(type)
+ 
+     def load_xpack
+       logger.info("Loading x-pack")
+-      require_relative(::File.join(LogStash::ROOT, "x-pack/lib/logstash_registry"))
++      require("x-pack/logstash_registry")
+     end
+ 
+     def load_available_plugins
+diff --git a/logstash-core/lib/logstash/runner.rb b/logstash-core/lib/logstash/runner.rb
+index 54b6cbe29f9..8ab52bcb141 100644
+--- a/logstash-core/lib/logstash/runner.rb
++++ b/logstash-core/lib/logstash/runner.rb
+@@ -9,7 +9,10 @@
+ LogStash::OSS = ENV["OSS"] == "true" || !File.exists?(LogStash::XPACK_PATH)
+ 
+ if !LogStash::OSS
+-  $LOAD_PATH << File.join(LogStash::XPACK_PATH, "lib")
++  xpack_dir = File.join(LogStash::XPACK_PATH, "lib")
++  unless $LOAD_PATH.include?(xpack_dir)
++    $LOAD_PATH.unshift(xpack_dir)
++  end
+ end
+ 
+ require "clamp"
+@@ -210,6 +213,7 @@ class LogStash::Runner < Clamp::StrictCommand
+ 
+   # We configure the registry and load any plugin that can register hooks
+   # with logstash, this needs to be done before any operation.
++  SYSTEM_SETTINGS = LogStash::SETTINGS.clone
+   LogStash::PLUGIN_REGISTRY.setup!
+ 
+   attr_reader :agent, :settings, :source_loader
+diff --git a/settings.gradle b/settings.gradle
+index 256c87a70b1..e01a199ed18 100644
+--- a/settings.gradle
++++ b/settings.gradle
+@@ -5,3 +5,10 @@ project(':logstash-integration-tests').projectDir = new File('./qa/integration')
+ project(':ingest-converter').projectDir = new File('./tools/ingest-converter')
+ project(':benchmark-cli').projectDir = new File('./tools/benchmark-cli')
+ project(':dependencies-report').projectDir = new File('./tools/dependencies-report')
++
++Boolean oss = System.getenv('OSS').equals('true')
++
++if (!oss) {
++  include ':logstash-xpack'
++  project(':logstash-xpack').projectDir = new File('./x-pack')
++}
+diff --git a/x-pack/build.gradle b/x-pack/build.gradle
+new file mode 100644
+index 00000000000..80fbb2e779d
+--- /dev/null
++++ b/x-pack/build.gradle
+@@ -0,0 +1,29 @@
++description = """Logstash X-Pack"""
++
++repositories {
++  mavenCentral()
++}
++
++buildscript {
++  repositories {
++    mavenCentral()
++  }
++}
++
++dependencies {
++  testCompile project(':logstash-core')
++  testCompile 'org.assertj:assertj-core:3.8.0'
++  testCompile 'junit:junit:4.12'
++}
++
++test {
++  exclude '/**'
++}
++
++task rubyTests(type: Test) {
++  inputs.files fileTree("${projectDir}/spec")
++  inputs.files fileTree("${projectDir}/lib")
++  inputs.files fileTree("${projectDir}/modules")
++  systemProperty 'logstash.core.root.dir', projectDir.absolutePath
++  include '/org/logstash/xpack/test/RSpecTests.class'
++}
+diff --git a/x-pack/lib/config_management/bootstrap_check.rb b/x-pack/lib/config_management/bootstrap_check.rb
+index f1f322d4456..432dd910db0 100644
+--- a/x-pack/lib/config_management/bootstrap_check.rb
++++ b/x-pack/lib/config_management/bootstrap_check.rb
+@@ -4,8 +4,6 @@
+ 
+ require "logstash/bootstrap_check/default_config"
+ 
+-java_import java.util.concurrent.TimeUnit
+-
+ module LogStash
+   module ConfigManagement
+     # Override the default Logstash's bootstrap check
+diff --git a/x-pack/lib/config_management/extension.rb b/x-pack/lib/config_management/extension.rb
+index 9d6a3c11c4d..7559f5d9517 100644
+--- a/x-pack/lib/config_management/extension.rb
++++ b/x-pack/lib/config_management/extension.rb
+@@ -4,7 +4,6 @@
+ 
+ require "logstash/environment"
+ require "logstash/universal_plugin"
+-require "logstash/runner"
+ require "config_management/hooks"
+ require "config_management/elasticsearch_source"
+ require "config_management/bootstrap_check"
+@@ -15,10 +14,12 @@ class Extension < LogStash::UniversalPlugin
+       include LogStash::Util::Loggable
+ 
+       def register_hooks(hooks)
++        require "logstash/runner"
+         hooks.register_hooks(LogStash::Runner, Hooks.new)
+       end
+ 
+       def additionals_settings(settings)
++        require "logstash/runner"
+         logger.trace("Registering additionals settings")
+ 
+         settings.register(LogStash::Setting::Boolean.new("xpack.management.enabled", false))
+diff --git a/x-pack/lib/config_management/hooks.rb b/x-pack/lib/config_management/hooks.rb
+index 1f28cfb3bf1..17de6bab5b7 100644
+--- a/x-pack/lib/config_management/hooks.rb
++++ b/x-pack/lib/config_management/hooks.rb
+@@ -2,7 +2,6 @@
+ # or more contributor license agreements. Licensed under the Elastic License;
+ # you may not use this file except in compliance with the Elastic License.
+ 
+-require "logstash/runner"
+ require "config_management/bootstrap_check"
+ require "config_management/elasticsearch_source"
+ require "logstash/config/source_loader"
+@@ -18,6 +17,7 @@ class Hooks
+ 
+       def before_bootstrap_checks(runner)
+         if management?(runner)
++          require "logstash/runner"
+           bootstrap_checks = LogStash::Runner::DEFAULT_BOOTSTRAP_CHECKS.dup
+ 
+           # We only need to allow logstash to start without any parameters
+diff --git a/x-pack/lib/monitoring/monitoring.rb b/x-pack/lib/monitoring/monitoring.rb
+index ec890f54b9a..a5cab7272d6 100644
+--- a/x-pack/lib/monitoring/monitoring.rb
++++ b/x-pack/lib/monitoring/monitoring.rb
+@@ -187,7 +187,7 @@ def additionals_settings(settings)
+       settings.register(LogStash::Setting::String.new("node.uuid", ""))
+     rescue => e
+       logger.error e.message
+-      logger.error e.backtrace
++      logger.error e.backtrace.to_s
+       raise e
+     end
+   end
+diff --git a/x-pack/lib/logstash_registry.rb b/x-pack/lib/x-pack/logstash_registry.rb
+similarity index 97%
+rename from x-pack/lib/logstash_registry.rb
+rename to x-pack/lib/x-pack/logstash_registry.rb
+index d30684a639b..3e57e03a4d6 100644
+--- a/x-pack/lib/logstash_registry.rb
++++ b/x-pack/lib/x-pack/logstash_registry.rb
+@@ -16,4 +16,4 @@
+                               LogStash::Modules::XpackScaffold.new("arcsight",
+                                                                    File.join(File.dirname(__FILE__), "..", "modules", "arcsight", "configuration"),
+                                                                    ["basic", "trial", "standard", "gold", "platinum"]
+-                              ))
+\ No newline at end of file
++                              ))
+diff --git a/x-pack/settings.gradle b/x-pack/settings.gradle
+new file mode 100644
+index 00000000000..c026507570c
+--- /dev/null
++++ b/x-pack/settings.gradle
+@@ -0,0 +1 @@
++rootProject.name = 'x-pack'
+diff --git a/x-pack/spec/config_management/bootstrap_check_spec.rb b/x-pack/spec/config_management/bootstrap_check_spec.rb
+index 2649a55dbe1..77d4f758671 100644
+--- a/x-pack/spec/config_management/bootstrap_check_spec.rb
++++ b/x-pack/spec/config_management/bootstrap_check_spec.rb
+@@ -11,7 +11,7 @@
+ describe LogStash::ConfigManagement::BootstrapCheck do
+   let(:extension) { LogStash::ConfigManagement::Extension.new }
+ 
+-  let(:system_settings) { LogStash::SETTINGS.clone }
++  let(:system_settings) { LogStash::Runner::SYSTEM_SETTINGS.clone }
+ 
+   subject { described_class }
+ 
+diff --git a/x-pack/spec/config_management/elasticsearch_source_spec.rb b/x-pack/spec/config_management/elasticsearch_source_spec.rb
+index 1361b99465f..8b1b2a5ee9a 100644
+--- a/x-pack/spec/config_management/elasticsearch_source_spec.rb
++++ b/x-pack/spec/config_management/elasticsearch_source_spec.rb
+@@ -15,7 +15,7 @@
+   let(:elasticsearch_username) { "elastictest" }
+   let(:elasticsearch_password) { "testchangeme" }
+   let(:extension) { LogStash::ConfigManagement::Extension.new }
+-  let(:system_settings) { LogStash::SETTINGS.clone }
++  let(:system_settings) { LogStash::Runner::SYSTEM_SETTINGS.clone }
+   let(:mock_license_client)  { double("http_client") }
+   let(:license_status) { 'active'}
+   let(:license_type) { 'trial' }
+diff --git a/x-pack/spec/config_management/extension_spec.rb b/x-pack/spec/config_management/extension_spec.rb
+index c399fe675f8..d3ce558560e 100644
+--- a/x-pack/spec/config_management/extension_spec.rb
++++ b/x-pack/spec/config_management/extension_spec.rb
+@@ -23,7 +23,7 @@
+   end
+ 
+   describe "#additionals_settings" do
+-    subject(:settings) { LogStash::SETTINGS.clone }
++    subject(:settings) { LogStash::Runner::SYSTEM_SETTINGS.clone }
+ 
+     before { extension.additionals_settings(settings) }
+ 
+diff --git a/x-pack/spec/config_management/hooks_spec.rb b/x-pack/spec/config_management/hooks_spec.rb
+index 038d41745a6..7fe9ebb88e3 100644
+--- a/x-pack/spec/config_management/hooks_spec.rb
++++ b/x-pack/spec/config_management/hooks_spec.rb
+@@ -21,7 +21,7 @@
+   end
+ 
+   before do
+-    system_settings = LogStash::SETTINGS.clone
++    system_settings = LogStash::Runner::SYSTEM_SETTINGS.clone
+     stub_const("LogStash::SETTINGS", system_settings)
+     extension = LogStash::ConfigManagement::Extension.new
+     extension.additionals_settings(system_settings)
+diff --git a/x-pack/spec/helpers/elasticsearch_options_spec.rb b/x-pack/spec/helpers/elasticsearch_options_spec.rb
+index 57ec0e96a39..f3eaf1cc99c 100644
+--- a/x-pack/spec/helpers/elasticsearch_options_spec.rb
++++ b/x-pack/spec/helpers/elasticsearch_options_spec.rb
+@@ -90,7 +90,7 @@
+   let(:expected_username) { elasticsearch_username }
+   let(:expected_password) { elasticsearch_password }
+   let(:extension) {  LogStash::MonitoringExtension.new }
+-  let(:system_settings) { LogStash::SETTINGS.clone }
++  let(:system_settings) { LogStash::Runner::SYSTEM_SETTINGS.clone }
+ 
+   before :each do
+     extension.additionals_settings(system_settings)
+@@ -234,4 +234,4 @@
+       end
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/x-pack/spec/license_checker/license_info_spec.rb b/x-pack/spec/license_checker/license_info_spec.rb
+index ff4a894e5a8..a6d99597583 100644
+--- a/x-pack/spec/license_checker/license_info_spec.rb
++++ b/x-pack/spec/license_checker/license_info_spec.rb
+@@ -33,7 +33,7 @@ def update(license)
+   let(:issuer) { "elasticsearch"}
+   let(:start_date_in_millis) { -1 }
+   let(:extension) { LogStash::MonitoringExtension.new }
+-  let(:system_settings) { LogStash::SETTINGS.clone }
++  let(:system_settings) { LogStash::Runner::SYSTEM_SETTINGS.clone }
+   let(:elasticsearch_url) { ["https://localhost:9898"] }
+   let(:elasticsearch_username) { "elastictest" }
+   let(:elasticsearch_password) { "testchangeme" }
+diff --git a/x-pack/spec/license_checker/license_manager_spec.rb b/x-pack/spec/license_checker/license_manager_spec.rb
+index 8c4c16df8c7..96b21b056a8 100644
+--- a/x-pack/spec/license_checker/license_manager_spec.rb
++++ b/x-pack/spec/license_checker/license_manager_spec.rb
+@@ -31,7 +31,7 @@ def update(xpack_info)
+   let(:issuer) { "elasticsearch"}
+   let(:start_date_in_millis) { -1 }
+   let(:extension) { LogStash::MonitoringExtension.new }
+-  let(:system_settings) { LogStash::SETTINGS.clone }
++  let(:system_settings) { LogStash::Runner::SYSTEM_SETTINGS.clone }
+   let(:elasticsearch_url) { ["https://localhost:9898"] }
+   let(:elasticsearch_username) { "elastictest" }
+   let(:elasticsearch_password) { "testchangeme" }
+diff --git a/x-pack/spec/license_checker/license_reader_spec.rb b/x-pack/spec/license_checker/license_reader_spec.rb
+index 83d57dc6bfb..5199ce2b75f 100644
+--- a/x-pack/spec/license_checker/license_reader_spec.rb
++++ b/x-pack/spec/license_checker/license_reader_spec.rb
+@@ -16,7 +16,7 @@
+   let(:elasticsearch_password) { "testchangeme" }
+   let(:extension) { LogStash::MonitoringExtension.new }
+   let(:system_settings) do
+-    LogStash::SETTINGS.clone.tap do |system_settings|
++    LogStash::Runner::SYSTEM_SETTINGS.clone.tap do |system_settings|
+       extension.additionals_settings(system_settings) # register defaults from extension
+       apply_settings(settings, system_settings) # apply `settings`
+     end
+diff --git a/x-pack/spec/modules/module_license_checker_spec.rb b/x-pack/spec/modules/module_license_checker_spec.rb
+index 310e60754d6..b1ffd19e60c 100644
+--- a/x-pack/spec/modules/module_license_checker_spec.rb
++++ b/x-pack/spec/modules/module_license_checker_spec.rb
+@@ -8,7 +8,7 @@
+ describe LogStash::LicenseChecker::ModuleLicenseChecker do
+ 
+ 
+-  let(:settings) {LogStash::SETTINGS.clone}
++  let(:settings) { LogStash::Runner::SYSTEM_SETTINGS }
+ 
+ 
+   shared_examples "can not get a license" do
+@@ -111,4 +111,4 @@
+     include_examples "can not get a license"
+   end
+ 
+-end
+\ No newline at end of file
++end
+diff --git a/x-pack/spec/monitoring/inputs/metrics_spec.rb b/x-pack/spec/monitoring/inputs/metrics_spec.rb
+index 0b77f5fd7a5..fea504047d9 100644
+--- a/x-pack/spec/monitoring/inputs/metrics_spec.rb
++++ b/x-pack/spec/monitoring/inputs/metrics_spec.rb
+@@ -70,7 +70,7 @@
+     let(:number_of_events) { 20 }
+     let(:config) { "input { generator { count => #{number_of_events} } } output { null { } }" }
+ 
+-    let(:pipeline_settings) { LogStash::SETTINGS.clone.merge({
++    let(:pipeline_settings) { LogStash::Runner::SYSTEM_SETTINGS.clone.merge({
+       "pipeline.id" => "main",
+       "config.string" => config,
+     }) }
+@@ -184,7 +184,7 @@ def main_pipeline
+       let(:license_subject) {   subject { described_class.new(options) }}
+       let(:license_reader) { LogStash::LicenseChecker::LicenseReader.new(system_settings, 'monitoring', es_options)}
+       let(:extension) {  LogStash::MonitoringExtension.new }
+-      let(:system_settings) { LogStash::SETTINGS.clone }
++      let(:system_settings) { LogStash::Runner::SYSTEM_SETTINGS.clone }
+       let(:license_status) { 'active'}
+       let(:license_type) { 'trial' }
+       let(:license_expiry_date) { Time.now + (60 * 60 * 24)}
+diff --git a/x-pack/src/test/java/org/logstash/xpack/test/RSpecTests.java b/x-pack/src/test/java/org/logstash/xpack/test/RSpecTests.java
+new file mode 100644
+index 00000000000..241c6590dae
+--- /dev/null
++++ b/x-pack/src/test/java/org/logstash/xpack/test/RSpecTests.java
+@@ -0,0 +1,34 @@
++package org.logstash.xpack.test;
++
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Arrays;
++import org.jruby.runtime.builtin.IRubyObject;
++import org.junit.Assert;
++import org.junit.Test;
++import org.logstash.RubyUtil;
++import org.logstash.Rubyfier;
++
++public final class RSpecTests {
++    @Test
++    public void rspecTests() throws Exception {
++        RubyUtil.RUBY.getENV().put("IS_JUNIT_RUN", "true");
++        RubyUtil.RUBY.getGlobalVariables().set(
++            "$JUNIT_ARGV", Rubyfier.deep(RubyUtil.RUBY, Arrays.asList(
++                "-fd", "--pattern", "spec/**/*_spec.rb"
++            ))
++        );
++        final Path rspec = Paths.get(
++            org.assertj.core.util.Files.currentFolder().getParent(), "lib/bootstrap/rspec.rb"
++        );
++        final IRubyObject result = RubyUtil.RUBY.executeScript(
++            new String(Files.readAllBytes(rspec), StandardCharsets.UTF_8),
++            rspec.toFile().getAbsolutePath()
++        );
++        if (!result.toJava(Long.class).equals(0L)) {
++            Assert.fail("RSpec test suit saw at least one failure.");
++        }
++    }
++}

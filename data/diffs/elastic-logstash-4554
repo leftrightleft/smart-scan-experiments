@@ -1,0 +1,122 @@
+diff --git a/logstash-core/api/init.ru b/logstash-core/api/init.ru
+index b19248591aa..e9da7023fe0 100644
+--- a/logstash-core/api/init.ru
++++ b/logstash-core/api/init.ru
+@@ -9,6 +9,8 @@ require 'app/stats'
+ env = ENV["RACK_ENV"].to_sym
+ set :environment, env
+ 
++set :service, LogStash::Api::Service.instance
++
+ run LogStash::Api::Root
+ 
+ namespaces = { "/_stats" => LogStash::Api::Stats }
+diff --git a/logstash-core/api/lib/app.rb b/logstash-core/api/lib/app.rb
+index 82fa677c215..1381008615d 100644
+--- a/logstash-core/api/lib/app.rb
++++ b/logstash-core/api/lib/app.rb
+@@ -18,8 +18,7 @@ class BaseApp < ::Sinatra::Application
+ 
+     def initialize(app=nil)
+       super(app)
+-      @service = LogStash::Api::Service.instance
+-      @factory = CommandFactory.new(@service)
++      @factory = CommandFactory.new(settings.service)
+     end
+ 
+   end
+diff --git a/logstash-core/lib/logstash/inputs/metrics.rb b/logstash-core/lib/logstash/inputs/metrics.rb
+index 05c2ecd7fbb..62c83497b9d 100644
+--- a/logstash-core/lib/logstash/inputs/metrics.rb
++++ b/logstash-core/lib/logstash/inputs/metrics.rb
+@@ -45,7 +45,7 @@ def update(snapshot)
+       #   and the plugin thread (run method)
+       #   - How we handle back pressure here?
+       #   - one snashot should be only one event ?
+-      snapshot.metric_store.all.each do |metric|
++      snapshot.metric_store.each do |metric|
+         @queue << LogStash::Event.new({ "@timestamp" => snapshot.created_at }.merge(metric.to_hash))
+       end
+     end
+diff --git a/logstash-core/lib/logstash/instrument/metric_store.rb b/logstash-core/lib/logstash/instrument/metric_store.rb
+index b1b293a3e51..332ad35c7f6 100644
+--- a/logstash-core/lib/logstash/instrument/metric_store.rb
++++ b/logstash-core/lib/logstash/instrument/metric_store.rb
+@@ -26,7 +26,7 @@ def initialize
+     def fetch_or_store(namespaces, key, default_value = nil)
+       fetch_or_store_namespaces(namespaces).fetch_or_store(key, block_given? ? yield(key) : default_value)
+     end
+-    
++
+     # This method allow to retrieve values for a specific path,
+     #
+     #
+@@ -38,9 +38,15 @@ def get(*key_paths)
+ 
+     # Return all the individuals Metric
+     #
+-    # @return [Array] An array of all metric transformed in `Logstash::Event`
+-    def each
+-      all_metrics_recursively(@store).flatten
++    # @return [Array] An array of all metric transformed in `Logstash::Event`, or in case of passing a block it yields
++    # the expected value as other Enumerable implementations.
++    def each(&block)
++      data = each_recursively(@store).flatten
++      if block_given?
++        data.each(&block)
++      else
++        return data
++      end
+     end
+ 
+     private
+@@ -81,7 +87,7 @@ def each_recursively(values)
+     # @return [Concurrent::Map] Map where the metrics should be saved
+     def fetch_or_store_namespaces(namespaces_path)
+       path_map = fetch_or_store_namespace_recursively(@store, namespaces_path)
+-      
++
+       # This mean one of the namespace and key are colliding
+       # and we have to deal it upstream.
+       unless path_map.is_a?(Concurrent::Map)
+diff --git a/logstash-core/lib/logstash/instrument/metric_type/base.rb b/logstash-core/lib/logstash/instrument/metric_type/base.rb
+index 211a52c777f..2557a57f7ad 100644
+--- a/logstash-core/lib/logstash/instrument/metric_type/base.rb
++++ b/logstash-core/lib/logstash/instrument/metric_type/base.rb
+@@ -15,7 +15,7 @@ def to_event(created_at = Time.now)
+     end
+ 
+     def inspect
+-      "#{self.class.name} - namespaces: #{namespaces} key: #{@key} value: #{value}"
++      "#{self.class.name} - namespaces: #{@namespaces} key: #{@key} value: #{value}"
+     end
+ 
+     protected
+diff --git a/logstash-core/spec/logstash/inputs/metrics_spec.rb b/logstash-core/spec/logstash/inputs/metrics_spec.rb
+index 5e2f1607878..7391f7cc72c 100644
+--- a/logstash-core/spec/logstash/inputs/metrics_spec.rb
++++ b/logstash-core/spec/logstash/inputs/metrics_spec.rb
+@@ -14,6 +14,23 @@
+     end
+   end
+ 
++  describe "#update" do
++
++    let(:namespaces)  { [:root, :base] }
++    let(:key)        { :foo }
++    let(:metric_store) { LogStash::Instrument::MetricStore.new }
++
++    it "should fill up the queue with received events" do
++      Thread.new { subject.run(queue) }
++      sleep(0.1)
++      subject.stop
++
++      metric_store.fetch_or_store(namespaces, key, LogStash::Instrument::MetricType::Counter.new(namespaces, key))
++      subject.update(LogStash::Instrument::Snapshot.new(metric_store))
++      expect(queue.count).to eq(1)
++    end
++  end
++
+   describe "#stop" do
+     it "should remove itself from the the collector observer" do
+       expect(LogStash::Instrument::Collector.instance).to receive(:delete_observer).with(subject)

@@ -1,0 +1,269 @@
+diff --git a/docs/static/command-line-flags.asciidoc b/docs/static/command-line-flags.asciidoc
+index 7d722ad939f..bb349f8a888 100644
+--- a/docs/static/command-line-flags.asciidoc
++++ b/docs/static/command-line-flags.asciidoc
+@@ -42,6 +42,11 @@ Logstash has the following flags. You can use the `--help` flag to display this
+ --debug
+  Increase verbosity to the last level (trace), more verbose.
+ 
++--debug-config
++ Print the compiled config ruby code out as a debug log (you must also have --debug enabled).
++ WARNING: This will include any 'password' options passed to plugin configs as plaintext, and may result
++ in plaintext passwords appearing in your logs!
++
+ -V, --version
+   Display the version of Logstash.
+ 
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index 397e3d7156b..57a51526d19 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -9,6 +9,7 @@
+ LogStash::Environment.load_locale!
+ 
+ class LogStash::Agent < Clamp::Command
++
+   DEFAULT_INPUT = "input { stdin { type => stdin } }"
+   DEFAULT_OUTPUT = "output { stdout { codec => rubydebug } }"
+ 
+@@ -53,6 +54,10 @@ class LogStash::Agent < Clamp::Command
+   option "--verbose", :flag, I18n.t("logstash.agent.flag.verbose")
+   option "--debug", :flag, I18n.t("logstash.agent.flag.debug")
+ 
++  option "--debug-config", :flag,
++    I18n.t("logstash.runner.flag.debug_config"),
++    :attribute_name => :debug_config, :default => false
++
+   option ["-V", "--version"], :flag,
+     I18n.t("logstash.agent.flag.version")
+ 
+@@ -263,6 +268,7 @@ def show_gems
+   #
+   # Log file stuff, plugin path checking, etc.
+   def configure
++    @pipeline_settings[:debug_config] = debug_config?
+     configure_logging(log_file)
+     configure_plugin_paths(plugin_paths)
+   end # def configure
+diff --git a/logstash-core/lib/logstash/config/loader.rb b/logstash-core/lib/logstash/config/loader.rb
+new file mode 100644
+index 00000000000..64e45aac53c
+--- /dev/null
++++ b/logstash-core/lib/logstash/config/loader.rb
+@@ -0,0 +1,97 @@
++require "logstash/config/defaults"
++
++module LogStash; module Config; class Loader
++  attr_accessor :debug_config
++
++  def initialize(logger, debug_config=false)
++    @logger = logger
++    @debug_config = debug_config
++  end
++
++  def format_config(config_path, config_string)
++    config_string = config_string.to_s
++    if config_path
++      # Append the config string.
++      # This allows users to provide both -f and -e flags. The combination
++      # is rare, but useful for debugging.
++      config_string = config_string + load_config(config_path)
++    else
++      # include a default stdin input if no inputs given
++      if config_string !~ /input *{/
++        config_string += LogStash::Config::Defaults.input
++      end
++      # include a default stdout output if no outputs given
++      if config_string !~ /output *{/
++        config_string += LogStash::Config::Defaults.output
++      end
++    end
++    config_string
++  end
++
++  def load_config(path)
++    begin
++      uri = URI.parse(path)
++
++      case uri.scheme
++      when nil then
++        local_config(path)
++      when /http/ then
++        fetch_config(uri)
++      when "file" then
++        local_config(uri.path)
++      else
++        fail(I18n.t("logstash.runner.configuration.scheme-not-supported", :path => path))
++      end
++    rescue URI::InvalidURIError
++      # fallback for windows.
++      # if the parsing of the file failed we assume we can reach it locally.
++      # some relative path on windows arent parsed correctly (.\logstash.conf)
++      local_config(path)
++    end
++  end
++
++  def local_config(path)
++    path = ::File.expand_path(path)
++    path = ::File.join(path, "*") if ::File.directory?(path)
++
++    if Dir.glob(path).length == 0
++      fail(I18n.t("logstash.runner.configuration.file-not-found", :path => path))
++    end
++
++    config = ""
++    encoding_issue_files = []
++    Dir.glob(path).sort.each do |file|
++      next unless ::File.file?(file)
++      if file.match(/~$/)
++        @logger.debug("NOT reading config file because it is a temp file", :config_file => file)
++        next
++      end
++      @logger.debug("Reading config file", :config_file => file)
++      cfg = ::File.read(file)
++      if !cfg.ascii_only? && !cfg.valid_encoding?
++        encoding_issue_files << file
++      end
++      config << cfg + "\n"
++      if @debug_config
++        @logger.debug? && @logger.debug("\nThe following is the content of a file", :config_file => file.to_s)
++        @logger.debug? && @logger.debug("\n" + cfg + "\n\n")
++      end
++    end
++    if encoding_issue_files.any?
++      fail("The following config files contains non-ascii characters but are not UTF-8 encoded #{encoding_issue_files}")
++    end
++    if @debug_config
++      @logger.debug? && @logger.debug("\nThe following is the merged configuration")
++      @logger.debug? && @logger.debug("\n" + config + "\n\n")
++    end
++    return config
++  end # def load_config
++
++  def fetch_config(uri)
++    begin
++      Net::HTTP.get(uri) + "\n"
++    rescue Exception => e
++      fail(I18n.t("logstash.runner.configuration.fetch-failed", :path => uri.to_s, :message => e.message))
++    end
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index d29206aa20f..1d1091c40f1 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -24,7 +24,8 @@ module LogStash; class Pipeline
+     :pipeline_batch_size => 125,
+     :pipeline_batch_delay => 5, # in milliseconds
+     :flush_interval => 5, # in seconds
+-    :flush_timeout_interval => 60 # in seconds
++    :flush_timeout_interval => 60, # in seconds
++    :debug_config => false 
+   }
+   MAX_INFLIGHT_WARN_THRESHOLD = 10_000
+ 
+@@ -52,7 +53,9 @@ def initialize(config_str, settings = {})
+     code = @config.compile
+     # The config code is hard to represent as a log message...
+     # So just print it.
+-    @logger.debug? && @logger.debug("Compiled pipeline code:\n#{code}")
++    if @settings[:debug_config]
++      @logger.debug? && @logger.debug("Compiled pipeline code:\n#{code}")
++    end
+     begin
+       eval(code)
+     rescue => e
+@@ -479,4 +482,18 @@ def stalling_threads_info
+       .each {|t| t.delete("blocked_on") }
+       .each {|t| t.delete("status") }
+   end
++
++  # Sometimes we log stuff that will dump the pipeline which may contain
++  # sensitive information (like the raw syntax tree which can contain passwords)
++  # We want to hide most of what's in here
++  def inspect
++    {
++      :pipeline_id => @pipeline_id,
++      :settings => @settings.inspect,
++      :ready => @ready,
++      :running => @running,
++      :flushing => @flushing
++    }
++  end
++
+ end end
+diff --git a/logstash-core/locales/en.yml b/logstash-core/locales/en.yml
+index d19b5421683..97b5a7a7366 100644
+--- a/logstash-core/locales/en.yml
++++ b/logstash-core/locales/en.yml
+@@ -193,6 +193,10 @@ en:
+         debug: |+
+           Most verbose logging. This causes 'debug'
+           level logs to be emitted.
++        debug-config: |+
++          Print the compiled config ruby code out as a debug log (you must also have --debug enabled).
++          WARNING: This will include any 'password' options passed to plugin configs as plaintext, and may result
++          in plaintext passwords appearing in your logs!  
+         unsafe_shutdown: |+
+           Force logstash to exit during shutdown even
+           if there are still inflight events in memory.
+diff --git a/logstash-core/spec/logstash/agent_spec.rb b/logstash-core/spec/logstash/agent_spec.rb
+index 54f994d88f4..cb0df1ff573 100644
+--- a/logstash-core/spec/logstash/agent_spec.rb
++++ b/logstash-core/spec/logstash/agent_spec.rb
+@@ -58,5 +58,28 @@
+       subject.configure_plugin_paths(multiple_paths)
+     end
+   end
+-end
+ 
++  describe "debug_config" do
++    let(:pipeline_string) { "input {} output {}" }
++    let(:pipeline) { double("pipeline") }
++
++    before(:each) do
++      allow(pipeline).to receive(:run)
++    end
++    it "should set 'debug_config' to false by default" do
++      expect(LogStash::Pipeline).to receive(:new).
++        with(anything,hash_including(:debug_config => false)).
++        and_return(pipeline)
++      args = ["--debug", "-e", pipeline_string]
++      subject.run(args)
++    end
++
++    it "should allow overriding debug_config" do
++      expect(LogStash::Pipeline).to receive(:new).
++        with(anything, hash_including(:debug_config => true))
++        .and_return(pipeline)
++      args = ["--debug", "--debug-config",  "-e", pipeline_string]
++      subject.run(args)
++    end
++  end
++end
+diff --git a/logstash-core/spec/logstash/pipeline_spec.rb b/logstash-core/spec/logstash/pipeline_spec.rb
+index 45b3f46bb2d..0713cfe6438 100644
+--- a/logstash-core/spec/logstash/pipeline_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_spec.rb
+@@ -416,7 +416,7 @@ class TestPipeline < LogStash::Pipeline
+       Thread.new { pipeline.run }
+       sleep 0.1 while !pipeline.ready?
+       # give us a bit of time to flush the events
+-      wait(5).for do
++      wait(15).for do
+         next unless output && output.events && output.events.first
+         output.events.first["message"].split("\n").count
+       end.to eq(number_of_events)
+diff --git a/logstash-core/spec/logstash/runner_spec.rb b/logstash-core/spec/logstash/runner_spec.rb
+index cc9415be0ab..cc4033e178c 100644
+--- a/logstash-core/spec/logstash/runner_spec.rb
++++ b/logstash-core/spec/logstash/runner_spec.rb
+@@ -40,7 +40,7 @@ def run(args); end
+ 
+   describe "pipeline settings" do
+     let(:pipeline_string) { "input { stdin {} } output { stdout {} }" }
+-    let(:base_pipeline_settings) { { :pipeline_id => "base" } }
++    let(:base_pipeline_settings) { { :pipeline_id => "base", :debug_config => false } }
+     let(:pipeline) { double("pipeline") }
+ 
+     before(:each) do

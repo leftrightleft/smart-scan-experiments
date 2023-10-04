@@ -1,0 +1,827 @@
+diff --git a/build.gradle b/build.gradle
+index d311e31c9af..269e759ed6a 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -306,13 +306,15 @@ task generateLicenseReport(type: JavaExec) {
+ 
+     String licenseReportInputCSV = project.hasProperty("licenseReportInputCSV") ? project.property("licenseReportInputCSV") : "build/dependencies.csv.ruby"
+     String licenseReportOutputCSV = project.hasProperty("licenseReportOutputCSV") ? project.property("licenseReportOutputCSV") : "build/dependencies.csv"
++    String noticePath = "NOTICE.txt"
+ 
+     classpath = project.files([jarFile])
+     main = "org.logstash.dependencies.Main"
+     args \
+       licenseReportInputCSV, \
+       project.getBuildDir().toString() + "/licenseReportFolders.txt", \
+-      licenseReportOutputCSV
++      licenseReportOutputCSV, \
++      noticePath
+ }
+ 
+ task generateLicenseReportInputs() {
+diff --git a/ci/docker_license_check.sh b/ci/docker_license_check.sh
+index 413733bd8b6..a90d65bf2db 100755
+--- a/ci/docker_license_check.sh
++++ b/ci/docker_license_check.sh
+@@ -1,2 +1,5 @@
+ #!/bin/bash
+-ci/docker_run.sh ci/license_check.sh
++export JRUBY_OPTS="-J-Xmx1g"
++export GRADLE_OPTS="-Xmx2g -Dorg.gradle.daemon=false -Dorg.gradle.logging.level=info"
++
++ci/docker_run.sh logstash-license-check ci/license_check.sh -m 4G
+diff --git a/ci/license_check.sh b/ci/license_check.sh
+index dfa2e2520df..c2654a1b95a 100755
+--- a/ci/license_check.sh
++++ b/ci/license_check.sh
+@@ -1,6 +1,7 @@
+-#!/bin/bash -ie
++#!/bin/bash -i
+ export GRADLE_OPTS="-Dorg.gradle.daemon=false -Dorg.gradle.logging.level=info"
+ 
++rake plugin:install-default
+ bin/dependencies-report --csv report.csv
+ # We want this to show on the CI server
+ cat report.csv
+diff --git a/tools/dependencies-report/src/main/java/org/logstash/dependencies/Dependency.java b/tools/dependencies-report/src/main/java/org/logstash/dependencies/Dependency.java
+index d6838447fd9..da1b01e7635 100644
+--- a/tools/dependencies-report/src/main/java/org/logstash/dependencies/Dependency.java
++++ b/tools/dependencies-report/src/main/java/org/logstash/dependencies/Dependency.java
+@@ -3,11 +3,17 @@
+ import org.apache.commons.csv.CSVFormat;
+ import org.apache.commons.csv.CSVRecord;
+ 
++import java.io.BufferedReader;
++import java.io.File;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.InputStreamReader;
+ import java.io.Reader;
++import java.net.URL;
++import java.nio.file.Path;
++import java.nio.file.Paths;
+ import java.util.Objects;
++import java.util.Scanner;
+ import java.util.SortedSet;
+ 
+ class Dependency implements Comparable<Dependency> {
+@@ -72,8 +78,9 @@ private static Dependency fromJavaCsvRecord(CSVRecord record) {
+             throw new IllegalStateException(err);
+         }
+         colonIndex = nameAndVersion.indexOf(':', colonIndex + 1);
+-        if (colonIndex == -1) {
+-            String err = String.format("Could not parse java artifact name and version from '%s'",
++        String[] split = nameAndVersion.split(":");
++        if (split.length != 3) {
++            String err = String.format("Could not parse java artifact name and version from '%s', must be of the form group:name:version",
+                     nameAndVersion);
+             throw new IllegalStateException(err);
+         }
+@@ -107,4 +114,53 @@ public int hashCode() {
+     public int compareTo(Dependency o) {
+         return (name + version).compareTo(o.name + o.version);
+     }
++
++    public String noticeSourcePath() {
++        return "LS_HOME/tools/dependencies-report/src/main/resources/notices/" + noticeFilename();
++    }
++
++    public String noticeFilename() {
++        return String.format("%s-%s-NOTICE.txt", name, version != null ? version : "NOVERSION");
++    }
++
++    public String resourceName() {
++        return "/notices/" + noticeFilename();
++    }
++
++    public URL noticeURL() {
++        return Dependency.class.getResource(resourceName());
++    }
++
++    public boolean noticeExists() {
++        return noticeURL() != null;
++    }
++
++    public String notice() throws IOException {
++       if (!noticeExists()) throw new IOException(String.format("No notice file found at '%s'", noticeFilename()));
++
++       try (InputStream noticeStream = Dependency.class.getResourceAsStream(resourceName())) {
++            return new Scanner(noticeStream, "UTF-8").useDelimiter("\\A").next();
++       }
++    }
++
++    public Path noticePath() {
++        // Get the base first since this always exists, otherwise getResource will return null if its for a notice
++        // that doesn't exist
++        String noticesBase = ReportGenerator.class.getResource("/notices").getPath();
++        Path path = Paths.get(noticesBase, noticeFilename());
++        return path;
++    }
++
++    public String getName() {
++        return name;
++    }
++
++    public String getVersion() {
++        return version;
++    }
++
++    @Override
++    public String toString() {
++        return "<Dependency " + name + " v" + version + ">";
++    }
+ }
+diff --git a/tools/dependencies-report/src/main/java/org/logstash/dependencies/Main.java b/tools/dependencies-report/src/main/java/org/logstash/dependencies/Main.java
+index c67b1fe6faf..7462a0716d1 100644
+--- a/tools/dependencies-report/src/main/java/org/logstash/dependencies/Main.java
++++ b/tools/dependencies-report/src/main/java/org/logstash/dependencies/Main.java
+@@ -5,6 +5,7 @@
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.nio.file.Files;
++import java.nio.file.Path;
+ import java.nio.file.Paths;
+ import java.util.List;
+ 
+@@ -17,25 +18,28 @@ public class Main {
+     static final String ACCEPTABLE_LICENSES_PATH = "/acceptableLicenses.csv";
+ 
+     public static void main(String[] args) throws IOException {
+-        if (args.length < 3) {
+-            System.out.println("Usage: org.logstash.dependencies.Main <pathToRubyDependencies.csv> <pathToJavaLicenseReportFolders.txt> <output.csv>");
++        if (args.length < 4) {
++            System.out.println("Usage: org.logstash.dependencies.Main <pathToRubyDependencies.csv> <pathToJavaLicenseReportFolders.txt> <output.csv> <NOTICE.txt>");
+             System.exit(1);
+         }
+ 
++
+         InputStream rubyDependenciesStream = new FileInputStream(args[0]);
+         List<String> javaDependencyReports = Files.readAllLines(Paths.get(args[1]));
+         InputStream[] javaDependenciesStreams = new InputStream[javaDependencyReports.size()];
+         for (int k = 0; k < javaDependencyReports.size(); k++) {
+             javaDependenciesStreams[k] = new FileInputStream(javaDependencyReports.get(k) + "/licenses.csv");
+         }
+-        FileWriter outputWriter = new FileWriter(args[2]);
++        FileWriter licenseCSVWriter = new FileWriter(args[2]);
++        FileWriter noticeWriter = new FileWriter(args[3]);
+ 
+         boolean reportResult = new ReportGenerator().generateReport(
+                 getResourceAsStream(LICENSE_MAPPING_PATH),
+                 getResourceAsStream(ACCEPTABLE_LICENSES_PATH),
+                 rubyDependenciesStream,
+                 javaDependenciesStreams,
+-                outputWriter
++                licenseCSVWriter,
++                noticeWriter
+         );
+ 
+         // If there were unknown results in the report, exit with a non-zero status
+diff --git a/tools/dependencies-report/src/main/java/org/logstash/dependencies/ReportGenerator.java b/tools/dependencies-report/src/main/java/org/logstash/dependencies/ReportGenerator.java
+index e1854203f33..6935c090fb7 100644
+--- a/tools/dependencies-report/src/main/java/org/logstash/dependencies/ReportGenerator.java
++++ b/tools/dependencies-report/src/main/java/org/logstash/dependencies/ReportGenerator.java
+@@ -9,6 +9,9 @@
+ import java.io.InputStreamReader;
+ import java.io.Reader;
+ import java.io.Writer;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.HashMap;
+@@ -30,44 +33,55 @@ public class ReportGenerator {
+     final String UNKNOWN_LICENSE = "UNKNOWN";
+     final Collection<Dependency> UNKNOWN_LICENSES = new ArrayList<Dependency>();
+     final String[] CSV_HEADERS = {"name", "version", "revision", "url", "license", "copyright"};
++    public final Collection<Dependency> MISSING_NOTICE = new ArrayList<Dependency>();
+ 
+     public boolean generateReport(
+             InputStream licenseMappingStream,
+             InputStream acceptableLicensesStream,
+             InputStream rubyDependenciesStream,
+             InputStream[] javaDependenciesStreams,
+-            Writer output) throws IOException {
+-
++            Writer licenseOutput,
++            Writer noticeOutput) throws IOException {
+         SortedSet<Dependency> dependencies = new TreeSet<>();
++
+         Dependency.addDependenciesFromRubyReport(rubyDependenciesStream, dependencies);
++        addJavaDependencies(javaDependenciesStreams, dependencies);
+ 
+-        for (InputStream stream : javaDependenciesStreams) {
+-            Dependency.addDependenciesFromJavaReport(stream, dependencies);
++        checkDependencyLicenses(licenseMappingStream, acceptableLicensesStream, dependencies);
++        checkDependencyNotices(noticeOutput, dependencies);
++
++        writeLicenseCSV(licenseOutput, dependencies);
++
++        String msg = "Generated report with %d dependencies (%d unknown or unacceptable licenses, %d unknown or missing notices).";
++        System.out.println(String.format(msg + "\n", dependencies.size(), UNKNOWN_LICENSES.size(), MISSING_NOTICE.size()));
++
++        reportUnknownLicenses();
++        reportMissingNotices();
++
++        licenseOutput.close();
++        noticeOutput.close();
++
++        return UNKNOWN_LICENSES.isEmpty() && MISSING_NOTICE.isEmpty();
++    }
++
++    private void checkDependencyNotices(Writer noticeOutput, SortedSet<Dependency> dependencies) throws IOException {
++        for (Dependency dependency : dependencies) {
++            checkDependencyNotice(noticeOutput, dependency);
+         }
++    }
+ 
++    private void checkDependencyLicenses(InputStream licenseMappingStream, InputStream acceptableLicensesStream, SortedSet<Dependency> dependencies) throws IOException {
+         Map<String, LicenseUrlPair> licenseMapping = new HashMap<>();
+         readLicenseMapping(licenseMappingStream, licenseMapping);
+         List<String> acceptableLicenses = new ArrayList<>();
+         readAcceptableLicenses(acceptableLicensesStream, acceptableLicenses);
++
+         for (Dependency dependency : dependencies) {
+-            String nameAndVersion = dependency.name + ":" + dependency.version;
+-            if (licenseMapping.containsKey(nameAndVersion)) {
+-                LicenseUrlPair pair = licenseMapping.get(nameAndVersion);
+-
+-                if (pair.url != null && !pair.url.equals("") &&
+-                   (acceptableLicenses.stream().anyMatch(pair.license::equalsIgnoreCase))) {
+-                    dependency.spdxLicense = pair.license;
+-                    dependency.url = pair.url;
+-                } else {
+-                    // unacceptable license or missing URL
+-                    UNKNOWN_LICENSES.add(dependency);
+-                }
+-            } else {
+-                dependency.spdxLicense = UNKNOWN_LICENSE;
+-                UNKNOWN_LICENSES.add(dependency);
+-            }
++            checkDependencyLicense(licenseMapping, acceptableLicenses, dependency);
+         }
++    }
+ 
++    private void writeLicenseCSV(Writer output, SortedSet<Dependency> dependencies) throws IOException {
+         try (CSVPrinter csvPrinter = new CSVPrinter(output,
+                 CSVFormat.DEFAULT.withHeader(CSV_HEADERS))) {
+             for (Dependency dependency : dependencies) {
+@@ -75,11 +89,19 @@ public boolean generateReport(
+             }
+             csvPrinter.flush();
+         }
++    }
+ 
+-        String msg = "Generated report with %d dependencies (%d unknown or unacceptable licenses).";
+-        System.out.println(String.format(msg + "\n", dependencies.size(), UNKNOWN_LICENSES.size()));
++    private void reportMissingNotices() {
++        if (!MISSING_NOTICE.isEmpty()) {
++            System.out.println("The following NOTICE.txt entries are missing, please add them:");
++            for (Dependency dependency : MISSING_NOTICE) {
++                System.out.println(dependency.noticeSourcePath());
++            }
++        }
++    }
+ 
+-        if (UNKNOWN_LICENSES.size() > 0) {
++    private void reportUnknownLicenses() {
++        if (!UNKNOWN_LICENSES.isEmpty()) {
+             String errMsg =
+                 "Add complying licenses (using the SPDX license ID from https://spdx.org/licenses) " +
+                 "with URLs for the libraries listed below to tools/dependencies-report/src/main/resources/" +
+@@ -90,8 +112,47 @@ public boolean generateReport(
+                         String.format("\"%s:%s\"", dependency.name, dependency.version));
+             }
+         }
++    }
++
++    private void addJavaDependencies(InputStream[] javaDependenciesStreams, SortedSet<Dependency> dependencies) throws IOException {
++        for (InputStream stream : javaDependenciesStreams) {
++            Dependency.addDependenciesFromJavaReport(stream, dependencies);
++        }
++    }
+ 
+-        return UNKNOWN_LICENSES.size() == 0;
++    private void checkDependencyNotice(Writer noticeOutput, Dependency dependency) throws IOException {
++        if (dependency.noticeExists()) {
++            String notice = dependency.notice();
++
++            boolean noticeIsBlank = notice.matches("\\A\\s*\\Z");
++            if (!noticeIsBlank) {
++                noticeOutput.write(String.format("\n==========\nNotice for: %s-%s\n----------\n\n", dependency.name, dependency.version));
++                noticeOutput.write(notice);
++            } else {
++                MISSING_NOTICE.add(dependency);
++            }
++        } else {
++            MISSING_NOTICE.add(dependency);
++        }
++    }
++
++    private void checkDependencyLicense(Map<String, LicenseUrlPair> licenseMapping, List<String> acceptableLicenses, Dependency dependency) {
++        String nameAndVersion = dependency.name + ":" + dependency.version;
++        if (licenseMapping.containsKey(nameAndVersion)) {
++            LicenseUrlPair pair = licenseMapping.get(nameAndVersion);
++
++            if (pair.url != null && !pair.url.equals("") &&
++               (acceptableLicenses.stream().anyMatch(pair.license::equalsIgnoreCase))) {
++                dependency.spdxLicense = pair.license;
++                dependency.url = pair.url;
++            } else {
++                // unacceptable license or missing URL
++                UNKNOWN_LICENSES.add(dependency);
++            }
++        } else {
++            dependency.spdxLicense = UNKNOWN_LICENSE;
++            UNKNOWN_LICENSES.add(dependency);
++        }
+     }
+ 
+     private void readAcceptableLicenses(InputStream stream, List<String> acceptableLicenses)
+diff --git a/tools/dependencies-report/src/main/resources/notices/numerizer-0.1.1-NOTICE.txt b/tools/dependencies-report/src/main/resources/notices/numerizer-0.1.1-NOTICE.txt
+new file mode 100644
+index 00000000000..5ebc8b9ac41
+--- /dev/null
++++ b/tools/dependencies-report/src/main/resources/notices/numerizer-0.1.1-NOTICE.txt
+@@ -0,0 +1 @@
++FAKER
+diff --git a/tools/dependencies-report/src/test/java/org/logstash/dependencies/ReportGeneratorTest.java b/tools/dependencies-report/src/test/java/org/logstash/dependencies/ReportGeneratorTest.java
+index 28f55f51309..471a1446503 100644
+--- a/tools/dependencies-report/src/test/java/org/logstash/dependencies/ReportGeneratorTest.java
++++ b/tools/dependencies-report/src/test/java/org/logstash/dependencies/ReportGeneratorTest.java
+@@ -1,81 +1,118 @@
+ package org.logstash.dependencies;
+ 
++import org.junit.Before;
+ import org.junit.Test;
+ 
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.StringWriter;
++import java.util.Optional;
+ import java.util.Scanner;
+ 
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertFalse;
+-import static org.junit.Assert.assertTrue;
++import static org.hamcrest.CoreMatchers.containsString;
++import static org.hamcrest.CoreMatchers.not;
++import static org.junit.Assert.*;
+ import static org.logstash.dependencies.Main.ACCEPTABLE_LICENSES_PATH;
+ 
+ public class ReportGeneratorTest {
++    StringWriter csvOutput;
++    StringWriter noticeOutput;
++    ReportGenerator rg;
++
++    @Before
++    public void setup() {
++        csvOutput = new StringWriter();
++        noticeOutput = new StringWriter();
++    }
+ 
+     @Test
++    // Tests both licenses and notices
+     public void testSuccessfulReport() throws IOException {
+         String expectedOutput = getStringFromStream(
+                 Main.getResourceAsStream("/expectedOutput.txt"));
+-        StringWriter output = new StringWriter();
+-        boolean result = runReportGenerator("/licenseMapping-good.csv", output);
++        String expectedNoticeOutput = getStringFromStream(
++                Main.getResourceAsStream("/expectedNoticeOutput.txt"));
++        boolean result = runReportGenerator("/licenseMapping-good.csv", csvOutput, noticeOutput);
+ 
+         assertTrue(result);
+-        assertEquals(normalizeEol(expectedOutput), normalizeEol(output.toString()));
++        assertEquals(normalizeEol(expectedOutput), normalizeEol(csvOutput.toString()));
++        assertEquals(normalizeEol(expectedNoticeOutput), normalizeEol(noticeOutput.toString()));
+     }
+ 
+     @Test
+     public void testReportWithMissingLicenses() throws IOException {
+-        StringWriter output = new StringWriter();
+-        boolean result = runReportGenerator("/licenseMapping-missing.csv", output);
++        boolean result = runReportGenerator("/licenseMapping-missing.csv", csvOutput, noticeOutput);
+ 
+         assertFalse(result);
+ 
+         // verify that the two components in the test input with missing licenses are
+         // listed in the output with no license, i.e., an empty license field followed by CR/LF
+-        assertTrue(output.toString().contains("commons-io:commons-io,2.5,,,,\r\n"));
+-        assertTrue(output.toString().contains("filesize,0.0.4,,,,\r\n"));
++        assertTrue(csvOutput.toString().contains("commons-io:commons-io,2.5,,,,\r\n"));
++        assertTrue(csvOutput.toString().contains("filesize,0.0.4,,,,\r\n"));
+     }
+ 
+     @Test
+     public void testReportWithUnacceptableLicenses() throws IOException {
+-        StringWriter output = new StringWriter();
+-        boolean result = runReportGenerator("/licenseMapping-unacceptable.csv", output);
++        boolean result = runReportGenerator("/licenseMapping-unacceptable.csv", csvOutput, noticeOutput);
+ 
+         assertFalse(result);
+ 
+         // verify that the two components in the test input with unacceptable licenses are
+         // listed in the output with no license, i.e., an empty license field followed by CR/LF
+-        assertTrue(output.toString().contains("com.fasterxml.jackson.core:jackson-core,2.7.3,,,,\r\n"));
+-        assertTrue(output.toString().contains("bundler,1.16.0,,,,\r\n"));
++        assertThat(csvOutput.toString(), containsString("com.fasterxml.jackson.core:jackson-core,2.7.3,,,,\r\n"));
++        assertThat(csvOutput.toString(), containsString("bundler,1.16.0,,,,\r\n"));
+     }
+ 
+     @Test
+     public void testReportWithMissingUrls() throws IOException {
+-        StringWriter output = new StringWriter();
+-        boolean result = runReportGenerator("/licenseMapping-missingUrls.csv", output);
++        boolean result = runReportGenerator("/licenseMapping-missingUrls.csv", csvOutput, noticeOutput);
+ 
+         assertFalse(result);
+ 
+         // verify that the two components in the test input with missing URLs are
+         // listed in the output with no license, i.e., an empty license field followed by CR/LF
+-        assertTrue(output.toString().contains("org.codehaus.janino:commons-compiler,3.0.8,,,,\r\n"));
+-        assertTrue(output.toString().contains("json-parser,,,,,\r\n"));
++        assertTrue(csvOutput.toString().contains("org.codehaus.janino:commons-compiler,3.0.8,,,,\r\n"));
++        assertTrue(csvOutput.toString().contains("json-parser,,,,,\r\n"));
++    }
++
++    @Test
++    public void testReportWithMissingNotices() throws IOException {
++        boolean result = runReportGenerator(
++                "/licenseMapping-missingNotices.csv",
++                new InputStream[] {Main.getResourceAsStream("/javaLicensesMissingNotice.csv")},
++                csvOutput,
++                noticeOutput
++        );
++
++        assertFalse(result);
++
++        assertThat(noticeOutput.toString(), not(containsString("noNoticeDep")));
++        Optional<Dependency> found = rg.MISSING_NOTICE.stream().filter(d -> d.getName().equals("co.elastic:noNoticeDep") && d.getVersion().equals("0.0.1")).findFirst();
++        assertTrue(found.isPresent());
+     }
+ 
+-    private static boolean runReportGenerator(String licenseMappingPath, StringWriter output)
++    private boolean runReportGenerator(String licenseMappingPath, StringWriter csvOutput, StringWriter noticeOutput) throws IOException {
++       return runReportGenerator(
++               licenseMappingPath,
++               new InputStream[]{
++                        Main.getResourceAsStream("/javaLicenses1.csv"),
++                        Main.getResourceAsStream("/javaLicenses2.csv"),
++                },
++               csvOutput,
++               noticeOutput
++       ) ;
++    }
++
++    private boolean runReportGenerator(String licenseMappingPath, InputStream[] javaLicenses, StringWriter csvOutput, StringWriter noticeOutput)
+             throws IOException {
+-        ReportGenerator rg = new ReportGenerator();
++        rg = new ReportGenerator();
+         return rg.generateReport(
+                 Main.getResourceAsStream(licenseMappingPath),
+                 Main.getResourceAsStream(ACCEPTABLE_LICENSES_PATH),
+                 Main.getResourceAsStream("/rubyDependencies.csv"),
+-                new InputStream[]{
+-                        Main.getResourceAsStream("/javaLicenses1.csv"),
+-                        Main.getResourceAsStream("/javaLicenses2.csv"),
+-                },
+-                output
++                javaLicenses,
++                csvOutput,
++                noticeOutput
+         );
+     }
+ 
+diff --git a/tools/dependencies-report/src/test/resources/expectedNoticeOutput.txt b/tools/dependencies-report/src/test/resources/expectedNoticeOutput.txt
+new file mode 100644
+index 00000000000..49d4169464d
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/expectedNoticeOutput.txt
+@@ -0,0 +1,113 @@
++
++==========
++Notice for: bundler-1.16.0
++----------
++
++TEST
++==========
++Notice for: bundler-1.16.1
++----------
++
++TEST-bundler-1.16.1
++
++==========
++Notice for: com.fasterxml.jackson.core:jackson-core-2.7.3
++----------
++
++TEST
++
++==========
++Notice for: com.fasterxml.jackson.core:jackson-core-2.9.1
++----------
++
++TEST
++
++==========
++Notice for: com.fasterxml.jackson.core:jackson-core-2.9.4
++----------
++
++TEST
++
++==========
++Notice for: com.google.errorprone:javac-shaded-9-dev-r4023-3
++----------
++
++TEST
++
++==========
++Notice for: commons-io:commons-io-2.5
++----------
++
++TEST
++
++==========
++Notice for: control.js-
++----------
++
++TEST
++
++==========
++Notice for: filesize-0.0.4
++----------
++
++TEST
++
++==========
++Notice for: gradle.plugin.com.github.jk1:gradle-license-report-0.7.1
++----------
++
++TEST
++
++==========
++Notice for: jar-dependencies-0.3.10
++----------
++
++TEST
++
++==========
++Notice for: jar-dependencies-0.3.11
++----------
++
++TEST
++
++==========
++Notice for: jar-dependencies-0.3.12
++----------
++
++TEST
++
++==========
++Notice for: jruby-openssl-0.9.20
++----------
++
++TEST
++
++==========
++Notice for: jruby-openssl-0.9.21
++----------
++
++TEST
++
++==========
++Notice for: jruby-readline-1.1.1
++----------
++
++TEST
++
++==========
++Notice for: json-parser-
++----------
++
++TEST
++
++==========
++Notice for: junit:junit-4.12
++----------
++
++TEST
++
++==========
++Notice for: org.codehaus.janino:commons-compiler-3.0.8
++----------
++
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/javaLicensesMissingNotice.csv b/tools/dependencies-report/src/test/resources/javaLicensesMissingNotice.csv
+new file mode 100644
+index 00000000000..373a9d6123d
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/javaLicensesMissingNotice.csv
+@@ -0,0 +1,3 @@
++"artifact","moduleUrl","moduleLicense","moduleLicenseUrl",
++"co.elastic:noNoticeDep:0.0.1","Apache License, Version 2.0","http://www.apache.org/licenses/LICENSE-2.0.txt",
++"gradle.plugin.com.github.jk1:gradle-license-report:0.7.1",,,,
+\ No newline at end of file
+diff --git a/tools/dependencies-report/src/test/resources/licenseMapping-missingNotices.csv b/tools/dependencies-report/src/test/resources/licenseMapping-missingNotices.csv
+new file mode 100644
+index 00000000000..f99b4bca8ff
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/licenseMapping-missingNotices.csv
+@@ -0,0 +1,63 @@
++dependency,dependencyUrl,licenseOverride
++"co.elastic:noNoticeDep:0.0.1",,MIT
++"webrick:1.3.1",,BSD-2-Clause-FreeBSD
++"bundler:1.16.0",https://rubygems.org/gems/bundler/versions/1.16.0,MIT
++"webhdfs:0.8.0",,Apache-2.0
++"avl_tree:1.2.1",,BSD-2-Clause-FreeBSD
++"filesize:0.0.4",https://rubygems.org/gems/filesize/versions/0.0.4,MIT
++"filewatch:0.9.0",,MIT
++"gelfd:0.2.0",,Apache-2.0
++"gmetric:0.1.3",,MIT
++"UNKNOWNgzip:1.0",,UNKNOWN
++"UNKNOWNjls-grok:0.11.4",,UNKNOWN
++"jls-lumberjack:0.0.26",,Apache-2.0
++"march_hare:3.1.1",,MIT
++"method_source:0.8.2",,MIT
++"metriks:0.9.9.8",,MIT
++"numerizer:0.1.1",,MIT
++"rspec-sequencing:0.1.0",,Apache-2.0
++"rubyzip:1.2.1",,BSD-2-Clause-FreeBSD
++"snappy-jars:1.1.0.1.2",,Apache-2.0
++"snmp:1.2.0",,MIT
++"stud:0.0.23",,Apache-2.0
++"com.google.googlejavaformat:google-java-format:1.1",,Apache-2.0
++"com.google.guava:guava:19.0",,Apache-2.0
++"org.apache.logging.log4j:log4j-api:2.9.1",,Apache-2.0
++"org.apache.logging.log4j:log4j-core:2.9.1",,Apache-2.0
++"org.apache.logging.log4j:log4j-slf4j-impl:2.9.1",,Apache-2.0
++"org.codehaus.janino:commons-compiler:3.0.8",https://github.com/janino-compiler/janino,BSD-3-Clause-Attribution
++"org.codehaus.janino:janino:3.0.8",,BSD-3-Clause-Attribution
++"com.fasterxml.jackson.dataformat:jackson-dataformat-cbor:2.9.5",,Apache-2.0
++"org.jruby:jruby-complete:9.1.13.0",,EPL-2.0|Ruby
++"org.slf4j:slf4j-api:1.7.25",,MIT
++"org.eclipse.core:org.eclipse.core.commands:3.6.0",,EPL-1.0
++"org.eclipse.core:org.eclipse.core.contenttype:3.4.100",,EPL-1.0
++"org.eclipse.core:org.eclipse.core.expressions:3.4.300",,EPL-1.0
++"org.eclipse.core:org.eclipse.core.filesystem:1.3.100",,EPL-1.0
++"org.eclipse.core:org.eclipse.core.jobs:3.5.100",,EPL-1.0
++"org.eclipse.core:org.eclipse.core.resources:3.7.100",,EPL-1.0
++"org.eclipse.core:org.eclipse.core.runtime:3.7.0",,EPL-1.0
++"org.eclipse.equinox:org.eclipse.equinox.app:1.3.100",,EPL-1.0
++"org.eclipse.equinox:org.eclipse.equinox.common:3.6.0",,EPL-1.0
++"org.eclipse.equinox:org.eclipse.equinox.preferences:3.4.1",,EPL-1.0
++"org.eclipse.equinox:org.eclipse.equinox.registry:3.5.101",,EPL-1.0
++"org.eclipse.jdt:org.eclipse.jdt.core:3.10.0",,EPL-1.0
++"org.eclipse.osgi:org.eclipse.osgi:3.7.1",,EPL-1.0
++"org.eclipse.text:org.eclipse.text:3.5.101",,EPL-1.0
++"bundler:1.16.1",https://rubygems.org/gems/bundler/versions/1.16.1,MIT
++"com.fasterxml.jackson.core:jackson-core:2.7.3",https://github.com/FasterXML/jackson-core/tree/jackson-core-2.7.3,Apache-2.0
++"com.fasterxml.jackson.core:jackson-core:2.9.1",https://github.com/FasterXML/jackson-core/tree/jackson-core-2.9.1,Apache-2.0
++"com.fasterxml.jackson.core:jackson-core:2.9.4",https://github.com/FasterXML/jackson-core/tree/jackson-core-2.9.4,Apache-2.0
++"com.google.errorprone:javac-shaded:9-dev-r4023-3",http://repo1.maven.org/maven2/com/google/errorprone/javac-shaded/9-dev-r4023-3/,EPL-1.0
++"commons-io:commons-io:2.5",https://commons.apache.org/proper/commons-io/index.html,Apache-2.0
++"control.js:",https://github.com/zombieleet/control,MIT
++"gradle.plugin.com.github.jk1:gradle-license-report:0.7.1",https://github.com/jk1/Gradle-License-Report,Apache-2.0
++"jar-dependencies:0.3.10",https://rubygems.org/gems/jar-dependencies/versions/0.3.10,Apache-2.0
++"jar-dependencies:0.3.11",https://rubygems.org/gems/jar-dependencies/versions/0.3.11,MIT
++"jar-dependencies:0.3.12",https://rubygems.org/gems/jar-dependencies/versions/0.3.12,MIT
++"jruby-openssl:0.9.20",https://rubygems.org/gems/jruby-openssl/versions/0.9.20-java,Apache-2.0
++"jruby-openssl:0.9.21",https://rubygems.org/gems/jruby-openssl/versions/0.9.21-java,Apache-2.0
++"jruby-readline:1.1.1",https://rubygems.org/gems/jruby-readline/versions/1.1.1-java,Apache-2.0
++"json-parser:",https://rubygems.org/gems/json-parser/versions/0.0.1,Apache-2.0
++"junit:junit:4.12",https://github.com/junit-team/junit4,Apache-2.0
++"junit:junit:4.12",https://github.com/junit-team/junit4,Apache-2.0
+diff --git a/tools/dependencies-report/src/test/resources/notices/bundler-1.16.0-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/bundler-1.16.0-NOTICE.txt
+new file mode 100644
+index 00000000000..3b12464976a
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/bundler-1.16.0-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+\ No newline at end of file
+diff --git a/tools/dependencies-report/src/test/resources/notices/bundler-1.16.1-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/bundler-1.16.1-NOTICE.txt
+new file mode 100644
+index 00000000000..2ce57e3db2d
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/bundler-1.16.1-NOTICE.txt
+@@ -0,0 +1 @@
++TEST-bundler-1.16.1
+diff --git a/tools/dependencies-report/src/test/resources/notices/com.fasterxml.jackson.core:jackson-core-2.7.3-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/com.fasterxml.jackson.core:jackson-core-2.7.3-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/com.fasterxml.jackson.core:jackson-core-2.7.3-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/com.fasterxml.jackson.core:jackson-core-2.9.1-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/com.fasterxml.jackson.core:jackson-core-2.9.1-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/com.fasterxml.jackson.core:jackson-core-2.9.1-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/com.fasterxml.jackson.core:jackson-core-2.9.4-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/com.fasterxml.jackson.core:jackson-core-2.9.4-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/com.fasterxml.jackson.core:jackson-core-2.9.4-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/com.google.errorprone:javac-shaded-9-dev-r4023-3-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/com.google.errorprone:javac-shaded-9-dev-r4023-3-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/com.google.errorprone:javac-shaded-9-dev-r4023-3-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/commons-io:commons-io-2.5-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/commons-io:commons-io-2.5-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/commons-io:commons-io-2.5-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/control.js--NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/control.js--NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/control.js--NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/filesize-0.0.4-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/filesize-0.0.4-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/filesize-0.0.4-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/gradle.plugin.com.github.jk1:gradle-license-report-0.7.1-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/gradle.plugin.com.github.jk1:gradle-license-report-0.7.1-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/gradle.plugin.com.github.jk1:gradle-license-report-0.7.1-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/jar-dependencies-0.3.10-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/jar-dependencies-0.3.10-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/jar-dependencies-0.3.10-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/jar-dependencies-0.3.11-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/jar-dependencies-0.3.11-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/jar-dependencies-0.3.11-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/jar-dependencies-0.3.12-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/jar-dependencies-0.3.12-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/jar-dependencies-0.3.12-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/jruby-openssl-0.9.20-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/jruby-openssl-0.9.20-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/jruby-openssl-0.9.20-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/jruby-openssl-0.9.21-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/jruby-openssl-0.9.21-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/jruby-openssl-0.9.21-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/jruby-readline-1.1.1-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/jruby-readline-1.1.1-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/jruby-readline-1.1.1-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/json-parser--NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/json-parser--NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/json-parser--NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/junit:junit-4.12-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/junit:junit-4.12-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/junit:junit-4.12-NOTICE.txt
+@@ -0,0 +1 @@
++TEST
+diff --git a/tools/dependencies-report/src/test/resources/notices/org.codehaus.janino:commons-compiler-3.0.8-NOTICE.txt b/tools/dependencies-report/src/test/resources/notices/org.codehaus.janino:commons-compiler-3.0.8-NOTICE.txt
+new file mode 100644
+index 00000000000..2a02d41ce21
+--- /dev/null
++++ b/tools/dependencies-report/src/test/resources/notices/org.codehaus.janino:commons-compiler-3.0.8-NOTICE.txt
+@@ -0,0 +1 @@
++TEST

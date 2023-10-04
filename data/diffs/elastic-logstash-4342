@@ -1,0 +1,1096 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index 1f307c61838..570030bc5c9 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -3,77 +3,148 @@
+ require "logstash/errors"
+ require "logstash/config/cpu_core_strategy"
+ require "logstash/pipeline"
++require "logstash/config/loader"
+ require "uri"
+ require "stud/trap"
+ 
+ LogStash::Environment.load_locale!
+ 
+ class LogStash::Agent
++  attr_reader :logger, :state
+ 
+-  attr_writer :logger
+-
+-  def initialize
++  def initialize(params)
++    @logger = params[:logger]
+     @pipelines = {}
++    @pipeline_threads = {}
++    @config_loader = LogStash::Config::Loader.new(@logger, false)
++    @config_string = params[:config_string]
++    @config_path = params[:config_path]
++    @auto_reload = params[:auto_reload]
++    @pipeline_settings = params[:pipeline_settings]
++    @reload_interval = params[:reload_interval] || 5 # seconds
++    @upgrade_mutex = Mutex.new
++    # @state represents the necessary information for the agent's lifecycle.
++    # this base implementation uses the configuration string itself as state.
++    # if fetch_state returns a different string, it is regarded as new state
++    # and upgrade_state will take care of stopping the previous pipeline and
++    # starting a new one
++    # a subclass of this base Agent could use more complex state objects such
++    # as a hash map containing versioning, update_at timestamp, etc.
++    @state = clean_state
+   end
+ 
+   def execute
+-    # Make SIGINT/SIGTERM shutdown the pipeline.
+-    sigint_id = trap_sigint()
+-    sigterm_id = trap_sigterm()
++    @thread = Thread.current
++    @logger.info("starting agent", :state => @state)
++
++    if @auto_reload
++      Stud.interval(@reload_interval) do
++        if clean_state? || running_pipelines?
++          reload_state!
++        else
++          break
++        end
++      end
++    else
++      reload_state!
++      while !Stud.stop?
++        if clean_state? || running_pipelines?
++          sleep 0.5
++        else
++          break
++        end
++      end
++    end
++  end
++
++  def shutdown
++    shutdown_pipelines
++  end
+ 
+-    @pipelines.each {|_, p| p.run } # blocking operation. works now because size <= 1
+-    return 0
++  def reload_state!
++    new_state = fetch_state
++    if valid_state?(new_state)
++      if new_state?(@state, new_state)
++        @logger.warn("fetched new state. upgrading..", :state => new_state)
++        @upgrade_mutex.synchronize { upgrade_state(new_state) }
++      else
++        @logger.debug("same state, ignoring..")
++      end
++    else
++      @logger.error("invalid state", :state => new_state)
++    end
+   rescue => e
+     @logger.fatal I18n.t("oops", :error => e)
+     @logger.fatal e.backtrace if @logger.debug? || $DEBUGLIST.include?("stacktrace")
+     return 1
+-  ensure
+-    Stud::untrap("INT", sigint_id) unless sigint_id.nil?
+-    Stud::untrap("TERM", sigterm_id) unless sigterm_id.nil?
+-  end # def execute
++  end
+ 
++  private
+   def add_pipeline(pipeline_id, config_str, settings = {})
+     @pipelines[pipeline_id] = LogStash::Pipeline.new(config_str, settings)
+   end
+ 
+-  private
+-  # Emit a warning message.
+-  def warn(message)
+-    # For now, all warnings are fatal.
+-    raise LogStash::ConfigurationError, message
+-  end # def warn
++  def start_pipeline(id)
++    return unless @pipelines[id]
++    @logger.info("starting pipeline", :id => id)
++    @pipeline_threads[id] = Thread.new do
++      LogStash::Util.set_thread_name("pipeline.#{id}")
++      @pipelines[id].run
++    end
++  end
+ 
+-  # Emit a failure message and abort.
+-  def fail(message)
+-    raise LogStash::ConfigurationError, message
+-  end # def fail
++  def stop_pipeline(id)
++    return unless @pipelines[id]
++    @logger.warn("stopping pipeline", :id => id)
++    @pipelines[id].shutdown do
++      LogStash::ShutdownController.start(@pipelines[id], @pipeline_threads[id])
++    end
++    @pipeline_threads[id].join
++  end
+ 
+   def shutdown_pipelines
+-    @pipelines.each do |_, pipeline|
+-      pipeline.shutdown do
+-        ::LogStash::ShutdownController.start(pipeline)
+-      end
+-    end
++    @pipelines.each { |id, _| stop_pipeline(id) }
+   end
+ 
+-  def trap_sigterm
+-    Stud::trap("TERM") do
+-      @logger.warn(I18n.t("logstash.agent.sigterm"))
+-      shutdown_pipelines
++  def running_pipelines?
++    @upgrade_mutex.synchronize do
++      @pipeline_threads.select {|_, pipeline| pipeline.alive? }.any?
+     end
+   end
+ 
+-  def trap_sigint
+-    Stud::trap("INT") do
+-      if @interrupted_once
+-        @logger.fatal(I18n.t("logstash.agent.forced_sigint"))
+-        exit
+-      else
+-        @logger.warn(I18n.t("logstash.agent.sigint"))
+-        Thread.new(@logger) {|logger| sleep 5; logger.warn(I18n.t("logstash.agent.slow_shutdown")) }
+-        @interrupted_once = true
+-        shutdown_pipelines
+-      end
+-    end
++  # Override the methods below if you're implementing your own agent
++  def upgrade_state(new_state)
++    stop_pipeline("base")
++    add_pipeline("base", new_state, @pipeline_settings)
++  rescue => e
++    @logger.error("failed to update state", :new_state => new_state, :message => e.message, :backtrace => e.backtrace)
++    @logger.warn("reverting to previous state", :state => @state)
++    add_pipeline("base", @state, @pipeline_settings) unless clean_state?
++    @state
++  else
++    @state = new_state
++  ensure
++    start_pipeline("base") unless clean_state?
++  end
++
++  def fetch_state
++    @config_loader.format_config(@config_path, @config_string)
+   end
++
++  def valid_state?(new_state)
++    new_state.is_a?(String)
++  end
++
++  def new_state?(old_state, new_state)
++    old_state != new_state
++  end
++
++  def clean_state
++    ""
++  end
++
++  def clean_state?
++    @state == clean_state
++  end
++
+ end # class LogStash::Agent
+diff --git a/logstash-core/lib/logstash/agent_plugin_registry.rb b/logstash-core/lib/logstash/agent_plugin_registry.rb
+new file mode 100644
+index 00000000000..d7fb95f1ccf
+--- /dev/null
++++ b/logstash-core/lib/logstash/agent_plugin_registry.rb
+@@ -0,0 +1,66 @@
++# encoding: utf-8
++require "logstash/agent"
++
++module LogStash module AgentPluginRegistry
++  DEFAULT_AGENT_NAME = :default
++  class DuplicatePluginError < Error; end
++
++  REGISTRY = {}
++
++  # Reset plugin registry to just the default plugin
++  def self.reset!
++    REGISTRY.clear
++    REGISTRY[DEFAULT_AGENT_NAME] = LogStash::Agent
++  end
++  # Just have the defaults when the process starts
++  reset!
++
++  # Search gems for available plugins and load their libs
++  def self.load_all
++    find_plugins.each do |plugin|
++      name = plugin.name.split('-')[-1]
++      require "logstash/agents/#{name}"
++    end
++  end
++
++  # Return a list of Gem::Specification s that start with logstash-agent-
++  def self.find_plugins
++    ::Gem::Specification.find_all{|spec| spec.name =~ /logstash-agent-/ }
++  end
++
++  # To be called by a plugin when its class is first loaded
++  # Plugins should call this with the following code:
++  #
++  # require 'lib/logstash/agent_plugin_registry'
++  #
++  # class MyLogStashAgent < LogStash::Agent
++  #   LogStash::AgentPluginRegistry.register(:my_logstash_agent, self)
++  #
++  #   # ...
++  # end
++  def self.register(name, plugin_class)
++    name_sym = name.to_sym
++
++    if (conflicting_class = registry[name_sym])
++      raise DuplicatePluginError, "Could not register plugin '#{plugin_class}'" <<
++        " as '#{name}', this name is already taken by '#{conflicting_class}'"
++    end
++
++    registry[name_sym] = plugin_class
++  end
++
++  # A hash of plugin names to plugin classes
++  def self.registry
++    REGISTRY
++  end
++
++  # Get a plugin by name
++  def self.lookup(name)
++    registry[name.to_sym]
++  end
++
++  # List of available plugins
++  def self.available
++    registry.keys
++  end
++end end
+diff --git a/logstash-core/lib/logstash/config/defaults.rb b/logstash-core/lib/logstash/config/defaults.rb
+index ac3466f771d..c0c18fd7c04 100644
+--- a/logstash-core/lib/logstash/config/defaults.rb
++++ b/logstash-core/lib/logstash/config/defaults.rb
+@@ -6,6 +6,14 @@ module LogStash module Config module Defaults
+ 
+   extend self
+ 
++  def input
++    "input { stdin { type => stdin } }"
++  end
++
++  def output
++    "output { stdout { codec => rubydebug } }"
++  end
++
+   def cpu_cores
+     Concurrent.processor_count
+   end
+diff --git a/logstash-core/lib/logstash/config/loader.rb b/logstash-core/lib/logstash/config/loader.rb
+new file mode 100644
+index 00000000000..e1f34661645
+--- /dev/null
++++ b/logstash-core/lib/logstash/config/loader.rb
+@@ -0,0 +1,99 @@
++require "logstash/config/defaults"
++
++module LogStash; module Config; class Loader
++  def initialize(logger, is_config_test)
++    @logger = logger
++    @is_config_test = is_config_test
++  end
++
++  def config_test?
++    !!@is_config_test
++  end
++
++  def format_config(config_path, config_string)
++    config_string = config_string.to_s
++    if config_path
++      # Append the config string.
++      # This allows users to provide both -f and -e flags. The combination
++      # is rare, but useful for debugging.
++      config_string = config_string + load_config(config_path)
++    else
++      # include a default stdin input if no inputs given
++      if config_string !~ /input *{/
++        config_string += LogStash::Config::Defaults.input
++      end
++      # include a default stdout output if no outputs given
++      if config_string !~ /output *{/
++        config_string += LogStash::Config::Defaults.output
++      end
++    end
++    config_string
++  end
++
++  def load_config(path)
++    begin
++      uri = URI.parse(path)
++
++      case uri.scheme
++      when nil then
++        local_config(path)
++      when /http/ then
++        fetch_config(uri)
++      when "file" then
++        local_config(uri.path)
++      else
++        fail(I18n.t("logstash.runner.configuration.scheme-not-supported", :path => path))
++      end
++    rescue URI::InvalidURIError
++      # fallback for windows.
++      # if the parsing of the file failed we assume we can reach it locally.
++      # some relative path on windows arent parsed correctly (.\logstash.conf)
++      local_config(path)
++    end
++  end
++
++  def local_config(path)
++    path = ::File.expand_path(path)
++    path = ::File.join(path, "*") if ::File.directory?(path)
++
++    if Dir.glob(path).length == 0
++      fail(I18n.t("logstash.runner.configuration.file-not-found", :path => path))
++    end
++
++    config = ""
++    encoding_issue_files = []
++    Dir.glob(path).sort.each do |file|
++      next unless ::File.file?(file)
++      if file.match(/~$/)
++        @logger.debug("NOT reading config file because it is a temp file", :config_file => file)
++        next
++      end
++      @logger.debug("Reading config file", :config_file => file)
++      cfg = ::File.read(file)
++      if !cfg.ascii_only? && !cfg.valid_encoding?
++        encoding_issue_files << file
++      end
++      config << cfg + "\n"
++      if config_test?
++        @logger.debug? && @logger.debug("\nThe following is the content of a file", :config_file => file.to_s)
++        @logger.debug? && @logger.debug("\n" + cfg + "\n\n")
++      end
++    end
++    if encoding_issue_files.any?
++      fail("The following config files contains non-ascii characters but are not UTF-8 encoded #{encoding_issue_files}")
++    end
++    if config_test?
++      @logger.debug? && @logger.debug("\nThe following is the merged configuration")
++      @logger.debug? && @logger.debug("\n" + config + "\n\n")
++    end
++    return config
++  end # def load_config
++
++  def fetch_config(uri)
++    begin
++      Net::HTTP.get(uri) + "\n"
++    rescue Exception => e
++      fail(I18n.t("logstash.runner.configuration.fetch-failed", :path => uri.to_s, :message => e.message))
++    end
++  end
++end end end
+\ No newline at end of file
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index 48aa1c8a83d..f335deec581 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -16,6 +16,16 @@
+ module LogStash; class Pipeline
+   attr_reader :inputs, :filters, :outputs, :input_to_filter, :filter_to_output
+ 
++  def self.config_valid?(config_str)
++    begin
++      # There should be a better way to test this ideally
++      self.new(config_str)
++      true
++    rescue Exception => e
++      e
++    end
++  end
++
+   def initialize(config_str, settings = {})
+     @logger = Cabin::Channel.get(LogStash)
+ 
+diff --git a/logstash-core/lib/logstash/runner.rb b/logstash-core/lib/logstash/runner.rb
+index ee9c0dceb61..e968a27db7b 100644
+--- a/logstash-core/lib/logstash/runner.rb
++++ b/logstash-core/lib/logstash/runner.rb
+@@ -10,12 +10,12 @@
+ LogStash::Environment.load_locale!
+ 
+ require "logstash/namespace"
++require "logstash/agent_plugin_registry"
+ require "logstash/agent"
++require "logstash/config/defaults"
+ 
+ class LogStash::Runner < Clamp::Command
+-
+-  DEFAULT_INPUT = "input { stdin { type => stdin } }"
+-  DEFAULT_OUTPUT = "output { stdout { codec => rubydebug } }"
++  class MissingAgentError < StandardError; end # Raised when the user asks for an agent plugin that doesn't exist
+ 
+   option ["-f", "--config"], "CONFIG_PATH",
+     I18n.t("logstash.runner.flag.config"),
+@@ -23,8 +23,9 @@ class LogStash::Runner < Clamp::Command
+ 
+   option "-e", "CONFIG_STRING",
+     I18n.t("logstash.runner.flag.config-string",
+-           :default_input => DEFAULT_INPUT, :default_output => DEFAULT_OUTPUT),
+-    :default => "", :attribute_name => :config_string
++           :default_input => LogStash::Config::Defaults.input,
++           :default_output => LogStash::Config::Defaults.output),
++    :default => nil, :attribute_name => :config_string
+ 
+   option ["-w", "--filterworkers"], "COUNT",
+     I18n.t("logstash.runner.flag.filterworkers"),
+@@ -65,10 +66,19 @@ class LogStash::Runner < Clamp::Command
+     I18n.t("logstash.runner.flag.rubyshell"),
+     :attribute_name => :ruby_shell
+ 
++  option ["-a", "--agent"], "AGENT",
++    I18n.t("logstash.runner.flag.agent"),
++    :attribute_name => :agent_name, :default => LogStash::AgentPluginRegistry::DEFAULT_AGENT_NAME
++
++  option ["-r", "--[no-]auto-reload"], :flag,
++    I18n.t("logstash.runner.flag.auto_reload"),
++    :attribute_name => :auto_reload, :default => false
++
+   attr_reader :agent
+ 
+   def initialize(*args)
+-    @agent = LogStash::Agent.new
++    LogStash::AgentPluginRegistry.load_all
++    @logger = Cabin::Channel.get(LogStash)
+     super(*args)
+   end
+ 
+@@ -78,8 +88,6 @@ def execute
+     require "stud/task"
+     require "cabin" # gem 'cabin'
+ 
+-    @logger = Cabin::Channel.get(LogStash)
+-
+     LogStash::Util::set_thread_name(self.class.name)
+ 
+     if RUBY_VERSION < "1.9.2"
+@@ -102,36 +110,64 @@ def execute
+ 
+     return start_shell(@ruby_shell, binding) if @ruby_shell
+ 
+-    if @config_string.nil? && @config_path.nil?
++    if config_string.nil? && config_path.nil?
+       fail(I18n.t("logstash.runner.missing-configuration"))
+     end
+ 
+-    @agent.logger = @logger
++    if config_test?
++      config_loader = LogStash::Config::Loader.new(@logger, config_test?)
++      config_str = config_loader.format_config(config_path, config_string)
++      config_error = LogStash::Pipeline.config_valid?(config_str)
++      if config_error == true
++        @logger.terminal "Configuration OK"
++        return 0
++      else
++        @logger.fatal I18n.t("logstash.error", :error => config_error)
++        return 1
++      end
++    end
+ 
+-    config_string = format_config(@config_path, @config_string)
++    pipeline_settings = { "filter-workers" => filter_workers }
+ 
+-    @agent.add_pipeline("base", config_string, :filter_workers => filter_workers)
++    @agent = create_agent(:logger => @logger,
++                          :config_string => config_string,
++                          :config_path => config_path,
++                          :auto_reload => @auto_reload,
++                          :pipeline_settings => pipeline_settings)
+ 
+-    if config_test?
+-      puts "Configuration OK"
+-    else
+-      task = Stud::Task.new { @agent.execute }
+-      return task.wait
+-    end
++    # enable sigint/sigterm before starting the agent
++    # to properly handle a stalled agent
++    sigint_id = trap_sigint()
++    sigterm_id = trap_sigterm()
++
++    @agent_task = Stud::Task.new { @agent.execute }
++
++    # no point in enabling config reloading before the agent starts
++    sighup_id = trap_sighup()
++
++    @agent_task.wait
++
++    @agent.shutdown
+ 
+   rescue LoadError => e
+     fail("Configuration problem.")
+   rescue LogStash::ConfigurationError => e
++    @logger.warn I18n.t("logstash.runner.configtest-flag-information")
+     @logger.fatal I18n.t("logstash.error", :error => e)
+-    if !config_test?
+-      @logger.warn I18n.t("logstash.runner.configtest-flag-information")
+-    end
+     show_short_help
+     return 1
++  rescue MissingAgentError => e
++    @logger.fatal("Could not load specified agent",
++                  :agent_name => agent_name,
++                  :valid_agent_names => LogStash::AgentPluginRegistry.available.map(&:to_s))
++    return 1
+   rescue => e
+     @logger.fatal I18n.t("oops", :error => e)
+     @logger.debug e.backtrace if $DEBUGLIST.include?("stacktrace")
+   ensure
++    Stud::untrap("INT", sigint_id) unless sigint_id.nil?
++    Stud::untrap("TERM", sigterm_id) unless sigterm_id.nil?
++    Stud::untrap("HUP", sighup_id) unless sighup_id.nil?
+     @log_fd.close if @log_fd
+   end # def self.main
+ 
+@@ -184,6 +220,12 @@ def configure_plugin_paths(paths)
+     end
+   end
+ 
++  def create_agent(*args)
++    agent_class = LogStash::AgentPluginRegistry.lookup(agent_name)
++    @logger.info("Creating new agent", :class => agent_class)
++    agent_class.new(*args)
++  end
++
+   # Point logging at a specific path.
+   def configure_logging(path)
+     # Set with the -v (or -vv...) flag
+@@ -231,93 +273,6 @@ def configure_logging(path)
+     # http://jira.codehaus.org/browse/JRUBY-7003
+   end # def configure_logging
+ 
+-  def format_config(config_path, config_string)
+-    config_string = config_string.to_s
+-    if config_path
+-      # Append the config string.
+-      # This allows users to provide both -f and -e flags. The combination
+-      # is rare, but useful for debugging.
+-      config_string = config_string + load_config(config_path)
+-    else
+-      # include a default stdin input if no inputs given
+-      if config_string !~ /input *{/
+-        config_string += DEFAULT_INPUT
+-      end
+-      # include a default stdout output if no outputs given
+-      if config_string !~ /output *{/
+-        config_string += DEFAULT_OUTPUT
+-      end
+-    end
+-    config_string
+-  end
+-
+-  def load_config(path)
+-    begin
+-      uri = URI.parse(path)
+-
+-      case uri.scheme
+-      when nil then
+-        local_config(path)
+-      when /http/ then
+-        fetch_config(uri)
+-      when "file" then
+-        local_config(uri.path)
+-      else
+-        fail(I18n.t("logstash.runner.configuration.scheme-not-supported", :path => path))
+-      end
+-    rescue URI::InvalidURIError
+-      # fallback for windows.
+-      # if the parsing of the file failed we assume we can reach it locally.
+-      # some relative path on windows arent parsed correctly (.\logstash.conf)
+-      local_config(path)
+-    end
+-  end
+-
+-  def local_config(path)
+-    path = File.expand_path(path)
+-    path = File.join(path, "*") if File.directory?(path)
+-
+-    if Dir.glob(path).length == 0
+-      fail(I18n.t("logstash.runner.configuration.file-not-found", :path => path))
+-    end
+-
+-    config = ""
+-    encoding_issue_files = []
+-    Dir.glob(path).sort.each do |file|
+-      next unless File.file?(file)
+-      if file.match(/~$/)
+-        @logger.debug("NOT reading config file because it is a temp file", :config_file => file)
+-        next
+-      end
+-      @logger.debug("Reading config file", :config_file => file)
+-      cfg = File.read(file)
+-      if !cfg.ascii_only? && !cfg.valid_encoding?
+-        encoding_issue_files << file
+-      end
+-      config << cfg + "\n"
+-      if config_test?
+-        @logger.debug? && @logger.debug("\nThe following is the content of a file", :config_file => file.to_s)
+-        @logger.debug? && @logger.debug("\n" + cfg + "\n\n")
+-      end
+-    end
+-    if (encoding_issue_files.any?)
+-      fail("The following config files contains non-ascii characters but are not UTF-8 encoded #{encoding_issue_files}")
+-    end
+-    if config_test?
+-      @logger.debug? && @logger.debug("\nThe following is the merged configuration")
+-      @logger.debug? && @logger.debug("\n" + config + "\n\n")
+-    end
+-    return config
+-  end # def load_config
+-
+-  def fetch_config(uri)
+-    begin
+-      Net::HTTP.get(uri) + "\n"
+-    rescue Exception => e
+-      fail(I18n.t("logstash.runner.configuration.fetch-failed", :path => uri.to_s, :message => e.message))
+-    end
+-  end
+-
+   # Emit a failure message and abort.
+   def fail(message)
+     raise LogStash::ConfigurationError, message
+@@ -342,4 +297,33 @@ def start_shell(shell, start_binding)
+       fail(I18n.t("logstash.runner.invalid-shell"))
+     end
+   end
++
++  def trap_sighup
++    Stud::trap("HUP") do
++      @logger.warn(I18n.t("logstash.agent.sighup"))
++      @agent.reload_state!
++    end
++  end
++
++  def trap_sigterm
++    Stud::trap("TERM") do
++      @logger.warn(I18n.t("logstash.agent.sigterm"))
++      @agent_task.stop!
++    end
++  end
++
++  def trap_sigint
++    Stud::trap("INT") do
++      if @interrupted_once
++        @logger.fatal(I18n.t("logstash.agent.forced_sigint"))
++        exit
++      else
++        @logger.warn(I18n.t("logstash.agent.sigint"))
++        Thread.new(@logger) {|logger| sleep 5; logger.warn(I18n.t("logstash.agent.slow_shutdown")) }
++        @interrupted_once = true
++        @agent_task.stop!
++      end
++    end
++  end
++
+ end # class LogStash::Runner
+diff --git a/logstash-core/lib/logstash/shutdown_controller.rb b/logstash-core/lib/logstash/shutdown_controller.rb
+index 6941753bbc8..fc38d3dd1c7 100644
+--- a/logstash-core/lib/logstash/shutdown_controller.rb
++++ b/logstash-core/lib/logstash/shutdown_controller.rb
+@@ -9,8 +9,9 @@ class ShutdownController
+ 
+     attr_reader :cycle_period, :report_every, :abort_threshold
+ 
+-    def initialize(pipeline, cycle_period=CHECK_EVERY, report_every=REPORT_EVERY, abort_threshold=ABORT_AFTER)
++    def initialize(pipeline, pipeline_thread, cycle_period=CHECK_EVERY, report_every=REPORT_EVERY, abort_threshold=ABORT_AFTER)
+       @pipeline = pipeline
++      @pipeline_thread = pipeline_thread
+       @cycle_period = cycle_period
+       @report_every = report_every
+       @abort_threshold = abort_threshold
+@@ -33,8 +34,8 @@ def self.logger
+       @logger ||= Cabin::Channel.get(LogStash)
+     end
+ 
+-    def self.start(pipeline, cycle_period=CHECK_EVERY, report_every=REPORT_EVERY, abort_threshold=ABORT_AFTER)
+-      controller = self.new(pipeline, cycle_period, report_every, abort_threshold)
++    def self.start(pipeline, pipeline_thread, cycle_period=CHECK_EVERY, report_every=REPORT_EVERY, abort_threshold=ABORT_AFTER)
++      controller = self.new(pipeline, pipeline_thread, cycle_period, report_every, abort_threshold)
+       Thread.new(controller) { |controller| controller.start }
+     end
+ 
+@@ -47,6 +48,7 @@ def start
+       cycle_number = 0
+       stalled_count = 0
+       Stud.interval(@cycle_period) do
++        break unless @pipeline_thread.alive?
+         @reports << Report.from_pipeline(@pipeline)
+         @reports.delete_at(0) if @reports.size > @report_every # expire old report
+         if cycle_number == (@report_every - 1) # it's report time!
+diff --git a/logstash-core/locales/en.yml b/logstash-core/locales/en.yml
+index 1b2ce1dd51c..3a0578978ae 100644
+--- a/logstash-core/locales/en.yml
++++ b/logstash-core/locales/en.yml
+@@ -60,9 +60,9 @@ en:
+       sighup: >-
+         SIGHUP received.
+       sigint: >-
+-        SIGINT received. Shutting down the pipeline.
++        SIGINT received. Shutting down the agent.
+       sigterm: >-
+-        SIGTERM received. Shutting down the pipeline.
++        SIGTERM received. Shutting down the agent.
+       slow_shutdown: |-
+         Received shutdown signal, but pipeline is still waiting for in-flight events
+         to be processed. Sending another ^C will force quit Logstash, but this may cause
+@@ -166,6 +166,10 @@ en:
+           Check configuration for valid syntax and then exit.
+         filterworkers: |+
+           Sets the number of filter workers to run.
++        auto_reload: |+
++          Monitor configuration changes and reload
++          whenever it is changed.
++          NOTE: use SIGHUP to manually reload the config
+         log: |+
+           Write logstash internal logs to the given
+           file. Without this flag, logstash will emit
+@@ -204,3 +208,5 @@ en:
+         rubyshell: |+
+           Drop to shell instead of running as normal.
+           Valid shells are "irb" and "pry"
++        agent: |+
++          Specify an alternate agent plugin name.
+\ No newline at end of file
+diff --git a/logstash-core/spec/logstash/agent_plugin_registry_spec.rb b/logstash-core/spec/logstash/agent_plugin_registry_spec.rb
+new file mode 100644
+index 00000000000..79ad5816410
+--- /dev/null
++++ b/logstash-core/spec/logstash/agent_plugin_registry_spec.rb
+@@ -0,0 +1,43 @@
++# encoding: utf-8
++require "spec_helper"
++require "logstash/runner"
++require "stud/task"
++
++describe LogStash::AgentPluginRegistry do
++  class TestAgent < LogStash::Agent; end
++  class TestAgent2 < LogStash::Agent; end
++
++  subject { described_class }
++
++  after(:each) do
++    LogStash::AgentPluginRegistry.reset!
++  end
++
++  describe "the default registry with no registered plugins" do
++    it "should have the default agent" do
++      expect(subject.lookup(LogStash::AgentPluginRegistry::DEFAULT_AGENT_NAME)).to eql(LogStash::Agent)
++    end
++
++    it "should only have one plugin registered" do
++      expect(subject.available.size).to eql(1)
++    end
++
++    it "should be able to register an additional plugin" do
++      subject.register(:foo, TestAgent)
++      expect(subject.lookup(:foo)).to eql(TestAgent)
++    end
++
++    context "with two plugins under the same name" do
++      before do
++        subject.register(:foo, TestAgent)
++      end
++
++      it "should not allow the second plugin to be registered" do
++        expect do
++          subject.register(:foo, TestAgent2)
++        end.to raise_error(LogStash::AgentPluginRegistry::DuplicatePluginError)
++      end
++    end
++  end
++
++end
+diff --git a/logstash-core/spec/logstash/agent_spec.rb b/logstash-core/spec/logstash/agent_spec.rb
+index 9a609ddf886..ad234450fad 100644
+--- a/logstash-core/spec/logstash/agent_spec.rb
++++ b/logstash-core/spec/logstash/agent_spec.rb
+@@ -1,5 +1,135 @@
+ # encoding: utf-8
+ require 'spec_helper'
++require 'stud/temporary'
+ 
+ describe LogStash::Agent do
++
++  let(:logger) { double("logger") }
++  let(:agent_args) { { :logger => logger } }
++  subject { LogStash::Agent.new(agent_args) }
++
++  before :each do
++    [:info, :warn, :error, :fatal, :debug].each do |level|
++      allow(logger).to receive(level)
++    end
++  end
++
++  context "when passing :pipeline_settings" do
++    let(:config_string) { "input { } filter { drop { } } output { }" }
++    let(:pipeline_settings) { { :filter_workers => 4 } }
++    let(:agent_args) do
++      {
++        :logger => logger,
++        :auto_reload => true,
++        :reload_interval => 0.01,
++        :config_string => config_string,
++        :pipeline_settings => pipeline_settings
++      }
++    end
++    it "should delegate pipeline_settings to new pipelines" do
++      expect(subject).to receive(:add_pipeline).with("base", config_string, pipeline_settings)
++      subject.execute
++    end
++  end
++
++  describe "#execute" do
++    context "when auto_reload is false" do
++      let(:agent_args) { { :logger => logger, :auto_reload => false, :reload_interval => 0.01 } }
++      context "if state is clean" do
++        it "should only reload_state once" do
++          allow(subject).to receive(:sleep)
++          expect(subject).to receive(:reload_state!).exactly(:once)
++          t = Thread.new { subject.execute }
++          sleep 0.1
++          Stud.stop!(t)
++          t.join
++        end
++      end
++    end
++
++    context "when auto_reload is true" do
++      let(:agent_args) { { :logger => logger, :auto_reload => true, :reload_interval => 0.01 } }
++      context "if state is clean" do
++        it "should periodically reload_state" do
++          expect(subject).to receive(:reload_state!).at_least(:twice)
++          t = Thread.new { subject.execute }
++          sleep 0.1
++          Stud.stop!(t)
++          t.join
++        end
++      end
++    end
++  end
++
++  describe "#reload_state!" do
++    context "when fetching a new state" do
++      it "upgrades the state" do
++        allow(subject).to receive(:fetch_state).and_return("input { plugin {} } output { plugin {} }")
++        expect(subject).to receive(:upgrade_state)
++        subject.send(:reload_state!)
++      end
++    end
++    context "when fetching the same state" do
++      it "doesn't upgrade the state" do
++        allow(subject).to receive(:fetch_state).and_return("")
++        expect(subject).to_not receive(:upgrade_state)
++        subject.send(:reload_state!)
++      end
++    end
++  end
++
++  describe "#upgrade_state" do
++    context "when the upgrade fails" do
++      before :each do
++        allow(subject).to receive(:fetch_state).and_return("input { plugin {} } output { plugin {} }")
++        allow(subject).to receive(:add_pipeline).and_raise(StandardError)
++      end
++      it "leaves the state untouched" do
++        subject.send(:reload_state!)
++        expect(subject.state).to eq("")
++      end
++      context "and current state is empty" do
++        it "should not start a pipeline" do
++          expect(subject).to_not receive(:start_pipeline)
++          subject.send(:reload_state!)
++        end
++      end
++    end
++
++    context "when the upgrade succeeds" do
++      let(:new_state) { "input { generator { count => 1 } } output { stdout {} }" }
++      before :each do
++        allow(subject).to receive(:fetch_state).and_return(new_state)
++        allow(subject).to receive(:add_pipeline)
++      end
++      it "updates the state" do
++        subject.send(:reload_state!)
++        expect(subject.state).to eq(new_state)
++      end
++      it "starts the pipeline" do
++        expect(subject).to receive(:start_pipeline)
++        subject.send(:reload_state!)
++      end
++    end
++  end
++
++  describe "#fetch_state" do
++    let(:file_config) { "input { generator { count => 100 } } output { stdout { } }" }
++    let(:cli_config) { "filter { drop { } } " }
++    let(:tmp_config_path) { Stud::Temporary.pathname }
++    let(:agent_args) { { :logger => logger, :config_string => "filter { drop { } } ", :config_path => tmp_config_path } }
++
++    before :each do
++      IO.write(tmp_config_path, file_config)
++    end
++
++    after :each do
++      File.unlink(tmp_config_path)
++    end
++
++    it "should join the config string and config path content" do
++      expect(subject.send(:fetch_state).strip).to eq(cli_config + IO.read(tmp_config_path))
++    end
++
++  end
+ end
+diff --git a/logstash-core/spec/logstash/config/loader_spec.rb b/logstash-core/spec/logstash/config/loader_spec.rb
+new file mode 100644
+index 00000000000..cc5fba037ca
+--- /dev/null
++++ b/logstash-core/spec/logstash/config/loader_spec.rb
+@@ -0,0 +1,36 @@
++# encoding: utf-8
++require "spec_helper"
++require "logstash/config/loader"
++
++describe LogStash::Config::Loader do
++  subject { described_class.new(Cabin::Channel.get, false) }
++  context "when local" do
++    before { expect(subject).to receive(:local_config).with(path) }
++
++    context "unix" do
++      let(:path) { './test.conf' }
++      it 'works with relative path' do
++        subject.load_config(path)
++      end
++    end
++
++    context "windows" do
++      let(:path) { '.\test.conf' }
++      it 'work with relative windows path' do
++        subject.load_config(path)
++      end
++    end
++  end
++
++  context "when remote" do
++    context 'supported scheme' do
++      let(:path) { "http://test.local/superconfig.conf" }
++      let(:dummy_config) { 'input {}' }
++
++      before { expect(Net::HTTP).to receive(:get) { dummy_config } }
++      it 'works with http' do
++        expect(subject.load_config(path)).to eq("#{dummy_config}\n")
++      end
++    end
++  end
++end
+diff --git a/logstash-core/spec/logstash/runner_spec.rb b/logstash-core/spec/logstash/runner_spec.rb
+index 3dec2c0e7ef..813f6cc9eec 100644
+--- a/logstash-core/spec/logstash/runner_spec.rb
++++ b/logstash-core/spec/logstash/runner_spec.rb
+@@ -17,15 +17,21 @@ def run(args); end
+   end
+ 
+   describe "argument parsing" do
+-
+     subject { LogStash::Runner.new("") }
+     context "when -e is given" do
+ 
+-      let(:args) { ["-e", ""] }
++      let(:args) { ["-e", "input {} output {}"] }
++      let(:agent) { double("agent") }
++      let(:agent_logger) { double("agent logger") }
++
++      before do
++        allow(agent).to receive(:logger=).with(anything)
++        allow(agent).to receive(:shutdown)
++      end
+ 
+       it "should execute the agent" do
+-        expect(subject.agent).to receive(:add_pipeline).once
+-        expect(subject.agent).to receive(:execute).once
++        expect(subject).to receive(:create_agent).and_return(agent)
++        expect(agent).to receive(:execute).once
+         subject.run(args)
+       end
+     end
+@@ -33,44 +39,30 @@ def run(args); end
+     context "with no arguments" do
+       let(:args) { [] }
+       it "should show help" do
+-        expect(subject).to receive(:show_short_help).once
+-        expect(channel).to receive(:fatal).once
+         expect(channel).to receive(:warn).once
++        expect(channel).to receive(:fatal).once
++        expect(subject).to receive(:show_short_help).once
+         subject.run(args)
+       end
+     end
+   end
+ 
+-  context "when loading the configuration" do
++  context "--agent" do
++    class DummyAgent < LogStash::Agent
++      def initialize; end
++    end
++
++    let(:agent_name) { "testagent" }
+     subject { LogStash::Runner.new("") }
+-    context "when local" do
+-      before { expect(subject).to receive(:local_config).with(path) }
+-
+-      context "unix" do
+-        let(:path) { './test.conf' }
+-        it 'works with relative path' do
+-          subject.load_config(path)
+-        end
+-      end
+ 
+-      context "windows" do
+-        let(:path) { '.\test.conf' }
+-        it 'work with relative windows path' do
+-          subject.load_config(path)
+-        end
+-      end
++    before do
++      LogStash::AgentPluginRegistry.register(agent_name, DummyAgent)
++      allow(subject).to receive(:execute) # stub this out to reduce test work/output
++      subject.run(["-a", "testagent", "-e" "input {} output {}"])
+     end
+ 
+-    context "when remote" do
+-      context 'supported scheme' do
+-        let(:path) { "http://test.local/superconfig.conf" }
+-        let(:dummy_config) { 'input {}' }
+-
+-        before { expect(Net::HTTP).to receive(:get) { dummy_config } }
+-        it 'works with http' do
+-          expect(subject.load_config(path)).to eq("#{dummy_config}\n")
+-        end
+-      end
++    it "should set the proper agent" do
++      expect(subject.create_agent.class).to eql(DummyAgent)
+     end
+   end
+ 
+diff --git a/logstash-core/spec/logstash/shutdown_controller_spec.rb b/logstash-core/spec/logstash/shutdown_controller_spec.rb
+index 5f755f290a8..da36f46a516 100644
+--- a/logstash-core/spec/logstash/shutdown_controller_spec.rb
++++ b/logstash-core/spec/logstash/shutdown_controller_spec.rb
+@@ -6,7 +6,7 @@
+ 
+   let(:check_every) { 0.01 }
+   let(:check_threshold) { 100 }
+-  subject { LogStash::ShutdownController.new(pipeline, check_every) }
++  subject { LogStash::ShutdownController.new(pipeline, Thread.current, check_every) }
+   let(:pipeline) { double("pipeline") }
+   report_count = 0
+ 

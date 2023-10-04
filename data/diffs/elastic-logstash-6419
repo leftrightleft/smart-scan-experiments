@@ -1,0 +1,666 @@
+diff --git a/Gemfile b/Gemfile
+index b8fbebb9bc8..e4ffbbf1f4f 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -116,3 +116,26 @@ gem "logstash-output-tcp"
+ gem "logstash-output-udp"
+ gem "logstash-output-webhdfs"
+ gem "logstash-filter-dissect"
++gem "logstash-filter-multiline", :path => "~/Code/es/logstash-filter-multiline"
++gem "logstash-input-dlq", :path => "~/Code/es/talevy-logstash-input-dlq"
++gem "jar-dependencies", ">= 0"
++gem "ruby-maven", "~> 3.3"
++gem "logstash-patterns-core", ">= 0"
++gem "pry", ">= 0"
++gem "rspec-wait", ">= 0"
++gem "childprocess", ">= 0"
++gem "ftw", "~> 0.0.42"
++gem "rspec-sequencing", ">= 0"
++gem "gmetric", ">= 0"
++gem "gelf", "= 1.3.2"
++gem "timecop", ">= 0"
++gem "jdbc-derby", ">= 0"
++gem "coveralls", ">= 0"
++gem "addressable", "~> 2.3.0"
++gem "elasticsearch", ">= 0"
++gem "sinatra", ">= 0"
++gem "webrick", ">= 0"
++gem "poseidon", ">= 0"
++gem "snappy", ">= 0"
++gem "webmock", "~> 1.21.0"
++>>>>>>> initial dlq
+diff --git a/config/logstash.yml b/config/logstash.yml
+index 1cdec6f74d6..66cddd4f952 100644
+--- a/config/logstash.yml
++++ b/config/logstash.yml
+@@ -131,6 +131,16 @@
+ #
+ # queue.checkpoint.interval: 1000
+ #
++# ------------ Dead-Letter Queue Settings --------------
++# Flag to turn on dead-letter queue.
++#
++dead_letter_queue.enable: true
++#
++# If using dead_letter_queue.enable: true, the directory path where the data files will be stored.
++# Default is path.data/dead_letter_queue
++#
++# path.dead_letter_queue: false
++#
+ # ------------ Metrics Settings --------------
+ #
+ # Bind address for the metrics REST endpoint
+diff --git a/docs/static/settings-file.asciidoc b/docs/static/settings-file.asciidoc
+index a09ab1a9b1c..36da4ee611f 100644
+--- a/docs/static/settings-file.asciidoc
++++ b/docs/static/settings-file.asciidoc
+@@ -134,6 +134,14 @@ The `logstash.yml` file includes the following settings:
+ | The interval in milliseconds when a checkpoint is forced on the head page when persistent queues are enabled (`queue.type: persisted`). Specify `queue.checkpoint.interval: 0` for no periodic checkpoint.
+ | 1000
+ 
++| `dead_letter_queue.enable`
++| Flag to instruct Logstash to enable the DLQ feature supported by plugins.
++| `false`
++
++| `path.dql`
++| The directory path where the data files will be stored for the dead-letter queue.
++| `path.data/dlq`
++
+ | `http.host`
+ | The bind address for the metrics REST endpoint.
+ | `"127.0.0.1"`
+diff --git a/logstash-core/lib/logstash/api/command_factory.rb b/logstash-core/lib/logstash/api/command_factory.rb
+index 2d790b5ee1c..d81dabd8d09 100644
+--- a/logstash-core/lib/logstash/api/command_factory.rb
++++ b/logstash-core/lib/logstash/api/command_factory.rb
+@@ -5,6 +5,7 @@
+ require "logstash/api/commands/stats"
+ require "logstash/api/commands/node"
+ require "logstash/api/commands/default_metadata"
++require "logstash/api/commands/dlq"
+ 
+ 
+ module LogStash
+@@ -19,7 +20,8 @@ def initialize(service)
+           :plugins_command => ::LogStash::Api::Commands::System::Plugins,
+           :stats => ::LogStash::Api::Commands::Stats,
+           :node => ::LogStash::Api::Commands::Node,
+-          :default_metadata => ::LogStash::Api::Commands::DefaultMetadata
++          :default_metadata => ::LogStash::Api::Commands::DefaultMetadata,
++          :dlq => ::LogStash::Api::Commands::Dlq
+         }
+       end
+ 
+diff --git a/logstash-core/lib/logstash/api/commands/base.rb b/logstash-core/lib/logstash/api/commands/base.rb
+index d2bef44e6fb..c84d6a825ab 100644
+--- a/logstash-core/lib/logstash/api/commands/base.rb
++++ b/logstash-core/lib/logstash/api/commands/base.rb
+@@ -5,7 +5,7 @@ module Api
+     module Commands
+       class Base
+         attr_reader :service
+-        
++
+         def initialize(service = LogStash::Api::Service.instance)
+           @service = service
+         end
+@@ -13,7 +13,7 @@ def initialize(service = LogStash::Api::Service.instance)
+         def uptime
+           service.agent.uptime
+         end
+-        
++
+         def started_at
+           (LogStash::Agent::STARTED_AT.to_f * 1000.0).to_i
+         end
+diff --git a/logstash-core/lib/logstash/api/commands/dlq.rb b/logstash-core/lib/logstash/api/commands/dlq.rb
+new file mode 100644
+index 00000000000..f4d2f9b0b3a
+--- /dev/null
++++ b/logstash-core/lib/logstash/api/commands/dlq.rb
+@@ -0,0 +1,21 @@
++# encoding: utf-8
++require "logstash/api/commands/base"
++require 'logstash/util/thread_dump'
++require_relative "hot_threads_reporter"
++
++module LogStash module Api module Commands
++  class Dlq < Commands::Base
++    def initialize(service = LogStash::Api::Service.instance)
++      super(service)
++      @pipeline_id, @pipeline = @service.agent.pipelines.first
++    end
++
++    def list
++      {
++        :pipeline => {
++          @pipeline_id => @pipeline.dlq_manager.queues
++        }
++      }
++    end
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/api/modules/dlq.rb b/logstash-core/lib/logstash/api/modules/dlq.rb
+new file mode 100644
+index 00000000000..e2fcd2afd2d
+--- /dev/null
++++ b/logstash-core/lib/logstash/api/modules/dlq.rb
+@@ -0,0 +1,17 @@
++# encoding: utf-8
++module LogStash
++  module Api
++    module Modules
++      class Dlq < ::LogStash::Api::Modules::Base
++
++        before do
++          @command = factory.build(:dlq)
++        end
++
++        get "/" do
++          respond_with(@command.list())
++        end
++      end
++    end
++  end
++end
+diff --git a/logstash-core/lib/logstash/api/rack_app.rb b/logstash-core/lib/logstash/api/rack_app.rb
+index 79965e431ed..bc33c1af0e1 100644
+--- a/logstash-core/lib/logstash/api/rack_app.rb
++++ b/logstash-core/lib/logstash/api/rack_app.rb
+@@ -1,6 +1,7 @@
+ require "sinatra"
+ require "rack"
+ require "logstash/api/modules/base"
++require "logstash/api/modules/dlq"
+ require "logstash/api/modules/node"
+ require "logstash/api/modules/node_stats"
+ require "logstash/api/modules/plugins"
+@@ -105,7 +106,8 @@ def self.rack_namespaces(agent)
+           "/_stats" => LogStash::Api::Modules::Stats,
+           "/_node/stats" => LogStash::Api::Modules::NodeStats,
+           "/_node/plugins" => LogStash::Api::Modules::Plugins,
+-          "/_node/logging" => LogStash::Api::Modules::Logging
++          "/_node/logging" => LogStash::Api::Modules::Logging,
++          "/dlq" => LogStash::Api::Modules::Dlq
+         }
+       end
+     end
+diff --git a/logstash-core/lib/logstash/codecs/base.rb b/logstash-core/lib/logstash/codecs/base.rb
+index cf8b582d9d5..4f493f4ea33 100644
+--- a/logstash-core/lib/logstash/codecs/base.rb
++++ b/logstash-core/lib/logstash/codecs/base.rb
+@@ -14,7 +14,7 @@ def self.plugin_type
+     "codec"
+   end
+ 
+-  def initialize(params={})
++  def initialize(params = {}, dlq=nil)
+     super
+     config_init(@params)
+     register if respond_to?(:register)
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index c17bf0e657e..63d544b2569 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -48,6 +48,7 @@ module Environment
+             Setting::Numeric.new("queue.checkpoint.acks", 1024), # 0 is unlimited
+             Setting::Numeric.new("queue.checkpoint.writes", 1024), # 0 is unlimited
+             Setting::Numeric.new("queue.checkpoint.interval", 1000), # 0 is no time-based checkpointing
++            Setting::Boolean.new("dead_letter_queue.enable", false),
+             Setting::TimeValue.new("slowlog.threshold.warn", "-1"),
+             Setting::TimeValue.new("slowlog.threshold.info", "-1"),
+             Setting::TimeValue.new("slowlog.threshold.debug", "-1"),
+@@ -57,13 +58,21 @@ module Environment
+   # Compute the default queue path based on `path.data`
+   default_queue_file_path = ::File.join(SETTINGS.get("path.data"), "queue")
+   SETTINGS.register Setting::WritableDirectory.new("path.queue", default_queue_file_path)
+-  
++  # Compute the default dead_letter_queue path based on `path.data`
++  default_dlq_file_path = ::File.join(SETTINGS.get("path.data"), "dead_letter_queue")
++  SETTINGS.register Setting::WritableDirectory.new("path.dead_letter_queue", default_dlq_file_path)
++
+   SETTINGS.on_post_process do |settings|
+     # If the data path is overriden but the queue path isn't recompute the queue path
+     # We need to do this at this stage because of the weird execution order
+     # our monkey-patched Clamp follows
+-    if settings.set?("path.data") && !settings.set?("path.queue")
+-      settings.set_value("path.queue", ::File.join(settings.get("path.data"), "queue"))
++    if settings.set?("path.data")
++      if !settings.set?("path.queue")
++        settings.set_value("path.queue", ::File.join(settings.get("path.data"), "queue"))
++      end
++      if !settings.set?("path.dead_letter_queue")
++        settings.set_value("path.queue", ::File.join(settings.get("path.data"), "dead_letter_queue"))
++      end
+     end
+   end
+ 
+diff --git a/logstash-core/lib/logstash/filter_delegator.rb b/logstash-core/lib/logstash/filter_delegator.rb
+index e5adee779c1..710ce423dc2 100644
+--- a/logstash-core/lib/logstash/filter_delegator.rb
++++ b/logstash-core/lib/logstash/filter_delegator.rb
+@@ -14,11 +14,11 @@ class FilterDelegator
+     ]
+     def_delegators :@filter, *DELEGATED_METHODS
+ 
+-    def initialize(logger, klass, metric, plugin_args)
++    def initialize(logger, klass, metric, plugin_args, dlq)
+       @logger = logger
+       @klass = klass
+       @id = plugin_args["id"]
+-      @filter = klass.new(plugin_args)
++      @filter = klass.new(plugin_args, dlq)
+ 
+       # Scope the metrics to the plugin
+       namespaced_metric = metric.namespace(@id.to_sym)
+diff --git a/logstash-core/lib/logstash/filters/base.rb b/logstash-core/lib/logstash/filters/base.rb
+index 8b1ab5e07b4..76985083bab 100644
+--- a/logstash-core/lib/logstash/filters/base.rb
++++ b/logstash-core/lib/logstash/filters/base.rb
+@@ -123,7 +123,7 @@ def self.plugin_type
+   end
+ 
+   public
+-  def initialize(params)
++  def initialize(params, dlq=nil)
+     super
+     config_init(@params)
+     @threadsafe = true
+diff --git a/logstash-core/lib/logstash/inputs/base.rb b/logstash-core/lib/logstash/inputs/base.rb
+index ca769278893..e20186a13d8 100644
+--- a/logstash-core/lib/logstash/inputs/base.rb
++++ b/logstash-core/lib/logstash/inputs/base.rb
+@@ -55,7 +55,7 @@ def self.plugin_type
+   end
+ 
+   public
+-  def initialize(params={})
++  def initialize(params, dlq=nil)
+     super
+     @threadable = false
+     @stop_called = Concurrent::AtomicBoolean.new(false)
+diff --git a/logstash-core/lib/logstash/inputs/threadable.rb b/logstash-core/lib/logstash/inputs/threadable.rb
+index 04d834b722c..12ff8d05e15 100644
+--- a/logstash-core/lib/logstash/inputs/threadable.rb
++++ b/logstash-core/lib/logstash/inputs/threadable.rb
+@@ -10,7 +10,7 @@ class LogStash::Inputs::Threadable < LogStash::Inputs::Base
+   # This is the same as declaring the input multiple times
+   config :threads, :validate => :number, :default => 1
+  
+-  def initialize(params)
++  def initialize(params, dlq=nil)
+     super
+     @threadable = true
+   end
+diff --git a/logstash-core/lib/logstash/output_delegator.rb b/logstash-core/lib/logstash/output_delegator.rb
+index 23166f0cf0a..6cbe0454ba0 100644
+--- a/logstash-core/lib/logstash/output_delegator.rb
++++ b/logstash-core/lib/logstash/output_delegator.rb
+@@ -7,7 +7,7 @@
+ module LogStash class OutputDelegator
+   attr_reader :metric, :metric_events, :strategy, :namespaced_metric, :metric_events, :id
+ 
+-  def initialize(logger, output_class, metric, strategy_registry, plugin_args)
++  def initialize(logger, output_class, metric, strategy_registry, plugin_args, dlq)
+     @logger = logger
+     @output_class = output_class
+     @metric = metric
+@@ -18,7 +18,7 @@ def initialize(logger, output_class, metric, strategy_registry, plugin_args)
+     
+     @strategy = strategy_registry.
+                   class_for(self.concurrency).
+-                  new(@logger, @output_class, @metric, plugin_args)
++                  new(@logger, @output_class, @metric, plugin_args, dlq)
+     
+     @namespaced_metric = metric.namespace(id.to_sym)
+     @namespaced_metric.gauge(:name, config_name)
+diff --git a/logstash-core/lib/logstash/output_delegator_strategies/legacy.rb b/logstash-core/lib/logstash/output_delegator_strategies/legacy.rb
+index 81f695afc9d..8d4eb0190e1 100644
+--- a/logstash-core/lib/logstash/output_delegator_strategies/legacy.rb
++++ b/logstash-core/lib/logstash/output_delegator_strategies/legacy.rb
+@@ -2,9 +2,9 @@
+ module LogStash module OutputDelegatorStrategies class Legacy
+   attr_reader :worker_count, :workers
+   
+-  def initialize(logger, klass, metric, plugin_args)
++  def initialize(logger, klass, metric, plugin_args, dlq)
+     @worker_count = (plugin_args["workers"] || 1).to_i
+-    @workers = @worker_count.times.map { klass.new(plugin_args) }
++    @workers = @worker_count.times.map { klass.new(plugin_args, dlq) }
+     @workers.each {|w| w.metric = metric }
+     @worker_queue = SizedQueue.new(@worker_count)
+     @workers.each {|w| @worker_queue << w}
+diff --git a/logstash-core/lib/logstash/output_delegator_strategies/shared.rb b/logstash-core/lib/logstash/output_delegator_strategies/shared.rb
+index 9650cf7ee22..5ccc2516922 100644
+--- a/logstash-core/lib/logstash/output_delegator_strategies/shared.rb
++++ b/logstash-core/lib/logstash/output_delegator_strategies/shared.rb
+@@ -1,6 +1,6 @@
+ module LogStash module OutputDelegatorStrategies class Shared
+-  def initialize(logger, klass, metric, plugin_args)
+-    @output = klass.new(plugin_args)
++  def initialize(logger, klass, metric, plugin_args, dlq)
++    @output = klass.new(plugin_args, dlq)
+     @output.metric = metric
+   end
+   
+diff --git a/logstash-core/lib/logstash/output_delegator_strategies/single.rb b/logstash-core/lib/logstash/output_delegator_strategies/single.rb
+index d576a22df6f..5705bb199f4 100644
+--- a/logstash-core/lib/logstash/output_delegator_strategies/single.rb
++++ b/logstash-core/lib/logstash/output_delegator_strategies/single.rb
+@@ -1,6 +1,6 @@
+ module LogStash module OutputDelegatorStrategies class Single
+-  def initialize(logger, klass, metric, plugin_args)
+-    @output = klass.new(plugin_args)
++  def initialize(logger, klass, metric, plugin_args, dlq)
++    @output = klass.new(plugin_args, dlq)
+     @output.metric = metric
+     @mutex = Mutex.new
+   end
+diff --git a/logstash-core/lib/logstash/outputs/base.rb b/logstash-core/lib/logstash/outputs/base.rb
+index 5e3ce1ad1a3..bbd8c085a63 100644
+--- a/logstash-core/lib/logstash/outputs/base.rb
++++ b/logstash-core/lib/logstash/outputs/base.rb
+@@ -58,7 +58,7 @@ def self.plugin_type
+   end
+ 
+   public
+-  def initialize(params={})
++  def initialize(params, dlq=nil)
+     super
+     config_init(@params)
+ 
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index b2dff61d619..27a47813d2f 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -21,6 +21,7 @@
+ require "logstash/output_delegator"
+ require "logstash/filter_delegator"
+ require "logstash/queue_factory"
++require "logstash/dlq_manager"
+ 
+ module LogStash; class BasePipeline
+   include LogStash::Util::Loggable
+@@ -89,11 +90,11 @@ def plugin(plugin_type, name, *args)
+     klass = Plugin.lookup(plugin_type, name)
+ 
+     if plugin_type == "output"
+-      OutputDelegator.new(@logger, klass, type_scoped_metric,  OutputDelegatorStrategyRegistry.instance, args)
++      OutputDelegator.new(@logger, klass, type_scoped_metric,  OutputDelegatorStrategyRegistry.instance, args, @dlq_manager)
+     elsif plugin_type == "filter"
+-      FilterDelegator.new(@logger, klass, type_scoped_metric, args)
++      FilterDelegator.new(@logger, klass, type_scoped_metric, args, @dlq_manager)
+     else # input
+-      input_plugin = klass.new(args)
++      input_plugin = klass.new(args, @dlq_manager)
+       input_plugin.metric = type_scoped_metric.namespace(id)
+       input_plugin
+     end
+@@ -120,7 +121,8 @@ module LogStash; class Pipeline < BasePipeline
+     :metric,
+     :filter_queue_client,
+     :input_queue_client,
+-    :queue
++    :queue,
++    :dlq_manager
+ 
+   MAX_INFLIGHT_WARN_THRESHOLD = 10_000
+ 
+@@ -157,6 +159,12 @@ def initialize(config_str, settings = SETTINGS, namespaced_metric = nil)
+     )
+     @drain_queue =  @settings.get_value("queue.drain")
+ 
++    @dlq_manager = nil
++    if @settings.get_value("dead_letter_queue.enable")
++      managed_path = ::File.join(@settings.get_value("path.dead_letter_queue"), @pipeline_id)
++      @dlq_manager = LogStash::DeadLetterQueueManager.new(managed_path)
++    end
++
+     @events_filtered = Concurrent::AtomicFixnum.new(0)
+     @events_consumed = Concurrent::AtomicFixnum.new(0)
+ 
+@@ -223,7 +231,6 @@ def run
+     shutdown_flusher
+     shutdown_workers
+ 
+-    close
+ 
+     @logger.debug("Pipeline #{@pipeline_id} has been shutdown")
+ 
+@@ -234,6 +241,7 @@ def run
+   def close
+     @filter_queue_client.close
+     @queue.close
++    @dlq_manager.close unless @dlq.nil?
+   end
+ 
+   def transition_to_running
+@@ -341,6 +349,7 @@ def worker_loop(batch_size, batch_delay)
+       filter_batch(batch)
+       flush_filters_to_batch(batch, :final => false) if signal.flush?
+       output_batch(batch)
++
+       @filter_queue_client.close_batch(batch)
+ 
+       # keep break at end of loop, after the read_batch operation, some pipeline specs rely on this "final read_batch" before shutdown.
+@@ -397,7 +406,6 @@ def output_batch(batch)
+     output_events_map.each do |output, events|
+       output.multi_receive(events)
+     end
+-    
+     @filter_queue_client.add_output_metrics(batch)
+   end
+ 
+diff --git a/logstash-core/lib/logstash/plugin.rb b/logstash-core/lib/logstash/plugin.rb
+index 841a39e2baf..0d7eb9c6a37 100644
+--- a/logstash-core/lib/logstash/plugin.rb
++++ b/logstash-core/lib/logstash/plugin.rb
+@@ -44,7 +44,7 @@ def eql?(other)
+     self.class.name == other.class.name && @params == other.params
+   end
+ 
+-  def initialize(params=nil)
++  def initialize(params, dlq_manager=nil)
+     @logger = self.logger
+     # need to access settings statically because plugins are initialized in config_ast with no context.
+     settings = LogStash::SETTINGS
+@@ -56,6 +56,7 @@ def initialize(params=nil)
+     # The id should always be defined normally, but in tests that might not be the case
+     # In the future we may make this more strict in the Plugin API
+     @params["id"] ||= "#{self.class.config_name}_#{SecureRandom.uuid}"
++    @dlq_manager = dlq_manager
+   end
+ 
+   # Return a uniq ID for this plugin configuration, by default
+@@ -122,12 +123,22 @@ def metric
+                          LogStash::Instrument::NamespacedNullMetric.new(@metric, :null)
+                        end
+   end
++
+   # return the configured name of this plugin
+   # @return [String] The name of the plugin defined by `config_name`
+   def config_name
+     self.class.config_name
+   end
+ 
++  # commit event to dlq
++  def dlq_commit(event, reason)
++    if @dlq_manager.nil?
++      raise ArgumentError, "DLQ is not enabled, plugin cannot commit to it"
++    else
++      @dlq_manager.write(LogStash::DLQEntry.new(event, config_name, id, reason))
++    end
++  end
++
+   # This is keep for backward compatibility, the logic was moved into the registry class
+   # but some plugins use this method to return a specific instance on lookup
+   #
+diff --git a/logstash-core/lib/logstash/util/wrapped_acked_queue.rb b/logstash-core/lib/logstash/util/wrapped_acked_queue.rb
+index b733d221f46..d51f9d39aa4 100644
+--- a/logstash-core/lib/logstash/util/wrapped_acked_queue.rb
++++ b/logstash-core/lib/logstash/util/wrapped_acked_queue.rb
+@@ -201,6 +201,7 @@ def close_batch(batch)
+       end
+ 
+       def start_clock
++        return if @event_metric.nil? || @pipeline_metric.nil?
+         @inflight_clocks[Thread.current] = [
+           @event_metric.time(:duration_in_millis),
+           @pipeline_metric.time(:duration_in_millis)
+@@ -226,11 +227,13 @@ def add_starting_metrics(batch)
+       end
+ 
+       def add_filtered_metrics(batch)
++        return if @event_metric.nil? || @pipeline_metric.nil?
+         @event_metric.increment(:filtered, batch.filtered_size)
+         @pipeline_metric.increment(:filtered, batch.filtered_size)
+       end
+ 
+       def add_output_metrics(batch)
++        return if @event_metric.nil? || @pipeline_metric.nil?
+         @event_metric.increment(:out, batch.filtered_size)
+         @pipeline_metric.increment(:out, batch.filtered_size)
+       end
+@@ -291,10 +294,10 @@ def each(&blk)
+         # TODO: for https://github.com/elastic/logstash/issues/6055 = will have to properly refactor
+         @iterating = true
+         @originals.each do |e, _|
+-          blk.call(e) unless e.cancelled?
++          blk.call(e) unless (e.respond_to?(:cancelled?) && e.cancelled?)
+         end
+         @generated.each do |e, _|
+-          blk.call(e) unless e.cancelled?
++          blk.call(e) unless (e.respond_to?(:cancelled?) && e.cancelled?)
+         end
+         @iterating = false
+         update_generated
+diff --git a/logstash-core/spec/logstash/agent_spec.rb b/logstash-core/spec/logstash/agent_spec.rb
+index 7c40baab865..5ada995a974 100644
+--- a/logstash-core/spec/logstash/agent_spec.rb
++++ b/logstash-core/spec/logstash/agent_spec.rb
+@@ -456,8 +456,8 @@
+     # Theses values are compared with what we store in the metric store.
+     class DummyOutput2 < LogStash::Outputs::DroppingDummyOutput; end
+ 
+-    let!(:dummy_output) { LogStash::Outputs::DroppingDummyOutput.new }
+-    let!(:dummy_output2) { DummyOutput2.new }
++    let!(:dummy_output) { LogStash::Outputs::DroppingDummyOutput.new({}, nil) }
++    let!(:dummy_output2) { DummyOutput2.new({}, nil) }
+     let(:initial_generator_threshold) { 1000 }
+     let(:pipeline_thread) do
+       Thread.new do
+@@ -468,8 +468,8 @@ class DummyOutput2 < LogStash::Outputs::DroppingDummyOutput; end
+ 
+ 
+     before :each do
+-      allow(LogStash::Outputs::DroppingDummyOutput).to receive(:new).at_least(:once).with(anything).and_return(dummy_output)
+-      allow(DummyOutput2).to receive(:new).at_least(:once).with(anything).and_return(dummy_output2)
++      allow(LogStash::Outputs::DroppingDummyOutput).to receive(:new).at_least(:once).with(anything, nil).and_return(dummy_output)
++      allow(DummyOutput2).to receive(:new).at_least(:once).with(anything, nil).and_return(dummy_output2)
+ 
+       allow(LogStash::Plugin).to receive(:lookup).with("input", "generator").and_return(LogStash::Inputs::Generator)
+       allow(LogStash::Plugin).to receive(:lookup).with("codec", "plain").and_return(LogStash::Codecs::Plain)
+diff --git a/logstash-core/spec/logstash/filter_delegator_spec.rb b/logstash-core/spec/logstash/filter_delegator_spec.rb
+index 951c72f69d3..4cbe4984ac0 100644
+--- a/logstash-core/spec/logstash/filter_delegator_spec.rb
++++ b/logstash-core/spec/logstash/filter_delegator_spec.rb
+@@ -1,4 +1,4 @@
+-# encoding: utf-8
++# encodingrspec ./logstash-core/spec/logstash/output_delegator_spec.rb:36: utf-8
+ require "spec_helper"
+ require "logstash/filter_delegator"
+ require "logstash/instrument/null_metric"
+@@ -26,11 +26,11 @@ def register; end
+     end
+   end
+ 
+-  subject { described_class.new(logger, plugin_klass, metric, config) }
++  subject { described_class.new(logger, plugin_klass, metric, config, nil) }
+ 
+   it "create a plugin with the passed options" do
+-    expect(plugin_klass).to receive(:new).with(config).and_return(plugin_klass.new(config))
+-    described_class.new(logger, plugin_klass, metric, config)
++    expect(plugin_klass).to receive(:new).with(config, nil).and_return(plugin_klass.new(config))
++    described_class.new(logger, plugin_klass, metric, config, nil)
+   end
+ 
+   context "when the plugin support flush" do
+diff --git a/logstash-core/spec/logstash/output_delegator_spec.rb b/logstash-core/spec/logstash/output_delegator_spec.rb
+index e86c0556f71..021ad8a39ec 100644
+--- a/logstash-core/spec/logstash/output_delegator_spec.rb
++++ b/logstash-core/spec/logstash/output_delegator_spec.rb
+@@ -9,7 +9,7 @@
+   let(:collector) { [] }
+   let(:metric) { LogStash::Instrument::NamespacedNullMetric.new(collector, :null) }
+ 
+-  subject { described_class.new(logger, out_klass, metric, ::LogStash::OutputDelegatorStrategyRegistry.instance, plugin_args) }
++  subject { described_class.new(logger, out_klass, metric, ::LogStash::OutputDelegatorStrategyRegistry.instance, plugin_args, nil) }
+ 
+   context "with a plain output plugin" do
+     let(:out_klass) { double("output klass") }
+@@ -39,7 +39,7 @@
+ 
+     it "should push the name of the plugin to the metric" do
+       expect(metric).to receive(:gauge).with(:name, out_klass.config_name)
+-      described_class.new(logger, out_klass, metric, ::LogStash::OutputDelegatorStrategyRegistry.instance, plugin_args)
++      described_class.new(logger, out_klass, metric, ::LogStash::OutputDelegatorStrategyRegistry.instance, plugin_args, nil)
+     end
+ 
+     context "after having received a batch of events" do
+@@ -103,7 +103,7 @@
+           end
+ 
+           it "should set the correct parameters on the instance" do
+-            expect(out_klass).to have_received(:new).with(plugin_args)
++            expect(out_klass).to have_received(:new).with(plugin_args, nil)
+           end
+ 
+           it "should set the metric on the instance" do
+diff --git a/logstash-core/spec/logstash/pipeline_pq_file_spec.rb b/logstash-core/spec/logstash/pipeline_pq_file_spec.rb
+index 29130e41580..0c6886791f9 100644
+--- a/logstash-core/spec/logstash/pipeline_pq_file_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_pq_file_spec.rb
+@@ -13,7 +13,7 @@ def self.make_shared
+     @concurrency = :shared
+   end
+ 
+-  def initialize(params={})
++  def initialize(params, dlq=nil)
+     super
+     @num_closes = 0
+     @event_count = 0
+diff --git a/logstash-core/spec/support/mocks_classes.rb b/logstash-core/spec/support/mocks_classes.rb
+index a69b89bc821..2857b9ca526 100644
+--- a/logstash-core/spec/support/mocks_classes.rb
++++ b/logstash-core/spec/support/mocks_classes.rb
+@@ -11,6 +11,12 @@ class DummyInput < LogStash::Inputs::Base
+       def run(queue)
+         # noop
+       end
++    attr_reader :num_closes, :events
++
++    def initialize(params={}, dlq=nil)
++      super
++      @num_closes = 0
++      @events = []
+     end
+   end
+   module Outputs
+@@ -44,7 +50,7 @@ class DummyOutputWithEventsArray < LogStash::Outputs::Base
+ 
+       attr_reader :events
+ 
+-      def initialize(params={})
++      def initialize(params={}, dlq=nil)
+         super
+         @events = []
+       end
+@@ -66,7 +72,7 @@ class DroppingDummyOutput < LogStash::Outputs::Base
+ 
+       attr_reader :num_closes
+ 
+-      def initialize(params={})
++      def initialize(params={}, dlq=nil)
+         super
+         @num_closes = 0
+         @events_received = Concurrent::AtomicFixnum.new(0)

@@ -1,0 +1,371 @@
+diff --git a/docs/tutorials/zeromq.md b/docs/tutorials/zeromq.md
+new file mode 100644
+index 00000000000..b914bdd325b
+--- /dev/null
++++ b/docs/tutorials/zeromq.md
+@@ -0,0 +1,125 @@
++---
++title: ZeroMQ - logstash
++layout: content_right
++---
++
++*ZeroMQ support in Logstash is currently in an experimental phase. As such, parts of this document are subject to change.*
++
++# ZeroMQ
++Simply put ZeroMQ (0mq) is a socket on steroids. This makes it a perfect compliment to Logstash - a pipe on steroids.
++
++ZeroMQ allows you to easily create sockets of various types for moving data around. These sockets are refered to in ZeroMQ by the behavior of each side of the socket pair:
++
++* PUSH/PULL
++* REQ/REP
++* PUB/SUB
++* ROUTER/DEALER
++
++There is also a `PAIR` socket type as well.
++
++Additionally, the socket type is independent of the connection method. A PUB/SUB socket pair could have the SUB side of the socket be a listener and the PUB side a connecting client. This makes it very easy to fit ZeroMQ into various firewalled architectures.
++
++Note that this is not a full-fledged tutorial on ZeroMQ. It is a tutorial on how Logstash uses ZeroMQ.
++
++# ZeroMQ and logstash
++In the spirit of ZeroMQ, Logstash takes these socket type pairs and uses them to create topologies with some very simply rules that make usage very easy to understand:
++
++- The receiving end of a socket pair is always a logstash input
++- The sending end of a socket pair is always a logstash output
++- By default, inputs `bind`/listen and outputs `connect`
++- Logstash refers to the socket pairs as topologies and mirrors the naming scheme from ZeroMQ
++- By default, ZeroMQ inputs listen on all interfaces on port 2120, ZeroMQ outputs connect to `localhost` on port 2120
++
++The currently understood Logstash topologies for ZeroMQ inputs and outputs are:
++
++* `pushpull`
++* `pubsub`
++* `pair`
++
++We have found from various discussions that these three topologies will cover most of user's needs. We hope to expose the full span of ZeroMQ socket types as time goes on.
++
++By keeping the options simple, this allows you to get started VERY easily with what are normally complex message flows. No more confusion over `exchanges` and `queues` and `brokers`. If you need to add fanout capability to your flow, you can simply use the following configs:
++
++* _node agent lives at 192.168.1.2_
++* _indexer agent lives at 192.168.1.1_
++
++```
++# Node agent config
++input { stdin { type => "test-stdin-input" } }
++output { zeromq { topology => "pubsub" address => "tcp://192.168.1.1.:2120" } }
++```
++
++```
++# Indexer agent config
++input { zeromq { topology => "pubsub" } }
++output { stdout { debug => true }}
++```
++
++If for some reason you need connections to initiate from the indexer because of firewall rules:
++
++```
++# Node agent config - now listening on all interfaces port 2120
++input { stdin { type => "test-stdin-input" } }
++output { zeromq { topology => "pubsub" address => "tcp://*.:2120" mode => "server" } }
++```
++
++```
++# Indexer agent config
++input { zeromq { topology => "pubsub" address => "tcp://192.168.1.2" mode => "client" } }
++output { stdout { debug => true }}
++```
++
++As stated above, by default `inputs` always start as listeners and `outputs` always start as initiators. Please don't confuse what happens once the socket is connect with the direction of the connection. ZeroMQ separates connection from topology. In the second case of the above configs, once the two sockets are connected, regardless of who initiated the connection, the message flow itself is absolute. The indexer is reading events from the node.
++
++# Which topology to use
++The choice of topology can be broken down very easily based on need
++
++## one to one
++Use `pair` topology. On the output side, specify the ipaddress and port of the input side.
++
++## broadcast
++Use `pubsub`
++If you need to broadcast ALL messages to multiple hosts that each need to see all events, use `pubsub`. Note that all events are broadcast to all subscribers.
++
++## Filter workers
++Use `pushpull`
++In `pushpull`, ZeroMQ automatically load balances to all connected peers. This means that no peer sees the same message as any other peer.
++
++# What's with the address format?
++ZeroMQ supports multiple types of transports:
++
++* inproc:// (unsupported by logstash due to threading)
++* tcp:// (exactly what it sounds like)
++* ipc:// (probably useless in logstash)
++* pgm:// and epgm:// (a multicast format - only usable with PUB and SUB socket types)
++
++For pretty much all cases, you'll be using `tcp://` transports with Logstash.
++
++# sockopts
++Sockopts is not you choosing between blue or black socks. ZeroMQ supports setting various flags or options on sockets. In the interest of minimizing configuration syntax, these are _hidden_ behind a logstash configuration element called `sockopts`. You probably won't need to tune these for most cases. If you do need to tune them, you'll probably set the following:
++
++## ZMQ::SUBSCRIBE - applies to `pubsub`
++This opt mimics the routing keys functionality in AMQP. Imagine you have a network of receivers but only a subset of the messages need to be seen by a subset of the hosts. You can use this option as a routing key to facilite that:
++
++```
++# This output is a PUB
++output {
++  zeromq { topology => "pubsub" sockopts => ["ZMQ::SUBSCRIBE", "logs.production.%{host}"] }
++}
++```
++
++```
++# This output is a SUB
++# I only care about db1 logs
++input { zeromq { type => "db1logs" address => "tcp://<ipaddress>:2120" sockopts => ["ZMQ::SUBSCRIBE","logs.production.db1"]}}
++```
++
++## ZMQ::HWM - sets the high water mark
++The high water mark is the maximum number of messages a given socket pair can have in its internal queue. Use this to throttle essentially.
++
++## ZMQ::SWAP_SIZE
++TODO
++
++## ZMQ::IDENTITY
++TODO
++
+diff --git a/lib/logstash/inputs/zeromq.rb b/lib/logstash/inputs/zeromq.rb
+index 3535be3b20e..5fb951523c0 100644
+--- a/lib/logstash/inputs/zeromq.rb
++++ b/lib/logstash/inputs/zeromq.rb
+@@ -15,38 +15,81 @@ class LogStash::Inputs::ZeroMQ < LogStash::Inputs::Base
+   config_name "zeromq"
+   plugin_status "experimental"
+ 
+-  # 0mq socket address to connect or bind to
+-  config :address, :validate => :string, :default => "tcp://127.0.0.1:2120"
++  # 0mq socket address to connect or bind
++  # Please note that `inproc://` will not work with logstash
++  # as each we use a context per thread.
++  # By default, inputs bind/listen
++  # and outputs connect
++  config :address, :validate => :array, :default => ["tcp://*:2120"]
+ 
+-  # 0mq queue size
+-  config :queue_size, :validate => :number, :default => 20
++  # 0mq topology
++  # The default logstash topologies work as follows:
++  # * pushpull - inputs are pull, outputs are push
++  # * pubsub - inputs are subscribers, outputs are publishers
++  # * pair - inputs are clients, inputs are servers
++  #
++  # If the predefined topology flows don't work for you,
++  # you can change the 'mode' setting
++  # TODO (lusis) add req/rep MAYBE
++  # TODO (lusis) add router/dealer
++  config :topology, :validate => ["pushpull", "pubsub", "pair"]
+ 
+-  # 0mq topic (Used with ZMQ_SUBSCRIBE, see http://api.zeromq.org/2-1:zmq-setsockopt 
+-  # for 'ZMQ_SUBSCRIBE: Establish message filter')
+-  config :queue, :validate => :string, :default => "" # default all
++  # mode
++  # server mode binds/listens
++  # client mode connects
++  config :mode, :validate => ["server", "client"], :default => "server"
+ 
+-  # wether to bind ("server") or connect ("client") to the socket
+-  config :mode, :validate => [ "server", "client"], :default => "client"
+-
+-  @source = "0mq_#{@address}/#{@queue}"
++  # 0mq socket options
++  # This exposes zmq_setsockopt
++  # for advanced tuning
++  # see http://api.zeromq.org/2-1:zmq-setsockopt for details
++  #
++  # This is where you would set values like:
++  # ZMQ::HWM - high water mark
++  # ZMQ::IDENTITY - named queues
++  # ZMQ::SWAP_SIZE - space for disk overflow
++  # ZMQ::SUBSCRIBE - topic filters for pubsub
++  #
++  # example: sockopt => ["ZMQ::HWM", 50, "ZMQ::IDENTITY", "my_named_queue"]
++  config :sockopt, :validate => :hash
+ 
+   public
+   def register
+     require "ffi-rzmq"
+     require "logstash/util/zeromq"
+     self.class.send(:include, LogStash::Util::ZeroMQ)
+-    @subscriber = context.socket(ZMQ::SUB)
+-    error_check(@subscriber.setsockopt(ZMQ::HWM, @queue_size),
+-                "while setting ZMQ:HWM == #{@queue_size.inspect}")
+-    error_check(@subscriber.setsockopt(ZMQ::SUBSCRIBE, @queue),
+-                "while setting ZMQ:SUBSCRIBE == #{@queue.inspect}")
+-    error_check(@subscriber.setsockopt(ZMQ::LINGER, 1),
++
++    case @topology
++    when "pair"
++      zmq_const = ZMQ::PAIR 
++    when "pushpull"
++      zmq_const = ZMQ::PULL
++    when "pubsub"
++      zmq_const = ZMQ::SUB
++    end # case socket_type
++    @zsocket = context.socket(zmq_const)
++
++    error_check(@zsocket.setsockopt(ZMQ::LINGER, 1),
+                 "while setting ZMQ::LINGER == 1)")
+-    setup(@subscriber, @address)
++
++    # TODO (lusis)
++    # wireup sockopt hash
++    if @sockopt
++      @sockopt.each do |opt,value|
++        sockopt = opt.split('::')[1]
++        option = ZMQ.const_defined?(sockopt) ? ZMQ.const_get(sockopt) : ZMQ.const_missing(sockopt)
++        error_check(@zsocket.setsockopt(option, value),
++                "while setting #{opt} == 1)")
++      end
++    end
++    
++    @address.each do |addr|
++      setup(@zsocket, addr)
++    end
+   end # def register
+ 
+   def teardown
+-    error_check(@subscriber.close, "while closing the zmq socket")
++    error_check(@zsocket.close, "while closing the zmq socket")
+   end # def teardown
+ 
+   def server?
+@@ -57,7 +100,7 @@ def run(output_queue)
+     begin
+       loop do
+         msg = ''
+-        rc = @subscriber.recv_string(msg)
++        rc = @zsocket.recv_string(msg)
+         error_check(rc, "in recv_string")
+         @logger.debug("0mq: receiving", :event => msg)
+         e = self.to_event(msg, @source)
+@@ -66,10 +109,10 @@ def run(output_queue)
+         end
+       end
+     rescue => e
+-      @logger.debug("ZMQ Error", :subscriber => @subscriber,
++      @logger.debug("ZMQ Error", :subscriber => @zsocket,
+                     :exception => e, :backtrace => e.backtrace)
+     rescue Timeout::Error
+-      @logger.debug("Read timeout", subscriber => @subscriber)
++      @logger.debug("Read timeout", subscriber => @zsocket)
+     end # begin
+   end # def run
+ end # class LogStash::Inputs::ZeroMQ
+diff --git a/lib/logstash/outputs/zeromq.rb b/lib/logstash/outputs/zeromq.rb
+index af4da2672e2..48dfd6c3577 100644
+--- a/lib/logstash/outputs/zeromq.rb
++++ b/lib/logstash/outputs/zeromq.rb
+@@ -14,31 +14,80 @@ class LogStash::Outputs::ZeroMQ < LogStash::Outputs::Base
+   config_name "zeromq"
+   plugin_status "experimental"
+ 
+-  # 0mq socket address to connect or bind to
+-  config :address, :validate => :string, :default => "tcp://127.0.0.1:2120"
++  # 0mq socket address to connect or bind
++  # Please note that `inproc://` will not work with logstash
++  # As each we use a context per thread
++  # By default, inputs bind/listen
++  # and outputs connect
++  config :address, :validate => :array, :default => ["tcp://127.0.0.1:2120"]
+ 
+-  # 0mq topic (Used with ZMQ_SUBSCRIBE, see http://api.zeromq.org/2-1:zmq-setsockopt 
+-  # for 'ZMQ_SUBSCRIBE: Establish message filter')
+-  config :queue, :validate => :string, :default => ""
++  # 0mq topology
++  # The default logstash topologies work as follows:
++  # * pushpull - inputs are pull, outputs are push
++  # * pubsub - inputs are subscribers, outputs are publishers
++  # * pair - inputs are clients, inputs are servers
++  #
++  # If the predefined topology flows don't work for you,
++  # you can change the 'mode' setting
++  # TODO (lusis) add req/rep MAYBE
++  # TODO (lusis) add router/dealer
++  config :topology, :validate => ["pushpull", "pubsub", "pair"]
+ 
+-  # Whether to bind ("server") or connect ("client") to the socket
+-  config :mode, :validate => [ "server", "client"], :default => "server"
++  # mode
++  # server mode binds/listens
++  # client mode connects
++  config :mode, :validate => ["server", "client"], :default => "client"
++
++  # 0mq socket options
++  # This exposes zmq_setsockopt
++  # for advanced tuning
++  # see http://api.zeromq.org/2-1:zmq-setsockopt for details
++  #
++  # This is where you would set values like:
++  # ZMQ::HWM - high water mark
++  # ZMQ::IDENTITY - named queues
++  # ZMQ::SWAP_SIZE - space for disk overflow
++  # ZMQ::SUBSCRIBE - topic filters for pubsub
++  #
++  # example: sockopt => ["ZMQ::HWM", 50, "ZMQ::IDENTITY", "my_named_queue"]
++  config :sockopt, :validate => :hash
+ 
+   public
+   def register
+     require "ffi-rzmq"
+     require "logstash/util/zeromq"
+-    # Unfortunately it's not possible to simply include at the class level
+-    # because the Config mixin thinks we're the included module and not the base-class
+     self.class.send(:include, LogStash::Util::ZeroMQ)
+-    @publisher = context.socket(ZMQ::PUB)
+-    if !@queue.empty?
+-      error_check(@publisher.setsockopt(ZMQ::SUBSCRIBE, @queue),
+-                  "while setting ZMQ::SUBSCRIBE to #{@queue.inspect}")
++
++    # Translate topology shorthand to socket types
++    case @topology
++    when "pair"
++      zmq_const = ZMQ::PAIR
++    when "pushpull"
++      zmq_const = ZMQ::PUSH
++    when "pubsub"
++      zmq_const = ZMQ::PUB
++    end # case socket_type
++
++    @zsocket = context.socket(zmq_const)
++
++    error_check(@zsocket.setsockopt(ZMQ::LINGER, 1),
++                "while setting ZMQ::LINGER == 1)")
++
++    # TODO (lusis)
++    # wireup sockopt hash better
++    # making assumptions on split
++    if @sockopt
++      @sockopt.each do |opt,value|
++        sockopt = opt.split('::')[1]
++        option = ZMQ.const_defined?(sockopt) ? ZMQ.const_get(sockopt) : ZMQ.const_missing(sockopt)
++        error_check(@zsocket.setsockopt(option, value),
++                "while setting #{opt} == 1)")
++      end
++    end
++
++    @address.each do |addr|
++      setup(@zsocket, addr)
+     end
+-    error_check(@publisher.setsockopt(ZMQ::LINGER, 1),
+-                "while setting ZMQ::SUBSCRIBE to 1")
+-    setup(@publisher, @address)
+   end # def register
+ 
+   public
+@@ -61,9 +110,9 @@ def receive(event)
+ 
+     begin
+       @logger.debug("0mq: sending", :event => wire_event)
+-      error_check(@publisher.send_string(wire_event), "in send_string")
++      error_check(@zsocket.send_string(wire_event), "in send_string")
+     rescue => e
+-      @logger.warn("0mq output exception", :address => @address, :queue => @queue, :exception => e, :backtrace => e.backtrace)
++      @logger.warn("0mq output exception", :address => @address, :queue => @queue_name, :exception => e, :backtrace => e.backtrace)
+     end
+   end # def receive
+ end # class LogStash::Outputs::ZeroMQ

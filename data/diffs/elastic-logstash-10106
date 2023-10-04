@@ -1,0 +1,755 @@
+diff --git a/config/log4j2.properties b/config/log4j2.properties
+index 6c4699b90ae..a9eed0a3e83 100644
+--- a/config/log4j2.properties
++++ b/config/log4j2.properties
+@@ -96,3 +96,6 @@ logger.slowlog.level = trace
+ logger.slowlog.appenderRef.console_slowlog.ref = ${sys:ls.log.format}_console_slowlog
+ logger.slowlog.appenderRef.rolling_slowlog.ref = ${sys:ls.log.format}_rolling_slowlog
+ logger.slowlog.additivity = false
++
++logger.licensereader.name = logstash.licensechecker.licensereader
++logger.licensereader.level = error
+diff --git a/logstash-core/lib/logstash/runner.rb b/logstash-core/lib/logstash/runner.rb
+index 714af908bb9..bc964a9dc13 100644
+--- a/logstash-core/lib/logstash/runner.rb
++++ b/logstash-core/lib/logstash/runner.rb
+@@ -348,6 +348,8 @@ def execute
+     # lock path.data before starting the agent
+     @data_path_lock = FileLockFactory.obtainLock(java.nio.file.Paths.get(setting("path.data")).to_absolute_path, ".lock")
+ 
++    logger.info("Starting Logstash", "logstash.version" => LOGSTASH_VERSION)
++
+     @dispatcher.fire(:before_agent)
+     @agent = create_agent(@settings, @source_loader)
+     @dispatcher.fire(:after_agent)
+@@ -357,8 +359,6 @@ def execute
+     sigint_id = trap_sigint()
+     sigterm_id = trap_sigterm()
+ 
+-    logger.info("Starting Logstash", "logstash.version" => LOGSTASH_VERSION)
+-
+     @agent_task = Stud::Task.new { @agent.execute }
+ 
+     # no point in enabling config reloading before the agent starts
+diff --git a/x-pack/lib/config_management/elasticsearch_source.rb b/x-pack/lib/config_management/elasticsearch_source.rb
+index 9d738e32228..f8a860fbbce 100644
+--- a/x-pack/lib/config_management/elasticsearch_source.rb
++++ b/x-pack/lib/config_management/elasticsearch_source.rb
+@@ -142,7 +142,13 @@ def config_path
+       end
+ 
+       def populate_license_state(xpack_info)
+-        if !xpack_info.installed?
++        if xpack_info.failed?
++          {
++              :state => :error,
++              :log_level => :error,
++              :log_message => "Failed to fetch X-Pack information from Elasticsearch. This is likely due to failure to reach a live Elasticsearch cluster."
++          }
++        elsif !xpack_info.installed?
+           {
+               :state => :error,
+               :log_level => :error,
+@@ -193,4 +199,4 @@ def client
+       end
+     end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/x-pack/lib/license_checker/license_manager.rb b/x-pack/lib/license_checker/license_manager.rb
+index 414e3e6e411..076570041aa 100644
+--- a/x-pack/lib/license_checker/license_manager.rb
++++ b/x-pack/lib/license_checker/license_manager.rb
+@@ -39,9 +39,6 @@ def current_xpack_info
+       def fetch_xpack_info
+         xpack_info = @license_reader.fetch_xpack_info
+ 
+-        # TODO: we should be more lenient when we're having issues
+-        xpack_info ||= XPackInfo.xpack_not_installed
+-
+         update_xpack_info(xpack_info)
+       end
+ 
+diff --git a/x-pack/lib/license_checker/license_reader.rb b/x-pack/lib/license_checker/license_reader.rb
+index 1fb74f1093f..be978ae1d06 100644
+--- a/x-pack/lib/license_checker/license_reader.rb
++++ b/x-pack/lib/license_checker/license_reader.rb
+@@ -18,6 +18,7 @@ def initialize(settings, feature, options)
+         @namespace = "xpack.#{feature}"
+         @settings = settings
+         @es_options = options
++        @es_options.merge!("resurrect_delay" => 30)
+       end
+ 
+       ##
+@@ -37,8 +38,12 @@ def fetch_xpack_info
+           XPackInfo.xpack_not_installed
+         end
+       rescue => e
+-        logger.error('Unable to retrieve license information from license server', :message => e.message, :class => e.class.name, :backtrace => e.backtrace)
+-        nil
++        if logger.debug?
++          logger.error('Unable to retrieve license information from license server', :message => e.message, :class => e.class.name, :backtrace => e.backtrace)
++        else
++          logger.error('Unable to retrieve license information from license server', :message => e.message)
++        end
++        XPackInfo.failed_to_fetch
+       end
+ 
+       ##
+diff --git a/x-pack/lib/license_checker/x_pack_info.rb b/x-pack/lib/license_checker/x_pack_info.rb
+index ee16990ee02..e2461f56e7f 100644
+--- a/x-pack/lib/license_checker/x_pack_info.rb
++++ b/x-pack/lib/license_checker/x_pack_info.rb
+@@ -14,10 +14,11 @@ class XPackInfo
+ 
+       LICENSE_TYPES = :trial, :basic, :standard, :gold, :platinum
+ 
+-      def initialize(license, features = nil, installed=true)
++      def initialize(license, features = nil, installed=true, failed = false)
+         @license = license
+         @installed = installed
+         @features = features
++        @failed = failed
+ 
+         freeze
+       end
+@@ -31,6 +32,10 @@ def method_missing(meth)
+         end
+       end
+ 
++      def failed?
++        @failed
++      end
++
+       def installed?
+         @installed
+       end
+@@ -86,7 +91,11 @@ def self.from_es_response(es_response)
+       end
+ 
+       def self.xpack_not_installed
+-        XPackInfo.new(nil, nil,false)
++        XPackInfo.new(nil, nil, false)
++      end
++
++      def self.failed_to_fetch
++        XPackInfo.new(nil, nil, false, true)
+       end
+     end
+   end
+diff --git a/x-pack/lib/modules/module_license_checker.rb b/x-pack/lib/modules/module_license_checker.rb
+index 1bab2f34492..3e3ea15c29a 100644
+--- a/x-pack/lib/modules/module_license_checker.rb
++++ b/x-pack/lib/modules/module_license_checker.rb
+@@ -37,7 +37,13 @@ def setup(settings)
+       end
+ 
+       def populate_license_state(xpack_info)
+-        if !xpack_info.installed?
++        if xpack_info.failed?
++          {
++              :state => :error,
++              :log_level => :error,
++              :log_message => "Failed to fetch X-Pack information from Elasticsearch. This is likely due to failure to reach a live Elasticsearch cluster."
++          }
++        elsif !xpack_info.installed?
+           {
+               :state => :error,
+               :log_level => :error,
+diff --git a/x-pack/lib/monitoring/inputs/metrics.rb b/x-pack/lib/monitoring/inputs/metrics.rb
+index d602d0bec1e..d7ac8447516 100644
+--- a/x-pack/lib/monitoring/inputs/metrics.rb
++++ b/x-pack/lib/monitoring/inputs/metrics.rb
+@@ -5,7 +5,6 @@
+ require "logstash/event"
+ require "logstash/inputs/base"
+ require "logstash/instrument/collector"
+-require 'license_checker/licensed'
+ require 'helpers/elasticsearch_options'
+ require "concurrent"
+ require "thread"
+@@ -17,17 +16,12 @@ module LogStash module Inputs
+   # This input further transform it into a `Logstash::Event`, which can be consumed by the shipper and
+   # shipped to Elasticsearch
+   class Metrics < LogStash::Inputs::Base
+-    include LogStash::LicenseChecker::Licensed, LogStash::Helpers::ElasticsearchOptions
+-
+     require "monitoring/inputs/metrics/state_event_factory"
+     require "monitoring/inputs/metrics/stats_event_factory"
+     
+     @pipelines_mutex = Mutex.new
+     @pipelines = {}
+ 
+-    VALID_LICENSES = %w(basic trial standard gold platinum)
+-    FEATURE = 'monitoring'
+-
+     require "monitoring/inputs/timer_task_logger"
+     
+     attr_reader :queue, :agent
+@@ -52,16 +46,12 @@ def register
+       @agent = nil
+       @settings = LogStash::SETTINGS.clone
+       @last_updated_pipeline_hashes = []
+-      @es_options = es_options_from_settings_or_modules(FEATURE, @settings)
+-      setup_license_checker(FEATURE)
++      @agent = execution_context.agent if execution_context
+     end
+ 
+     def pipeline_started(agent, pipeline)
+       @agent = agent
+-
+-      with_license_check do
+-        update_pipeline_state(pipeline)
+-      end
++      update_pipeline_state(pipeline)
+     end
+ 
+     def configure_snapshot_poller
+@@ -104,10 +94,8 @@ def stop
+     end
+ 
+     def update(snapshot)
+-      with_license_check do
+-        update_stats(snapshot)
+-        update_states
+-      end
++      update_stats(snapshot)
++      update_states
+     end
+ 
+     def update_stats(snapshot)
+@@ -166,40 +154,6 @@ def emit_event(event)
+       queue << event
+     end
+ 
+-    def populate_license_state(xpack_info)
+-      if !xpack_info.installed?
+-        {
+-            :state => :error,
+-            :log_level => :error,
+-            :log_message => "X-Pack is installed on Logstash but not on Elasticsearch. Please install X-Pack on Elasticsearch to use the monitoring feature. Other features may be available."
+-        }
+-      elsif !xpack_info.license_available?
+-        {
+-            :state => :error,
+-            :log_level => :error,
+-            :log_message => 'Monitoring is not available: License information is currently unavailable. Please make sure you have added your production elasticsearch connection info in the xpack.monitoring.elasticsearch settings.'
+-        }
+-      elsif !xpack_info.license_one_of?(VALID_LICENSES)
+-        {
+-            :state => :error,
+-            :log_level => :error,
+-            :log_message => "Monitoring is not available: #{xpack_info.license_type} is not a valid license for this feature."
+-        }
+-      elsif !xpack_info.license_active?
+-        {
+-            :state => :ok,
+-            :log_level => :warn,
+-            :log_message => 'Monitoring requires a valid license. You can continue to monitor Logstash, but please contact your administrator to update your license'
+-        }
+-      else
+-        unless xpack_info.feature_enabled?(FEATURE)
+-          logger.warn('Monitoring installed and enabled in Logstash, but not enabled in Elasticsearch')
+-        end
+-
+-        { :state => :ok, :log_level => :info, :log_message => 'Monitoring License OK' }
+-      end
+-    end
+-
+     private
+     def remove_reserved_fields(event)
+       event.remove("@timestamp")
+diff --git a/x-pack/lib/monitoring/internal_pipeline_source.rb b/x-pack/lib/monitoring/internal_pipeline_source.rb
+index 9aa03e97786..403617960e8 100644
+--- a/x-pack/lib/monitoring/internal_pipeline_source.rb
++++ b/x-pack/lib/monitoring/internal_pipeline_source.rb
+@@ -3,20 +3,91 @@
+ # you may not use this file except in compliance with the Elastic License.
+ 
+ require "logstash/config/source/base"
++require 'license_checker/licensed'
++require 'helpers/elasticsearch_options'
+ 
+ module LogStash module Monitoring
+   class InternalPipelineSource < LogStash::Config::Source::Base
+-    def initialize(pipeline_config)
++    include LogStash::LicenseChecker::Licensed
++    include LogStash::Helpers::ElasticsearchOptions
++    include LogStash::Util::Loggable
++    VALID_LICENSES = %w(basic trial standard gold platinum)
++    FEATURE = 'monitoring'
++
++    def initialize(pipeline_config, agent)
+       super(pipeline_config.settings)
+       @pipeline_config = pipeline_config
++      @settings = LogStash::SETTINGS.clone
++      @agent = agent
++      @es_options = es_options_from_settings_or_modules(FEATURE, @settings)
++      setup_license_checker(FEATURE)
+     end
+ 
+     def pipeline_configs
+-      return @pipeline_config
++      @pipeline_config
+     end
+ 
+     def match?
+-      true
++      valid_basic_license?
++    end
++
++    def update_license_state(xpack_info)
++      return if valid_basic_license?
++      super(xpack_info) if xpack_info
++      if valid_basic_license?
++        logger.info("Validated license for monitoring. Enabling monitoring pipeline.")
++        enable_monitoring()
++      end
+     end
++
++    private
++    def valid_basic_license?
++      @license_state ? license_check : false
++    end
++
++    def enable_monitoring
++      @agent.converge_state_and_update
++    end
++
++    def populate_license_state(xpack_info)
++      if xpack_info.failed?
++        {
++            :state => :error,
++            :log_level => :error,
++            :log_message => "Failed to fetch X-Pack information from Elasticsearch. This is likely due to failure to reach a live Elasticsearch cluster."
++        }
++      elsif !xpack_info.installed?
++        {
++            :state => :error,
++            :log_level => :error,
++            :log_message => "X-Pack is installed on Logstash but not on Elasticsearch. Please install X-Pack on Elasticsearch to use the monitoring feature. Other features may be available."
++        }
++      elsif !xpack_info.license_available?
++        {
++            :state => :error,
++            :log_level => :error,
++            :log_message => 'Monitoring is not available: License information is currently unavailable. Please make sure you have added your production elasticsearch connection info in the xpack.monitoring.elasticsearch settings.'
++        }
++      elsif !xpack_info.license_one_of?(VALID_LICENSES)
++        {
++            :state => :error,
++            :log_level => :error,
++            :log_message => "Monitoring is not available: #{xpack_info.license_type} is not a valid license for this feature."
++        }
++      elsif !xpack_info.license_active?
++        {
++            :state => :ok,
++            :log_level => :warn,
++            :log_message => 'Monitoring requires a valid license. You can continue to monitor Logstash, but please contact your administrator to update your license'
++        }
++      else
++        unless xpack_info.feature_enabled?(FEATURE)
++          logger.warn('Monitoring installed and enabled in Logstash, but not enabled in Elasticsearch')
++        end
++
++        { :state => :ok, :log_level => :info, :log_message => 'Monitoring License OK' }
++      end
++    end
++
+   end
+ end end
+diff --git a/x-pack/lib/monitoring/monitoring.rb b/x-pack/lib/monitoring/monitoring.rb
+index f209539b3cd..bfbd40f6800 100644
+--- a/x-pack/lib/monitoring/monitoring.rb
++++ b/x-pack/lib/monitoring/monitoring.rb
+@@ -95,7 +95,7 @@ def after_agent(runner)
+ 
+         logger.trace("registering the metrics pipeline")
+         LogStash::SETTINGS.set("node.uuid", runner.agent.id)
+-        internal_pipeline_source = LogStash::Monitoring::InternalPipelineSource.new(setup_metrics_pipeline)
++        internal_pipeline_source = LogStash::Monitoring::InternalPipelineSource.new(setup_metrics_pipeline, runner.agent)
+         runner.source_loader.add_source(internal_pipeline_source)
+       rescue => e
+         logger.error("Failed to set up the metrics pipeline", :message => e.message, :backtrace => e.backtrace)
+diff --git a/x-pack/spec/license_checker/license_reader_spec.rb b/x-pack/spec/license_checker/license_reader_spec.rb
+index 5199ce2b75f..0112a7a8840 100644
+--- a/x-pack/spec/license_checker/license_reader_spec.rb
++++ b/x-pack/spec/license_checker/license_reader_spec.rb
+@@ -64,8 +64,8 @@
+       before(:each) do
+         expect(mock_client).to receive(:get).with('_xpack').and_raise(Puma::ConnectionError)
+       end
+-      it 'returns nil' do
+-        expect(subject.fetch_xpack_info).to be_nil
++      it 'returns failed to fetch' do
++        expect(subject.fetch_xpack_info.failed?).to be_truthy
+       end
+     end
+     context 'when client raises a 5XX' do
+@@ -74,7 +74,7 @@
+         expect(mock_client).to receive(:get).with('_xpack').and_raise(exception_500)
+       end
+       it 'returns nil' do
+-        expect(subject.fetch_xpack_info).to be_nil
++        expect(subject.fetch_xpack_info.failed?).to be_truthy
+       end
+     end
+     context 'when client raises a 404' do
+diff --git a/x-pack/spec/modules/module_license_checker_spec.rb b/x-pack/spec/modules/module_license_checker_spec.rb
+index b1ffd19e60c..b22fa2ebdfa 100644
+--- a/x-pack/spec/modules/module_license_checker_spec.rb
++++ b/x-pack/spec/modules/module_license_checker_spec.rb
+@@ -4,6 +4,7 @@
+ 
+ require "modules/module_license_checker"
+ require "logstash/modules/settings_merger"
++require 'license_checker/x_pack_info'
+ 
+ describe LogStash::LicenseChecker::ModuleLicenseChecker do
+ 
+@@ -15,7 +16,8 @@
+ 
+     before(:each) {
+       expect(subject).to receive(:license_reader).and_return(mock_reader)
+-      expect(mock_reader).to receive(:fetch_xpack_info).and_return(nil)
++      expect(mock_reader).to receive(:fetch_xpack_info).and_return(LogStash::LicenseChecker::XPackInfo.failed_to_fetch)
++
+     }
+     let(:mock_reader) {double("reader")}
+ 
+diff --git a/x-pack/spec/monitoring/inputs/metrics_spec.rb b/x-pack/spec/monitoring/inputs/metrics_spec.rb
+index fea504047d9..0cda3ea423f 100644
+--- a/x-pack/spec/monitoring/inputs/metrics_spec.rb
++++ b/x-pack/spec/monitoring/inputs/metrics_spec.rb
+@@ -9,7 +9,6 @@
+ require 'spec_helper'
+ require "json"
+ require "json-schema"
+-require 'license_checker/x_pack_info'
+ require 'monitoring/monitoring'
+ 
+ describe LogStash::Inputs::Metrics do
+@@ -121,15 +120,8 @@ def main_pipeline
+       agent.shutdown
+     end
+ 
+-    let(:license_state_ok) do
+-      {:state => :ok, :log_level => :info, :log_message => 'Monitoring License OK'}
+-    end
+-
+     context 'after the pipeline is setup' do
+       before do
+-        allow(subject).to receive(:setup_license_checker)
+-        allow(subject).to receive(:es_options_from_settings_or_modules).and_return(es_options)
+-        allow(subject).to receive(:get_current_license_state).and_return(license_state_ok)
+         allow(subject).to receive(:exec_timer_task)
+         allow(subject).to receive(:sleep_till_stop)
+         setup_pipeline
+@@ -142,9 +134,6 @@ def main_pipeline
+     describe "#update" do
+       before :each do
+         allow(subject).to receive(:fetch_global_stats).and_return({"uuid" => "00001" })
+-        allow(subject).to receive(:setup_license_checker)
+-        allow(subject).to receive(:es_options_from_settings_or_modules).and_return(es_options)
+-        allow(subject).to receive(:get_current_license_state).and_return(license_state_ok)
+         allow(subject).to receive(:exec_timer_task)
+         allow(subject).to receive(:sleep_till_stop)
+         setup_pipeline
+@@ -175,151 +164,6 @@ def main_pipeline
+         end
+       end
+     end
+-
+-    context 'license testing' do
+-      let(:elasticsearch_url) { ["https://localhost:9898"] }
+-      let(:elasticsearch_username) { "elastictest" }
+-      let(:elasticsearch_password) { "testchangeme" }
+-      let(:mock_license_client) { double("es_client")}
+-      let(:license_subject) {   subject { described_class.new(options) }}
+-      let(:license_reader) { LogStash::LicenseChecker::LicenseReader.new(system_settings, 'monitoring', es_options)}
+-      let(:extension) {  LogStash::MonitoringExtension.new }
+-      let(:system_settings) { LogStash::Runner::SYSTEM_SETTINGS.clone }
+-      let(:license_status) { 'active'}
+-      let(:license_type) { 'trial' }
+-      let(:license_expiry_date) { Time.now + (60 * 60 * 24)}
+-      let(:license_expiry_in_millis) { license_expiry_date.to_i * 1000 }
+-
+-      let(:xpack_response) {
+-        LogStash::Json.load("{
+-          \"license\": {
+-            \"status\": \"#{license_status}\",
+-            \"uid\": \"9a48c67c-ce2c-4169-97bf-37d324b8ab80\",
+-            \"type\": \"#{license_type}\",
+-            \"expiry_date_in_millis\": #{license_expiry_in_millis}
+-          }
+-        }")
+-      }
+-
+-
+-      let(:no_xpack_response) {
+-        LogStash::Json.load("{
+-          \"error\": {
+-            \"root_cause\": [
+-              {
+-                \"type\": \"index_not_found_exception\",
+-                \"reason\": \"no such index\",
+-                \"resource.type\": \"index_or_alias\",
+-                \"resource.id\": \"_xpack\",
+-                \"index_uuid\": \"_na_\",
+-                \"index\": \"_xpack\"
+-              }],
+-            \"type\": \"index_not_found_exception\",
+-            \"reason\": \"no such index\",
+-            \"resource.type\": \"index_or_alias\",
+-            \"resource.id\": \"_xpack\",
+-            \"index_uuid\": \"_na_\",
+-            \"index\": \"_xpack\"
+-          },
+-          \"status\": 404
+-        }")
+-      }
+-
+-      let(:no_xpack_response_5_6) {
+-        LogStash::Json.load("{
+-         \"error\": {
+-            \"root_cause\":
+-              [{
+-                \"type\":\"illegal_argument_exception\",
+-                \"reason\": \"No endpoint or operation is available at [_xpack]\"
+-              }],
+-                \"type\":\"illegal_argument_exception\",
+-                \"reason\": \"No endpoint or operation is available at [_xpack]\"
+-              },
+-              \"status\": 400
+-          }")
+-        }
+-
+-
+-      let(:settings) do
+-        {
+-            "xpack.monitoring.enabled" => true,
+-            "xpack.monitoring.elasticsearch.url" => elasticsearch_url,
+-            "xpack.monitoring.elasticsearch.username" => elasticsearch_username,
+-            "xpack.monitoring.elasticsearch.password" => elasticsearch_password,
+-        }
+-      end
+-
+-      before :each do
+-        extension.additionals_settings(system_settings)
+-        apply_settings(settings, system_settings)
+-        allow(subject).to receive(:fetch_global_stats).and_return({"uuid" => "00001" })
+-        allow(subject).to receive(:es_options_from_settings_or_modules).and_return(es_options)
+-        allow(subject).to receive(:exec_timer_task)
+-        allow(subject).to receive(:sleep_till_stop)
+-
+-        allow(subject).to receive(:license_reader).and_return(license_reader)
+-        allow(license_reader).to receive(:build_client).and_return(mock_license_client)
+-      end
+-
+-      describe 'with licensing' do
+-        context 'when xpack has not been installed on es 6' do
+-          before :each do
+-            expect(mock_license_client).to receive(:get).with('_xpack').and_return(no_xpack_response)
+-            setup_pipeline
+-            subject.update(collector.snapshot_metric)
+-          end
+-
+-          it_behaves_like 'events are not added to the queue'
+-        end
+-
+-        context 'when xpack has not been installed on 5.6' do
+-          before :each do
+-            expect(mock_license_client).to receive(:get).with('_xpack').and_return(no_xpack_response_5_6)
+-            setup_pipeline
+-            subject.update(collector.snapshot_metric)
+-          end
+-
+-          it_behaves_like 'events are not added to the queue'
+-        end
+-
+-        context 'when the license has expired' do
+-          let(:license_status) { 'expired'}
+-          let(:license_expiry_date) { Time.now - (60 * 60 * 24)}
+-
+-          before :each do
+-            expect(mock_license_client).to receive(:get).with('_xpack').and_return(xpack_response)
+-            setup_pipeline
+-            subject.update(collector.snapshot_metric)
+-          end
+-
+-          it_behaves_like 'events are added to the queue'
+-        end
+-
+-        context 'when the license server is not available' do
+-          let(:mock_license_client) { double('license_client')}
+-          before :each do
+-            expect(mock_license_client).to receive(:get).and_raise("An error is here")
+-            setup_pipeline
+-            subject.update(collector.snapshot_metric)
+-          end
+-
+-          it_behaves_like 'events are not added to the queue'
+-        end
+-
+-        %w(basic standard trial standard gold platinum).sample(1).each  do |license_type|
+-          context "With a valid #{license_type} license" do
+-            let(:license_type) { license_type }
+-            before :each do
+-              expect(mock_license_client).to receive(:get).with('_xpack').and_return(xpack_response)
+-              setup_pipeline
+-              subject.update(collector.snapshot_metric)
+-            end
+-            it_behaves_like 'events are added to the queue'
+-          end
+-        end
+-      end
+-    end
+   end
+ 
+   context "unit tests" do
+@@ -335,7 +179,6 @@ def main_pipeline
+ 
+       describe "system pipelines" do
+         before(:each) do
+-          allow(subject).to receive(:valid_license?).and_return(true)
+           allow(pipeline).to receive(:system?).and_return(true)
+           allow(subject).to receive(:emit_event)
+           subject.update_pipeline_state(pipeline)
+@@ -348,7 +191,6 @@ def main_pipeline
+ 
+       describe "normal pipelines" do
+         before(:each) do
+-          allow(subject).to receive(:valid_license?).and_return(true)
+           allow(pipeline).to receive(:system?).and_return(false)
+           allow(subject).to receive(:state_event_for).with(pipeline).and_return(state_event)
+           allow(subject).to receive(:emit_event)
+diff --git a/x-pack/spec/monitoring/internal_pipeline_source_spec.rb b/x-pack/spec/monitoring/internal_pipeline_source_spec.rb
+new file mode 100644
+index 00000000000..db61e8a484c
+--- /dev/null
++++ b/x-pack/spec/monitoring/internal_pipeline_source_spec.rb
+@@ -0,0 +1,122 @@
++# Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
++# or more contributor license agreements. Licensed under the Elastic License;
++# you may not use this file except in compliance with the Elastic License.
++
++require "logstash-core"
++require "logstash/agent"
++require "logstash/agent"
++require "monitoring/inputs/metrics"
++require "logstash/config/pipeline_config"
++require "logstash/config/source/local"
++require 'license_checker/x_pack_info'
++require "rspec/wait"
++require 'spec_helper'
++require "json"
++require "json-schema"
++require 'license_checker/x_pack_info'
++require 'monitoring/monitoring'
++
++
++describe LogStash::Monitoring::InternalPipelineSource do
++  context 'license testing' do
++    let(:xpack_monitoring_interval) { 1 }
++    let(:options) { { "collection_interval" => xpack_monitoring_interval,
++                        "collection_timeout_interval" => 600 } }
++
++    subject { described_class.new(pipeline_config, mock_agent) }
++    let(:mock_agent) { double("agent")}
++    let(:mock_license_client) { double("es_client")}
++    let(:license_reader) { LogStash::LicenseChecker::LicenseReader.new(system_settings, 'monitoring', es_options)}
++    let(:system_settings) { LogStash::Runner::SYSTEM_SETTINGS.clone }
++    let(:license_status) { 'active'}
++    let(:license_type) { 'trial' }
++    let(:license_expiry_date) { Time.now + (60 * 60 * 24)}
++    let(:source) { LogStash::Config::Source::Local }
++    let(:pipeline_id) { :main }
++    let(:ordered_config_parts) do
++      [
++        org.logstash.common.SourceWithMetadata.new("file", "/tmp/1", 0, 0, "input { generator1 }"),
++        org.logstash.common.SourceWithMetadata.new("file", "/tmp/2", 0, 0,  "input { generator2 }"),
++        org.logstash.common.SourceWithMetadata.new("file", "/tmp/3", 0, 0, "input { generator3 }"),
++        org.logstash.common.SourceWithMetadata.new("file", "/tmp/4", 0, 0, "input { generator4 }"),
++        org.logstash.common.SourceWithMetadata.new("file", "/tmp/5", 0, 0, "input { generator5 }"),
++        org.logstash.common.SourceWithMetadata.new("file", "/tmp/6", 0, 0, "input { generator6 }"),
++        org.logstash.common.SourceWithMetadata.new("string", "config_string", 0, 0, "input { generator1 }"),
++      ]
++    end
++
++    let(:unordered_config_parts) { ordered_config_parts.shuffle }
++
++    let(:pipeline_config) { LogStash::Config::PipelineConfig.new(source, pipeline_id, unordered_config_parts, system_settings) }
++
++    let(:es_options) do
++      {
++          'url' => elasticsearch_url,
++          'user' => elasticsearch_username,
++          'password' => elasticsearch_password
++      }
++    end
++    let(:elasticsearch_url) { ["https://localhost:9898"] }
++    let(:elasticsearch_username) { "elastictest" }
++    let(:elasticsearch_password) { "testchangeme" }
++
++    let(:settings) do
++      {
++        "xpack.monitoring.enabled" => true,
++        "xpack.monitoring.elasticsearch.url" => elasticsearch_url,
++        "xpack.monitoring.elasticsearch.username" => elasticsearch_username,
++        "xpack.monitoring.elasticsearch.password" => elasticsearch_password,
++      }
++    end
++
++    before :each do
++      allow(subject).to receive(:es_options_from_settings_or_modules).and_return(es_options)
++      allow(subject).to receive(:license_reader).and_return(license_reader)
++      allow(license_reader).to receive(:build_client).and_return(mock_license_client)
++    end
++
++    describe 'with licensing' do
++      context 'when xpack has not been installed on es 6' do
++        let(:xpack_info) { LogStash::LicenseChecker::XPackInfo.xpack_not_installed }
++        it "does not start the pipeline" do
++          expect(subject).to_not receive(:enable_monitoring)
++          subject.update_license_state(xpack_info)
++        end
++      end
++      context 'when the license has expired' do
++        let(:license) do
++          { "status" => "inactive", "type" => license_type }
++        end
++        let(:xpack_info) { LogStash::LicenseChecker::XPackInfo.new(license, nil) }
++        it "still starts the pipeline" do
++          expect(subject).to receive(:enable_monitoring)
++          subject.update_license_state(xpack_info)
++        end
++      end
++      context 'when the license server is not available' do
++        let(:xpack_info) { LogStash::LicenseChecker::XPackInfo.new(nil, nil, nil, true) }
++        it "does not start the pipeline" do
++          expect(subject).to_not receive(:enable_monitoring)
++          subject.update_license_state(xpack_info)
++        end
++      end
++
++      %w(basic standard trial gold platinum).each  do |license_type|
++        context "With a valid #{license_type} license" do
++          let(:license_type) { license_type }
++          let(:license) do
++            { "status" => "active", "type" => license_type }
++          end
++          let(:features) do
++            { "monitoring" => { "enabled" => true } }
++          end
++          let(:xpack_info) { LogStash::LicenseChecker::XPackInfo.new(license, features) }
++          it "starts the pipeline" do
++            expect(subject).to receive(:enable_monitoring)
++            subject.update_license_state(xpack_info)
++          end
++        end
++      end
++    end
++  end
++end

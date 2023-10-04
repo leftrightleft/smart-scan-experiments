@@ -1,0 +1,191 @@
+diff --git a/CONTRIBUTORS b/CONTRIBUTORS
+index 20dbde43069..c6a20508141 100644
+--- a/CONTRIBUTORS
++++ b/CONTRIBUTORS
+@@ -75,6 +75,7 @@ Contributors:
+ * Leandro Moreira (leandromoreira)
+ * Hao Chen (haoch)
+ * Jake Landis (jakelandis)
++* Mike Place (cachedout)
+ 
+ Note: If you've sent me patches, bug reports, or otherwise contributed to
+ logstash, and you aren't on the list above and want to be, please let me know
+diff --git a/logstash-core/lib/logstash/api/commands/stats.rb b/logstash-core/lib/logstash/api/commands/stats.rb
+index 461644b7a2b..9172bedc8a5 100644
+--- a/logstash-core/lib/logstash/api/commands/stats.rb
++++ b/logstash-core/lib/logstash/api/commands/stats.rb
+@@ -49,7 +49,7 @@ def process
+             :peak_open_file_descriptors,
+             :max_file_descriptors,
+             [:mem, [:total_virtual_in_bytes]],
+-            [:cpu, [:total_in_millis, :percent, :load_average]]
++            [:cpu, [:total_in_millis, :percent, :load_average, :num_cpus]]
+           )
+         end
+ 
+diff --git a/logstash-core/lib/logstash/instrument/periodic_poller/jvm.rb b/logstash-core/lib/logstash/instrument/periodic_poller/jvm.rb
+index 0c6f598441e..abc03953774 100644
+--- a/logstash-core/lib/logstash/instrument/periodic_poller/jvm.rb
++++ b/logstash-core/lib/logstash/instrument/periodic_poller/jvm.rb
+@@ -15,6 +15,7 @@
+ java_import 'javax.naming.directory.Attribute'
+ java_import 'org.logstash.instrument.reports.MemoryReport'
+ java_import 'org.logstash.instrument.reports.ProcessReport'
++java_import 'org.logstash.instrument.reports.SystemReport'
+ 
+ 
+ module LogStash module Instrument module PeriodicPoller
+@@ -58,6 +59,7 @@ def collect
+       collect_process_metrics
+       collect_gc_stats
+       collect_load_average
++      collect_num_cpus
+     end
+ 
+     def collect_gc_stats
+@@ -105,6 +107,11 @@ def collect_process_metrics
+ 
+     end
+ 
++    def collect_num_cpus
++      sys_report = SystemReport.generate
++      metric.gauge([:jvm, :process, :cpu], :num_cpus, sys_report["system.available_processors"] )
++    end
++
+     def collect_load_average
+       begin
+         load_average = @load_average.get
+diff --git a/logstash-core/lib/logstash/instrument/periodic_poller/load_average.rb b/logstash-core/lib/logstash/instrument/periodic_poller/load_average.rb
+index 1e13f1a9ca2..bb2790b6512 100644
+--- a/logstash-core/lib/logstash/instrument/periodic_poller/load_average.rb
++++ b/logstash-core/lib/logstash/instrument/periodic_poller/load_average.rb
+@@ -27,11 +27,13 @@ def self.get(content = ::File.read(LOAD_AVG_FILE))
+     class Other
+       def self.get()
+         load_average_1m = ManagementFactory.getOperatingSystemMXBean().getSystemLoadAverage()
++        system_cpus = ManagementFactory.getOperatingSystemMXBean().getAvailableProcessors()
+ 
+         return nil if load_average_1m.nil?
+ 
+         {
+-          :"1m" => load_average_1m
++          :"1m" => load_average_1m,
++          :"norm" => {:"1m" => load_average_1m / system_cpus}
+         }
+       end
+     end
+diff --git a/logstash-core/spec/logstash/instrument/periodic_poller/load_average_spec.rb b/logstash-core/spec/logstash/instrument/periodic_poller/load_average_spec.rb
+index 7063466e303..f8253ff9a00 100644
+--- a/logstash-core/spec/logstash/instrument/periodic_poller/load_average_spec.rb
++++ b/logstash-core/spec/logstash/instrument/periodic_poller/load_average_spec.rb
+@@ -42,6 +42,7 @@
+ 
+         before do
+           expect(ManagementFactory).to receive(:getOperatingSystemMXBean).and_return(double("OperatingSystemMXBean", :getSystemLoadAverage => load_avg))
++          expect(ManagementFactory).to receive(:getOperatingSystemMXBean).and_return(double("OperatingSystemMXBean", :getAvailableProcessors => 4))
+         end
+ 
+         it "returns the value" do
+@@ -52,6 +53,7 @@
+       context "when 'OperatingSystemMXBean.getSystemLoadAverage' doesn't return anything" do
+         before do
+           expect(ManagementFactory).to receive(:getOperatingSystemMXBean).and_return(double("OperatingSystemMXBean", :getSystemLoadAverage => nil))
++          expect(ManagementFactory).to receive(:getOperatingSystemMXBean).and_return(double("OperatingSystemMXBean", :getAvailableProcessors => 4))
+         end
+ 
+         it "returns nothing" do
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/reports/SystemReport.java b/logstash-core/src/main/java/org/logstash/instrument/reports/SystemReport.java
+new file mode 100644
+index 00000000000..e621679963b
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/instrument/reports/SystemReport.java
+@@ -0,0 +1,17 @@
++package org.logstash.instrument.reports;
++
++import org.logstash.instrument.monitors.SystemMonitor;
++
++import java.util.Map;
++
++public class SystemReport {
++    private SystemReport() { }
++
++    /**
++     * Build a report with current System information
++     * @return a Map with the current system report
++     */
++    public static Map<String, Object> generate() {
++        return SystemMonitor.detect().toMap();
++    }
++}
+diff --git a/qa/integration/specs/monitoring_api_spec.rb b/qa/integration/specs/monitoring_api_spec.rb
+index c40e5302b18..00977a8a2c4 100644
+--- a/qa/integration/specs/monitoring_api_spec.rb
++++ b/qa/integration/specs/monitoring_api_spec.rb
+@@ -48,6 +48,18 @@
+     end
+   end
+ 
++  it "can retrive system stats" do
++    logstash_service = @fixture.get_service("logstash")
++    logstash_service.start_with_stdin
++    logstash_service.wait_for_logstash
++    Stud.try(max_retry.times, [StandardError, RSpec::Expectations::ExpectationNotMetError]) do
++      result = logstash_service.monitoring_api.node_stats rescue nil
++      expect(result).not_to be_nil
++      expect(result["process"]["cpu"]["num_cpus"]).to be > 0
++    end
++  end
++
++
+   it 'can retrieve dlq stats' do
+     logstash_service = @fixture.get_service("logstash")
+     logstash_service.start_with_stdin
+diff --git a/x-pack/lib/monitoring/inputs/metrics/stats_event_factory.rb b/x-pack/lib/monitoring/inputs/metrics/stats_event_factory.rb
+index a8d9a24b338..c1897d233e4 100644
+--- a/x-pack/lib/monitoring/inputs/metrics/stats_event_factory.rb
++++ b/x-pack/lib/monitoring/inputs/metrics/stats_event_factory.rb
+@@ -65,13 +65,14 @@ def format_jvm_stats(stats)
+ 
+     def format_os_stats(stats)
+       load_average = stats.extract_metrics([:jvm, :process, :cpu], :load_average)
++      num_cpus = stats.extract_metrics([:jvm, :process, :cpu], :num_cpus)
+       if os_stats?(stats)
+         cpuacct = stats.extract_metrics([:os, :cgroup, :cpuacct], :control_group, :usage_nanos)
+         cgroups_stats = stats.extract_metrics([:os, :cgroup, :cpu, :stat], :number_of_elapsed_periods, :number_of_times_throttled, :time_throttled_nanos)
+         control_group = stats.get_shallow(:os, :cgroup, :cpu, :control_group).value
+-        {:cpu => load_average, :cgroup => {:cpuacct =>  cpuacct, :cpu => {:control_group => control_group, :stat => cgroups_stats}}}
++        {:cpu => {:load_average => load_average[:load_average], :num_cpus => num_cpus[:num_cpus]}, :cgroup => {:cpuacct =>  cpuacct, :cpu => {:control_group => control_group, :stat => cgroups_stats}}}
+       else
+-        {:cpu => load_average}
++        {:cpu => {:load_average => load_average[:load_average], :num_cpus => num_cpus[:num_cpus]}}
+       end
+     end
+ 
+diff --git a/x-pack/spec/monitoring/schemas/monitoring_document_schema.json b/x-pack/spec/monitoring/schemas/monitoring_document_schema.json
+index df7238b0658..8db7089ca37 100644
+--- a/x-pack/spec/monitoring/schemas/monitoring_document_schema.json
++++ b/x-pack/spec/monitoring/schemas/monitoring_document_schema.json
+@@ -95,7 +95,7 @@
+       "properties": {
+         "cpu": {
+           "type": "object",
+-          "required": ["load_average"],
++          "required": ["load_average", "num_cpus"],
+           "properties": {
+             "load_average": {
+               "type": "object",
+@@ -105,10 +105,13 @@
+                 "5m": {"type": "number"},
+                 "15m": {"type": "number"}
+               }
++            },
++             "num_cpus": {
++               "type": "number"
+             }
+           }
++         }
+         }
+-      }
+     },
+     "events": {"$ref": "#/definitions/events"},
+     "queue": {

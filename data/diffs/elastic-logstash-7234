@@ -1,0 +1,278 @@
+diff --git a/qa/integration/services/dockerized/Dockerfile b/qa/integration/services/dockerized/Dockerfile
+new file mode 100644
+index 00000000000..045ba94de2c
+--- /dev/null
++++ b/qa/integration/services/dockerized/Dockerfile
+@@ -0,0 +1,32 @@
++FROM debian:stretch
++##
++# Define a base image for all service images.
++##
++
++ENV _JAVA_OPTIONS "-Djava.net.preferIPv4Stack=true"
++ENV TERM=linux
++
++RUN apt-get update && apt-get install -y curl openjdk-8-jre-headless netcat
++
++RUN adduser --disabled-password --gecos '' tester
++USER tester
++
++# Define the work directory. Use this variable in derivated images and
++# shell scripts.
++ENV WORKDIR /home/tester
++WORKDIR $WORKDIR
++
++# Script with routines that can be used in derived images.
++ADD helpers.sh .
++
++# Expect this script in the context directory of a derived image. It should
++# contain the service setup instructions, and is going to be the first executed
++# command when a derived image is built.
++ONBUILD ADD setup.sh .
++ONBUILD RUN ./setup.sh
++
++# Expect this script in the context directory of a derived image. It should
++# contain the service start up instructions, and is going to be executed when
++# a container is started.
++ONBUILD ADD run.sh .
++CMD ["./run.sh"]
+diff --git a/qa/integration/services/dockerized/elasticsearch/Dockerfile b/qa/integration/services/dockerized/elasticsearch/Dockerfile
+new file mode 100644
+index 00000000000..55451ac9680
+--- /dev/null
++++ b/qa/integration/services/dockerized/elasticsearch/Dockerfile
+@@ -0,0 +1,3 @@
++FROM logstash:ci_sandbox
++
++expose 9200 9300
+diff --git a/qa/integration/services/dockerized/elasticsearch/run.sh b/qa/integration/services/dockerized/elasticsearch/run.sh
+new file mode 100755
+index 00000000000..fcf0005bf37
+--- /dev/null
++++ b/qa/integration/services/dockerized/elasticsearch/run.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash
++
++ES_HOME=${WORKDIR}/elasticsearch
++
++# Set "http.host" to make the service visible from outside the container.
++${ES_HOME}/bin/elasticsearch -E http.host=0.0.0.0
+diff --git a/qa/integration/services/dockerized/elasticsearch/setup.sh b/qa/integration/services/dockerized/elasticsearch/setup.sh
+new file mode 100755
+index 00000000000..f2db6fd3bb3
+--- /dev/null
++++ b/qa/integration/services/dockerized/elasticsearch/setup.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++
++if [ -n "${ES_VERSION+1}" ]; then
++  echo "Elasticsearch version is $ES_VERSION"
++  version=$ES_VERSION
++else
++   version=5.0.1
++fi
++
++ES_HOME=${WORKDIR}/elasticsearch
++
++download_url=https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-$version.tar.gz
++curl -s -o elasticsearch.tar.gz $download_url
++mkdir -p $ES_HOME
++tar -xzf elasticsearch.tar.gz --strip-components=1 -C $ES_HOME/.
+diff --git a/qa/integration/services/dockerized/helpers.sh b/qa/integration/services/dockerized/helpers.sh
+new file mode 100644
+index 00000000000..7f3e9c0ffd2
+--- /dev/null
++++ b/qa/integration/services/dockerized/helpers.sh
+@@ -0,0 +1,23 @@
++#!/bin/bash
++
++##
++# Add routines and/or variables that can be shared between the
++# service containers.
++##
++
++PORT_WAIT_COUNT=20
++
++# Check service responds on given port.
++# Parameters:
++#   - the port number.
++wait_for_port() {
++    count=$PORT_WAIT_COUNT
++    port=$1
++    while ! nc -z localhost $port && [[ $count -ne 0 ]]; do
++        count=$(( $count - 1 ))
++        [[ $count -eq 0 ]] && return 1
++        sleep 0.5
++    done
++    # just in case, one more time
++    nc -z localhost $port
++}
+diff --git a/qa/integration/services/elasticsearch_service.rb b/qa/integration/services/elasticsearch_service.rb
+index 66963aca5de..3b45feb3688 100644
+--- a/qa/integration/services/elasticsearch_service.rb
++++ b/qa/integration/services/elasticsearch_service.rb
+@@ -1,12 +1,21 @@
++require_relative "service_container"
+ require 'elasticsearch'
++require 'docker'
+ 
+-class ElasticsearchService < Service
++class ElasticsearchService < ServiceContainer
+   def initialize(settings)
+     super("elasticsearch", settings)
++
++    # Binding container to host ports.
++    @container_create_opts[:HostConfig] = {
++                                            :PortBindings => {
++                                              '9200/tcp' => [{ :HostPort => '9200' }],
++                                              '9300/tcp' => [{ :HostPort => '9300' }]
++                                          }}
+   end
+ 
+   def get_client
+     Elasticsearch::Client.new(:hosts => "localhost:9200")
+   end
+ 
+-end
+\ No newline at end of file
++end
+diff --git a/qa/integration/services/elasticsearch_setup.sh b/qa/integration/services/elasticsearch_setup.sh
+deleted file mode 100755
+index 0f916c9cce0..00000000000
+--- a/qa/integration/services/elasticsearch_setup.sh
++++ /dev/null
+@@ -1,43 +0,0 @@
+-#!/bin/bash
+-set -ex
+-current_dir="$(dirname "$0")"
+-
+-source "$current_dir/helpers.sh"
+-
+-if [ -n "${ES_VERSION+1}" ]; then
+-  echo "Elasticsearch version is $ES_VERSION"
+-  version=$ES_VERSION
+-else
+-   version=5.0.1
+-fi
+-
+-ES_HOME=$INSTALL_DIR/elasticsearch
+-
+-setup_es() {
+-  if [ ! -d $ES_HOME ]; then
+-      local version=$1
+-      download_url=https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-$version.tar.gz
+-      curl -sL $download_url > $INSTALL_DIR/elasticsearch.tar.gz
+-      mkdir $ES_HOME
+-      tar -xzf $INSTALL_DIR/elasticsearch.tar.gz --strip-components=1 -C $ES_HOME/.
+-      rm $INSTALL_DIR/elasticsearch.tar.gz
+-  fi
+-}
+-
+-start_es() {
+-  es_args=$@
+-  $ES_HOME/bin/elasticsearch $es_args -p $ES_HOME/elasticsearch.pid > /tmp/elasticsearch.log 2>/dev/null &
+-  count=120
+-  echo "Waiting for elasticsearch to respond..."
+-  while ! curl --silent localhost:9200 && [[ $count -ne 0 ]]; do
+-      count=$(( $count - 1 ))
+-      [[ $count -eq 0 ]] && return 1
+-      sleep 1
+-  done
+-  echo "Elasticsearch is Up !"
+-  return 0
+-}
+-
+-setup_install_dir
+-setup_es $version
+-start_es
+diff --git a/qa/integration/services/elasticsearch_teardown.sh b/qa/integration/services/elasticsearch_teardown.sh
+deleted file mode 100755
+index f8e4dd51139..00000000000
+--- a/qa/integration/services/elasticsearch_teardown.sh
++++ /dev/null
+@@ -1,15 +0,0 @@
+-#!/bin/bash
+-set -e
+-current_dir="$(dirname "$0")"
+-
+-source "$current_dir/helpers.sh"
+-
+-ES_HOME=$INSTALL_DIR/elasticsearch
+-
+-stop_es() {
+-    pid=$(cat $ES_HOME/elasticsearch.pid)
+-    [ "x$pid" != "x" ] && [ "$pid" -gt 0 ]
+-    kill -SIGTERM $pid
+-}
+-
+-stop_es
+\ No newline at end of file
+diff --git a/qa/integration/services/service_container.rb b/qa/integration/services/service_container.rb
+new file mode 100644
+index 00000000000..1d013c779f5
+--- /dev/null
++++ b/qa/integration/services/service_container.rb
+@@ -0,0 +1,63 @@
++require_relative "service"
++require "docker"
++
++# Represents a service running within a container.
++class ServiceContainer < Service
++
++  def initialize(name, settings)
++    super(name, settings)
++
++    @base_image_context = File.expand_path("../dockerized", __FILE__)
++
++    @image_context = File.join(@base_image_context, @name)
++
++    # Options to create the container.
++    @container_create_opts = {}
++  end
++
++  def setup
++    puts "Setting up #{@name} service."
++
++    puts "Building the base container image."
++    @base_image = Docker::Image.build_from_dir(@base_image_context)
++    # Tag the base image.
++    #Caution: change this tag can cause failure to build the service container.
++    @base_image.tag('repo' => 'logstash', 'tag' => 'ci_sandbox', force: true)
++    puts "Finished building the base image."
++
++    puts "Building the container image."
++    self.build_image
++    puts "Finished building the image."
++
++    puts "Starting the container."
++    self.start_container
++    puts "Finished starting the container."
++
++    puts "Finished setting up #{@name} service."
++  end
++
++  def teardown
++    puts "Tearing down #{@name} service."
++
++    puts "Stop the container."
++    self.stop_container
++    puts "Finished stopping the container."
++
++    puts "Finished tearing down of #{@name} service."
++  end
++
++  def build_image
++    @image = Docker::Image.build_from_dir(@image_context)
++  end
++
++  def start_container
++    @container_create_opts[:Image] = @image.id
++    @container = Docker::Container.create(@container_create_opts)
++    @container.start
++  end
++
++  def stop_container
++    @container.stop
++    @container.delete(:force => true, :volumes => true)
++  end
++end

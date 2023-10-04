@@ -1,0 +1,105 @@
+diff --git a/logstash-core-queue-jruby/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueExtLibrary.java b/logstash-core-queue-jruby/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueExtLibrary.java
+index e36f425ee3f..63a01b8d290 100644
+--- a/logstash-core-queue-jruby/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueExtLibrary.java
++++ b/logstash-core-queue-jruby/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueExtLibrary.java
+@@ -112,6 +112,11 @@ public IRubyObject ruby_current_byte_size(ThreadContext context) {
+             return context.runtime.newFixnum(queue.getCurrentByteSize());
+         }
+ 
++        @JRubyMethod(name = "current_persisted_bytes")
++        public IRubyObject ruby_current_persisted_bytes(ThreadContext context) {
++            return context.runtime.newFixnum(queue.getCurrentPhysicallyPersistedByteSize());
++        }
++
+         @JRubyMethod(name = "acked_count")
+         public IRubyObject ruby_acked_count(ThreadContext context) {
+             return context.runtime.newFixnum(queue.getAckedCount());
+diff --git a/logstash-core-queue-jruby/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueMemoryExtLibrary.java b/logstash-core-queue-jruby/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueMemoryExtLibrary.java
+index db80f228454..a7a2f0f897e 100644
+--- a/logstash-core-queue-jruby/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueMemoryExtLibrary.java
++++ b/logstash-core-queue-jruby/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueMemoryExtLibrary.java
+@@ -106,6 +106,11 @@ public IRubyObject ruby_current_byte_size(ThreadContext context) {
+             return context.runtime.newFixnum(queue.getCurrentByteSize());
+         }
+ 
++        @JRubyMethod(name = "current_persisted_bytes")
++        public IRubyObject ruby_current_persisted_bytes(ThreadContext context) {
++            return context.runtime.newFixnum(queue.getCurrentPhysicallyPersistedByteSize());
++        }
++
+         @JRubyMethod(name = "acked_count")
+         public IRubyObject ruby_acked_count(ThreadContext context) {
+             return context.runtime.newFixnum(queue.getAckedCount());
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index f513ce1b86d..53fc686766c 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -539,6 +539,7 @@ def collect_stats
+         n.gauge(:page_capacity_in_bytes, queue.page_capacity)
+         n.gauge(:max_queue_size_in_bytes, queue.max_size_in_bytes)
+         n.gauge(:max_unread_events, queue.max_unread_events)
++        n.gauge(:queue_size_on_disk, queue.current_persisted_bytes)
+       end
+       pipeline_metric.namespace([:data]).tap do |n|
+         n.gauge(:free_space_in_bytes, file_store.get_unallocated_space)
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java b/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java
+index 981e9af00d5..e999db13dde 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java
+@@ -126,6 +126,10 @@ public long getCurrentByteSize() {
+         return this.currentByteSize;
+     }
+ 
++    public long getCurrentPhysicallyPersistedByteSize() {
++        return headPage.getPageIO().getHead() + tailPages.stream().mapToLong((p) -> p.getPageIO().getHead()).sum();
++    }
++
+     public int getPageCapacity() {
+         return this.pageCapacity;
+     }
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/AbstractByteBufferPageIO.java b/logstash-core/src/main/java/org/logstash/common/io/AbstractByteBufferPageIO.java
+index bdc7714f647..a4871e7e7e8 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/AbstractByteBufferPageIO.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/AbstractByteBufferPageIO.java
+@@ -265,6 +265,11 @@ public int persistedByteCount(int byteCount) {
+         return SEQNUM_SIZE + LENGTH_SIZE + byteCount + CHECKSUM_SIZE;
+     }
+ 
++    @Override
++    public int getHead() {
++        return this.head;
++    }
++
+     protected int checksum(byte[] bytes) {
+         checkSummer.reset();
+         checkSummer.update(bytes, 0, bytes.length);
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/PageIO.java b/logstash-core/src/main/java/org/logstash/common/io/PageIO.java
+index 5796c6c1d1d..d091fdcfcff 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/PageIO.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/PageIO.java
+@@ -39,6 +39,9 @@ public interface PageIO extends Closeable {
+     // @return the data container total capacity in bytes
+     int getCapacity();
+ 
++    // @return the current head offset within the page
++    int getHead();
++
+     // @return the actual persisted byte count (with overhead) for the given data bytes
+     int persistedByteCount(int bytes);
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/wip/MemoryPageIOStream.java b/logstash-core/src/main/java/org/logstash/common/io/wip/MemoryPageIOStream.java
+index 3d0e66762cb..be7e3b67aad 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/wip/MemoryPageIOStream.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/wip/MemoryPageIOStream.java
+@@ -155,6 +155,11 @@ public int getCapacity() {
+         return capacity;
+     }
+ 
++    @Override
++    public int getHead() {
++        return writePosition;
++    }
++
+     @Override
+     public void deactivate() {
+         // do nothing

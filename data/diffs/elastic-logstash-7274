@@ -1,0 +1,701 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index 9f0eddfab7b..8d15ce04e06 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -7,6 +7,7 @@
+ require "logstash/instrument/periodic_pollers"
+ require "logstash/instrument/collector"
+ require "logstash/instrument/metric"
++require "logstash/instrument/metric_factory"
+ require "logstash/pipeline"
+ require "logstash/webserver"
+ require "logstash/event_dispatcher"
+@@ -66,10 +67,6 @@ def initialize(settings = LogStash::SETTINGS, source_loader = nil)
+ 
+     @state_resolver = LogStash::StateResolver.new(metric)
+ 
+-    @pipeline_reload_metric = metric.namespace([:stats, :pipelines])
+-    @instance_reload_metric = metric.namespace([:stats, :reloads])
+-    initialize_agent_metrics
+-
+     @dispatcher = LogStash::EventDispatcher.new(self)
+     LogStash::PLUGIN_REGISTRY.hooks.register_emitter(self.class, dispatcher)
+     dispatcher.fire(:after_initialize)
+@@ -413,6 +410,9 @@ def configure_metrics_collectors
+       LogStash::Instrument::NullMetric.new(@collector)
+     end
+ 
++    metric_factory = ::LogStash::Instrument::MetricFactory.new(@metric)
++    @agent_metrics = org.logstash.instrument.metrics.namespaces.AgentMetrics.new(metric_factory)
++
+     @periodic_pollers = LogStash::Instrument::PeriodicPollers.new(@metric, settings.get("queue.type"), self)
+     @periodic_pollers.start
+   end
+@@ -493,36 +493,16 @@ def update_failures_metrics(action, action_result)
+       initialize_pipeline_metrics(action)
+     end
+ 
+-    @instance_reload_metric.increment(:failures)
+-
+-    @pipeline_reload_metric.namespace([action.pipeline_id, :reloads]).tap do |n|
+-      n.increment(:failures)
+-      n.gauge(:last_error, { :message => action_result.message, :backtrace => action_result.backtrace})
+-      n.gauge(:last_failure_timestamp, LogStash::Timestamp.now)
+-    end
+-  end
+-
+-  def initialize_agent_metrics
+-    @instance_reload_metric.increment(:successes, 0)
+-    @instance_reload_metric.increment(:failures, 0)
++    @agent_metrics.
++      get_pipeline_metrics(action.pipeline_id).
++      reload_failure(action_result.message, action_result.backtrace)
+   end
+ 
+   def initialize_pipeline_metrics(action)
+-    @pipeline_reload_metric.namespace([action.pipeline_id, :reloads]).tap do |n|
+-      n.increment(:successes, 0)
+-      n.increment(:failures, 0)
+-      n.gauge(:last_error, nil)
+-      n.gauge(:last_success_timestamp, nil)
+-      n.gauge(:last_failure_timestamp, nil)
+-    end
++    pipeline_metrics = @agent_metrics.add_pipeline(action.pipeline_id)
+   end
+ 
+   def update_successful_reload_metrics(action, action_result)
+-    @instance_reload_metric.increment(:successes)
+-
+-    @pipeline_reload_metric.namespace([action.pipeline_id, :reloads]).tap do |n|
+-      n.increment(:successes)
+-      n.gauge(:last_success_timestamp, action_result.executed_at)
+-    end
++    @agent_metrics.get_pipeline_metrics(action.pipeline_id).reload_success
+   end
+ end # class LogStash::Agent
+diff --git a/logstash-core/lib/logstash/instrument/collector.rb b/logstash-core/lib/logstash/instrument/collector.rb
+index 08e72599f3d..ee1efd1bdce 100644
+--- a/logstash-core/lib/logstash/instrument/collector.rb
++++ b/logstash-core/lib/logstash/instrument/collector.rb
+@@ -38,6 +38,7 @@ def push(namespaces_path, key, type, *metric_type_params)
+         end
+ 
+         metric.execute(*metric_type_params)
++        metric
+       rescue MetricStore::NamespacesExpectedError => e
+         logger.error("Collector: Cannot record metric", :exception => e)
+       rescue NameError => e
+diff --git a/logstash-core/lib/logstash/instrument/metric_factory.rb b/logstash-core/lib/logstash/instrument/metric_factory.rb
+new file mode 100644
+index 00000000000..697882c028e
+--- /dev/null
++++ b/logstash-core/lib/logstash/instrument/metric_factory.rb
+@@ -0,0 +1,25 @@
++module LogStash module Instrument
++  class MetricFactory
++    include org.logstash.instrument.metrics.MetricFactory
++
++    def initialize(metric)
++      @metric = metric
++    end
++
++    def makeGauge(namespace, key, initial_value)
++      gauge = @metric.namespace(keywordize(namespace)).gauge(key.to_sym, initial_value)
++      gauge.java_metric
++    end
++
++    def makeCounter(namespace, key, initial_value)
++      counter = @metric.namespace(keywordize(namespace)).increment(key.to_sym, initial_value)
++      counter.java_metric
++    end
++
++    private
++
++    def keywordize(namespace)
++      namespace.map(&:to_sym)
++    end
++  end
++end; end
+\ No newline at end of file
+diff --git a/logstash-core/lib/logstash/instrument/metric_type/counter.rb b/logstash-core/lib/logstash/instrument/metric_type/counter.rb
+index e99bca57939..1866b339a5b 100644
+--- a/logstash-core/lib/logstash/instrument/metric_type/counter.rb
++++ b/logstash-core/lib/logstash/instrument/metric_type/counter.rb
+@@ -6,8 +6,8 @@ module LogStash module Instrument module MetricType
+   class Counter < Base
+     def initialize(namespaces, key, value = 0)
+       super(namespaces, key)
+-
+-      @counter = Concurrent::AtomicFixnum.new(value)
++      @key = key
++      @counter = org.logstash.instrument.metrics.Counter.new(value)
+     end
+ 
+     def increment(value = 1)
+@@ -23,7 +23,11 @@ def execute(action, value = 1)
+     end
+ 
+     def value
+-      @counter.value
++      @counter.get
++    end
++
++    def java_metric
++      @counter
+     end
+   end
+ end; end; end
+diff --git a/logstash-core/lib/logstash/instrument/metric_type/gauge.rb b/logstash-core/lib/logstash/instrument/metric_type/gauge.rb
+index 7981bc877a5..ddcf7782942 100644
+--- a/logstash-core/lib/logstash/instrument/metric_type/gauge.rb
++++ b/logstash-core/lib/logstash/instrument/metric_type/gauge.rb
+@@ -8,15 +8,23 @@ class Gauge < Base
+     def initialize(namespaces, key)
+       super(namespaces, key)
+ 
+-      @gauge = Concurrent::MutexAtomicReference.new()
++      @gauge = org.logstash.instrument.metrics.Gauge.new(nil)
+     end
+ 
+-    def execute(action, value = nil)
++    def execute(action, value=nil)
++      @gauge.set(value)
++    end
++
++    def set(value)
+       @gauge.set(value)
+     end
+ 
+     def value
+       @gauge.get
+     end
++
++    def java_metric
++      @gauge
++    end
+   end
+ end; end; end
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index 929b2383652..faa26af0604 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -106,6 +106,7 @@ def plugin(plugin_type, name, *args)
+ 
+     # use NullMetric if called in the BasePipeline context otherwise use the @metric value
+     metric = @metric || Instrument::NullMetric.new
++    @agent_metrics = org.logstash.instrument.metrics.namespaces.AgentMetrics
+ 
+     pipeline_scoped_metric = metric.namespace([:stats, :pipelines, pipeline_id.to_s.to_sym, :plugins])
+     # Scope plugins of type 'input' to 'inputs'
+diff --git a/logstash-core/spec/logstash/agent/metrics_spec.rb b/logstash-core/spec/logstash/agent/metrics_spec.rb
+index a66aac1067c..07e367a3f0a 100644
+--- a/logstash-core/spec/logstash/agent/metrics_spec.rb
++++ b/logstash-core/spec/logstash/agent/metrics_spec.rb
+@@ -139,8 +139,8 @@ def mhash(*path_elements)
+       end
+ 
+       it "records the `message` and the `backtrace`" do
+-        expect(mval(:stats, :pipelines, pipeline_name, :reloads, :last_error)[:message]).to_not be_nil
+-        expect(mval(:stats, :pipelines, pipeline_name, :reloads, :last_error)[:backtrace]).to_not be_nil
++        expect(mval(:stats, :pipelines, pipeline_name, :reloads, :last_error).message).to_not be_nil
++        expect(mval(:stats, :pipelines, pipeline_name, :reloads, :last_error).backtrace).to_not be_nil
+       end
+ 
+       it "records the time of the last failure" do
+diff --git a/logstash-core/spec/logstash/agent_spec.rb b/logstash-core/spec/logstash/agent_spec.rb
+index 1da3c75faa1..1f02eb4e46c 100644
+--- a/logstash-core/spec/logstash/agent_spec.rb
++++ b/logstash-core/spec/logstash/agent_spec.rb
+@@ -386,7 +386,7 @@
+       it "sets the success reload timestamp" do
+         snapshot = subject.metric.collector.snapshot_metric
+         value = snapshot.metric_store.get_with_path("/stats/pipelines")[:stats][:pipelines][:main][:reloads][:last_success_timestamp].value
+-        expect(value).to be_a(LogStash::Timestamp)
++        expect(value).to be_a(org.logstash.Timestamp)
+       end
+ 
+       it "does not set the last reload error" do
+@@ -415,14 +415,13 @@
+       it "sets the failure reload timestamp" do
+         snapshot = subject.metric.collector.snapshot_metric
+         value = snapshot.metric_store.get_with_path("/stats/pipelines")[:stats][:pipelines][:main][:reloads][:last_failure_timestamp].value
+-        expect(value).to be_a(LogStash::Timestamp)
++        expect(value).to be_a(org.logstash.Timestamp)
+       end
+ 
+       it "sets the last reload error" do
+         snapshot = subject.metric.collector.snapshot_metric
+         value = snapshot.metric_store.get_with_path("/stats/pipelines")[:stats][:pipelines][:main][:reloads][:last_error].value
+-        expect(value).to be_a(Hash)
+-        expect(value).to include(:message, :backtrace)
++        expect(value).not_to be_nil
+       end
+ 
+       it "increases the failed reload count" do
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/Counter.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/Counter.java
+new file mode 100644
+index 00000000000..f96bd84f4ab
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/Counter.java
+@@ -0,0 +1,34 @@
++package org.logstash.instrument.metrics;
++
++import java.util.concurrent.atomic.LongAdder;
++
++/**
++ * Created by andrewvc on 5/30/17.
++ */
++public class Counter {
++    private final LongAdder value = new LongAdder();
++
++    public Counter(long initialValue) {
++        this.value.add(initialValue);
++    }
++
++    public void increment(long v) {
++        this.value.add(v);
++    }
++
++    public void increment() {
++        this.increment(1);
++    }
++
++    public void decrement(long v) {
++        this.value.add(-v);
++    }
++
++    public void decrement() {
++        this.decrement(1);
++    }
++
++    public long get() {
++        return this.value.longValue();
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/Gauge.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/Gauge.java
+new file mode 100644
+index 00000000000..f0b55a6af91
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/Gauge.java
+@@ -0,0 +1,22 @@
++package org.logstash.instrument.metrics;
++
++import java.util.concurrent.atomic.AtomicReference;
++
++/**
++ * Created by andrewvc on 5/30/17.
++ */
++public class Gauge<T> {
++    private volatile T value;
++
++    public Gauge(T initialValue) {
++        this.value = initialValue;
++    }
++
++    public void set(T newValue) {
++        this.value = newValue;
++    };
++
++    public T get() {
++        return this.value;
++    };
++}
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/MetricFactory.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/MetricFactory.java
+new file mode 100644
+index 00000000000..3c1903d9344
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/MetricFactory.java
+@@ -0,0 +1,11 @@
++package org.logstash.instrument.metrics;
++
++import java.util.List;
++
++/**
++ * Created by andrewvc on 5/30/17.
++ */
++public interface MetricFactory {
++    <T> Gauge<T> makeGauge(List<String> namespace, String key, T initialValue);
++    Counter makeCounter(List<String> namespace, String key, long initialValue);
++}
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/namespaces/AgentMetrics.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/namespaces/AgentMetrics.java
+new file mode 100644
+index 00000000000..96d6ecf7170
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/namespaces/AgentMetrics.java
+@@ -0,0 +1,59 @@
++package org.logstash.instrument.metrics.namespaces;
++
++import org.logstash.instrument.metrics.Counter;
++import org.logstash.instrument.metrics.MetricFactory;
++
++import java.util.Arrays;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++
++/**
++ * Created by andrewvc on 5/30/17.
++ */
++public class AgentMetrics {
++    private final MetricFactory metricFactory;
++    private final Counter reloadSuccesses;
++    private final Counter reloadFailures;
++    private final Map<String, PipelineMetrics> pipelineMetrics;
++
++    public AgentMetrics(MetricFactory metricFactory) {
++        this.metricFactory = metricFactory;
++
++        List<String> reloadsNamespace = Arrays.asList("stats", "reloads");
++        reloadSuccesses = metricFactory.makeCounter(reloadsNamespace, "successes", 0);
++        reloadFailures = metricFactory.makeCounter(reloadsNamespace, "failures", 0);
++
++        this.pipelineMetrics = new ConcurrentHashMap<>();
++    }
++
++    protected void reloadSuccess() {
++        this.reloadSuccesses.increment();
++    }
++
++    public long getReloadSuccesses() {
++        return reloadSuccesses.get();
++    }
++
++    protected void reloadFailure() {
++        this.reloadFailures.increment();
++    }
++
++    public long getReloadFailures() {
++        return this.reloadFailures.get();
++    }
++
++    public PipelineMetrics addPipeline(String pipelineId) {
++        PipelineMetrics metrics = new PipelineMetrics(pipelineId, metricFactory, this);
++        pipelineMetrics.put(pipelineId, metrics);
++        return metrics;
++    }
++
++    public void removePipeline(String pipelineId) {
++        pipelineMetrics.remove(pipelineId);
++    }
++
++    public PipelineMetrics getPipelineMetrics(String pipelineId) {
++        return pipelineMetrics.get(pipelineId);
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/namespaces/PipelineMetrics.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/namespaces/PipelineMetrics.java
+new file mode 100644
+index 00000000000..a2f713470b3
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/namespaces/PipelineMetrics.java
+@@ -0,0 +1,99 @@
++package org.logstash.instrument.metrics.namespaces;
++
++import com.fasterxml.jackson.databind.annotation.JsonSerialize;
++import org.logstash.Timestamp;
++import org.logstash.instrument.metrics.Counter;
++import org.logstash.instrument.metrics.Gauge;
++import org.logstash.instrument.metrics.MetricFactory;
++
++import java.util.Arrays;
++import java.util.List;
++import java.util.stream.Collectors;
++import java.util.stream.Stream;
++
++/**
++ * Created by andrewvc on 5/30/17.
++ */
++public class PipelineMetrics {
++    private final String pipelineId;
++    private final MetricFactory metricFactory;
++    private final List<String> namespaceRoot;
++    private final List<String> reloadsNamespace;
++    private final Counter reloadSuccesses;
++    private final Counter reloadFailures;
++    private final Gauge<Timestamp> lastReloadSuccessTimestamp;
++    private final Gauge<Timestamp> lastReloadFailureTimestamp;
++    private final AgentMetrics agentMetrics;
++    private volatile Gauge<ReloadFailure> lastReloadFailure;
++
++    public PipelineMetrics(String pipelineId, MetricFactory metricFactory, AgentMetrics agentMetrics) {
++        this.pipelineId = pipelineId;
++        this.metricFactory = metricFactory;
++        this.agentMetrics = agentMetrics;
++        this.namespaceRoot = Arrays.asList("stats", "pipelines", pipelineId);
++
++        this.reloadsNamespace = Stream.concat(namespaceRoot.stream(), Stream.of("reloads")).collect(Collectors.toList());
++        this.reloadSuccesses = metricFactory.makeCounter(reloadsNamespace, "successes", 0);
++        this.reloadFailures = metricFactory.makeCounter(reloadsNamespace, "failures", 0);
++
++        this.lastReloadSuccessTimestamp = metricFactory.makeGauge(reloadsNamespace, "last_success_timestamp", null);
++        this.lastReloadFailureTimestamp = metricFactory.makeGauge(reloadsNamespace, "last_failure_timestamp", null);
++        this.lastReloadFailure = metricFactory.makeGauge(reloadsNamespace, "last_error", null);
++    }
++
++    public void reloadSuccess() {
++        this.agentMetrics.reloadSuccess();
++
++        this.reloadSuccesses.increment();
++        this.lastReloadSuccessTimestamp.set(Timestamp.now());
++    }
++
++    public long getReloadSuccesses() {
++        return this.reloadSuccesses.get();
++    }
++
++    public Timestamp getLastReloadSuccessTimestamp() {
++        return this.lastReloadSuccessTimestamp.get();
++    }
++
++    class ReloadFailure {
++        @JsonSerialize
++        private final String message;
++        @JsonSerialize
++        private final List<String> backtrace;
++
++        ReloadFailure(String message, List<String> backtrace) {
++            this.message = message;
++            this.backtrace = backtrace;
++        }
++
++        public String getMessage() {
++            return message;
++        }
++
++        public List<String> getBacktrace() {
++            return backtrace;
++        }
++    }
++
++    public void reloadFailure(String message, List<String> backtrace) {
++        this.agentMetrics.reloadFailure();
++
++        this.reloadFailures.increment();
++        this.lastReloadFailureTimestamp.set(Timestamp.now());
++
++        this.lastReloadFailure.set(new ReloadFailure(message, backtrace));
++    }
++
++    public Timestamp getLastReloadFailureTimestamp() {
++        return this.lastReloadFailureTimestamp.get();
++    }
++
++    public ReloadFailure getLastReloadFailure() {
++        return this.lastReloadFailure.get();
++    }
++
++    public long getReloadFailures() {
++        return this.reloadFailures.get();
++    }
++}
+diff --git a/logstash-core/src/test/java/org/logstash/instrument/metrics/CounterTest.java b/logstash-core/src/test/java/org/logstash/instrument/metrics/CounterTest.java
+new file mode 100644
+index 00000000000..dc722b31b80
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/instrument/metrics/CounterTest.java
+@@ -0,0 +1,50 @@
++package org.logstash.instrument.metrics;
++
++import org.junit.Before;
++import org.junit.Test;
++
++import static org.hamcrest.core.Is.is;
++import static org.junit.Assert.*;
++
++/**
++ * Created by andrewvc on 6/1/17.
++ */
++public class CounterTest {
++    Counter counter;
++
++    @Before
++    public void init() {
++        counter = new Counter(0);
++    }
++
++    @Test
++    public void testInitialization() {
++        Counter counter = new Counter(123);
++        assertThat(counter.get(), is(123L));
++    }
++
++    @Test
++    public void testIncrement() {
++        counter.increment();
++        assertThat(counter.get(), is(1L));
++    }
++
++    @Test
++    public void testParameterizedIncrement() {
++        counter.increment(456);
++        assertThat(counter.get(), is(456L));
++    }
++
++    @Test
++    public void testDecrement() {
++        counter.decrement();
++        assertThat(counter.get(), is(-1L));
++    }
++
++    @Test
++    public void testParameterizedDecrement() {
++        counter.decrement(456);
++        assertThat(counter.get(), is(-456L));
++    }
++
++}
+\ No newline at end of file
+diff --git a/logstash-core/src/test/java/org/logstash/instrument/metrics/GaugeTest.java b/logstash-core/src/test/java/org/logstash/instrument/metrics/GaugeTest.java
+new file mode 100644
+index 00000000000..fc7bf9b5e13
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/instrument/metrics/GaugeTest.java
+@@ -0,0 +1,24 @@
++package org.logstash.instrument.metrics;
++
++import org.junit.Test;
++
++import static org.hamcrest.core.Is.is;
++import static org.junit.Assert.*;
++
++/**
++ * Created by andrewvc on 6/1/17.
++ */
++public class GaugeTest {
++    @Test
++    public void testInitialization() {
++        Gauge<Integer> gauge = new Gauge<>(123);
++        assertThat(gauge.get(), is(123));
++    }
++
++    @Test
++    public void testSet() {
++        Gauge<Integer> gauge = new Gauge<>(456);
++        gauge.set(90210);
++        assertThat(gauge.get(), is(90210));
++    }
++}
+\ No newline at end of file
+diff --git a/logstash-core/src/test/java/org/logstash/instrument/metrics/namespaces/AgentMetricsTest.java b/logstash-core/src/test/java/org/logstash/instrument/metrics/namespaces/AgentMetricsTest.java
+new file mode 100644
+index 00000000000..d55418cbbd8
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/instrument/metrics/namespaces/AgentMetricsTest.java
+@@ -0,0 +1,27 @@
++package org.logstash.instrument.metrics.namespaces;
++
++import org.junit.Before;
++import org.junit.Test;
++
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.core.Is.is;
++import static org.hamcrest.core.IsNull.notNullValue;
++
++/**
++ * Created by andrewvc on 5/31/17.
++ */
++public class AgentMetricsTest {
++    AgentMetrics agent;
++
++    @Before
++    public void make() {
++        agent = new AgentMetrics(new TestMetricFactory());
++    }
++
++    @Test
++    public void testAddingPipeline() {
++        agent.addPipeline("foo");
++        PipelineMetrics pipelineMetrics = agent.getPipelineMetrics("foo");
++        assertThat(pipelineMetrics, is(notNullValue()));
++    }
++}
+diff --git a/logstash-core/src/test/java/org/logstash/instrument/metrics/namespaces/PipelineMetricsTest.java b/logstash-core/src/test/java/org/logstash/instrument/metrics/namespaces/PipelineMetricsTest.java
+new file mode 100644
+index 00000000000..a4ca3d4e179
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/instrument/metrics/namespaces/PipelineMetricsTest.java
+@@ -0,0 +1,55 @@
++package org.logstash.instrument.metrics.namespaces;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.logstash.instrument.metrics.MetricFactory;
++
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.Assert.*;
++import static org.hamcrest.core.Is.is;
++import static org.hamcrest.core.IsNull.notNullValue;
++
++/**
++ * Created by andrewvc on 6/1/17.
++ */
++public class PipelineMetricsTest {
++    AgentMetrics agentMetrics;
++    PipelineMetrics pipelineMetrics;
++    @Before
++    public void init() {
++        MetricFactory metricFactory = new TestMetricFactory();
++        agentMetrics = new AgentMetrics(metricFactory);
++        pipelineMetrics = new PipelineMetrics("foo", metricFactory, agentMetrics);
++    }
++
++    @Test
++    public void testInitialState() {
++        assertThat(pipelineMetrics.getReloadFailures(), is(0L));
++        assertThat(pipelineMetrics.getReloadSuccesses(), is(0L));
++    }
++
++    @Test
++    public void testReloadSuccess() {
++        pipelineMetrics.reloadSuccess();
++        assertThat(agentMetrics.getReloadSuccesses(), is(1L));
++        assertThat(pipelineMetrics.getReloadSuccesses(), is(1L));
++        assertThat(pipelineMetrics.getLastReloadSuccessTimestamp(), is(notNullValue()));
++    }
++
++    @Test
++    public void testReloadFailure() {
++        String message = "myMessage";
++        List<String> backtrace = Arrays.asList("foo", "bar");
++
++        pipelineMetrics.reloadFailure(message, backtrace);
++        assertThat(agentMetrics.getReloadFailures(), is(1L));
++        assertThat(pipelineMetrics.getReloadFailures(), is(1L));
++        assertThat(pipelineMetrics.getLastReloadFailureTimestamp(), is(notNullValue()));
++        assertThat(pipelineMetrics.getLastReloadFailure().getMessage(), is(message));
++        assertThat(pipelineMetrics.getLastReloadFailure().getBacktrace(), is(backtrace));
++    }
++}
+\ No newline at end of file
+diff --git a/logstash-core/src/test/java/org/logstash/instrument/metrics/namespaces/TestMetricFactory.java b/logstash-core/src/test/java/org/logstash/instrument/metrics/namespaces/TestMetricFactory.java
+new file mode 100644
+index 00000000000..07c9f899448
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/instrument/metrics/namespaces/TestMetricFactory.java
+@@ -0,0 +1,23 @@
++package org.logstash.instrument.metrics.namespaces;
++
++import org.logstash.instrument.metrics.Counter;
++import org.logstash.instrument.metrics.Gauge;
++import org.logstash.instrument.metrics.MetricFactory;
++
++import java.util.List;
++
++/**
++ * Created by andrewvc on 6/1/17.
++ */
++public class TestMetricFactory implements MetricFactory{
++
++    @Override
++    public <T> Gauge<T> makeGauge(List<String> namespace, String key, T initialValue) {
++        return new Gauge<>(initialValue);
++    }
++
++    @Override
++    public Counter makeCounter(List<String> namespace, String key, long initialValue) {
++        return new Counter(initialValue);
++    }
++}

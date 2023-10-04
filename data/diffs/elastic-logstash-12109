@@ -1,0 +1,547 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index 966db271c89..fd0b8be4e80 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -199,7 +199,9 @@ def converge_state_and_update
+ 
+     converge_result
+   rescue => e
+-    logger.error("An exception happened when converging configuration", :exception => e.class, :message => e.message, :backtrace => e.backtrace)
++    attributes = {:exception => e.class, :message => e.message}
++    attributes.merge!({:backtrace => e.backtrace}) if logger.debug?
++    logger.error("An exception happened when converging configuration", attributes)
+   end
+ 
+   # Calculate the Logstash uptime in milliseconds
+diff --git a/logstash-core/lib/logstash/java_pipeline.rb b/logstash-core/lib/logstash/java_pipeline.rb
+index 7f054f2ff5e..4e0deb2f8a8 100644
+--- a/logstash-core/lib/logstash/java_pipeline.rb
++++ b/logstash-core/lib/logstash/java_pipeline.rb
+@@ -17,6 +17,7 @@
+ 
+ require "thread"
+ require "concurrent"
++require "thwait"
+ require "logstash/filters/base"
+ require "logstash/inputs/base"
+ require "logstash/outputs/base"
+@@ -119,19 +120,31 @@ def start
+     @finished_run.make_false
+ 
+     @thread = Thread.new do
++      error_log_params = ->(e) {
++        default_logging_keys(
++          :exception => e,
++          :backtrace => e.backtrace,
++          "pipeline.sources" => pipeline_source_details
++        )
++      }
++
+       begin
+         LogStash::Util.set_thread_name("pipeline.#{pipeline_id}")
+         ThreadContext.put("pipeline.id", pipeline_id)
+         run
+         @finished_run.make_true
+       rescue => e
+-        close
+-        pipeline_log_params = default_logging_keys(
+-          :exception => e,
+-          :backtrace => e.backtrace,
+-          "pipeline.sources" => pipeline_source_details)
+-        logger.error("Pipeline aborted due to error", pipeline_log_params)
++        # no need to log at ERROR level since this log will be redundant to the log in
++        # the worker loop thread global rescue clause
++        logger.debug("Pipeline terminated by worker error", error_log_params.call(e))
+       ensure
++        # we must trap any exception here to make sure the following @finished_execution
++        # is always set to true regardless of any exception before in the close method call
++        begin
++          close
++        rescue => e
++          logger.error("Pipeline close error, ignoring", error_log_params.call(e))
++        end
+         @finished_execution.make_true
+       end
+     end
+@@ -176,21 +189,18 @@ def run
+ 
+     transition_to_running
+     start_flusher # Launches a non-blocking thread for flush events
+-    wait_inputs
+-    transition_to_stopped
+-
+-    @logger.debug("Input plugins stopped! Will shutdown filter/output workers.", default_logging_keys)
+-
+-    shutdown_flusher
+-    shutdown_workers
++    begin
++      monitor_inputs_and_workers
++    ensure
++      transition_to_stopped
+ 
+-    close
++      shutdown_flusher
++      shutdown_workers
+ 
++      close
++    end
+     @logger.debug("Pipeline has been shutdown", default_logging_keys)
+-
+-    # exit code
+-    return 0
+-  end # def run
++  end
+ 
+   def transition_to_running
+     @running.make_true
+@@ -275,7 +285,16 @@ def start_workers
+         thread = Thread.new do
+           Util.set_thread_name("[#{pipeline_id}]>worker#{t}")
+           ThreadContext.put("pipeline.id", pipeline_id)
+-          worker_loop.run
++          begin
++            worker_loop.run
++          rescue => e
++            # WorkerLoop.run() catches all Java Exception class and re-throws as IllegalStateException with the
++            # original exception as the cause
++            @logger.error(
++              "Pipeline worker error, the pipeline will be stopped",
++              default_logging_keys(:error => e.cause.message, :exception => e.cause.class, :backtrace => e.cause.backtrace)
++            )
++          end
+         end
+         @worker_threads << thread
+       end
+@@ -305,10 +324,20 @@ def resolve_cluster_uuids
+     end.to_a.compact
+   end
+ 
+-  def wait_inputs
+-    @input_threads.each do |thread|
+-      thread.join # Thread or java.lang.Thread (both have #join)
++  def monitor_inputs_and_workers
++    twait = ThreadsWait.new(*(@input_threads + @worker_threads))
++
++    while !@input_threads.empty?
++      terminated_thread = twait.next_wait
++      if @input_threads.delete(terminated_thread).nil?
++        # this is a worker thread termination
++        # delete it from @worker_threads so that wait_for_workers does not wait for it
++        @worker_threads.delete(terminated_thread)
++        raise("Worker thread terminated in pipeline.id: #{pipeline_id}")
++      end
+     end
++
++    @logger.debug("Input plugins stopped! Will shutdown filter/output workers.", default_logging_keys)
+   end
+ 
+   def start_inputs
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index 99088bbad12..d16fbed5cc0 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -402,8 +402,10 @@ def filter_batch(events)
+     #
+     # Users need to check their configuration or see if there is a bug in the
+     # plugin.
+-    @logger.error("Exception in pipelineworker, the pipeline stopped processing new events, please check your filter configuration and restart Logstash.",
+-                  default_logging_keys("exception" => e.message, "backtrace" => e.backtrace))
++    @logger.error(
++      "Pipeline worker error, the pipeline will be stopped",
++      default_logging_keys("exception" => e.message, "backtrace" => e.backtrace)
++    )
+ 
+     raise e
+   end
+diff --git a/logstash-core/lib/logstash/pipelines_registry.rb b/logstash-core/lib/logstash/pipelines_registry.rb
+index 433a397e65f..54110c35090 100644
+--- a/logstash-core/lib/logstash/pipelines_registry.rb
++++ b/logstash-core/lib/logstash/pipelines_registry.rb
+@@ -17,40 +17,100 @@
+ 
+ module LogStash
+   class PipelineState
+-    attr_reader :pipeline_id, :pipeline
++    attr_reader :pipeline_id
+ 
+     def initialize(pipeline_id, pipeline)
+       @pipeline_id = pipeline_id
+       @pipeline = pipeline
+-      @reloading = Concurrent::AtomicBoolean.new(false)
++      @loading = Concurrent::AtomicBoolean.new(false)
++
++      # this class uses a lock to ensure thread safe visibility.
++      @lock = Mutex.new
+     end
+ 
+     def terminated?
+-      # a reloading pipeline is never considered terminated
+-      @reloading.false? && @pipeline.finished_execution?
++      @lock.synchronize do
++        # a loading pipeline is never considered terminated
++        @loading.false? && @pipeline.finished_execution?
++      end
+     end
+ 
+-    def set_reloading(is_reloading)
+-      @reloading.value = is_reloading
++    def set_loading(is_loading)
++      @lock.synchronize do
++        @loading.value = is_loading
++      end
+     end
+ 
+     def set_pipeline(pipeline)
+-      raise(ArgumentError, "invalid nil pipeline") if pipeline.nil?
+-      @pipeline = pipeline
++      @lock.synchronize do
++        raise(ArgumentError, "invalid nil pipeline") if pipeline.nil?
++        @pipeline = pipeline
++      end
++    end
++
++    def pipeline
++      @lock.synchronize { @pipeline }
+     end
+   end
+ 
++  class PipelineStates
++
++    def initialize
++      @states = {}
++      @locks = {}
++      @lock = Mutex.new
++    end
++
++    def get(pipeline_id)
++      @lock.synchronize do
++        @states[pipeline_id]
++      end
++    end
++
++    def put(pipeline_id, state)
++      @lock.synchronize do
++        @states[pipeline_id] = state
++      end
++    end
++
++    def remove(pipeline_id)
++      @lock.synchronize do
++        @states.delete(pipeline_id)
++        @locks.delete(pipeline_id)
++      end
++    end
++
++    def size
++      @lock.synchronize do
++        @states.size
++      end
++    end
++
++    def empty?
++      @lock.synchronize do
++        @states.empty?
++      end
++    end
++
++    def each_with_object(init, &block)
++      states = @lock.synchronize { @states.dup }
++      states.each_with_object(init, &block)
++    end
++
++    def get_lock(pipeline_id)
++      @lock.synchronize do
++        @locks[pipeline_id] ||= Mutex.new
++      end
++    end
++  end
++
++
+   class PipelinesRegistry
+     attr_reader :states
+     include LogStash::Util::Loggable
+ 
+     def initialize
+-      # we leverage the semantic of the Java ConcurrentHashMap for the
+-      # compute() method which is atomic; calling compute() concurrently
+-      # will block until the other compute finishes so no mutex is necessary
+-      # for synchronizing compute calls
+-      @states = java.util.concurrent.ConcurrentHashMap.new
+-      @locks = java.util.concurrent.ConcurrentHashMap.new
++      @states = PipelineStates.new
+     end
+ 
+     # Execute the passed creation logic block and create a new state upon success
+@@ -62,23 +122,35 @@ def initialize
+     #
+     # @return [Boolean] new pipeline creation success
+     def create_pipeline(pipeline_id, pipeline, &create_block)
+-      lock = get_lock(pipeline_id)
++      lock = @states.get_lock(pipeline_id)
+       lock.lock
+-
+       success = false
+ 
+       state = @states.get(pipeline_id)
+-      if state
+-        if state.terminated?
++
++      if state && !state.terminated?
++        logger.error("Attempted to create a pipeline that already exists", :pipeline_id => pipeline_id)
++        return false
++      end
++
++      if state.nil?
++        state = PipelineState.new(pipeline_id, pipeline)
++        state.set_loading(true)
++        @states.put(pipeline_id, state)
++        begin
+           success = yield
+-          state.set_pipeline(pipeline)
+-        else
+-          logger.error("Attempted to create a pipeline that already exists", :pipeline_id => pipeline_id)
++        ensure
++          state.set_loading(false)
++          @states.remove(pipeline_id) unless success
+         end
+-        @states.put(pipeline_id, state)
+       else
+-        success = yield
+-        @states.put(pipeline_id, PipelineState.new(pipeline_id, pipeline)) if success
++        state.set_loading(true)
++        state.set_pipeline(pipeline)
++        begin
++          success = yield
++        ensure
++          state.set_loading(false)
++        end
+       end
+ 
+       success
+@@ -92,22 +164,20 @@ def create_pipeline(pipeline_id, pipeline, &create_block)
+     #
+     # @yieldparam [Pipeline] the pipeline to terminate
+     def terminate_pipeline(pipeline_id, &stop_block)
+-      lock = get_lock(pipeline_id)
++      lock = @states.get_lock(pipeline_id)
+       lock.lock
+ 
+       state = @states.get(pipeline_id)
+       if state.nil?
+         logger.error("Attempted to terminate a pipeline that does not exists", :pipeline_id => pipeline_id)
+-        @states.remove(pipeline_id)
+       else
+         yield(state.pipeline)
+-        @states.put(pipeline_id, state)
+       end
+     ensure
+       lock.unlock
+     end
+ 
+-    # Execute the passed reloading logic block in the context of the reloading state and set new pipeline in state
++    # Execute the passed reloading logic block in the context of the loading state and set new pipeline in state
+     # @param pipeline_id [String, Symbol] the pipeline id
+     # @param reload_block [Block] the reloading execution logic
+     #
+@@ -115,26 +185,26 @@ def terminate_pipeline(pipeline_id, &stop_block)
+     #
+     # @return [Boolean] new pipeline creation success
+     def reload_pipeline(pipeline_id, &reload_block)
+-      lock = get_lock(pipeline_id)
++      lock = @states.get_lock(pipeline_id)
+       lock.lock
+       success = false
+ 
+       state = @states.get(pipeline_id)
++
+       if state.nil?
+         logger.error("Attempted to reload a pipeline that does not exists", :pipeline_id => pipeline_id)
+-        @states.remove(pipeline_id)
+-      else
+-        state.set_reloading(true)
+-        begin
+-          success, new_pipeline = yield
+-          state.set_pipeline(new_pipeline)
+-        ensure
+-          state.set_reloading(false)
+-        end
+-        @states.put(pipeline_id, state)
++        return false
+       end
+ 
+-    success
++      state.set_loading(true)
++      begin
++        success, new_pipeline = yield
++        state.set_pipeline(new_pipeline)
++      ensure
++        state.set_loading(false)
++      end
++
++      success
+     ensure
+       lock.unlock
+     end
+@@ -153,7 +223,7 @@ def size
+ 
+     # @return [Boolean] true if the states collection is empty.
+     def empty?
+-      @states.isEmpty
++      @states.empty?
+     end
+ 
+     # @return [Hash{String=>Pipeline}]
+@@ -189,11 +259,5 @@ def select_pipelines(&optional_state_filter)
+         end
+       end
+     end
+-
+-    def get_lock(pipeline_id)
+-      @locks.compute_if_absent(pipeline_id) do |k|
+-        java.util.concurrent.locks.ReentrantLock.new
+-      end
+-    end
+   end
+ end
+diff --git a/logstash-core/spec/logstash/java_pipeline_spec.rb b/logstash-core/spec/logstash/java_pipeline_spec.rb
+index 68ad5c91abc..69f5ceab9a2 100644
+--- a/logstash-core/spec/logstash/java_pipeline_spec.rb
++++ b/logstash-core/spec/logstash/java_pipeline_spec.rb
+@@ -88,6 +88,17 @@ def threadsafe?() false; end
+   def close() end
+ end
+ 
++class DummyCrashingFilter < LogStash::Filters::Base
++  config_name "dummycrashingfilter"
++  milestone 2
++
++  def register; end
++
++  def filter(event)
++    raise("crashing filter")
++  end
++end
++
+ class DummySafeFilter < LogStash::Filters::Base
+   config_name "dummysafefilter"
+   milestone 2
+@@ -226,6 +237,37 @@ def flush(options)
+     end
+   end
+ 
++  context "a crashing worker" do
++    subject { mock_java_pipeline_from_string(config, pipeline_settings_obj) }
++
++    let(:pipeline_settings) { { "pipeline.batch.size" => 1, "pipeline.workers" => 1 } }
++    let(:config) do
++      <<-EOS
++      input { generator {} }
++      filter { dummycrashingfilter {} }
++      output { dummyoutput {} }
++      EOS
++    end
++    let(:dummyoutput) { ::LogStash::Outputs::DummyOutput.new }
++
++    before :each do
++      allow(::LogStash::Outputs::DummyOutput).to receive(:new).with(any_args).and_return(dummyoutput)
++      allow(LogStash::Plugin).to receive(:lookup).with("input", "generator").and_return(LogStash::Inputs::Generator)
++      allow(LogStash::Plugin).to receive(:lookup).with("codec", "plain").and_return(LogStash::Codecs::Plain)
++      allow(LogStash::Plugin).to receive(:lookup).with("filter", "dummycrashingfilter").and_return(DummyCrashingFilter)
++      allow(LogStash::Plugin).to receive(:lookup).with("output", "dummyoutput").and_return(::LogStash::Outputs::DummyOutput)
++    end
++
++    after :each do
++      subject.shutdown
++    end
++
++    it "does not raise in the main thread, terminates the run thread and finishes execution" do
++      expect { subject.start && subject.thread.join }.to_not raise_error
++      expect(subject.finished_execution?).to be_truthy
++    end
++  end
++
+   describe "defaulting the pipeline workers based on thread safety" do
+     before(:each) do
+       allow(LogStash::Plugin).to receive(:lookup).with("input", "dummyinput").and_return(DummyInput)
+diff --git a/logstash-core/spec/logstash/pipelines_registry_spec.rb b/logstash-core/spec/logstash/pipelines_registry_spec.rb
+index 7a718354444..7cda6a834c0 100644
+--- a/logstash-core/spec/logstash/pipelines_registry_spec.rb
++++ b/logstash-core/spec/logstash/pipelines_registry_spec.rb
+@@ -101,6 +101,47 @@
+         end
+       end
+     end
++
++    context "when pipeline is initializing" do
++      let (:wait_start_create_block) { Queue.new }
++      let (:wait_before_exiting_create_block) { Queue.new }
++      let (:slow_initializing_pipeline) { double("slow_initializing_pipeline") }
++      let (:pipeline2) { double("pipeline2") }
++
++      it "should create a loading state before calling the create block" do
++
++        # create a thread which calls create_pipeline and wait in the create
++        # block so we can controle the pipeline initialization phase
++        t = Thread.new do
++          subject.create_pipeline(pipeline_id, slow_initializing_pipeline) do
++            # signal that we entered the create block
++            wait_start_create_block << "ping"
++
++            # stall here until wait_before_exiting_create_block receives a message
++            wait_before_exiting_create_block.pop
++
++            true
++          end
++        end
++
++        # stall here until subject.create_pipeline has been called in the above thread
++        # and it entered the create block
++        wait_start_create_block.pop
++
++        # finished_execution? should not be called in the below tests using terminated?
++        # because the loading state is true. This is to make sure the state is used and not
++        # the pipeline termination status
++        expect(slow_initializing_pipeline).not_to receive(:finished_execution?)
++
++        expect(subject.states.get(pipeline_id).terminated?).to be_falsey
++        expect(subject.get_pipeline(pipeline_id)).to eq(slow_initializing_pipeline)
++        expect(subject.empty?).to be_falsey
++
++        # signal termination of create block
++        wait_before_exiting_create_block << "ping"
++        t.join
++      end
++    end
+   end
+ 
+   context "terminating a pipeline" do
+diff --git a/logstash-core/spec/support/matchers.rb b/logstash-core/spec/support/matchers.rb
+index b87f08c173f..288b35e2e22 100644
+--- a/logstash-core/spec/support/matchers.rb
++++ b/logstash-core/spec/support/matchers.rb
+@@ -93,9 +93,9 @@ def all_instance_methods_implemented?
+     try(30) do
+       pipeline = agent.get_pipeline(pipeline_config.pipeline_id)
+       expect(pipeline).to_not be_nil
++      expect(pipeline.running?).to be_truthy
+     end
+     expect(pipeline.config_str).to eq(pipeline_config.config_string)
+-    expect(pipeline.running?).to be_truthy
+     expect(agent.running_pipelines.keys.map(&:to_s)).to include(pipeline_config.pipeline_id.to_s)
+   end
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/execution/WorkerLoop.java b/logstash-core/src/main/java/org/logstash/execution/WorkerLoop.java
+index 843f67fe7a0..b0e974d3d54 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/WorkerLoop.java
++++ b/logstash-core/src/main/java/org/logstash/execution/WorkerLoop.java
+@@ -98,10 +98,6 @@ public void run() {
+             execution.compute(batch, true, true);
+             readClient.closeBatch(batch);
+         } catch (final Exception ex) {
+-            LOGGER.error(
+-                "Exception in pipelineworker, the pipeline stopped processing new events, please check your filter configuration and restart Logstash.",
+-                ex
+-            );
+             throw new IllegalStateException(ex);
+         }
+     }

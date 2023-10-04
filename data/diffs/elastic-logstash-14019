@@ -1,0 +1,144 @@
+diff --git a/config/logstash.yml b/config/logstash.yml
+index 0e07005b0f6..912a4554bd3 100644
+--- a/config/logstash.yml
++++ b/config/logstash.yml
+@@ -281,6 +281,9 @@
+ #
+ # ------------ Other Settings --------------
+ #
++# Run Logstash with superuser
++# on_superuser: BLOCK, WARN(default), ALLOW
++#
+ # Where to find custom plugins
+ # path.plugins: []
+ #
+diff --git a/docker/data/logstash/env2yaml/env2yaml.go b/docker/data/logstash/env2yaml/env2yaml.go
+index 2643bb65555..ceda59ad3dc 100644
+--- a/docker/data/logstash/env2yaml/env2yaml.go
++++ b/docker/data/logstash/env2yaml/env2yaml.go
+@@ -93,6 +93,7 @@ func normalizeSetting(setting string) (string, error) {
+ 		"modules",
+ 		"path.logs",
+ 		"path.plugins",
++		"on_superuser",
+ 		"xpack.monitoring.enabled",
+ 		"xpack.monitoring.collection.interval",
+ 		"xpack.monitoring.elasticsearch.hosts",
+diff --git a/docs/static/settings-file.asciidoc b/docs/static/settings-file.asciidoc
+index 694d548e5b7..0ca5ef28f51 100644
+--- a/docs/static/settings-file.asciidoc
++++ b/docs/static/settings-file.asciidoc
+@@ -313,4 +313,8 @@ separating each log lines per pipeline could be helpful in case you need to trou
+   and `NAME` is the name of the plugin.
+ | Platform-specific. See <<dir-layout>>.
+ 
++| `on_superuser`
++| Flag to indicate properly utilizing superuser potentials when running Logstash. Offered options are `WARN`, `BLOCK` and `ALLOW`.
++| `WARN`
++
+ |=======================================================================
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 0147a1cf61f..20f4825d0c4 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -34,6 +34,7 @@ module Environment
+   end
+ 
+   [
++            Setting::String.new("on_superuser", "WARN", true, ["WARN", "BLOCK", "ALLOW"]),
+             Setting::String.new("node.name", Socket.gethostname),
+     Setting::NullableString.new("path.config", nil, false),
+  Setting::WritableDirectory.new("path.data", ::File.join(LogStash::Environment::LOGSTASH_HOME, "data")),
+diff --git a/logstash-core/lib/logstash/runner.rb b/logstash-core/lib/logstash/runner.rb
+index 1aaa3c9315c..333c395d41d 100644
+--- a/logstash-core/lib/logstash/runner.rb
++++ b/logstash-core/lib/logstash/runner.rb
+@@ -285,6 +285,8 @@ def execute
+     require "logstash/util/java_version"
+     require "stud/task"
+ 
++    running_as_root
++
+     if log_configuration_contains_javascript_usage?
+       logger.error("Logging configuration uses Script log appender or filter with Javascript, which is no longer supported.")
+       return 1
+@@ -440,6 +442,17 @@ def execute
+     @log_fd.close if @log_fd
+   end # def self.main
+ 
++  def running_as_root
++    on_superuser_setting = setting("on_superuser")
++    if Process.euid() == 0 && on_superuser_setting.eql?("ALLOW") == false
++      if on_superuser_setting.eql?("WARN")
++        deprecation_logger.deprecated("NOTICE: Running Logstash as root is not recommended and won't be allowed in the future. Set 'on_superuser' to 'BLOCK' to avoid startup errors in future releases.")
++      else
++        raise(RuntimeError, "Logstash cannot be run as root.")
++      end
++    end
++  end
++
+   def log_configuration_contains_javascript_usage?
+      context = LoggerContext.getContext(false)
+      config = context.configuration
+diff --git a/logstash-core/spec/logstash/runner_spec.rb b/logstash-core/spec/logstash/runner_spec.rb
+index d503e384c59..62a891d6242 100644
+--- a/logstash-core/spec/logstash/runner_spec.rb
++++ b/logstash-core/spec/logstash/runner_spec.rb
+@@ -26,6 +26,7 @@
+ require "logstash/modules/util"
+ require "logstash/elasticsearch_client"
+ require "json"
++require "webmock/rspec"
+ require_relative "../support/helpers"
+ require_relative "../support/matchers"
+ 
+@@ -644,4 +645,49 @@
+       end
+     end
+   end
++
++  describe "on_superuser" do
++    subject { LogStash::Runner.new("") }
++    let(:args) { ["-e", "input {} output {}"] }
++    let(:deprecation_logger_stub) { double("DeprecationLogger").as_null_object }
++    before(:each) { allow(runner).to receive(:deprecation_logger).and_return(deprecation_logger_stub) }
++
++    context "unintentionally running logstash as root" do
++      before do
++        expect(Process).to receive(:euid).and_return(0)
++      end
++      it "fails with bad exit" do
++        LogStash::SETTINGS.set("on_superuser", "BLOCK")
++        expect(logger).to receive(:fatal) do |msg, hash|
++          expect(msg).to eq("An unexpected error occurred!")
++          expect(hash[:error].to_s).to match("Logstash cannot be run as root.")
++        end
++        expect(subject.run(args)).to eq(1)
++      end
++    end
++
++    context "intentionally running logstash as root " do
++      before do
++        expect(Process).to receive(:euid).and_return(0)
++      end
++      it "runs successfully with warning message" do
++        LogStash::SETTINGS.set("on_superuser", "WARN")
++        expect(logger).not_to receive(:fatal)
++        expect(deprecation_logger_stub).to receive(:deprecated).with(/NOTICE: Running Logstash as root is not recommended and won't be allowed in the future. Set 'on_superuser' to 'BLOCK' to avoid startup errors in future releases./)
++        expect { subject.run(args) }.not_to raise_error
++      end
++    end
++
++    context "running logstash as non-root " do
++      before do
++        expect(Process).to receive(:euid).and_return(100)
++      end
++      it "runs successfully without any messages" do
++        LogStash::SETTINGS.set("on_superuser", "BLOCK")
++        expect(logger).not_to receive(:fatal)
++        expect(deprecation_logger_stub).not_to receive(:deprecated).with(/NOTICE: Running Logstash as root is not recommended and won't be allowed in the future. Set 'on_superuser' to 'BLOCK' to avoid startup errors in future releases./)
++        expect { subject.run(args) }.not_to raise_error
++      end
++    end
++  end
+ end

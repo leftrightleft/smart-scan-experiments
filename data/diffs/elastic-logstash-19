@@ -1,0 +1,353 @@
+diff --git a/lib/logstash/filters/grok.rb b/lib/logstash/filters/grok.rb
+index 4c81aad0538..e2b7e05c10d 100644
+--- a/lib/logstash/filters/grok.rb
++++ b/lib/logstash/filters/grok.rb
+@@ -50,9 +50,21 @@ def filter(event)
+ 
+     if match
+       match.each_capture do |key, value|
++        match_type = nil
+         if key.include?(":")
+-          key = key.split(":")[1]
++          name, key, match_type = key.split(":")
+         end
++
++        # http://code.google.com/p/logstash/issues/detail?id=45
++        # Permit typing of captures by giving an additional colon and a type,
++        # like: %{FOO:name:int} for int coercion.
++        case match_type
++          when "int"
++            value = value.to_i
++          when "float"
++            value = value.to_f
++        end
++
+         if event.message == value
+           # Skip patterns that match the entire line
+           @logger.debug("Skipping capture '#{key}' since it matches the whole line.")
+@@ -65,7 +77,9 @@ def filter(event)
+           event.fields[key] = []
+         end
+ 
+-        if value && !value.empty?
++        # If value is not nil, or responds to empty and is not empty, add the
++        # value to the event.
++        if !value.nil? && (!value.empty? rescue true)
+           event.fields[key] << value
+         end
+       end
+diff --git a/lib/logstash/inputs/amqp.rb b/lib/logstash/inputs/amqp.rb
+index 9454f59e247..34d3d5cfe85 100644
+--- a/lib/logstash/inputs/amqp.rb
++++ b/lib/logstash/inputs/amqp.rb
+@@ -6,7 +6,7 @@
+ require "cgi"
+ 
+ class LogStash::Inputs::Amqp < LogStash::Inputs::Base
+-  MQTYPES = [ "fanout", "queue", "topic" ]
++  MQTYPES = [ "fanout", "direct", "topic" ]
+ 
+   public
+   def initialize(url, type, config={}, &block)
+@@ -39,20 +39,22 @@ def register
+     amqpsettings[:user] = @url.user if @url.user
+     amqpsettings[:pass] = @url.password if @url.password
+     amqpsettings[:logging] = query_args.include? "debug"
+-    @logger.debug("Connecting with AMQP settings #{amqpsettings.inspect} to set up #{@mqtype.inspect} queue #{@name.inspect}")
++    queue_name = ((@urlopts["queue"].nil? or @urlopts["queue"].empty?) ? "logstash-#{@name}" : @urlopts["queue"])
++    @logger.debug("Connecting with AMQP settings #{amqpsettings.inspect} to set up #{@mqtype.inspect} queue #{queue_name} on exchange #{@name.inspect}")
+     @amqp = AMQP.connect(amqpsettings)
+     @mq = MQ.new(@amqp)
+     @target = nil
+ 
+-    @target = @mq.queue(UUIDTools::UUID.timestamp_create)
++    @durable_exchange = @urlopts["durable_exchange"] ? true : false
++    @durable_queue = @urlopts["durable_queue"] ? true : false
++    @target = @mq.queue(queue_name, :durable => @durable_queue)
+     case @mqtype
+       when "fanout"
+-        #@target.bind(MQ.fanout(@url.path, :durable => true))
+-        @target.bind(@mq.fanout(@name))
++        @target.bind(@mq.fanout(@name, :durable => @durable_exchange))
+       when "direct"
+-        @target.bind(@mq.direct(@name))
++        @target.bind(@mq.direct(@name, :durable => @durable_exchange))
+       when "topic"
+-        @target.bind(@mq.topic(@name))
++        @target.bind(@mq.topic(@name, :durable => @durable_exchange))
+     end # case @mqtype
+ 
+     @target.subscribe(:ack => true) do |header, message|
+diff --git a/lib/logstash/outputs/amqp.rb b/lib/logstash/outputs/amqp.rb
+index 30b32019292..bba5b235927 100644
+--- a/lib/logstash/outputs/amqp.rb
++++ b/lib/logstash/outputs/amqp.rb
+@@ -5,12 +5,15 @@
+ require "cgi"
+ 
+ class LogStash::Outputs::Amqp < LogStash::Outputs::Base
+-  MQTYPES = [ "fanout", "queue", "topic" ]
++  MQTYPES = [ "fanout", "direct", "topic" ]
+ 
+   public
+   def initialize(url, config={}, &block)
+     super
+ 
++    @mq = nil
++    @bulk_prefix = nil
++
+     # Handle path /<vhost>/<type>/<name> or /<type>/<name>
+     # vhost allowed to contain slashes
+     if @url.path =~ %r{^/((.*)/)?([^/]+)/([^/]+)}
+@@ -36,25 +39,35 @@ def register
+     amqpsettings[:user] = @url.user if @url.user
+     amqpsettings[:pass] = @url.password if @url.password
+     amqpsettings[:logging] = query_args.include? "debug"
+-    @logger.debug("Connecting with AMQP settings #{amqpsettings.inspect} to set up #{@mqtype.inspect} queue #{@name.inspect}")
++    @logger.debug("Connecting with AMQP settings #{amqpsettings.inspect} to set up #{@mqtype.inspect} exchange #{@name.inspect}")
+     @amqp = AMQP.connect(amqpsettings)
+     @mq = MQ.new(@amqp)
+     @target = nil
+ 
++    if @urlopts.include? "es_index" and @urlopts.include? "es_type"
++      @bulk_prefix = { "index" => { "_index" => @urlopts["es_index"], "_type" => @urlopts["es_type"] } }.to_json + "\n"
++      @logger.debug "Preparing ElasticSearch bulk API header for injection: #{@bulk_prefix.inspect}"
++    end
++
++    @durable = @urlopts["durable"] ? true : false
+     case @mqtype
+       when "fanout"
+-        @target = @mq.fanout(@name)
+-      when "queue"
+-        @target = @mq.queue(@name, :durable => @urlopts["durable"] ? true : false)
++        @target = @mq.fanout(@name, :durable => @durable)
++      when "direct"
++        @target = @mq.direct(@name, :durable => @durable)
+       when "topic"
+-        @target = @mq.topic(@name)
++        @target = @mq.topic(@name, :durable => @durable)
+     end # case @mqtype
+   end # def register
+ 
+   public
+   def receive(event)
+     @logger.debug(["Sending event", { :url => @url, :event => event }])
+-    @target.publish(event.to_json)
++    if @bulk_prefix
++      @target.publish(@bulk_prefix + event.to_json + "\n")
++    else
++      @target.publish(event.to_json)
++    end
+   end # def receive
+ 
+   # This is used by the ElasticSearch AMQP/River output.
+diff --git a/lib/logstash/outputs/elasticsearch.rb b/lib/logstash/outputs/elasticsearch.rb
+index 4eca6f3c358..f372d9f3bc4 100644
+--- a/lib/logstash/outputs/elasticsearch.rb
++++ b/lib/logstash/outputs/elasticsearch.rb
+@@ -2,6 +2,7 @@
+ require "logstash/namespace"
+ require "logstash/outputs/amqp"
+ require "logstash/outputs/base"
++require "cgi"
+ 
+ class LogStash::Outputs::Elasticsearch < LogStash::Outputs::Base
+   public
+@@ -63,34 +64,50 @@ def register
+ 
+   public
+   def ready(params)
+-    case params["method"]
++    method = params.delete("method")
++    case method
+     when "http"
+       @logger.debug "ElasticSearch using http with URL #{@url.to_s}"
+       @http = EventMachine::HttpRequest.new(@url.to_s)
+       @callback = self.method(:receive_http)
+     when "river"
+-      params["port"] ||= 5672
+-      auth = "#{params["user"] or "guest"}:#{params["pass"] or "guest"}"
+-      mq_url = URI::parse("amqp://#{auth}@#{params["host"]}:#{params["port"]}/queue/#{params["queue"]}?durable=1")
++      river_type = params.delete("type") || "rabbitmq"
++      amqp_host = params.delete("host") || 'localhost'
++      amqp_port = params.delete("port") || 5672
++      amqp_exchange_type = params.delete("exchange_type") || "direct"
++      amqp_queue_name = params.delete("queue") || "es"
++      amqp_exchange_name = params.delete("exchange") || amqp_queue_name
++      amqp_exchange_durable = (params["durable"] || "false") =~ /^[ty1]/
++      amqp_user = params.delete("user") or "guest"
++      amqp_pass = params.delete("pass") or "guest"
++      amqp_vhost = params.delete("vhost") || "/"
++      vhost_str = (amqp_vhost == "/") ? "" : "/#{amqp_vhost}"
++      qs = params.map {|k,v| "#{CGI.escape(k)}=#{CGI.escape(v)}"}.join("&")
++      mq_url = URI::parse("amqp://#{amqp_user}:#{amqp_pass}@#{amqp_host}:#{amqp_port}#{vhost_str}/#{amqp_exchange_type}/#{amqp_exchange_name}?#{qs}")
+       @mq = LogStash::Outputs::Amqp.new(mq_url.to_s)
+       @mq.register
+       @callback = self.method(:receive_river)
+       em_url = URI.parse("http://#{@url.host}:#{@url.port}/_river/logstash#{@url.path.tr("/", "_")}/_meta")
+       unused, @es_index, @es_type = @url.path.split("/", 3)
+ 
+-      river_config = {"type" => params["type"],
+-                      params["type"] => {"host" => params["host"],
+-                                         "user" => params["user"],
+-                                         "port" => params["port"],
+-                                         "pass" => params["pass"],
+-                                         "vhost" => params["vhost"],
+-                                         "queue" => params["queue"],
+-                                         "exchange" => params["queue"],
+-                                        },
+-                     "index" => {"bulk_size" => 100,
+-                                 "bulk_timeout" => "10ms",
+-                                },
+-                     }
++      river_config = {
++        "type" => river_type,
++        river_type => {
++          "host" => amqp_host,
++          "user" => amqp_user,
++          "port" => amqp_port,
++          "pass" => amqp_pass,
++          "vhost" => amqp_vhost,
++          "queue" => amqp_queue_name,
++          "exchange" => amqp_exchange_name,
++          "exchange_durable" => amqp_exchange_durable ? "true" : "false",
++          "exchange_type" => amqp_exchange_type,
++        },
++        "index" => {
++          "bulk_size" => 100,
++          "bulk_timeout" => "10ms",
++        },
++      }
+       @logger.debug(["ElasticSearch using river", river_config])
+       http_setup = EventMachine::HttpRequest.new(em_url.to_s)
+       req = http_setup.put :body => river_config.to_json
+@@ -98,7 +115,7 @@ def ready(params)
+         @logger.warn "Error setting up river: #{req.response}"
+       end
+       @callback = self.method(:receive_river)
+-    else raise "unknown elasticsearch method #{params["method"].inspect}"
++    else raise "unknown elasticsearch method #{method.inspect}"
+     end
+ 
+     #receive(LogStash::Event.new({
+diff --git a/lib/logstash/outputs/gelf.rb b/lib/logstash/outputs/gelf.rb
+index 19ee4c34c1b..335ac8ce1a8 100644
+--- a/lib/logstash/outputs/gelf.rb
++++ b/lib/logstash/outputs/gelf.rb
+@@ -9,26 +9,40 @@
+ require "logstash/outputs/base"
+ 
+ class LogStash::Outputs::Gelf < LogStash::Outputs::Base
++  
++  public
++  def initialize(url, config={}, &block)
++    super
++
++    @chunksize = @urlopts["chunksize"].to_i || 1420
++    @level = @urlopts["level"] || 1
++    @facility = @urlopts["facility"] || 'logstash-gelf'
++    
++  end
++
+   public
+   def register
+-    # nothing to do
++    option_hash = Hash.new
++    option_hash["level"] = @level
++    option_hash["facility"] = @facility
++
++    @gelf = GELF::Notifier.new(@url.host, (@url.port or 12201), @chunksize, option_hash)
+   end # def register
+ 
+   public
+   def receive(event)
+-    # TODO(sissel): Use Gelf::Message instead
+-    gelf = Gelf.new(@url.host, (@url.port or 12201))
+-    gelf.short_message = (event.fields["message"] or event.message)
+-    gelf.full_message = (event.message)
+-    gelf.level = 1
+-    gelf.host = event["@source_host"]
+-    gelf.file = event["@source_path"]
++    m = Hash.new
++    m["short_message"] = (event.fields["message"] or event.message)
++    m["full_message"] = (event.message)
++    m["host"] = event["@source_host"]
++    m["file"] = event["@source_path"]
++    m["level"] = 1
+ 
+     event.fields.each do |name, value|
+       next if value == nil or value.empty?
+-      gelf.add_additional name, value
++      m["#{name}"] = value
+     end
+-    gelf.add_additional "event_timestamp", event.timestamp
+-    gelf.send
++    m["timestamp"] = event.timestamp
++    @gelf.notify!(m)
+   end # def receive
+ end # class LogStash::Outputs::Gelf
+diff --git a/lib/logstash/search/elasticsearch.rb b/lib/logstash/search/elasticsearch.rb
+index 2603b53f33d..6c9f4ff7c79 100644
+--- a/lib/logstash/search/elasticsearch.rb
++++ b/lib/logstash/search/elasticsearch.rb
+@@ -85,9 +85,8 @@ def search(query)
+       @logger.warn(["Query failed", query, req, req.response])
+       result.duration = Time.now - start_time
+       result.error_message = req.response
+-      #yield result
+ 
+-      yield({ "error" => req.response })
++      yield result
+     end
+   end # def search
+ 
+diff --git a/lib/logstash/web/public/js/logstash.js b/lib/logstash/web/public/js/logstash.js
+index 754e3432a43..5179365c79f 100644
+--- a/lib/logstash/web/public/js/logstash.js
++++ b/lib/logstash/web/public/js/logstash.js
+@@ -51,6 +51,7 @@
+         for (var i in histogram) {
+           flot_data.push([parseInt(histogram[i]["key"]), histogram[i]["count"]])
+         }
++        logstash.plot(flot_data, logstash.params.interval);
+         //console.log(histogram);
+ 
+         /* Try to be intelligent about how we choose the histogram interval.
+@@ -60,23 +61,23 @@
+          *
+          * This queries the backend several times, but should be reasonably
+          * speedy as this behaves roughly as a binary search. */
+-        if (flot_data.length < 6 && flot_data.length > 0 && tries > 0) {
++        //if (flot_data.length < 6 && flot_data.length > 0 && tries > 0) {
+           //console.log("Histogram bucket " + logstash.params.interval + " has only " + flot_data.length + " data points, trying smaller...");
+-          logstash.params.interval /= 2;
+-          if (logstash.params.interval < 1000) {
+-            tries = 0; /* stop trying, too small... */
+-            logstash.plot(flot_data, logstash.params.interval);
+-            return;
+-          }
+-          logstash.histogram(tries - 1);
+-        } else if (flot_data.length > 50 && tries > 0) {
++          //logstash.params.interval /= 2;
++          //if (logstash.params.interval < 1000) {
++            //tries = 0; /* stop trying, too small... */
++            //logstash.plot(flot_data, logstash.params.interval);
++            //return;
++          //}
++          //logstash.histogram(tries - 1);
++        //} else if (flot_data.length > 50 && tries > 0) {
+           //console.log("Histogram bucket " + logstash.params.interval + " too many (" + flot_data.length + ") data points, trying larger interval...");
+-          logstash.params.interval *= 2;
+-          logstash.histogram(tries - 1);
+-        } else {
++          //logstash.params.interval *= 2;
++          //logstash.histogram(tries - 1);
++        //} else {
+           //console.log("Histo:" + logstash.params.interval);
+-          logstash.plot(flot_data, logstash.params.interval);
+-        }
++          //logstash.plot(flot_data, logstash.params.interval);
++        //}
+       });
+     },
+ 

@@ -1,0 +1,129 @@
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractOutputDelegatorExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractOutputDelegatorExt.java
+index ecc921b46fa..24077d9cadd 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractOutputDelegatorExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractOutputDelegatorExt.java
+@@ -21,6 +21,8 @@
+ @JRubyClass(name = "AbstractOutputDelegator")
+ public abstract class AbstractOutputDelegatorExt extends RubyObject {
+ 
++    public static final String OUTPUT_METHOD_NAME = "multi_receive";
++
+     private AbstractMetricExt metric;
+ 
+     protected AbstractNamespacedMetricExt namespacedMetric;
+@@ -86,7 +88,7 @@ public IRubyObject metricEvents() {
+         return metricEvents;
+     }
+ 
+-    @JRubyMethod(name = "multi_receive")
++    @JRubyMethod(name = OUTPUT_METHOD_NAME)
+     public IRubyObject multiReceive(final IRubyObject events) {
+         final RubyArray batch = (RubyArray) events;
+         final int count = batch.size();
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java
+index 436f0dff72f..8825548d3e4 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java
+@@ -11,6 +11,7 @@
+ import org.jruby.RubyString;
+ import org.jruby.anno.JRubyClass;
+ import org.jruby.anno.JRubyMethod;
++import org.jruby.internal.runtime.methods.DynamicMethod;
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.logstash.RubyUtil;
+@@ -23,9 +24,11 @@
+ @JRubyClass(name = "JavaFilterDelegator")
+ public final class FilterDelegatorExt extends RubyObject {
+ 
++    private static final String FILTER_METHOD_NAME = "multi_filter";
++
+     private static final long serialVersionUID = 1L;
+ 
+-    private IRubyObject filterClass;
++    private RubyClass filterClass;
+ 
+     private IRubyObject filter;
+ 
+@@ -37,6 +40,8 @@ public final class FilterDelegatorExt extends RubyObject {
+ 
+     private LongCounter eventMetricIn;
+ 
++    private DynamicMethod filterMethod;
++
+     private LongCounter eventMetricTime;
+ 
+     private boolean flushes;
+@@ -46,7 +51,8 @@ public IRubyObject initialize(final ThreadContext context, final IRubyObject fil
+         final IRubyObject id) {
+         this.id = (RubyString) id;
+         this.filter = filter;
+-        this.filterClass = filter.getSingletonClass().getRealClass();
++        filterClass = filter.getSingletonClass().getRealClass();
++        filterMethod = filterClass.searchMethod(FILTER_METHOD_NAME);
+         final AbstractNamespacedMetricExt namespacedMetric =
+             (AbstractNamespacedMetricExt) filter.callMethod(context, "metric");
+         metricEvents = namespacedMetric.namespace(context, MetricKeys.EVENTS_KEY);
+@@ -66,6 +72,7 @@ public FilterDelegatorExt initForTesting(final IRubyObject filter) {
+         eventMetricIn = LongCounter.DUMMY_COUNTER;
+         eventMetricTime = LongCounter.DUMMY_COUNTER;
+         this.filter = filter;
++        filterMethod = filter.getMetaClass().searchMethod(FILTER_METHOD_NAME);
+         flushes = filter.respondsTo("flush");
+         return this;
+     }
+@@ -118,8 +125,8 @@ public IRubyObject getId() {
+     public RubyArray multiFilter(final RubyArray batch) {
+         eventMetricIn.increment((long) batch.size());
+         final long start = System.nanoTime();
+-        final RubyArray result = (RubyArray) filter.callMethod(
+-            WorkerLoop.THREAD_CONTEXT.get(), "multi_filter", batch
++        final RubyArray result = (RubyArray) filterMethod.call(
++            WorkerLoop.THREAD_CONTEXT.get(), filter, filterClass, FILTER_METHOD_NAME, batch
+         );
+         eventMetricTime.increment(
+             TimeUnit.MILLISECONDS.convert(System.nanoTime() - start, TimeUnit.NANOSECONDS)
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputStrategyExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputStrategyExt.java
+index b5e6d83936a..6816327d861 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputStrategyExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputStrategyExt.java
+@@ -108,20 +108,23 @@ public final IRubyObject doClose(final ThreadContext context) {
+             return close(context);
+         }
+ 
+-        @JRubyMethod(name = "multi_receive")
++        @JRubyMethod(name = AbstractOutputDelegatorExt.OUTPUT_METHOD_NAME)
+         public final IRubyObject multiReceive(final ThreadContext context, final IRubyObject events)
+             throws InterruptedException {
+             return output(context, events);
+         }
+ 
+         protected final void initOutputCallsite(final RubyClass outputClass) {
+-            outputMethod = outputClass.searchMethod("multi_receive");
++            outputMethod = outputClass.searchMethod(AbstractOutputDelegatorExt.OUTPUT_METHOD_NAME);
+             this.outputClass = outputClass;
+         }
+ 
+         protected final void invokeOutput(final ThreadContext context, final IRubyObject batch,
+             final IRubyObject pluginInstance) {
+-            outputMethod.call(context, pluginInstance, outputClass, "multi_receive", batch);
++            outputMethod.call(
++                context, pluginInstance, outputClass, AbstractOutputDelegatorExt.OUTPUT_METHOD_NAME,
++                batch
++            );
+         }
+ 
+         protected abstract IRubyObject output(ThreadContext context, IRubyObject events)
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/compiler/FakeOutClass.java b/logstash-core/src/test/java/org/logstash/config/ir/compiler/FakeOutClass.java
+index ad119783714..7ebb7263b70 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/compiler/FakeOutClass.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/compiler/FakeOutClass.java
+@@ -70,7 +70,7 @@ public IRubyObject executionContext(IRubyObject args) {
+         return this;
+     }
+ 
+-    @JRubyMethod(name = "multi_receive")
++    @JRubyMethod(name = AbstractOutputDelegatorExt.OUTPUT_METHOD_NAME)
+     public IRubyObject multiReceive(final IRubyObject args) {
+         multiReceiveCallCount++;
+         multiReceiveArgs = args;

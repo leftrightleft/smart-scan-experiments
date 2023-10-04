@@ -1,0 +1,235 @@
+diff --git a/logstash-core/lib/logstash/compiler/lscl.rb b/logstash-core/lib/logstash/compiler/lscl.rb
+index 4606da7e092..1e459810df5 100644
+--- a/logstash-core/lib/logstash/compiler/lscl.rb
++++ b/logstash-core/lib/logstash/compiler/lscl.rb
+@@ -439,8 +439,33 @@ module ComparisonExpression
+     include Helpers
+ 
+     def expr
+-      lval, comparison_method, rval = self.recursive_select(Selector, Expression, ComparisonOperator, Number, String).map(&:expr)
+-      comparison_method.call(source_meta, lval, rval)
++      lval, comparison_method, rval = self.recursive_select(RValue, ComparisonOperator)
++
++      ensure_comparable(lval, "left")
++      ensure_comparable(rval, "right")
++
++      comparison_method.expr.call(source_meta, lval.expr, rval.expr)
++    end
++
++    private
++
++    # while the grammar allows for either side of a comparison expression to be any `rvalue`,
++    # comparisons are not implemented for all `rvalue`; catch them here, where we
++    # can emit a helpful message.
++    def ensure_comparable(val, side)
++      return if val.is_a?(Selector)
++
++      return if val.is_a?(String)
++      return if val.is_a?(Number)
++
++      if val.is_a?(Array)
++        # empty arrays are explicitly supported.
++        return if val.expr.get.empty?
++
++        raise "Invalid Config: Comparison exprs do not support non-empty arrays; #{val._parse_context(self)}"
++      end
++
++      raise "Invalid Config: Unsupported #{val._node_type_name} value on #{side}-hand side of boolean expr; #{val._parse_context(self)}"
+     end
+   end
+ 
+diff --git a/logstash-core/lib/logstash/compiler/treetop_monkeypatches.rb b/logstash-core/lib/logstash/compiler/treetop_monkeypatches.rb
+index 48c3f0c7cea..25c1e51ce8a 100644
+--- a/logstash-core/lib/logstash/compiler/treetop_monkeypatches.rb
++++ b/logstash-core/lib/logstash/compiler/treetop_monkeypatches.rb
+@@ -90,4 +90,16 @@ def _inspect(indent="")
+         ""
+       )
+   end
++
++  def _parse_context(context = self)
++    start = interval.min
++    "line #{input.line_of(start)}, " +
++        "column #{input.column_of(start)} (byte #{start+1}) " +
++        "in `#{context.text_value}`"
++  end
++
++  def _node_type_name
++    name = self.class.name
++    name ? name.split('::').last : 'SyntaxNode'
++  end
+ end
+diff --git a/logstash-core/spec/logstash/compiler/compiler_spec.rb b/logstash-core/spec/logstash/compiler/compiler_spec.rb
+index dc9cf9dc379..9099ce49278 100644
+--- a/logstash-core/spec/logstash/compiler/compiler_spec.rb
++++ b/logstash-core/spec/logstash/compiler/compiler_spec.rb
+@@ -560,18 +560,92 @@ def compose(*statements)
+             end
+ 
+             describe "'=='" do
+-              let(:expression) { "[foo] == 5"}
++              let(:lhs) { fail(NotImplementedError) }
++              let(:expression) { "[foo] == #{rhs}"}
+ 
+-              it "should compile correctly" do
+-                expect(c_expression).to ir_eql(j.eEq(j.eEventValue("[foo]"), j.eValue(5.to_java)))
++              context 'when RHS represents an integer' do
++                let(:rhs) { '5' }
++                it "should compile correctly" do
++                  expect(c_expression).to ir_eql(j.eEq(j.eEventValue("[foo]"), j.eValue(5.to_java)))
++                end
++              end
++
++              context 'when RHS represents an empty array' do
++                let(:rhs) { '[]' }
++                it "should compile correctly" do
++                  expect(c_expression).to ir_eql(j.eEq(j.eEventValue("[foo]"), j.eValue([])))
++                end
++              end
++
++              # multi-item arrays are not supported because a single-item arrays in this context are
++              # syntactically ambiguous with _selector_s, which take a higher precedence; if/when support
++              # is added for unambiguously declaring a single-item array as a condition clause, this spec
++              # can be removed.
++              context 'when RHS represents a multi-item array' do
++                let(:rhs) { '["foo","bar"]'}
++                it "should fail to compile with a helpful message" do
++                  expect { c_expression }.to raise_error do |error|
++                    expect(error).to be_a_kind_of(RuntimeError)
++                    expect(error.message).to include("Invalid Config: Comparison exprs do not support non-empty arrays")
++                  end
++                end
++              end
++
++              # equality with a regexp is not something people _intend_ to do, and
++              # is an example of a valid `rvalue` that _parses_ but doesn't have semantic meaning.
++              context 'when RHS represents a Regexp' do
++                let(:rhs) { '/foo/' }
++                it "should fail to compile with a helpful message" do
++                  expect { c_expression }.to raise_error do |error|
++                    expect(error).to be_a_kind_of(RuntimeError)
++                    expect(error.message).to include("Invalid Config: Unsupported RegExp value on right-hand side of boolean expr")
++                  end
++                end
+               end
+             end
+ 
+             describe "'!='" do
+-              let(:expression) { "[foo] != 5"}
++              let(:lhs) { fail(NotImplementedError) }
++              let(:expression) { "[foo] != #{rhs}"}
+ 
+-              it "should compile correctly" do
+-                expect(c_expression).to ir_eql(j.eNeq(j.eEventValue("[foo]"), j.eValue(5.to_java)))
++              context 'when RHS represents an integer' do
++                let(:rhs) { '5' }
++                it "should compile correctly" do
++                  expect(c_expression).to ir_eql(j.eNeq(j.eEventValue("[foo]"), j.eValue(5.to_java)))
++                end
++              end
++
++              context 'when RHS represents an empty array' do
++                let(:rhs) { '[]' }
++                it "should compile correctly" do
++                  expect(c_expression).to ir_eql(j.eNeq(j.eEventValue("[foo]"), j.eValue([])))
++                end
++              end
++
++              # multi-item arrays are not supported because a single-item arrays in this context are
++              # syntactically ambiguous with `selector`s, which take a higher precedence; if/when support
++              # is added for unambiguously declaring a single-item array as a condition clause, this spec
++              # can be removed
++              context 'when RHS represents a multi-item array' do
++                let(:rhs) { '["foo","bar"]'}
++                it "should fail to compile with a helpful message" do
++                  expect { c_expression }.to raise_error do |error|
++                    expect(error).to be_a_kind_of(RuntimeError)
++                    expect(error.message).to include("Invalid Config: Comparison exprs do not support non-empty arrays")
++                  end
++                end
++              end
++
++              # equality with a regexp is not something people _intend_ to do, and
++              # is an example of a valid `rvalue` that _parses_ but doesn't have semantic meaning.
++              context 'when RHS represents a Regexp' do
++                let(:rhs) { '/foo/' }
++                it "should fail to compile with a helpful message" do
++                  expect { c_expression }.to raise_error do |error|
++                    expect(error).to be_a_kind_of(RuntimeError)
++                    expect(error.message).to include("Invalid Config: Unsupported RegExp value on right-hand side of boolean expr")
++                  end
++                end
+               end
+             end
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/EventCondition.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/EventCondition.java
+index 76773932462..2470fdb7016 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/EventCondition.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/EventCondition.java
+@@ -4,16 +4,13 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
++
+ import org.jruby.RubyInteger;
+ import org.jruby.RubyNumeric;
+ import org.jruby.RubyString;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.jruby.util.ByteList;
+-import org.logstash.ConvertedList;
+-import org.logstash.ConvertedMap;
+-import org.logstash.FieldReference;
+-import org.logstash.RubyUtil;
+-import org.logstash.Valuefier;
++import org.logstash.*;
+ import org.logstash.config.ir.expression.BinaryBooleanExpression;
+ import org.logstash.config.ir.expression.BooleanExpression;
+ import org.logstash.config.ir.expression.EventValueExpression;
+@@ -331,6 +328,12 @@ private static EventCondition eq(final EventValueExpression evalE,
+                 return new EventCondition.Compiler.FieldEqualsLong(
+                     field, ((Number) value).longValue()
+                 );
++            } else if (value instanceof List) {
++                if (!((List) value).isEmpty()) {
++                    // shouldn't get here; this is pre-validated in the lscl.
++                    throw new IllegalStateException("non-empty arrays are not allowed in boolean expressions");
++                }
++                return new FieldEqualsEmptyList(field);
+             }
+             throw new EventCondition.Compiler.UnexpectedTypeException(value);
+         }
+@@ -565,6 +568,20 @@ public boolean fulfilled(final JrubyEventExtLibrary.RubyEvent event) {
+             }
+         }
+ 
++        private static final class FieldEqualsEmptyList implements EventCondition {
++            private final FieldReference field;
++
++            private FieldEqualsEmptyList(final String field) {
++                this.field = FieldReference.from(field);
++            }
++
++            @Override
++            public boolean fulfilled(final JrubyEventExtLibrary.RubyEvent event) {
++                final Object val = event.getEvent().getUnconvertedField(field);
++                return val instanceof List && ((List) val).isEmpty();
++            }
++        }
++
+         private static final class FieldEqualsField implements EventCondition {
+ 
+             private final FieldReference one;
+@@ -577,9 +594,10 @@ private FieldEqualsField(final FieldReference one, final FieldReference other) {
+             }
+ 
+             @Override
+-            public boolean fulfilled(final JrubyEventExtLibrary.RubyEvent event) {
+-                return event.getEvent().getUnconvertedField(one)
+-                    .equals(event.getEvent().getUnconvertedField(other));
++            public boolean fulfilled(final JrubyEventExtLibrary.RubyEvent eventWrapper) {
++                final Event event = eventWrapper.getEvent();
++                return Objects.equals(event.getUnconvertedField(one),
++                                      event.getUnconvertedField(other));
+             }
+         }
+ 

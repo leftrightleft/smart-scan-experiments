@@ -1,0 +1,559 @@
+diff --git a/logstash-core-event-java/lib/logstash/event.rb b/logstash-core-event-java/lib/logstash/event.rb
+index 21d08178e75..8f6a1908901 100644
+--- a/logstash-core-event-java/lib/logstash/event.rb
++++ b/logstash-core-event-java/lib/logstash/event.rb
+@@ -3,6 +3,7 @@
+ require "logstash/namespace"
+ require "logstash/json"
+ require "logstash/string_interpolation"
++require "cabin"
+ 
+ # transcient pipeline events for normal in-flow signaling as opposed to
+ # flow altering exceptions. for now having base classes is adequate and
+diff --git a/logstash-core-event-java/spec/event_spec.rb b/logstash-core-event-java/spec/event_spec.rb
+index 3786551ea82..c42440370ab 100644
+--- a/logstash-core-event-java/spec/event_spec.rb
++++ b/logstash-core-event-java/spec/event_spec.rb
+@@ -196,7 +196,41 @@ def self.warn(message)
+     it "should warn on invalid timestamp object" do
+       LogStash::Event.logger = logger
+       expect(logger).to receive(:warn).once.with(/^Unrecognized/)
+-      LogStash::Event.new(TIMESTAMP => Object.new)
++      LogStash::Event.new(TIMESTAMP => Array.new)
++    end
++  end
++
++  context "to_hash" do
++    let (:source_hash) {  {"a" => 1, "b" => [1, 2, 3, {"h" => 1, "i" => "baz"}], "c" => {"d" => "foo", "e" => "bar", "f" => [4, 5, "six"]}} }
++    let (:source_hash_with_matada) {  source_hash.merge({"@metadata" => {"a" => 1, "b" => 2}}) }
++    subject { LogStash::Event.new(source_hash_with_matada) }
++
++    it "should include @timestamp and @version" do
++      h = subject.to_hash
++      expect(h).to include("@timestamp")
++      expect(h).to include("@version")
++      expect(h).not_to include("@metadata")
++    end
++
++    it "should include @timestamp and @version and @metadata" do
++      h = subject.to_hash_with_metadata
++      expect(h).to include("@timestamp")
++      expect(h).to include("@version")
++      expect(h).to include("@metadata")
++    end
++
++    it "should produce valid deep Ruby hash without metadata" do
++      h = subject.to_hash
++      h.delete("@timestamp")
++      h.delete("@version")
++      expect(h).to eq(source_hash)
++    end
++
++    it "should produce valid deep Ruby hash with metadata" do
++      h = subject.to_hash_with_metadata
++      h.delete("@timestamp")
++      h.delete("@version")
++      expect(h).to eq(source_hash_with_matada)
+     end
+   end
+ end
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/Javafier.java b/logstash-core-event-java/src/main/java/com/logstash/Javafier.java
+new file mode 100644
+index 00000000000..f4f16266570
+--- /dev/null
++++ b/logstash-core-event-java/src/main/java/com/logstash/Javafier.java
+@@ -0,0 +1,152 @@
++package com.logstash;
++
++import org.jruby.RubyArray;
++import org.jruby.RubyHash;
++import org.jruby.RubyString;
++import org.jruby.RubyObject;
++import org.jruby.RubyBoolean;
++import org.jruby.RubyArray;
++import org.jruby.RubyFloat;
++import org.jruby.RubyInteger;
++import org.jruby.RubyNil;
++import org.jruby.RubyBoolean;
++import org.jruby.RubyFixnum;
++import org.jruby.RubyTime;
++import org.jruby.RubySymbol;
++import org.jruby.ext.bigdecimal.RubyBigDecimal;
++import com.logstash.ext.JrubyTimestampExtLibrary;
++import org.jruby.runtime.builtin.IRubyObject;
++import java.math.BigDecimal;
++import org.joda.time.DateTime;
++import java.util.*;
++
++public class Javafier {
++
++    private Javafier(){}
++
++    public static List<Object> deep(RubyArray a) {
++        final ArrayList<Object> result = new ArrayList();
++
++        // TODO: (colin) investagate why .toJavaArrayUnsafe() which should be faster by avoiding copying produces nil values spec errors in arrays
++        for (IRubyObject o : a.toJavaArray()) {
++            result.add(deep(o));
++        }
++        return result;
++    }
++
++    public static HashMap<String, Object> deep(RubyHash h) {
++        final HashMap result = new HashMap();
++
++        h.visitAll(new RubyHash.Visitor() {
++            @Override
++            public void visit(IRubyObject key, IRubyObject value) {
++                result.put(deep(key).toString(), deep(value));
++            }
++        });
++        return result;
++    }
++
++    public static String deep(RubyString s) {
++        return s.asJavaString();
++    }
++
++    public static long deep(RubyInteger i) {
++        return i.getLongValue();
++    }
++
++    public static long deep(RubyFixnum n) {
++        return n.getLongValue();
++    }
++
++    public static double deep(RubyFloat f) {
++        return f.getDoubleValue();
++    }
++
++    public static BigDecimal deep(RubyBigDecimal bd) {
++        return bd.getBigDecimalValue();
++    }
++
++    public static Timestamp deep(JrubyTimestampExtLibrary.RubyTimestamp t) {
++        return t.getTimestamp();
++    }
++
++    public static boolean deep(RubyBoolean b) {
++        return b.isTrue();
++    }
++
++    public static Object deep(RubyNil n) {
++        return null;
++    }
++
++    public static DateTime deep(RubyTime t) {
++        return t.getDateTime();
++    }
++
++    public static String deep(RubySymbol s) {
++        return s.asJavaString();
++    }
++
++    public static Object deep(RubyBoolean.True b) {
++        return true;
++    }
++
++    public static Object deep(RubyBoolean.False b) {
++        return false;
++    }
++
++    public static Object deep(IRubyObject o) {
++        // TODO: (colin) this enum strategy is cleaner but I am hoping that is not slower than using a instanceof cascade
++
++        RUBYCLASS clazz;
++        try {
++            clazz = RUBYCLASS.valueOf(o.getClass().getSimpleName());
++        } catch (IllegalArgumentException e) {
++            throw new IllegalArgumentException("Missing Ruby class handling for full class name=" + o.getClass().getName() + ", simple name=" + o.getClass().getSimpleName());
++        }
++
++        switch(clazz) {
++            case RubyArray: return deep((RubyArray)o);
++            case RubyHash: return deep((RubyHash)o);
++            case RubyString: return deep((RubyString)o);
++            case RubyInteger: return deep((RubyInteger)o);
++            case RubyFloat: return deep((RubyFloat)o);
++            case RubyBigDecimal: return deep((RubyBigDecimal)o);
++            case RubyTimestamp: return deep((JrubyTimestampExtLibrary.RubyTimestamp)o);
++            case RubyBoolean: return deep((RubyBoolean)o);
++            case RubyFixnum: return deep((RubyFixnum)o);
++            case RubyTime: return deep((RubyTime)o);
++            case RubySymbol: return deep((RubySymbol)o);
++            case RubyNil: return deep((RubyNil)o);
++            case True: return deep((RubyBoolean.True)o);
++            case False: return deep((RubyBoolean.False)o);
++        }
++
++        if (o.isNil()) {
++            return null;
++        }
++
++        // TODO: (colin) temporary trace to spot any unhandled types
++        System.out.println("***** WARN: UNHANDLED IRubyObject full class name=" + o.getMetaClass().getRealClass().getName() + ", simple name=" + o.getClass().getSimpleName() + " java class=" + o.getJavaClass().toString() + " toString=" + o.toString());
++
++        return o.toJava(o.getJavaClass());
++    }
++
++    enum RUBYCLASS {
++        RubyString,
++        RubyInteger,
++        RubyFloat,
++        RubyBigDecimal,
++        RubyTimestamp,
++        RubyArray,
++        RubyHash,
++        RubyBoolean,
++        RubyFixnum,
++        RubyObject,
++        RubyNil,
++        RubyTime,
++        RubySymbol,
++        True,
++        False;
++    }
++}
++
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/RubyToJavaConverter.java b/logstash-core-event-java/src/main/java/com/logstash/RubyToJavaConverter.java
+deleted file mode 100644
+index 2170ad4b5fb..00000000000
+--- a/logstash-core-event-java/src/main/java/com/logstash/RubyToJavaConverter.java
++++ /dev/null
+@@ -1,45 +0,0 @@
+-package com.logstash;
+-
+-import org.jruby.RubyArray;
+-import org.jruby.RubyHash;
+-import org.jruby.RubyString;
+-import org.jruby.runtime.builtin.IRubyObject;
+-
+-import java.util.*;
+-
+-public class RubyToJavaConverter {
+-
+-    public static Object convert(IRubyObject obj) {
+-        if (obj instanceof RubyArray) {
+-            return convertToList((RubyArray) obj);
+-        } else if (obj instanceof RubyHash) {
+-            return convertToMap((RubyHash) obj);
+-        } else if (obj instanceof RubyString) {
+-            return convertToString((RubyString) obj);
+-        }
+-
+-        return obj.toJava(obj.getJavaClass());
+-    }
+-
+-    public static HashMap<String, Object> convertToMap(RubyHash hash) {
+-        HashMap<String, Object> hashMap = new HashMap();
+-        Set<RubyHash.RubyHashEntry> entries = hash.directEntrySet();
+-        for (RubyHash.RubyHashEntry e : entries) {
+-            hashMap.put(e.getJavaifiedKey().toString(), convert((IRubyObject) e.getValue()));
+-        }
+-        return hashMap;
+-    }
+-
+-    public static List<Object> convertToList(RubyArray array) {
+-        ArrayList<Object> list = new ArrayList();
+-        for (IRubyObject obj : array.toJavaArray()) {
+-            list.add(convert(obj));
+-        }
+-
+-        return list;
+-    }
+-
+-    public static String convertToString(RubyString string) {
+-        return string.decodeString();
+-    }
+-}
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/Rubyfier.java b/logstash-core-event-java/src/main/java/com/logstash/Rubyfier.java
+new file mode 100644
+index 00000000000..455075a8672
+--- /dev/null
++++ b/logstash-core-event-java/src/main/java/com/logstash/Rubyfier.java
+@@ -0,0 +1,57 @@
++package com.logstash;
++
++import com.logstash.ext.JrubyTimestampExtLibrary;
++import org.jruby.Ruby;
++import org.jruby.RubyArray;
++import org.jruby.RubyHash;
++import org.jruby.javasupport.JavaUtil;
++import org.jruby.runtime.builtin.IRubyObject;
++
++import java.util.*;
++
++public final class Rubyfier {
++
++    private Rubyfier(){}
++
++    public static IRubyObject deep(Ruby runtime, final Object input) {
++        if (input instanceof IRubyObject) return (IRubyObject)input;
++        if (input instanceof Map) return deepMap(runtime, (Map) input);
++        if (input instanceof List) return deepList(runtime, (List) input);
++        if (input instanceof Timestamp) return JrubyTimestampExtLibrary.RubyTimestamp.newRubyTimestamp(runtime, (Timestamp)input);
++        if (input instanceof Collection) throw new ClassCastException("unexpected Collection type " + input.getClass());
++
++        return JavaUtil.convertJavaToUsableRubyObject(runtime, input);
++    }
++
++    public static Object deepOnly(Ruby runtime, final Object input) {
++        if (input instanceof Map) return deepMap(runtime, (Map) input);
++        if (input instanceof List) return deepList(runtime, (List) input);
++        if (input instanceof Timestamp) return JrubyTimestampExtLibrary.RubyTimestamp.newRubyTimestamp(runtime, (Timestamp)input);
++        if (input instanceof Collection) throw new ClassCastException("unexpected Collection type " + input.getClass());
++
++        return input;
++    }
++
++    private static RubyArray deepList(Ruby runtime, final List list) {
++        final int length = list.size();
++        final RubyArray array = runtime.newArray(length);
++
++        for (Object item : list) {
++            // use deepOnly because RubyArray.add already calls JavaUtil.convertJavaToUsableRubyObject on item
++            array.add(deepOnly(runtime, item));
++        }
++
++        return array;
++    }
++
++    private static RubyHash deepMap(Ruby runtime, final Map<?, ?> map) {
++        RubyHash hash = RubyHash.newHash(runtime);
++
++        for (Map.Entry<?, ?> entry : map.entrySet()) {
++            // use deepOnly on value because RubyHash.put already calls JavaUtil.convertJavaToUsableRubyObject on items
++            hash.put(entry.getKey(), deepOnly(runtime, entry.getValue()));
++        }
++
++        return hash;
++    }
++}
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/Timestamp.java b/logstash-core-event-java/src/main/java/com/logstash/Timestamp.java
+index 09a8583ba2b..e8beb175da2 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/Timestamp.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/Timestamp.java
+@@ -3,6 +3,8 @@
+ import org.codehaus.jackson.map.annotate.JsonSerialize;
+ import org.joda.time.DateTime;
+ import org.joda.time.DateTimeZone;
++import org.joda.time.LocalDateTime;
++import org.joda.time.Duration;
+ import org.joda.time.format.DateTimeFormatter;
+ import org.joda.time.format.ISODateTimeFormat;
+ import org.jruby.Ruby;
+@@ -19,6 +21,8 @@ public class Timestamp implements Cloneable {
+     // TODO: is this DateTimeFormatter thread safe?
+     private static DateTimeFormatter iso8601Formatter = ISODateTimeFormat.dateTime();
+ 
++    private static final LocalDateTime JAN_1_1970 = new LocalDateTime(1970, 1, 1, 0, 0);
++
+     public Timestamp() {
+         this.time = new DateTime(DateTimeZone.UTC);
+     }
+@@ -67,6 +71,10 @@ public String toString() {
+         return toIso8601();
+     }
+ 
++    public long usec() {
++        return new Duration(JAN_1_1970.toDateTime(DateTimeZone.UTC), this.time).getMillis();
++    }
++
+     @Override
+     public Timestamp clone() throws CloneNotSupportedException {
+         Timestamp clone = (Timestamp)super.clone();
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyEventExtLibrary.java b/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyEventExtLibrary.java
+index 48bc1b57152..896a37c900b 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyEventExtLibrary.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyEventExtLibrary.java
+@@ -3,8 +3,10 @@
+ import com.logstash.Logger;
+ import com.logstash.Event;
+ import com.logstash.PathCache;
+-import com.logstash.RubyToJavaConverter;
++import com.logstash.Javafier;
+ import com.logstash.Timestamp;
++import com.logstash.Rubyfier;
++import com.logstash.Javafier;
+ import org.jruby.Ruby;
+ import org.jruby.RubyObject;
+ import org.jruby.RubyClass;
+@@ -24,6 +26,7 @@
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.jruby.runtime.load.Library;
++import org.jruby.ext.bigdecimal.RubyBigDecimal;
+ import java.io.IOException;
+ import java.util.Map;
+ import java.util.HashMap;
+@@ -41,10 +44,14 @@ public IRubyObject allocate(Ruby runtime, RubyClass rubyClass) {
+             }
+         }, module);
+ 
++        clazz.setConstant("METADATA", runtime.newString(Event.METADATA));
++        clazz.setConstant("METADATA_BRACKETS", runtime.newString(Event.METADATA_BRACKETS));
+         clazz.setConstant("TIMESTAMP", runtime.newString(Event.TIMESTAMP));
+         clazz.setConstant("TIMESTAMP_FAILURE_TAG", runtime.newString(Event.TIMESTAMP_FAILURE_TAG));
+         clazz.setConstant("TIMESTAMP_FAILURE_FIELD", runtime.newString(Event.TIMESTAMP_FAILURE_FIELD));
+         clazz.setConstant("DEFAULT_LOGGER", runtime.getModule("Cabin").getClass("Channel").callMethod("get", runtime.getModule("LogStash")));
++        clazz.setConstant("VERSION", runtime.newString(Event.VERSION));
++        clazz.setConstant("VERSION_ONE", runtime.newString(Event.VERSION_ONE));
+         clazz.defineAnnotatedMethods(RubyEvent.class);
+         clazz.defineAnnotatedConstants(RubyEvent.class);
+     }
+@@ -103,7 +110,7 @@ public IRubyObject ruby_initialize(ThreadContext context, IRubyObject[] args)
+             if (data.isNil()) {
+                 this.event = new Event();
+             } else if (data instanceof RubyHash) {
+-                HashMap<String, Object>  newObj = RubyToJavaConverter.convertToMap((RubyHash) data);
++                HashMap<String, Object>  newObj = Javafier.deep((RubyHash) data);
+                 this.event = new Event(newObj);
+             } else if (data instanceof Map) {
+                 this.event = new Event((Map) data);
+@@ -119,47 +126,22 @@ public IRubyObject ruby_initialize(ThreadContext context, IRubyObject[] args)
+         @JRubyMethod(name = "[]", required = 1)
+         public IRubyObject ruby_get_field(ThreadContext context, RubyString reference)
+         {
+-            String r = reference.asJavaString();
+-            Object value = this.event.getField(r);
+-            if (value instanceof Timestamp) {
+-                return JrubyTimestampExtLibrary.RubyTimestamp.newRubyTimestamp(context.runtime, (Timestamp)value);
+-            } else if (value instanceof List) {
+-                IRubyObject obj = JavaUtil.convertJavaToRuby(context.runtime, value);
+-                return obj.callMethod(context, "to_a");
+-            } else {
+-                return JavaUtil.convertJavaToRuby(context.runtime, value);
+-            }
++            Object value = this.event.getField(reference.asJavaString());
++            return Rubyfier.deep(context.runtime, value);
+         }
+ 
+         @JRubyMethod(name = "[]=", required = 2)
+         public IRubyObject ruby_set_field(ThreadContext context, RubyString reference, IRubyObject value)
+         {
+             String r = reference.asJavaString();
++
+             if (PathCache.getInstance().isTimestamp(r)) {
+                 if (!(value instanceof JrubyTimestampExtLibrary.RubyTimestamp)) {
+                     throw context.runtime.newTypeError("wrong argument type " + value.getMetaClass() + " (expected LogStash::Timestamp)");
+                 }
+                 this.event.setTimestamp(((JrubyTimestampExtLibrary.RubyTimestamp)value).getTimestamp());
+             } else {
+-                if (value instanceof RubyString) {
+-                    String val = ((RubyString) value).asJavaString();
+-                    this.event.setField(r, val);
+-                } else if (value instanceof RubyInteger) {
+-                    this.event.setField(r, ((RubyInteger) value).getLongValue());
+-                } else if (value instanceof RubyFloat) {
+-                    this.event.setField(r, ((RubyFloat) value).getDoubleValue());
+-                } else if (value instanceof JrubyTimestampExtLibrary.RubyTimestamp) {
+-                    // RubyTimestamp could be assigned in another field thant @timestamp
+-                    this.event.setField(r, ((JrubyTimestampExtLibrary.RubyTimestamp) value).getTimestamp());
+-                } else if (value instanceof RubyArray) {
+-                    this.event.setField(r, RubyToJavaConverter.convertToList((RubyArray) value));
+-                } else if (value instanceof RubyHash) {
+-                    this.event.setField(r, RubyToJavaConverter.convertToMap((RubyHash) value));
+-                } else if (value.isNil()) {
+-                    this.event.setField(r, null);
+-                } else {
+-                    throw context.runtime.newTypeError("wrong argument type " + value.getMetaClass());
+-                }
++                this.event.setField(r, Javafier.deep(value));
+             }
+             return value;
+         }
+@@ -193,7 +175,7 @@ public IRubyObject ruby_includes(ThreadContext context, RubyString reference)
+         @JRubyMethod(name = "remove", required = 1)
+         public IRubyObject ruby_remove(ThreadContext context, RubyString reference)
+         {
+-            return JavaUtil.convertJavaToRuby(context.runtime, this.event.remove(reference.asJavaString()));
++            return Rubyfier.deep(context.runtime, this.event.remove(reference.asJavaString()));
+         }
+ 
+         @JRubyMethod(name = "clone")
+@@ -233,11 +215,7 @@ public IRubyObject ruby_sprintf(ThreadContext context, IRubyObject format) throw
+             try {
+                 return RubyString.newString(context.runtime, event.sprintf(format.toString()));
+             } catch (IOException e) {
+-                throw new RaiseException(
+-                    getRuntime(),
+-                    (RubyClass) getRuntime().getModule("LogStash").getClass("Error"),
+-                    "timestamp field is missing", true
+-                );
++                throw new RaiseException(getRuntime(), (RubyClass)getRuntime().getModule("LogStash").getClass("Error"), "timestamp field is missing", true);
+             }
+         }
+ 
+@@ -250,26 +228,19 @@ public IRubyObject ruby_to_s(ThreadContext context)
+         @JRubyMethod(name = "to_hash")
+         public IRubyObject ruby_to_hash(ThreadContext context) throws IOException
+         {
+-            // TODO: is this the most efficient?
+-            RubyHash hash = JavaUtil.convertJavaToUsableRubyObject(context.runtime, this.event.toMap()).convertToHash();
+-            // inject RubyTimestamp in new hash
+-            hash.put(PathCache.TIMESTAMP, JrubyTimestampExtLibrary.RubyTimestamp.newRubyTimestamp(context.runtime, this.event.getTimestamp()));
+-            return hash;
++            return Rubyfier.deep(context.runtime, this.event.toMap());
+         }
+ 
+         @JRubyMethod(name = "to_hash_with_metadata")
+         public IRubyObject ruby_to_hash_with_metadata(ThreadContext context) throws IOException
+         {
+-            HashMap<String, Object> dataAndMetadata = new HashMap<String, Object>(this.event.getData());
+-            if (!this.event.getMetadata().isEmpty()) {
+-                dataAndMetadata.put(Event.METADATA, this.event.getMetadata());
+-            }
+-
+-            RubyHash hash = JavaUtil.convertJavaToUsableRubyObject(context.runtime, dataAndMetadata).convertToHash();
++            Map data = this.event.toMap();
++            Map metadata = this.event.getMetadata();
+ 
+-            // inject RubyTimestamp in new hash
+-            hash.put(PathCache.TIMESTAMP, JrubyTimestampExtLibrary.RubyTimestamp.newRubyTimestamp(context.runtime, this.event.getTimestamp()));
+-            return hash;
++            if (!metadata.isEmpty()) {
++                data.put(Event.METADATA, metadata);
++            }
++            return Rubyfier.deep(context.runtime, data);
+         }
+ 
+         @JRubyMethod(name = "to_java")
+@@ -304,6 +275,16 @@ public IRubyObject ruby_timestamp(ThreadContext context) throws IOException {
+             return new JrubyTimestampExtLibrary.RubyTimestamp(context.getRuntime(), this.event.getTimestamp());
+         }
+ 
++        @JRubyMethod(name = "timestamp=", required = 1)
++        public IRubyObject ruby_set_timestamp(ThreadContext context, IRubyObject value)
++        {
++            if (!(value instanceof JrubyTimestampExtLibrary.RubyTimestamp)) {
++                throw context.runtime.newTypeError("wrong argument type " + value.getMetaClass() + " (expected LogStash::Timestamp)");
++            }
++            this.event.setTimestamp(((JrubyTimestampExtLibrary.RubyTimestamp)value).getTimestamp());
++            return value;
++        }
++
+         // set a new logger for all Event instances
+         // there is no point in changing it at runtime for other reasons than in tests/specs.
+         @JRubyMethod(name = "logger=", required = 1, meta = true)
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyTimestampExtLibrary.java b/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyTimestampExtLibrary.java
+index f18c814da55..30296f4324e 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyTimestampExtLibrary.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyTimestampExtLibrary.java
+@@ -222,5 +222,17 @@ public IRubyObject ruby_gmtime(ThreadContext context)
+         {
+             return this;
+         }
++
++        @JRubyMethod(name = {"usec", "tv_usec"})
++        public IRubyObject ruby_usec(ThreadContext context)
++        {
++            return RubyFixnum.newFixnum(context.runtime, this.timestamp.usec());
++        }
++
++        @JRubyMethod(name = "year")
++        public IRubyObject ruby_year(ThreadContext context)
++        {
++            return RubyFixnum.newFixnum(context.runtime, this.timestamp.getTime().getYear());
++        }
+     }
+ }

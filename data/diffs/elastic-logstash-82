@@ -1,0 +1,329 @@
+diff --git a/Gemfile b/Gemfile
+index beb4323b999..fbfc25ac99d 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -33,14 +33,6 @@ gem "gmetric", "0.1.3" # outputs/ganglia, # License: MIT
+ gem "xmpp4r", "0.5" # outputs/xmpp, # License: As-Is
+ gem "gelfd", "0.2.0" #inputs/gelf, # License: Apache 2.0
+ 
+-gem "ffi-rzmq", "0.9.0"
+-gem "ffi"
+-
+-# ruby-debug is broken in 1.9.x due, at a minimum, the following:
+-#    Installing rbx-require-relative (0.0.5)
+-#    Gem::InstallError: rbx-require-relative requires Ruby version ~> 1.8.7.
+-#
+-# ruby-debug wants linecache which wants rbx-require-relative which won't
+-# install under 1.9.x. I never use ruby-debug anyway, so, kill it.
+-#gem "ruby-debug", "0.10.4"
+-#gem "mocha", "0.10.0"
++gem "ffi-rzmq", "~>0.9.0"
++gem "ruby-debug", "0.10.4"
++gem "mocha", "0.10.0"
+diff --git a/Gemfile.lock b/Gemfile.lock
+index 7f8ee7c9521..8523bd67304 100644
+--- a/Gemfile.lock
++++ b/Gemfile.lock
+@@ -58,8 +58,7 @@ DEPENDENCIES
+   awesome_print
+   bunny
+   cabin (= 0.1.7)
+-  ffi
+-  ffi-rzmq (= 0.9.0)
++  ffi-rzmq (~> 0.9.0)
+   filewatch (= 0.3.2)
+   gelf
+   gelfd (= 0.2.0)
+diff --git a/lib/logstash/inputs/zmq.rb b/lib/logstash/inputs/zmq.rb
+new file mode 100644
+index 00000000000..08dbb607264
+--- /dev/null
++++ b/lib/logstash/inputs/zmq.rb
+@@ -0,0 +1,104 @@
++require "logstash/inputs/base"
++require "logstash/namespace"
++
++# Read events over a 0MQ socket
++#
++# Like stdin and file inputs, each event is assumed to be one line of text.
++#
++# Can either accept connections from clients or connect to a server,
++# depending on `mode`.
++class LogStash::Inputs::Zmq < LogStash::Inputs::Base
++
++  config_name "zmq"
++  plugin_status "experimental"
++
++  # When mode is `server`, the address to listen on.
++  # When mode is `client`, the address to connect to.
++  config :socket_addresses, :validate => :array, :required => true
++
++  # Mode to operate in. `server` listens for client connections,
++  # `client` connects to a server.
++  config :mode, :validate => ["server", "client"], :default => "server"
++
++  # Currently only PULL and SUB are supported, other socket types might work as well
++  config :socket_type, :validate => :string, :default => "pull"
++
++  # PUB/SUB topics to subscribe
++  config :pubsub_topics, :validate => :array, :default => ["logstash"]
++
++  config :format, :validate => ["json", "json_event", "plain"], :default => "json_event"
++
++  flag("--threads THREADS", "Number of ZeroMQ threads to spawn") do |val|
++    ::LogStash::ZMQManager.threads = val.to_i
++  end
++
++  public
++  def register
++    require "logstash/zmq_manager"
++    require "ffi-rzmq"
++    @socket_type = @socket_type.upcase.to_sym
++    open_sockets
++  end # def register
++
++  def teardown
++    @socket.close
++    finished
++  end
++
++  def reload
++    @socket.close
++    open_sockets
++  end
++
++  private
++  def open_sockets
++    @socket = ::LogStash::ZMQManager.socket ::ZMQ.const_get @socket_type
++    case @socket_type
++    when :SUB
++      @pubsub_topics.each do |topic|
++        assert(@socket.setsockopt(::ZMQ::SUBSCRIBE, topic), "Failed to set socket topic")
++      end
++    when :PULL
++      # nothing really.
++    end
++  end
++
++  def server?
++    @mode == "server"
++  end # def server?
++
++  def assert(val, msg)
++    unless val == 0
++      raise RuntimeError, "ZMQ error #{ZMQ::Util.error_string}. #{msg}"
++    end
++  end
++
++  public
++  def run(output_queue)
++    @logger.info("Starting 0mq output", :address => @socket_address)
++    @socket_addresses.each do |addr|
++      if server?
++        @logger.info("Binding socket", :address => addr)
++        assert(@socket.bind(addr), "Failed to bind to #{addr}")
++      else
++        @logger.info("Connecting socket", :address => addr)
++        assert(@socket.connect(addr), "Failed connecting to #{addr}")
++      end
++    end
++    loop do
++      message = Array.new
++      assert(@socket.recv_strings(message), "Failed to recv message")
++      if message.count > 1 and @socket_type == :SUB
++        topic = message.first 
++        e = to_event message[1..-1].join("\n"), "0mq"
++      else
++        topic = nil
++        e = to_event message.join("\n"), "0mq"
++      end
++      # TODO (avishai): do we need to read the sender identity off the final frame?
++      e['@zmq_topic'] = topic if topic and e
++      @logger.debug("Got message from socket", :event => e, :topic => topic)
++      output_queue << e
++    end # loop
++  end # def run
++end # class LogStash::Inputs::Tcp
+diff --git a/lib/logstash/outputs/zmq.rb b/lib/logstash/outputs/zmq.rb
+new file mode 100644
+index 00000000000..52f46606464
+--- /dev/null
++++ b/lib/logstash/outputs/zmq.rb
+@@ -0,0 +1,117 @@
++require "logstash/outputs/base"
++require "logstash/namespace"
++
++
++# Write events over a 0MQ socket
++#
++# Each event json is separated by a newline.
++#
++# Can either accept connections from clients or connect to a server,
++# depending on `mode`.
++class LogStash::Outputs::Zmq < LogStash::Outputs::Base
++
++  config_name "zmq"
++  plugin_status "experimental"
++
++  config :socket_addresses, :validate => :array, :required => true
++
++  # Mode to operate in. `server` listens for client connections,
++  # `client` connects to a server.
++  config :mode, :validate => ["server", "client"], :default => "client"
++
++  # ZMQ socket type, currently only PUSH and PUB are supported (but others might work!)
++  config :socket_type, :validate => :string, :default => "push"
++
++  # High watermark, amount of messages to keep in memory when unable to send
++  config :hwm, :validate => :number, :default => 100
++  # Disk swap of messages, same as HWM but on disk
++  config :swap, :validate => :number, :default => 0
++  # Time to wait before dispairing and dropping messages when terminating and there are still unsent messages
++  config :linger, :validate => :number, :default => 1
++
++  # PUB/SUB topic, can be an sprintf string for dynamic per event topic, E.G. "%{@type}"
++  config :pubsub_topic, :validate => :string, :default => "logstash"
++
++  # message format, an sprintf string. If ommited json_event will be used
++  config :message_format, :validate => :string
++
++  flag("--threads THREADS", "Number of ZeroMQ threads to spawn") do |val|
++    ::LogStash::ZMQManager.threads = val.to_i
++  end
++
++  public
++  def register
++    require "ffi-rzmq"
++    require "logstash/zmq_manager"
++    @logger.info("Starting 0mq output", :socket_addresses => @socket_addresses)
++    @socket_type = @socket_type.upcase.to_sym
++    open_sockets
++  end # def register
++
++  def teardown
++    @socket.close
++    finished
++  end
++
++  def reload
++    @socket.close
++    open_sockets
++  end
++
++  private
++  def open_sockets
++    @socket = ::LogStash::ZMQManager.socket ::ZMQ.const_get @socket_type
++    @socket_addresses.each do |addr|
++      if server?
++        @logger.info("Binding socket", :address => addr)
++        @socket.bind addr
++      else
++        @logger.info("Connecting socket", :address => addr)
++        @socket.connect addr
++      end
++    end
++    assert(@socket.setsockopt(::ZMQ::HWM, @hwm), "Failed to set to set HWM")
++    assert(@socket.setsockopt(::ZMQ::SWAP, @swap), "Failed to set SWAP size")
++    assert(@socket.setsockopt(::ZMQ::LINGER, @linger) , "Failed to set socket linger time")
++  end
++
++  # parse the topic pattern
++  def topic(e)
++    e.sprintf(@pubsub_topic)
++  end
++
++  def server?
++    @mode == "server"
++  end # def server?
++
++  def assert(val, msg)
++    unless val == 0
++      raise RuntimeError, "ZMQ error #{ZMQ::Util.error_string}. #{msg}"
++    end
++  end
++
++  public
++  def receive(event)
++    return unless output?(event)
++
++    event_text = if @message_format
++      event.sprintf(@message_format) + "\n"
++    else
++      event.to_json
++    end
++
++    begin
++      case @socket_type
++      when :PUB
++        assert(@socket.send_string(topic(event), ::ZMQ::SNDMORE), "Failed to send event")
++      when :PUSH
++        # nothing really
++      end
++      assert(@socket.send_string(event_text), "Failed to send event")
++    rescue => e
++      @logger.warn("0mq output exception", :socket_addresses => @socket_addresses,
++                    :exception => e, :backtrace => e.backtrace)
++    end
++  end # def receive
++  
++end # class LogStash::Outputs::Tcp
+diff --git a/lib/logstash/zmq_manager.rb b/lib/logstash/zmq_manager.rb
+new file mode 100644
+index 00000000000..989894d73ac
+--- /dev/null
++++ b/lib/logstash/zmq_manager.rb
+@@ -0,0 +1,41 @@
++require 'ffi-rzmq'
++require 'thread'
++
++# singelton to hold the processwide ZMQ::Context
++class LogStash::ZMQManager
++  @@sockets = Array.new
++  @@mutex = Mutex.new
++  @@context = nil
++  @@threads = nil
++
++  # It only makes sense to set this before context has been instanciated
++  def self.threads=(n_threads)
++    unless @@context
++      @@threads ||= n_threads
++    end
++    self.threads
++  end
++
++  def self.threads
++    @@threads || 1
++  end
++
++  def self.get_context()
++    unless @@context
++      @@mutex.synchronize do
++        @@context = ZMQ::Context.new threads
++      end
++    end
++    @@context
++  end
++
++  def self.socket(type)
++    socket = get_context.socket type
++    @@sockets.push socket
++    return socket
++  end
++
++  def self.terminate
++    @@context.terminate
++  end
++end
+diff --git a/logstash.gemspec b/logstash.gemspec
+index 7cb68b24289..2d08e110516 100644
+--- a/logstash.gemspec
++++ b/logstash.gemspec
+@@ -31,7 +31,7 @@ Gem::Specification.new do |spec|
+   spec.add_dependency "gelf" # outputs/gelf, # License: MIT-style
+   spec.add_dependency "gmetric", "~> 0.1.3" # outputs/ganglia, # License: MIT
+   spec.add_dependency "haml" # License: MIT
+-  spec.add_dependency "jls-grok", "0.9.0" # for grok filter, BSD License
++  spec.add_dependency "jls-grok", "0.9.6" # for grok filter, BSD License
+   spec.add_dependency "jruby-elasticsearch", "~> 0.0.11" # BSD License
+   spec.add_dependency "jruby-openssl" # For enabling SSL support, CPL/GPL 2.0
+   spec.add_dependency "json" # Ruby license

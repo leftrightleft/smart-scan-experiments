@@ -1,0 +1,189 @@
+diff --git a/logstash-core-event-java/build.gradle b/logstash-core-event-java/build.gradle
+index 8227db430c2..838beebe291 100644
+--- a/logstash-core-event-java/build.gradle
++++ b/logstash-core-event-java/build.gradle
+@@ -94,6 +94,8 @@ idea {
+ dependencies {
+     compile 'com.fasterxml.jackson.core:jackson-core:2.7.3'
+     compile 'com.fasterxml.jackson.core:jackson-databind:2.7.3'
++    compile 'com.fasterxml.jackson.module:jackson-module-afterburner:2.7.3'
++    compile 'com.fasterxml.jackson.dataformat:jackson-dataformat-cbor:2.7.3'
+     provided 'org.jruby:jruby-core:1.7.25'
+     testCompile 'junit:junit:4.12'
+     testCompile 'net.javacrumbs.json-unit:json-unit:1.9.0'
+diff --git a/logstash-core-event-java/logstash-core-event-java.gemspec b/logstash-core-event-java/logstash-core-event-java.gemspec
+index 42c190b5f28..c74587bbb13 100644
+--- a/logstash-core-event-java/logstash-core-event-java.gemspec
++++ b/logstash-core-event-java/logstash-core-event-java.gemspec
+@@ -28,4 +28,6 @@ Gem::Specification.new do |gem|
+ 
+   gem.requirements << "jar com.fasterxml.jackson.core:jackson-core, 2.7.3"
+   gem.requirements << "jar com.fasterxml.jackson.core:jackson-databind, 2.7.3"
++  gem.requirements << "jar com.fasterxml.jackson.module:jackson-module-afterburner, 2.7.3"
++  gem.requirements << "jar com.fasterxml.jackson.dataformat:jackson-dataformat-cbor, 2.7.3"
+ end
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/Event.java b/logstash-core-event-java/src/main/java/com/logstash/Event.java
+index a95fb08e472..695d1db8654 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/Event.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/Event.java
+@@ -1,6 +1,5 @@
+ package com.logstash;
+ 
+-import com.fasterxml.jackson.databind.ObjectMapper;
+ import com.logstash.bivalues.NullBiValue;
+ import com.logstash.bivalues.StringBiValue;
+ import com.logstash.bivalues.TimeBiValue;
+@@ -17,6 +16,9 @@
+ import java.util.List;
+ import java.util.Map;
+ 
++import static com.logstash.ObjectMappers.CBOR_MAPPER;
++import static com.logstash.ObjectMappers.JSON_MAPPER;
++
+ 
+ public class Event implements Cloneable, Serializable {
+ 
+@@ -36,7 +38,6 @@ public class Event implements Cloneable, Serializable {
+     public static final String VERSION_ONE = "1";
+ 
+     private static final Logger DEFAULT_LOGGER = new StdioLogger();
+-    private static final ObjectMapper mapper = new ObjectMapper();
+ 
+     // logger is static since once set there is no point in changing it at runtime
+     // for other reasons than in tests/specs.
+@@ -167,10 +168,38 @@ public boolean includes(String reference) {
+         }
+     }
+ 
++    public byte[] toBinary() throws IOException {
++        HashMap<String, Map<String, Object>> hashMap = new HashMap<>();
++        hashMap.put("DATA", this.data);
++        hashMap.put("META", this.metadata);
++        return CBOR_MAPPER.writeValueAsBytes(hashMap);
++    }
++
++    public static Event fromBinary(byte[] source) throws IOException {
++        if (source == null || source.length == 0) {
++            return new Event();
++        }
++        Object o = CBOR_MAPPER.readValue(source, HashMap.class);
++        if (o instanceof Map) {
++            Map<String, Map<String, Object>> hashMap = (HashMap<String, Map<String, Object>>) o;
++            if (!hashMap.containsKey("DATA")) {
++                throw new IOException("The deserialized Map must contain the \"DATA\" key");
++            }
++            if (!hashMap.containsKey("META")) {
++                throw new IOException("The deserialized Map must contain the \"META\" key");
++            }
++            Map<String, Object> dataMap = hashMap.get("DATA");
++            dataMap.put(METADATA, hashMap.get("META"));
++            return new Event(dataMap);
++        } else {
++            throw new IOException("incompatible from binary object type=" + o.getClass().getName() + " , only HashMap is supported");
++        }
++    }
++
+     public String toJson()
+             throws IOException
+     {
+-        return mapper.writeValueAsString(this.data);
++        return JSON_MAPPER.writeValueAsString(this.data);
+     }
+ 
+     public static Event[] fromJson(String json)
+@@ -182,7 +211,7 @@ public static Event[] fromJson(String json)
+         }
+ 
+         Event[] result;
+-        Object o = mapper.readValue(json, Object.class);
++        Object o = JSON_MAPPER.readValue(json, Object.class);
+         // we currently only support Map or Array json objects
+         if (o instanceof Map) {
+             result = new Event[]{ new Event((Map)o) };
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/ObjectMappers.java b/logstash-core-event-java/src/main/java/com/logstash/ObjectMappers.java
+new file mode 100644
+index 00000000000..0714ca9e566
+--- /dev/null
++++ b/logstash-core-event-java/src/main/java/com/logstash/ObjectMappers.java
+@@ -0,0 +1,19 @@
++package com.logstash;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
++import com.fasterxml.jackson.dataformat.cbor.CBORGenerator;
++import com.fasterxml.jackson.module.afterburner.AfterburnerModule;
++
++public class ObjectMappers {
++    public static final ObjectMapper JSON_MAPPER = new ObjectMapper();
++    public static final ObjectMapper CBOR_MAPPER = new ObjectMapper(new CBORFactory());
++
++    static {
++        JSON_MAPPER.registerModule(new AfterburnerModule());
++
++        CBORFactory cborf = (CBORFactory) CBOR_MAPPER.getFactory();
++        cborf.configure(CBORGenerator.Feature.WRITE_MINIMAL_INTS, false);
++        CBOR_MAPPER.registerModule(new AfterburnerModule());
++    }
++}
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/Timestamp.java b/logstash-core-event-java/src/main/java/com/logstash/Timestamp.java
+index 434dc93a13c..f79507c7bc6 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/Timestamp.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/Timestamp.java
+@@ -1,6 +1,7 @@
+ package com.logstash;
+ 
+ import com.fasterxml.jackson.databind.annotation.JsonSerialize;
++import com.logstash.json.TimestampSerializer;
+ import org.joda.time.DateTime;
+ import org.joda.time.DateTimeZone;
+ import org.joda.time.LocalDateTime;
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/TimestampSerializer.java b/logstash-core-event-java/src/main/java/com/logstash/json/TimestampSerializer.java
+similarity index 88%
+rename from logstash-core-event-java/src/main/java/com/logstash/TimestampSerializer.java
+rename to logstash-core-event-java/src/main/java/com/logstash/json/TimestampSerializer.java
+index c90afdd9227..0f95a405835 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/TimestampSerializer.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/json/TimestampSerializer.java
+@@ -1,8 +1,9 @@
+-package com.logstash;
++package com.logstash.json;
+ 
+ import com.fasterxml.jackson.core.JsonGenerator;
+ import com.fasterxml.jackson.databind.JsonSerializer;
+ import com.fasterxml.jackson.databind.SerializerProvider;
++import com.logstash.Timestamp;
+ 
+ import java.io.IOException;
+ 
+diff --git a/logstash-core-event-java/src/test/java/com/logstash/EventTest.java b/logstash-core-event-java/src/test/java/com/logstash/EventTest.java
+index 0177e66346d..24ba9c86a8f 100644
+--- a/logstash-core-event-java/src/test/java/com/logstash/EventTest.java
++++ b/logstash-core-event-java/src/test/java/com/logstash/EventTest.java
+@@ -14,6 +14,27 @@
+ import static org.junit.Assert.assertFalse;
+ 
+ public class EventTest {
++    @Test
++    public void toBinaryRoundtrip() throws Exception {
++        Event e = new Event();
++        e.setField("foo", 42L);
++        e.setField("bar", 42);
++        HashMap inner = new HashMap(2);
++        inner.put("innerFoo", 42L);
++        inner.put("innerQuux", 42.42);
++        e.setField("baz", inner);
++        e.setField("[@metadata][foo]", 42L);
++        byte[] binary = e.toBinary();
++        Event er = Event.fromBinary(binary);
++        assertEquals(42L, er.getField("foo"));
++        assertEquals(42, er.getField("bar"));
++        assertEquals(42L, er.getField("[baz][innerFoo]"));
++        assertEquals(42.42, er.getField("[baz][innerQuux]"));
++        assertEquals(42L, er.getField("[@metadata][foo]"));
++
++        assertEquals(e.getTimestamp().toIso8601(), er.getTimestamp().toIso8601());
++    }
++
+     @Test
+     public void testBareToJson() throws Exception {
+         Event e = new Event();

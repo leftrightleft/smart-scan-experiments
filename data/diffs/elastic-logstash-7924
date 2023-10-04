@@ -1,0 +1,149 @@
+diff --git a/logstash-core/lib/logstash/config/config_ast.rb b/logstash-core/lib/logstash/config/config_ast.rb
+index 750550074e8..59acc26de12 100644
+--- a/logstash-core/lib/logstash/config/config_ast.rb
++++ b/logstash-core/lib/logstash/config/config_ast.rb
+@@ -43,7 +43,7 @@ def process_escape_sequences=(val)
+     end
+ 
+ 
+-    def compile
++    def compile(debug_logging)
+       LogStash::Config::AST.deferred_conditionals = []
+       LogStash::Config::AST.deferred_conditionals_index = 0
+       LogStash::Config::AST.plugin_instance_index = 0
+@@ -60,7 +60,7 @@ def compile
+ 
+       sections = recursive_select(LogStash::Config::AST::PluginSection)
+       sections.each do |s|
+-        code << s.compile_initializer
++        code << s.compile_initializer(debug_logging)
+       end
+ 
+       # start inputs
+@@ -75,12 +75,12 @@ def compile
+         definitions << "define_singleton_method :#{type}_func do |event|"
+         definitions << "  targeted_outputs = []" if type == "output"
+         definitions << "  events = [event]" if type == "filter"
+-        definitions << "  @logger.debug? && @logger.debug(\"#{type} received\", \"event\" => event.to_hash)"
+-
+-        sections.select { |s| s.plugin_type.text_value == type }.each do |s|
+-          definitions << s.compile.split("\n", -1).map { |e| "  #{e}" }
++        if debug_logging
++          definitions << "  @logger.debug(\"#{type} received\", \"event\" => event.to_hash)"
++        end
++        sections.select {|s| s.plugin_type.text_value == type}.each do |s|
++          definitions << s.compile.split("\n", -1).map {|e| "  #{e}"}
+         end
+-
+         definitions << "  events" if type == "filter"
+         definitions << "  targeted_outputs" if type == "output"
+         definitions << "end"
+@@ -104,7 +104,7 @@ def initialize(*args)
+     end
+ 
+     # Generate ruby code to initialize all the plugins.
+-    def compile_initializer
++    def compile_initializer(debug_logging)
+       generate_variables
+       code = []
+       @variables.each do |plugin, name|
+@@ -120,14 +120,22 @@ def compile_initializer
+ 
+           code << <<-CODE
+             @generated_objects[:#{name}_flush] = lambda do |options, &block|
+-              @logger.debug? && @logger.debug(\"Flushing\", :plugin => @generated_objects[:#{name}])
+-
++          CODE
++          if debug_logging
++            code << <<-CODE
++              @logger.debug(\"Flushing\", :plugin => @generated_objects[:#{name}])
++            CODE
++          end
++          code << <<-CODE
+               events = @generated_objects[:#{name}].flush(options)
+-
+               return if events.nil? || events.empty?
+-
+-              @logger.debug? && @logger.debug(\"Flushing\", :plugin => @generated_objects[:#{name}], :events => events.map { |x| x.to_hash  })
+-
++          CODE
++          if debug_logging
++            code << <<-CODE
++              @logger.debug(\"Flushing\", :plugin => @generated_objects[:#{name}], :events => events.map { |x| x.to_hash  })
++            CODE
++          end
++          code << <<-CODE
+               #{plugin.compile_starting_here.gsub(/^/, "  ")}
+ 
+               events.each{|e| block.call(e)}
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index 2211ca86c72..1fb7cee33ef 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -68,7 +68,7 @@ def initialize(pipeline_config, namespaced_metric = nil, agent = nil)
+     raise(ConfigurationError, grammar.failure_reason) if parsed_config.nil?
+ 
+     parsed_config.process_escape_sequences = settings.get_value("config.support_escapes")
+-    config_code = parsed_config.compile
++    config_code = parsed_config.compile(@logger.debug?)
+ 
+     # config_code = BasePipeline.compileConfig(config_str)
+ 
+diff --git a/logstash-core/spec/logstash/config/config_ast_spec.rb b/logstash-core/spec/logstash/config/config_ast_spec.rb
+index 769cb0a8bb1..e40ca153d06 100644
+--- a/logstash-core/spec/logstash/config/config_ast_spec.rb
++++ b/logstash-core/spec/logstash/config/config_ast_spec.rb
+@@ -64,7 +64,7 @@
+       it "should compile successfully" do
+         result = subject.parse(config)
+         expect(result).not_to(be_nil)
+-        expect { eval(result.compile) }.not_to(raise_error)
++        expect { eval(result.compile(false)) }.not_to(raise_error)
+       end
+     end
+ 
+@@ -83,7 +83,7 @@
+       it "should compile successfully" do
+         result = subject.parse(config)
+         expect(result).not_to(be_nil)
+-        expect { eval(result.compile) }.not_to(raise_error)
++        expect { eval(result.compile(false)) }.not_to(raise_error)
+       end
+     end
+ 
+@@ -103,7 +103,7 @@
+           }
+         ))
+ 
+-        expect { config.compile }.to raise_error(LogStash::ConfigurationError, /Duplicate keys found in your configuration: \["message"\]/)
++        expect { config.compile(false) }.to raise_error(LogStash::ConfigurationError, /Duplicate keys found in your configuration: \["message"\]/)
+       end
+ 
+       it "rejects duplicate keys in nested hash" do
+@@ -122,7 +122,7 @@
+           }
+         ))
+ 
+-        expect { config.compile }.to raise_error(LogStash::ConfigurationError, /Duplicate keys found in your configuration: \["cool"\]/)
++        expect { config.compile(false) }.to raise_error(LogStash::ConfigurationError, /Duplicate keys found in your configuration: \["cool"\]/)
+       end
+ 
+       it "rejects a key with multiple double quotes" do
+@@ -190,7 +190,7 @@
+         def initialize(config, settings)
+           grammar = LogStashConfigParser.new
+           @config = grammar.parse(config)
+-          @code = @config.compile
++          @code = @config.compile(false)
+           eval(@code)
+         end
+         def plugin(*args);end
+@@ -243,7 +243,7 @@ def plugin(*args);end
+         def initialize(config, settings)
+           grammar = LogStashConfigParser.new
+           @config = grammar.parse(config)
+-          @code = @config.compile
++          @code = @config.compile(false)
+           eval(@code)
+         end
+         def plugin(*args);end

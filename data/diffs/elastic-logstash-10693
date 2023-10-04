@@ -1,0 +1,656 @@
+diff --git a/docker/Makefile b/docker/Makefile
+index bf5f7400544..dd6653b749a 100644
+--- a/docker/Makefile
++++ b/docker/Makefile
+@@ -3,8 +3,8 @@ ELASTIC_REGISTRY ?= docker.elastic.co
+ 
+ export PATH := ./bin:./venv/bin:$(PATH)
+ 
+-# Determine the version to build. Override by setting ELASTIC_VERSION env var.
+-ELASTIC_VERSION := $(shell ./bin/elastic-version)
++# Determine the version to build.
++ELASTIC_VERSION := $(shell ../vendor/jruby/bin/jruby bin/elastic-version)
+ 
+ ifdef STAGING_BUILD_NUM
+   VERSION_TAG := $(ELASTIC_VERSION)-$(STAGING_BUILD_NUM)
+@@ -20,48 +20,64 @@ HTTPD ?= logstash-docker-artifact-server
+ 
+ FIGLET := pyfiglet -w 160 -f puffy
+ 
+-all: build-from-local-artifacts build-from-local-oss-artifacts
+-
+-test: lint docker-compose
+-	$(foreach FLAVOR, $(IMAGE_FLAVORS), \
+-	  $(FIGLET) "test: $(FLAVOR)"; \
+-	  ./bin/pytest tests --image-flavor=$(FLAVOR); \
+-	)
+-
+-test-snapshot:
+-	ELASTIC_VERSION=$(ELASTIC_VERSION)-SNAPSHOT make test
++all: build-from-local-artifacts build-from-local-oss-artifacts public-dockerfile
+ 
+ lint: venv
+ 	flake8 tests
+ 
+ # Build from artifacts on the local filesystem, using an http server (running
+ # in a container) to provide the artifacts to the Dockerfile.
+-build-from-local-artifacts: venv dockerfile docker-compose env2yaml
++build-from-local-artifacts: venv dockerfile env2yaml
+ 	docker run --rm -d --name=$(HTTPD) \
+ 	           -p 8000:8000 --expose=8000 -v $(ARTIFACTS_DIR):/mnt \
+ 	           python:3 bash -c 'cd /mnt && python3 -m http.server'
+-	gtimeout 120 bash -c 'until curl -s localhost:8000 > /dev/null; do sleep 1; done'
++	timeout 120 bash -c 'until curl -s localhost:8000 > /dev/null; do sleep 1; done'
+ 	pyfiglet -f puffy -w 160 "Building: full"; \
+ 	docker build --network=host -t $(IMAGE_TAG)-full:$(VERSION_TAG) -f $(ARTIFACTS_DIR)/Dockerfile-full data/logstash || \
+ 	  (docker kill $(HTTPD); false); \
+ 	docker tag $(IMAGE_TAG)-full:$(VERSION_TAG) $(IMAGE_TAG):$(VERSION_TAG);
+ 	docker kill $(HTTPD)
+ 
+-build-from-local-oss-artifacts: venv dockerfile docker-compose env2yaml
++build-from-local-oss-artifacts: venv dockerfile env2yaml
+ 	docker run --rm -d --name=$(HTTPD) \
+ 	           -p 8000:8000 --expose=8000 -v $(ARTIFACTS_DIR):/mnt \
+ 	           python:3 bash -c 'cd /mnt && python3 -m http.server'
+-	gtimeout 120 bash -c 'until curl -s localhost:8000 > /dev/null; do sleep 1; done'
++	timeout 120 bash -c 'until curl -s localhost:8000 > /dev/null; do sleep 1; done'
+ 	pyfiglet -f puffy -w 160 "Building: oss"; \
+ 	docker build --network=host -t $(IMAGE_TAG)-oss:$(VERSION_TAG) -f $(ARTIFACTS_DIR)/Dockerfile-oss data/logstash || \
+ 	  (docker kill $(HTTPD); false);
+ 	-docker kill $(HTTPD)
+ 
+-demo: docker-compose clean-demo
+-	docker-compose up
++COPY_FILES = $(ARTIFACTS_DIR)/docker/config/pipelines.yml $(ARTIFACTS_DIR)/docker/config/logstash-full.yml $(ARTIFACTS_DIR)/docker/config/log4j2.properties $(ARTIFACTS_DIR)/docker/pipeline/default.conf $(ARTIFACTS_DIR)/docker/bin/docker-entrypoint $(ARTIFACTS_DIR)/docker/env2yaml/env2yaml
++
++$(ARTIFACTS_DIR)/docker/config/pipelines.yml: data/logstash/config/pipelines.yml
++$(ARTIFACTS_DIR)/docker/config/logstash-full.yml: data/logstash/config/logstash-full.yml
++$(ARTIFACTS_DIR)/docker/config/log4j2.properties: data/logstash/config/log4j2.properties
++$(ARTIFACTS_DIR)/docker/pipeline/default.conf: data/logstash/pipeline/default.conf
++$(ARTIFACTS_DIR)/docker/bin/docker-entrypoint: data/logstash/bin/docker-entrypoint
++$(ARTIFACTS_DIR)/docker/env2yaml/env2yaml: data/logstash/env2yaml/env2yaml
++
++$(ARTIFACTS_DIR)/docker/%:
++	cp -f $< $@
++
++docker_paths:
++	mkdir -p $(ARTIFACTS_DIR)/docker/
++	mkdir -p $(ARTIFACTS_DIR)/docker/bin
++	mkdir -p $(ARTIFACTS_DIR)/docker/config
++	mkdir -p $(ARTIFACTS_DIR)/docker/env2yaml
++	mkdir -p $(ARTIFACTS_DIR)/docker/pipeline
++
++public-dockerfile: venv templates/Dockerfile.j2 docker_paths $(COPY_FILES)
++	jinja2 \
++	  -D elastic_version='$(ELASTIC_VERSION)' \
++	  -D version_tag='$(VERSION_TAG)' \
++	  -D image_flavor='full' \
++	  -D artifacts_dir='$(ARTIFACTS_DIR)' \
++	  -D release='$(RELEASE)' \
++	  templates/Dockerfile.j2 > $(ARTIFACTS_DIR)/docker/Dockerfile
+ 
+ # Push the image to the dedicated push endpoint at "push.docker.elastic.co"
+-push: test
++push:
+ 	$(foreach FLAVOR, $(IMAGE_FLAVORS), \
+ 	  docker tag $(IMAGE_TAG)-$(FLAVOR):$(VERSION_TAG) push.$(IMAGE_TAG)-$(FLAVOR):$(VERSION_TAG); \
+ 	  docker push push.$(IMAGE_TAG)-$(FLAVOR):$(VERSION_TAG); \
+@@ -111,23 +127,8 @@ dockerfile: venv templates/Dockerfile.j2
+ 	    templates/Dockerfile.j2 > $(ARTIFACTS_DIR)/Dockerfile-$(FLAVOR); \
+ 	)
+ 
+-
+-# Generate docker-compose files from Jinja2 templates.
+-docker-compose: venv
+-	$(foreach FLAVOR, $(IMAGE_FLAVORS), \
+-	  jinja2 \
+-	    -D version_tag='$(VERSION_TAG)' \
+-	    -D image_flavor='$(FLAVOR)' \
+-	    templates/docker-compose.yml.j2 > docker-compose-$(FLAVOR).yml; \
+-	)
+-	ln -sf docker-compose-$(DEFAULT_IMAGE_FLAVOR).yml docker-compose.yml
+-
+-clean: clean-demo
++clean:
+ 	rm -f ${ARTIFACTS_DIR}/env2yaml/env2yaml ${ARTIFACTS_DIR}/Dockerfile
+ 	rm -rf venv
+ 
+-clean-demo: docker-compose
+-	docker-compose down
+-	docker-compose rm --force
+-
+-.PHONY: clean clean-demo demo push test
++.PHONY: clean push
+diff --git a/docker/README.md b/docker/README.md
+index 4bd6af593f5..ae2edfd7fe1 100644
+--- a/docker/README.md
++++ b/docker/README.md
+@@ -13,7 +13,7 @@ Documentation can be found on the [Elastic website](https://www.elastic.co/guide
+ The images have been tested on Docker version 18.09.2, build 6247962
+ 
+ ## Requirements
+-A full build and test requires:
++A full build requires:
+ * Docker
+ * GNU Make
+ * Python 3.5 with Virtualenv
+@@ -29,11 +29,6 @@ rake artifact:docker
+ rake artifact:docker_oss
+ ```
+ 
+-## Contributing, issues and testing
+-
+-Acceptance tests for the image are located in the `test` directory, and can
+-be invoked with `make test`.
+-
+ This image is built on [Centos 7][centos-7].
+ 
+ [centos-7]: https://github.com/CentOS/sig-cloud-instance-images/blob/50281d86d6ed5c61975971150adfd0ede86423bb/docker/Dockerfile
+diff --git a/docker/requirements.txt b/docker/requirements.txt
+index eb42e8a6beb..b75870b5b4d 100644
+--- a/docker/requirements.txt
++++ b/docker/requirements.txt
+@@ -1,4 +1,3 @@
+-docker-compose==1.11.2
+ flake8==3.4.1
+ jinja2-cli[yaml]==0.6.0
+ jinja2==2.9.5
+diff --git a/docker/templates/Dockerfile.j2 b/docker/templates/Dockerfile.j2
+index 66a823c1652..11694d50b81 100644
+--- a/docker/templates/Dockerfile.j2
++++ b/docker/templates/Dockerfile.j2
+@@ -1,4 +1,10 @@
+ # This Dockerfile was generated from templates/Dockerfile.j2
++{% if release -%}
++{%   set url_root = 'https://artifacts.elastic.co/downloads/logstash' -%}
++{% else -%}
++{%   set url_root = 'http://localhost:8000' -%}
++{% endif -%}
++
+ {% if image_flavor == 'oss' -%}
+   {% set tarball = 'logstash-oss-%s.tar.gz' % elastic_version -%}
+ {% else -%}
+@@ -20,7 +26,7 @@ RUN groupadd --gid 1000 logstash && \
+       logstash
+ 
+ # Add Logstash itself.
+-RUN curl -Lo - 'http://localhost:8000/'{{ tarball }} | \
++RUN curl -Lo - {{ url_root }}/{{ tarball }} | \
+     tar zxf - -C /usr/share && \
+     mv /usr/share/logstash-{{ elastic_version }} /usr/share/logstash && \
+     chown --recursive logstash:logstash /usr/share/logstash/ && \
+diff --git a/docker/templates/docker-compose.yml.j2 b/docker/templates/docker-compose.yml.j2
+deleted file mode 100644
+index e228dd54501..00000000000
+--- a/docker/templates/docker-compose.yml.j2
++++ /dev/null
+@@ -1,23 +0,0 @@
+----
+-version: '3.0'
+-services:
+-  logstash:
+-    image: docker.elastic.co/logstash/logstash:{{ version_tag }}
+-    volumes:
+-      - ./examples/logstash.conf/:/usr/share/logstash/pipeline/logstash.conf
+-    networks:
+-      - elastic-stack
+-
+-  elasticsearch:
+-    image: docker.elastic.co/elasticsearch/elasticsearch-platinum:{{ version_tag }}
+-    networks:
+-      - elastic-stack
+-
+-  kibana:
+-    image: docker.elastic.co/kibana/kibana:{{ version_tag }}
+-    ports: [ '5601:5601' ]
+-    networks:
+-      - elastic-stack
+-
+-networks:
+-  elastic-stack:
+diff --git a/docker/tests/__init__.py b/docker/tests/__init__.py
+deleted file mode 100644
+index e69de29bb2d..00000000000
+diff --git a/docker/tests/conftest.py b/docker/tests/conftest.py
+deleted file mode 100644
+index b0bc563ec54..00000000000
+--- a/docker/tests/conftest.py
++++ /dev/null
+@@ -1,25 +0,0 @@
+-from subprocess import run
+-import pytest
+-from .constants import container_name, version
+-import docker
+-
+-docker_engine = docker.from_env()
+-
+-
+-def pytest_addoption(parser):
+-    """Customize testinfra with config options via cli args"""
+-    # Let us specify which docker-compose-(image_flavor).yml file to use
+-    parser.addoption('--image-flavor', action='store', default='full',
+-                     help='Docker image flavor; the suffix used in docker-compose-<flavor>.yml')
+-
+-
+-@pytest.fixture(scope='session', autouse=True)
+-def start_container():
+-    image = 'docker.elastic.co/logstash/logstash-%s:%s' % (pytest.config.getoption('--image-flavor'), version)
+-    docker_engine.containers.run(image, name=container_name, detach=True, stdin_open=False)
+-
+-
+-def pytest_unconfigure(config):
+-    container = docker_engine.containers.get(container_name)
+-    container.stop()
+-    container.remove()
+diff --git a/docker/tests/constants.py b/docker/tests/constants.py
+deleted file mode 100644
+index e0996dc5baa..00000000000
+--- a/docker/tests/constants.py
++++ /dev/null
+@@ -1,16 +0,0 @@
+-import os
+-import pytest
+-from subprocess import run, PIPE
+-
+-version = run('./bin/elastic-version', stdout=PIPE).stdout.decode().strip()
+-version_number = version.split('-')[0]  # '7.0.0-alpha1-SNAPSHOT' -> '7.0.0'
+-logstash_version_string = 'logstash %s' % version_number  # eg. 'logstash 7.0.0'
+-
+-
+-try:
+-    if len(os.environ['STAGING_BUILD_NUM']) > 0:
+-        version += '-%s' % os.environ['STAGING_BUILD_NUM']  # eg. '5.3.0-d5b30bd7'
+-except KeyError:
+-    pass
+-
+-container_name = 'logstash-test'
+diff --git a/docker/tests/docker-compose.yml b/docker/tests/docker-compose.yml
+deleted file mode 100644
+index fc7939532f8..00000000000
+--- a/docker/tests/docker-compose.yml
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-version: '3'
+-services:
+-  logstash:
+-    container_name: logstash-test
+diff --git a/docker/tests/fixtures.py b/docker/tests/fixtures.py
+deleted file mode 100644
+index 8d6f1d77677..00000000000
+--- a/docker/tests/fixtures.py
++++ /dev/null
+@@ -1,91 +0,0 @@
+-import json
+-import os
+-import yaml
+-from pytest import config, fixture
+-from .constants import container_name, version
+-from retrying import retry
+-from subprocess import run, PIPE
+-from time import sleep
+-
+-retry_settings = {
+-    'wait_fixed': 1000,
+-    'stop_max_attempt_number': 60
+-}
+-
+-
+-@fixture
+-def logstash(host):
+-    class Logstash:
+-        def __init__(self):
+-            self.version = version
+-            self.name = container_name
+-            self.process = host.process.get(comm='java')
+-            self.settings_file = host.file('/usr/share/logstash/config/logstash.yml')
+-            self.image_flavor = config.getoption('--image-flavor')
+-            self.image = 'docker.elastic.co/logstash/logstash-%s:%s' % (self.image_flavor, version)
+-
+-            if 'STAGING_BUILD_NUM' in os.environ:
+-                self.tag = '%s-%s' % (self.version, os.environ['STAGING_BUILD_NUM'])
+-            else:
+-                self.tag = self.version
+-
+-            self.docker_metadata = json.loads(
+-                run(['docker', 'inspect', self.image], stdout=PIPE).stdout.decode())[0]
+-
+-        def start(self, args=None):
+-            if args:
+-                arg_array = args.split(' ')
+-            else:
+-                arg_array = []
+-            run(['docker', 'run', '-d', '--name', self.name] + arg_array + [self.image])
+-
+-        def stop(self):
+-            run(['docker', 'kill', self.name])
+-            run(['docker', 'rm', self.name])
+-
+-        def restart(self, args=None):
+-            self.stop()
+-            self.start(args)
+-
+-        @retry(**retry_settings)
+-        def get_node_info(self):
+-            """Return the contents of Logstash's node info API.
+-
+-            It retries for a while, since Logstash may still be coming up.
+-            Refer: https://www.elastic.co/guide/en/logstash/master/node-info-api.html
+-            """
+-            result = json.loads(host.command.check_output('curl -s http://localhost:9600/_node'))
+-            assert 'workers' in result['pipelines']['main']
+-            return result
+-
+-        def get_settings(self):
+-            return yaml.load(self.settings_file.content_string)
+-
+-        def run(self, command):
+-            return host.run(command)
+-
+-        def stdout_of(self, command):
+-            return host.run(command).stdout.strip()
+-
+-        def stderr_of(self, command):
+-            return host.run(command).stderr.strip()
+-
+-        def environment(self, varname):
+-            environ = {}
+-            for line in self.run('env').stdout.strip().split("\n"):
+-                var, value = line.split('=')
+-                environ[var] = value
+-            return environ[varname]
+-
+-        def get_docker_log(self):
+-            return run(['docker', 'logs', self.name], stdout=PIPE).stdout.decode()
+-
+-        @retry(**retry_settings)
+-        def assert_in_log(self, string):
+-            assert string in self.get_docker_log()
+-
+-        @retry(**retry_settings)
+-        def assert_not_in_log(self, string):
+-            assert string not in self.get_docker_log()
+-
+-    return Logstash()
+diff --git a/docker/tests/helpers.py b/docker/tests/helpers.py
+deleted file mode 100644
+index a68eb876504..00000000000
+--- a/docker/tests/helpers.py
++++ /dev/null
+@@ -1,8 +0,0 @@
+-import subprocess
+-import os
+-from .constants import image, version
+-
+-try:
+-    version += '-%s' % os.environ['STAGING_BUILD_NUM']
+-except KeyError:
+-    pass
+diff --git a/docker/tests/test_basics.py b/docker/tests/test_basics.py
+deleted file mode 100644
+index 7ae50d93020..00000000000
+--- a/docker/tests/test_basics.py
++++ /dev/null
+@@ -1,50 +0,0 @@
+-from .fixtures import logstash
+-from .constants import logstash_version_string
+-
+-
+-def test_logstash_is_the_correct_version(logstash):
+-    assert logstash_version_string in logstash.stdout_of('logstash --version')
+-
+-
+-def test_the_default_user_is_logstash(logstash):
+-    assert logstash.stdout_of('whoami') == 'logstash'
+-
+-
+-def test_that_the_user_home_directory_is_usr_share_logstash(logstash):
+-    assert logstash.environment('HOME') == '/usr/share/logstash'
+-
+-
+-def test_locale_variables_are_set_correctly(logstash):
+-    assert logstash.environment('LANG') == 'en_US.UTF-8'
+-    assert logstash.environment('LC_ALL') == 'en_US.UTF-8'
+-
+-
+-def test_opt_logstash_is_a_symlink_to_usr_share_logstash(logstash):
+-    assert logstash.stdout_of('realpath /opt/logstash') == '/usr/share/logstash'
+-
+-
+-def test_all_logstash_files_are_owned_by_logstash(logstash):
+-    assert logstash.stdout_of('find /usr/share/logstash ! -user logstash') == ''
+-
+-
+-def test_logstash_user_is_uid_1000(logstash):
+-    assert logstash.stdout_of('id -u logstash') == '1000'
+-
+-
+-def test_logstash_user_is_gid_1000(logstash):
+-    assert logstash.stdout_of('id -g logstash') == '1000'
+-
+-
+-def test_logging_config_does_not_log_to_files(logstash):
+-    assert logstash.stdout_of('grep RollingFile /logstash/config/log4j2.properties') == ''
+-
+-
+-# REF: https://docs.openshift.com/container-platform/3.5/creating_images/guidelines.html
+-def test_all_files_in_logstash_directory_are_gid_zero(logstash):
+-    bad_files = logstash.stdout_of('find /usr/share/logstash ! -gid 0').split()
+-    assert len(bad_files) is 0
+-
+-
+-def test_all_directories_in_logstash_directory_are_setgid(logstash):
+-    bad_dirs = logstash.stdout_of('find /usr/share/logstash -type d ! -perm /g+s').split()
+-    assert len(bad_dirs) is 0
+diff --git a/docker/tests/test_entrypoint.py b/docker/tests/test_entrypoint.py
+deleted file mode 100644
+index f17f50f61b5..00000000000
+--- a/docker/tests/test_entrypoint.py
++++ /dev/null
+@@ -1,14 +0,0 @@
+-from .fixtures import logstash
+-import pytest
+-
+-
+-@pytest.mark.xfail
+-def test_whitespace_in_config_string_cli_flag(logstash):
+-    config = 'input{heartbeat{}}    output{stdout{}}'
+-    assert logstash.run("-t -e '%s'" % config).rc == 0
+-
+-
+-def test_running_an_arbitrary_command(logstash):
+-    result = logstash.run('uname --all')
+-    assert result.rc == 0
+-    assert 'GNU/Linux' in str(result.stdout)
+diff --git a/docker/tests/test_labels.py b/docker/tests/test_labels.py
+deleted file mode 100644
+index 97d8ff59d4b..00000000000
+--- a/docker/tests/test_labels.py
++++ /dev/null
+@@ -1,15 +0,0 @@
+-from .fixtures import logstash
+-
+-
+-def test_labels(logstash):
+-    labels = logstash.docker_metadata['Config']['Labels']
+-    assert labels['org.label-schema.name'] == 'logstash'
+-    assert labels['org.label-schema.schema-version'] == '1.0'
+-    assert labels['org.label-schema.url'] == 'https://www.elastic.co/products/logstash'
+-    assert labels['org.label-schema.vcs-url'] == 'https://github.com/elastic/logstash'
+-    assert labels['org.label-schema.vendor'] == 'Elastic'
+-    assert labels['org.label-schema.version'] == logstash.tag
+-    if logstash.image_flavor == 'oss':
+-        assert labels['license'] == 'Apache-2.0'
+-    else:
+-        assert labels['license'] == 'Elastic License'
+diff --git a/docker/tests/test_process.py b/docker/tests/test_process.py
+deleted file mode 100644
+index 574fcd46e40..00000000000
+--- a/docker/tests/test_process.py
++++ /dev/null
+@@ -1,15 +0,0 @@
+-from .fixtures import logstash
+-
+-
+-def test_process_is_pid_1(logstash):
+-    assert logstash.process.pid == 1
+-
+-
+-def test_process_is_running_as_the_correct_user(logstash):
+-    assert logstash.process.user == 'logstash'
+-
+-
+-def test_process_is_running_with_cgroup_override_flags(logstash):
+-    # REF: https://github.com/elastic/logstash-docker/pull/97
+-    assert '-Dls.cgroup.cpu.path.override=/' in logstash.process.args
+-    assert '-Dls.cgroup.cpuacct.path.override=/' in logstash.process.args
+diff --git a/docker/tests/test_settings.py b/docker/tests/test_settings.py
+deleted file mode 100644
+index 88529664888..00000000000
+--- a/docker/tests/test_settings.py
++++ /dev/null
+@@ -1,71 +0,0 @@
+-from .fixtures import logstash
+-from retrying import retry
+-import time
+-
+-
+-def test_setting_pipeline_workers_from_environment(logstash):
+-    logstash.restart(args='-e pipeline.workers=6')
+-    assert logstash.get_node_info()['pipelines']['main']['workers'] == 6
+-
+-
+-def test_setting_pipeline_batch_size_from_environment(logstash):
+-    logstash.restart(args='-e pipeline.batch.size=123')
+-    assert logstash.get_node_info()['pipelines']['main']['batch_size'] == 123
+-
+-
+-def test_setting_pipeline_batch_delay_from_environment(logstash):
+-    logstash.restart(args='-e pipeline.batch.delay=36')
+-    assert logstash.get_node_info()['pipelines']['main']['batch_delay'] == 36
+-
+-
+-def test_setting_pipeline_unsafe_shutdown_from_environment(logstash):
+-    logstash.restart(args='-e pipeline.unsafe_shutdown=true')
+-    assert logstash.get_settings()['pipeline.unsafe_shutdown'] is True
+-
+-
+-def test_setting_pipeline_unsafe_shutdown_with_shell_style_variable(logstash):
+-    logstash.restart(args='-e PIPELINE_UNSAFE_SHUTDOWN=true')
+-    assert logstash.get_settings()['pipeline.unsafe_shutdown'] is True
+-
+-
+-def test_setting_things_with_upcased_and_underscored_env_vars(logstash):
+-    logstash.restart(args='-e PIPELINE_BATCH_DELAY=24')
+-    assert logstash.get_node_info()['pipelines']['main']['batch_delay'] == 24
+-
+-
+-def test_disabling_xpack_monitoring_via_environment(logstash):
+-    logstash.restart(args='-e xpack.monitoring.enabled=false')
+-    assert logstash.get_settings()['xpack.monitoring.enabled'] is False
+-
+-
+-def test_enabling_java_execution_via_environment(logstash):
+-    logstash.restart(args='-e pipeline.java_execution=true')
+-    logstash.assert_in_log('logstash.javapipeline')
+-
+-
+-def test_disabling_java_execution_via_environment(logstash):
+-    logstash.restart(args='-e pipeline.java_execution=true')
+-    logstash.assert_not_in_log('logstash.javapipeline')
+-
+-
+-def test_setting_elasticsearch_urls_as_an_array(logstash):
+-    setting_string = '["http://node1:9200","http://node2:9200"]'
+-    logstash.restart(args='-e xpack.monitoring.elasticsearch.hosts=%s' % setting_string)
+-    live_setting = logstash.get_settings()['xpack.monitoring.elasticsearch.hosts']
+-    assert type(live_setting) is list
+-    assert 'http://node1:9200' in live_setting
+-    assert 'http://node2:9200' in live_setting
+-
+-
+-def test_invalid_settings_in_environment_are_ignored(logstash):
+-    logstash.restart(args='-e cheese.ftw=true')
+-    assert not logstash.settings_file.contains('cheese.ftw')
+-
+-
+-def test_settings_file_is_untouched_when_no_settings_in_env(logstash):
+-    original_timestamp = logstash.settings_file.mtime
+-    original_hash = logstash.settings_file.sha256sum
+-    logstash.restart()
+-    time.sleep(1)  # since mtime() has one second resolution
+-    assert logstash.settings_file.mtime == original_timestamp
+-    assert logstash.settings_file.sha256sum == original_hash
+diff --git a/rakelib/artifacts.rake b/rakelib/artifacts.rake
+index d8ae1455ab1..9c38cd3df0a 100644
+--- a/rakelib/artifacts.rake
++++ b/rakelib/artifacts.rake
+@@ -92,6 +92,18 @@ namespace "artifact" do
+     end.flatten.uniq
+   end
+ 
++  def source_modified_since?(time, excluder=nil)
++    skip_list = ["logstash-core-plugin-api/versions-gem-copy.yml", "logstash-core/versions-gem-copy.yml"]
++    result = false
++    files(excluder).each do |file|
++      next if File.mtime(file) < time || skip_list.include?(file)
++      puts "file modified #{file}"
++      result = true
++      break
++    end
++    result
++  end
++
+   desc "Generate rpm, deb, tar and zip artifacts"
+   task "all" => ["prepare", "build"]
+ 
+@@ -179,6 +191,12 @@ namespace "artifact" do
+     build_docker(true)
+   end
+ 
++  desc "Generate Dockerfile for default image"
++  task "dockerfile" => ["prepare", "generate_build_metadata"] do
++    puts("[dockerfile] Building Dockerfile")
++    build_dockerfile
++  end
++
+   # Auxiliary tasks
+   task "build" => [:generate_build_metadata] do
+     Rake::Task["artifact:gems"].invoke unless SNAPSHOT_BUILD
+@@ -190,6 +208,8 @@ namespace "artifact" do
+     Rake::Task["artifact:zip_oss"].invoke
+     Rake::Task["artifact:tar"].invoke
+     Rake::Task["artifact:tar_oss"].invoke
++    #Rake::Task["artifact:docker"].invoke
++    #Rake::Task["artifact:docker_oss"].invoke
+   end
+ 
+   task "generate_build_metadata" do
+@@ -271,6 +291,10 @@ namespace "artifact" do
+     require "archive/tar/minitar"
+     ensure_logstash_version_constant_defined
+     tarpath = "build/logstash#{tar_suffix}-#{LOGSTASH_VERSION}#{PACKAGE_SUFFIX}.tar.gz"
++    if File.exist?(tarpath) && ENV['SKIP_PREPARE'] == "1" && !source_modified_since?(File.mtime(tarpath))
++      puts("[artifact:tar] Source code not modified. Skipping build of #{tarpath}")
++      return
++    end
+     puts("[artifact:tar] building #{tarpath}")
+     gz = Zlib::GzipWriter.new(File.new(tarpath, "wb"), Zlib::BEST_COMPRESSION)
+     tar = Archive::Tar::Minitar::Output.new(gz)
+@@ -526,4 +550,16 @@ namespace "artifact" do
+       end
+     end
+   end
++
++  def build_dockerfile
++    env = {
++      "ARTIFACTS_DIR" => ::File.join(Dir.pwd, "build"),
++      "RELEASE" => ENV["RELEASE"],
++      "VERSION_QUALIFIER" => VERSION_QUALIFIER
++    }
++    Dir.chdir("docker") do |dir|
++      system(env, "make public-dockerfile")
++      puts "Dockerfile created in #{::File.join(env['ARTIFACTS_DIR'], 'docker')}"
++    end
++  end
+ end

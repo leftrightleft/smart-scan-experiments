@@ -1,0 +1,523 @@
+diff --git a/config/logstash.yml b/config/logstash.yml
+index 4444f155a5e..0ee5880d84c 100644
+--- a/config/logstash.yml
++++ b/config/logstash.yml
+@@ -85,6 +85,11 @@
+ #
+ # config.debug: false
+ #
++# When enabled, process escaped characters such as \n and \" in strings in the
++# pipeline configuration files.
++#
++# config.support_escapes: false
++#
+ # ------------ Module Settings ---------------
+ # Define modules here.  Modules definitions must be defined as an array.
+ # The simple way to see this is to prepend each `name` with a `-`, and keep
+diff --git a/docs/static/configuration.asciidoc b/docs/static/configuration.asciidoc
+index 2f47a4263c3..70afd481e8d 100644
+--- a/docs/static/configuration.asciidoc
++++ b/docs/static/configuration.asciidoc
+@@ -249,10 +249,24 @@ Example:
+ ==== String
+ 
+ A string must be a single character sequence. Note that string values are
+-enclosed in quotes, either double or single. Literal quotes in the string
+-need to be escaped with a backslash if they are of the same kind as the string
+-delimiter, i.e. single quotes within a single-quoted string need to be escaped
+-as well as double quotes within a double-quoted string.
++enclosed in quotes, either double or single. 
++
++===== Escape Sequences
++
++By default, escape sequences are not enabled. If you wish to use escape
++sequences in quoted strings, you will need to set
++`config.support_escapes: true` in your `logstash.yml`. When `true`, quoted
++strings (double and single) will have this transformation:
++
++|===========================
++| Text | Result
++| \r   | carriage return (ASCII 13)
++| \n   | new line (ASCII 10)
++| \t   | tab (ASCII 9)
++| \\   | backslash (ASCII 92)
++| \"   | double quote (ASCII 34)
++| \'   | single quote (ASCII 39)
++|===========================
+ 
+ Example:
+ 
+diff --git a/docs/static/releasenotes.asciidoc b/docs/static/releasenotes.asciidoc
+index 824e4a630c5..b8e5dcc9e29 100644
+--- a/docs/static/releasenotes.asciidoc
++++ b/docs/static/releasenotes.asciidoc
+@@ -12,6 +12,10 @@ This section summarizes the changes in the following releases:
+ 
+ Placeholder for alpha3 release notes
+ 
++* Added new `logstash.yml` setting: `config.support_escapes`. When
++  enabled, Logstash will interpret escape sequences in strings in the pipeline
++  configuration.
++
+ 
+ [[logstash-6-0-0-alpha2]]
+ === Logstash 6.0.0-alpha2 Release Notes
+diff --git a/docs/static/settings-file.asciidoc b/docs/static/settings-file.asciidoc
+index e81ea043176..a0daec9b4e3 100644
+--- a/docs/static/settings-file.asciidoc
++++ b/docs/static/settings-file.asciidoc
+@@ -138,6 +138,10 @@ The `logstash.yml` file includes the following settings:
+   in plaintext passwords appearing in your logs!
+ | `false`
+ 
++| `config.support_escapes`
++| When set to `true`, quoted strings will process the following escape sequences: `\n` becomes a literal newline (ASCII 10). `\r` becomes a literal carriage return (ASCII 13). `\t` becomes a literal tab (ASCII 9). `\\` becomes a literal backslash `\`. `\"` becomes a literal double quotation mark. `\'` becomes a literal quotation mark.
++| `false`
++
+ | `modules`
+ | When configured, `modules` must be in the nested YAML structure described above this table.
+ | None
+diff --git a/logstash-core/lib/logstash/compiler.rb b/logstash-core/lib/logstash/compiler.rb
+index 5001b221ced..3f4a109e079 100644
+--- a/logstash-core/lib/logstash/compiler.rb
++++ b/logstash-core/lib/logstash/compiler.rb
+@@ -7,9 +7,9 @@
+ module LogStash; class Compiler
+   include ::LogStash::Util::Loggable
+ 
+-  def self.compile_sources(*sources_with_metadata)
++  def self.compile_sources(sources_with_metadata, settings)
+     graph_sections = sources_with_metadata.map do |swm|
+-      self.compile_graph(swm)
++      self.compile_graph(swm, settings)
+     end
+ 
+     input_graph = Graph.combine(*graph_sections.map {|s| s[:input] }).graph
+@@ -30,7 +30,7 @@ def self.compile_sources(*sources_with_metadata)
+     PipelineIR.new(input_graph, filter_graph, output_graph, original_source)
+   end
+ 
+-  def self.compile_ast(source_with_metadata)
++  def self.compile_ast(source_with_metadata, settings)
+     if !source_with_metadata.is_a?(org.logstash.common.SourceWithMetadata)
+       raise ArgumentError, "Expected 'org.logstash.common.SourceWithMetadata', got #{source_with_metadata.class}"
+     end
+@@ -42,14 +42,15 @@ def self.compile_ast(source_with_metadata)
+       raise ConfigurationError, grammar.failure_reason
+     end
+ 
++    config.process_escape_sequences = settings.get_value("config.support_escapes")
+     config.compile(source_with_metadata)
+   end
+ 
+-  def self.compile_imperative(source_with_metadata)
+-    compile_ast(source_with_metadata)
++  def self.compile_imperative(source_with_metadata, settings)
++    compile_ast(source_with_metadata, settings)
+   end
+ 
+-  def self.compile_graph(source_with_metadata)
+-    Hash[compile_imperative(source_with_metadata).map {|section,icompiled| [section, icompiled.toGraph]}]
++  def self.compile_graph(source_with_metadata, settings)
++    Hash[compile_imperative(source_with_metadata, settings).map {|section,icompiled| [section, icompiled.toGraph]}]
+   end
+ end; end
+diff --git a/logstash-core/lib/logstash/compiler/lscl.rb b/logstash-core/lib/logstash/compiler/lscl.rb
+index 0b8729d5b28..7bc3e117604 100644
+--- a/logstash-core/lib/logstash/compiler/lscl.rb
++++ b/logstash-core/lib/logstash/compiler/lscl.rb
+@@ -2,10 +2,14 @@
+ require 'logstash/errors'
+ require "treetop"
+ require "logstash/compiler/treetop_monkeypatches"
++require "logstash/config/string_escape"
++
+ java_import org.logstash.config.ir.DSL
+ java_import org.logstash.common.SourceWithMetadata
+ 
+ module LogStashCompilerLSCLGrammar; module LogStash; module Compiler; module LSCL; module AST
++  PROCESS_ESCAPE_SEQUENCES = :process_escape_sequences
++
+   # Helpers for parsing LSCL files
+   module Helpers
+     def source_meta
+@@ -73,6 +77,10 @@ def section_type
+ 
+   class Config < Node
+     include Helpers
++
++    def process_escape_sequences=(val)
++      set_meta(PROCESS_ESCAPE_SEQUENCES, val)
++    end
+     
+     def compile(base_source_with_metadata=nil)
+       # There is no way to move vars across nodes in treetop :(
+@@ -176,7 +184,12 @@ def expr
+   
+   class String < Value
+     def expr
+-      jdsl.e_value(source_meta, text_value[1...-1])
++      value = if get_meta(PROCESS_ESCAPE_SEQUENCES)
++        ::LogStash::Config::StringEscape.process_escapes(text_value[1...-1])
++      else
++        text_value[1...-1]
++      end
++      jdsl.eValue(source_meta, value)
+     end
+   end
+   
+diff --git a/logstash-core/lib/logstash/compiler/treetop_monkeypatches.rb b/logstash-core/lib/logstash/compiler/treetop_monkeypatches.rb
+index 753b15aa4eb..48c3f0c7cea 100644
+--- a/logstash-core/lib/logstash/compiler/treetop_monkeypatches.rb
++++ b/logstash-core/lib/logstash/compiler/treetop_monkeypatches.rb
+@@ -10,6 +10,7 @@ def set_meta(key, value)
+     @ast_metadata ||= {}
+     @ast_metadata[key] = value
+   end
++
+   def compile
+     return "" if elements.nil?
+     return elements.collect(&:compile).reject(&:empty?).join("")
+diff --git a/logstash-core/lib/logstash/config/config_ast.rb b/logstash-core/lib/logstash/config/config_ast.rb
+index a079eec5722..750550074e8 100644
+--- a/logstash-core/lib/logstash/config/config_ast.rb
++++ b/logstash-core/lib/logstash/config/config_ast.rb
+@@ -5,6 +5,7 @@
+ require "logstash/compiler/treetop_monkeypatches"
+ 
+ module LogStash; module Config; module AST
++  PROCESS_ESCAPE_SEQUENCES = :process_escape_sequences
+ 
+   def self.deferred_conditionals=(val)
+     @deferred_conditionals = val
+@@ -37,6 +38,11 @@ def text_value_for_comments
+   end
+ 
+   class Config < Node
++    def process_escape_sequences=(val)
++      set_meta(PROCESS_ESCAPE_SEQUENCES, val)
++    end
++
++
+     def compile
+       LogStash::Config::AST.deferred_conditionals = []
+       LogStash::Config::AST.deferred_conditionals_index = 0
+@@ -279,7 +285,11 @@ def compile
+   end
+   class String < Value
+     def compile
+-      return Unicode.wrap(text_value[1...-1])
++      if get_meta(PROCESS_ESCAPE_SEQUENCES)
++        Unicode.wrap(LogStash::Config::StringEscape.process_escapes(text_value[1...-1]))
++      else
++        Unicode.wrap(text_value[1...-1])
++      end
+     end
+   end
+   class RegExp < Value
+diff --git a/logstash-core/lib/logstash/config/string_escape.rb b/logstash-core/lib/logstash/config/string_escape.rb
+new file mode 100644
+index 00000000000..84126407a48
+--- /dev/null
++++ b/logstash-core/lib/logstash/config/string_escape.rb
+@@ -0,0 +1,27 @@
++
++
++module LogStash; module Config; module StringEscape
++  class << self
++    def process_escapes(input)
++      input.gsub(/\\./) do |value|
++        process(value)
++      end
++    end
++
++    private
++    def process(value)
++      case value[1]
++      when '"', "'", "\\"
++        value[1]
++      when "n"
++        "\n"
++      when "r"
++        "\r"
++      when "t"
++        "\t"
++      else
++        value
++      end
++    end
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 44da34a3cc8..741526dccdc 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -25,6 +25,7 @@ module Environment
+            Setting::Boolean.new("config.test_and_exit", false),
+            Setting::Boolean.new("config.reload.automatic", false),
+            Setting::Numeric.new("config.reload.interval", 3), # in seconds
++           Setting::Boolean.new("config.support_escapes", false),
+            Setting::Boolean.new("metric.collect", true),
+             Setting::String.new("pipeline.id", "main"),
+            Setting::Boolean.new("pipeline.system", false),
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index 3b7e4cca889..a5d22a7c077 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -67,6 +67,7 @@ def initialize(pipeline_config, namespaced_metric = nil, agent = nil)
+     parsed_config = grammar.parse(config_str)
+     raise(ConfigurationError, grammar.failure_reason) if parsed_config.nil?
+ 
++    parsed_config.process_escape_sequences = settings.get_value("config.support_escapes")
+     config_code = parsed_config.compile
+ 
+     # config_code = BasePipeline.compileConfig(config_str)
+@@ -93,8 +94,10 @@ def dlq_writer
+   end
+ 
+   def compile_lir
+-    source_with_metadata = SourceWithMetadata.new("str", "pipeline", 0, 0, self.config_str)
+-    LogStash::Compiler.compile_sources(source_with_metadata)
++    sources_with_metadata = [
++      SourceWithMetadata.new("str", "pipeline", 0, 0, self.config_str)
++    ]
++    LogStash::Compiler.compile_sources(sources_with_metadata, @settings)
+   end
+ 
+   def plugin(plugin_type, name, *args)
+diff --git a/logstash-core/spec/logstash/compiler/compiler_spec.rb b/logstash-core/spec/logstash/compiler/compiler_spec.rb
+index 2c7ee7f93a8..da018062011 100644
+--- a/logstash-core/spec/logstash/compiler/compiler_spec.rb
++++ b/logstash-core/spec/logstash/compiler/compiler_spec.rb
+@@ -10,6 +10,8 @@ def j
+ 
+   let(:source_protocol) { "test_proto" }
+ 
++  let(:settings) { mock_settings({}) }
++
+   # Static import of these useful enums
+   INPUT = Java::OrgLogstashConfigIr::PluginDefinition::Type::INPUT
+   FILTER = Java::OrgLogstashConfigIr::PluginDefinition::Type::FILTER
+@@ -29,7 +31,7 @@ def j
+   describe "compiling to Pipeline" do
+     subject(:source_id) { "fake_sourcefile" }
+     let(:source_with_metadata) { org.logstash.common.SourceWithMetadata.new(source_protocol, source_id, 0, 0, source) }
+-    subject(:compiled) { puts "PCOMP"; described_class.compile_pipeline(source_with_metadata) }
++    subject(:compiled) { puts "PCOMP"; described_class.compile_pipeline(source_with_metadata, settings) }
+ 
+     describe "compiling multiple sources" do
+       let(:sources) do
+@@ -38,13 +40,14 @@ def j
+           "input { input_1 {} } filter { filter_1 {} } output { output_1 {} }"
+         ]
+       end
++
+       let(:sources_with_metadata) do
+         sources.map.with_index do |source, idx|
+           org.logstash.common.SourceWithMetadata.new("#{source_protocol}_#{idx}", "#{source_id}_#{idx}", 0, 0, source)
+         end
+       end
+ 
+-      subject(:pipeline) { described_class.compile_sources(*sources_with_metadata) }
++      subject(:pipeline) { described_class.compile_sources(sources_with_metadata, settings) }
+ 
+       it "should generate a hash" do
+         expect(pipeline.unique_hash).to be_a(String)
+@@ -97,8 +100,47 @@ def j
+   describe "compiling imperative" do
+     let(:source_id) { "fake_sourcefile" }
+     let(:source_with_metadata) { org.logstash.common.SourceWithMetadata.new(source_protocol, source_id, 0, 0, source) }
+-    subject(:compiled) { described_class.compile_imperative(source_with_metadata) }
++    subject(:compiled) { described_class.compile_imperative(source_with_metadata, settings) }
++
++    context "when config.support_escapes" do
++      let(:parser) { LogStashCompilerLSCLGrammarParser.new }
++
++      let(:processed_value)  { 'The computer says, "No"' }
++
++      let(:source) { 
++        %q(
++          input {
++            foo {
++              bar => "The computer says, \"No\""
++            }
++          }
++        )
++      }
++
++      let(:compiled_string) do
++        compiled[:input].toGraph.vertices.toArray.first.getPluginDefinition.arguments["bar"]
++      end
+ 
++      before do
++        settings.set_value("config.support_escapes", process_escape_sequences)
++      end
++
++      context "is enabled" do
++        let(:process_escape_sequences) { true }
++
++        it "should process escape sequences" do
++          expect(compiled_string).to be == processed_value
++        end
++      end
++
++      context "is false" do
++        let(:process_escape_sequences) { false }
++
++        it "should not process escape sequences" do
++          expect(compiled_string).not_to be == processed_value
++        end
++      end
++    end
+     describe "an empty file" do
+       let(:source) { "input {} output {}" }
+ 
+diff --git a/logstash-core/spec/logstash/config/config_ast_spec.rb b/logstash-core/spec/logstash/config/config_ast_spec.rb
+index 657b00523c4..769cb0a8bb1 100644
+--- a/logstash-core/spec/logstash/config/config_ast_spec.rb
++++ b/logstash-core/spec/logstash/config/config_ast_spec.rb
+@@ -6,6 +6,8 @@
+ require "logstash/config/config_ast"
+ 
+ describe LogStashConfigParser do
++  let(:settings) { mock_settings({}) }
++
+   context '#parse' do
+     context "valid configuration" do
+       it "should permit single-quoted attribute names" do
+@@ -77,7 +79,7 @@
+         }
+       CONFIG
+       subject { LogStashConfigParser.new }
+-         
++
+       it "should compile successfully" do
+         result = subject.parse(config)
+         expect(result).not_to(be_nil)
+@@ -142,12 +144,50 @@
+         expect(config).to be_nil
+       end
+     end
++
++    context "when config.support_escapes" do
++      let(:parser) { LogStashConfigParser.new }
++
++      let(:processed_value)  { 'The computer says, "No"' }
++
++      let(:config) {
++        parser.parse(%q(
++          input {
++            foo {
++              bar => "The computer says, \"No\""
++            }
++          }
++        ))
++      }
++
++      let(:compiled_string) { eval(config.recursive_select(LogStash::Config::AST::String).first.compile) }
++
++      before do
++        config.process_escape_sequences = escapes
++      end
++
++      context "is enabled" do
++        let(:escapes) { true }
++
++        it "should process escape sequences" do
++          expect(compiled_string).to be == processed_value
++        end
++      end
++
++      context "is false" do
++        let(:escapes) { false }
++
++        it "should not process escape sequences" do
++          expect(compiled_string).not_to be == processed_value
++        end
++      end
++    end
+   end
+ 
+   context "when using two plugin sections of the same type" do
+     let(:pipeline_klass) do
+       Class.new do
+-        def initialize(config)
++        def initialize(config, settings)
+           grammar = LogStashConfigParser.new
+           @config = grammar.parse(config)
+           @code = @config.compile
+@@ -166,7 +206,7 @@ def plugin(*args);end
+ 
+ 
+       it "should create a pipeline with both sections" do
+-        generated_objects = pipeline_klass.new(config_string).instance_variable_get("@generated_objects")
++        generated_objects = pipeline_klass.new(config_string, settings).instance_variable_get("@generated_objects")
+         filters = generated_objects.keys.map(&:to_s).select {|obj_name| obj_name.match(/^filter.+?_\d+$/) }
+         expect(filters.size).to eq(2)
+       end
+@@ -181,14 +221,13 @@ def plugin(*args);end
+ 
+ 
+       it "should create a pipeline with both sections" do
+-        generated_objects = pipeline_klass.new(config_string).instance_variable_get("@generated_objects")
++        generated_objects = pipeline_klass.new(config_string, settings).instance_variable_get("@generated_objects")
+         outputs = generated_objects.keys.map(&:to_s).select {|obj_name| obj_name.match(/^output.+?_\d+$/) }
+         expect(outputs.size).to eq(2)
+       end
+     end
+   end
+   context "when creating two instances of the same configuration" do
+-
+     let(:config_string) {
+       "input { generator { } }
+        filter {
+@@ -201,7 +240,7 @@ def plugin(*args);end
+ 
+     let(:pipeline_klass) do
+       Class.new do
+-        def initialize(config)
++        def initialize(config, settings)
+           grammar = LogStashConfigParser.new
+           @config = grammar.parse(config)
+           @code = @config.compile
+@@ -213,8 +252,8 @@ def plugin(*args);end
+ 
+     describe "generated conditional functionals" do
+       it "should be created per instance" do
+-        instance_1 = pipeline_klass.new(config_string)
+-        instance_2 = pipeline_klass.new(config_string)
++        instance_1 = pipeline_klass.new(config_string, settings)
++        instance_2 = pipeline_klass.new(config_string, settings)
+         generated_method_1 = instance_1.instance_variable_get("@generated_objects")[:cond_func_1]
+         generated_method_2 = instance_2.instance_variable_get("@generated_objects")[:cond_func_1]
+         expect(generated_method_1).to_not be(generated_method_2)
+diff --git a/logstash-core/spec/logstash/config/string_escape_spec.rb b/logstash-core/spec/logstash/config/string_escape_spec.rb
+new file mode 100644
+index 00000000000..a5f34568822
+--- /dev/null
++++ b/logstash-core/spec/logstash/config/string_escape_spec.rb
+@@ -0,0 +1,24 @@
++
++require "logstash/config/string_escape"
++
++describe LogStash::Config::StringEscape do
++  let(:result) { described_class.process_escapes(text) }
++
++  table = {
++    '\\"' => '"',
++    "\\'" => "'",
++    "\\n" => "\n",
++    "\\r" => "\r",
++    "\\t" => "\t",
++    "\\\\" => "\\",
++  }
++
++  table.each do |input, expected|
++    context "when processing #{input.inspect}" do
++      let(:text) { input }
++      it "should produce #{expected.inspect}" do
++        expect(result).to be == expected
++      end
++    end
++  end
++end

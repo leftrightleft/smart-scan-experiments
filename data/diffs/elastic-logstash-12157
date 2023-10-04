@@ -1,0 +1,714 @@
+diff --git a/ci/docker_acceptance_tests.sh b/ci/docker_acceptance_tests.sh
+new file mode 100755
+index 00000000000..027a227bdfe
+--- /dev/null
++++ b/ci/docker_acceptance_tests.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++set -e
++set -x
++
++# Since we are using the system jruby, we need to make sure our jvm process
++# uses at least 1g of memory, If we don't do this we can get OOM issues when
++# installing gems. See https://github.com/elastic/logstash/issues/5179
++export JRUBY_OPTS="-J-Xmx1g"
++export GRADLE_OPTS="-Xmx4g -Dorg.gradle.daemon=false -Dorg.gradle.logging.level=info -Dfile.encoding=UTF-8"
++
++# Can run either a specific flavor, or all flavors -
++# eg `ci/acceptance_tests.sh oss` will run tests for open source container
++#    `ci/acceptance_tests.sh full` will run tests for the default container
++#    `ci/acceptance_tests.sh` will run tests for all containers
++SELECTED_TEST_SUITE=$1
++
++# The acceptance test in our CI infrastructure doesn't clear the workspace between run
++# this mean the lock of the Gemfile can be sticky from a previous run, before generating any package
++# we will clear them out to make sure we use the latest version of theses files
++# If we don't do this we will run into gem Conflict error.
++[ -f Gemfile ] && rm Gemfile
++[ -f Gemfile.lock ] && rm Gemfile.lock
++
++LS_HOME="$PWD"
++QA_DIR="$PWD/qa"
++
++cd $QA_DIR
++bundle check || bundle install
++
++echo "Building Logstash artifacts"
++cd $LS_HOME
++
++if [[ $SELECTED_TEST_SUITE == "oss" ]]; then
++  echo "building oss docker images"
++  cd $LS_HOME
++  rake artifact:docker_oss
++  echo "Acceptance: Installing dependencies"
++  cd $QA_DIR
++  bundle install
++
++  echo "Acceptance: Running the tests"
++  bundle exec rspec docker/spec/oss/*_spec.rb
++elif [[ $SELECTED_TEST_SUITE == "full" ]]; then
++  echo "building full docker images"
++  cd $LS_HOME
++  rake artifact:docker
++  echo "Acceptance: Installing dependencies"
++  cd $QA_DIR
++  bundle install
++
++  echo "Acceptance: Running the tests"
++  bundle exec rspec docker/spec/full/*_spec.rb
++else
++  echo "Building all docker images"
++  cd $LS_HOME
++  rake artifact:docker_only
++
++  echo "Acceptance: Installing dependencies"
++  cd $QA_DIR
++  bundle install
++
++  echo "Acceptance: Running the tests"
++  bundle exec rspec docker/spec/**/*_spec.rb
++fi
+diff --git a/docker/Makefile b/docker/Makefile
+index 7bb782cab2f..0d215870d64 100644
+--- a/docker/Makefile
++++ b/docker/Makefile
+@@ -69,7 +69,9 @@ docker_paths:
+ 	mkdir -p $(ARTIFACTS_DIR)/docker/env2yaml
+ 	mkdir -p $(ARTIFACTS_DIR)/docker/pipeline
+ 
+-public-dockerfiles: venv templates/Dockerfile.j2 docker_paths $(COPY_FILES)
++public-dockerfiles: public-dockerfiles_oss public_dockerfiles_full
++
++public-dockerfiles_full: venv templates/Dockerfile.j2 docker_paths $(COPY_FILES)
+ 	jinja2 \
+ 	  -D created_date='$(DATE)' \
+ 	  -D elastic_version='$(ELASTIC_VERSION)' \
+@@ -78,6 +80,11 @@ public-dockerfiles: venv templates/Dockerfile.j2 docker_paths $(COPY_FILES)
+ 	  -D local_artifacts='false' \
+ 	  -D release='$(RELEASE)' \
+ 	  templates/Dockerfile.j2 > $(ARTIFACTS_DIR)/Dockerfile-full && \
++	cd $(ARTIFACTS_DIR)/docker && \
++	cp $(ARTIFACTS_DIR)/Dockerfile-full Dockerfile && \
++	tar -zcf ../logstash-$(VERSION_TAG)-docker-build-context.tar.gz Dockerfile bin config env2yaml pipeline
++
++public-dockerfiles_oss: venv templates/Dockerfile.j2 docker_paths $(COPY_FILES)
+ 	jinja2 \
+ 	  -D created_date='$(DATE)' \
+ 	  -D elastic_version='$(ELASTIC_VERSION)' \
+@@ -87,8 +94,6 @@ public-dockerfiles: venv templates/Dockerfile.j2 docker_paths $(COPY_FILES)
+ 	  -D release='$(RELEASE)' \
+ 	  templates/Dockerfile.j2 > $(ARTIFACTS_DIR)/Dockerfile-oss && \
+ 	cd $(ARTIFACTS_DIR)/docker && \
+-	cp $(ARTIFACTS_DIR)/Dockerfile-full Dockerfile && \
+-	tar -zcf ../logstash-$(VERSION_TAG)-docker-build-context.tar.gz Dockerfile bin config env2yaml pipeline && \
+ 	cp $(ARTIFACTS_DIR)/Dockerfile-oss Dockerfile && \
+ 	tar -zcf ../logstash-oss-$(VERSION_TAG)-docker-build-context.tar.gz Dockerfile bin config env2yaml pipeline
+ 
+diff --git a/qa/Gemfile b/qa/Gemfile
+index 02247c0ca20..5b28063891a 100644
+--- a/qa/Gemfile
++++ b/qa/Gemfile
+@@ -4,3 +4,4 @@ gem "rspec", "~> 3.1.0"
+ gem "rake"
+ gem "stud"
+ gem "pry", :group => :test
++gem 'docker-api'
+diff --git a/qa/docker/fixtures/custom_logstash_yml/logstash.yml b/qa/docker/fixtures/custom_logstash_yml/logstash.yml
+new file mode 100644
+index 00000000000..41f0994c3b4
+--- /dev/null
++++ b/qa/docker/fixtures/custom_logstash_yml/logstash.yml
+@@ -0,0 +1 @@
++pipeline.batch.size: 200
+\ No newline at end of file
+diff --git a/qa/docker/fixtures/multiple_pipelines/config/pipelines.yml b/qa/docker/fixtures/multiple_pipelines/config/pipelines.yml
+new file mode 100644
+index 00000000000..12cc498648e
+--- /dev/null
++++ b/qa/docker/fixtures/multiple_pipelines/config/pipelines.yml
+@@ -0,0 +1,4 @@
++- pipeline.id: pipeline_one
++  path.config: "/usr/share/logstash/pipeline/basic1.cfg"
++- pipeline.id: pipeline_two
++  path.config: "/usr/share/logstash/pipeline/basic2.cfg"
+\ No newline at end of file
+diff --git a/qa/docker/fixtures/multiple_pipelines/pipelines/basic1.cfg b/qa/docker/fixtures/multiple_pipelines/pipelines/basic1.cfg
+new file mode 100644
+index 00000000000..055a4040546
+--- /dev/null
++++ b/qa/docker/fixtures/multiple_pipelines/pipelines/basic1.cfg
+@@ -0,0 +1,7 @@
++input {
++beats {
++id => 'multi_pipeline1'
++port => 5044
++}
++}
++output { stdout {} }
+\ No newline at end of file
+diff --git a/qa/docker/fixtures/multiple_pipelines/pipelines/basic2.cfg b/qa/docker/fixtures/multiple_pipelines/pipelines/basic2.cfg
+new file mode 100644
+index 00000000000..c4ddd6bb92a
+--- /dev/null
++++ b/qa/docker/fixtures/multiple_pipelines/pipelines/basic2.cfg
+@@ -0,0 +1,7 @@
++input {
++beats {
++id => 'multi_pipeline2'
++port => 5044
++}
++}
++output { stdout {} }
+\ No newline at end of file
+diff --git a/qa/docker/fixtures/simple_pipeline/basic.cfg b/qa/docker/fixtures/simple_pipeline/basic.cfg
+new file mode 100644
+index 00000000000..eba040fd17f
+--- /dev/null
++++ b/qa/docker/fixtures/simple_pipeline/basic.cfg
+@@ -0,0 +1,7 @@
++input {
++beats {
++id => 'simple_pipeline'
++port => 5044
++}
++}
++output { stdout {} }
+\ No newline at end of file
+diff --git a/qa/docker/shared_examples/container.rb b/qa/docker/shared_examples/container.rb
+new file mode 100644
+index 00000000000..cdd6a4a8818
+--- /dev/null
++++ b/qa/docker/shared_examples/container.rb
+@@ -0,0 +1,76 @@
++shared_examples_for 'the container is configured correctly' do |flavor|
++
++  before do
++    @image = find_image(flavor)
++    @container = create_container(@image, {})
++  end
++
++  after do
++    cleanup_container(@container)
++  end
++
++  context 'logstash' do
++    it 'should run with the correct version' do
++      expect(exec_in_container(@container, 'logstash --version')).to match /#{version}/
++    end
++
++    it 'should be running an API server on port 9600' do
++      wait_for_logstash(@container)
++      expect(get_logstash_status(@container)).to eql 'green'
++    end
++  end
++
++  context 'container files' do
++    it 'should have the correct license agreement' do
++      expect(exec_in_container(@container, 'cat /usr/share/logstash/LICENSE.txt')).to have_correct_license_agreement(flavor)
++    end
++
++    it 'should have the correct user' do
++      expect(exec_in_container(@container, 'whoami').chomp).to eql 'logstash'
++    end
++
++    it 'should have the correct home directory' do
++      expect(exec_in_container(@container, 'printenv HOME').chomp).to eql '/usr/share/logstash'
++    end
++
++    it 'should link /opt/logstash to /usr/share/logstash' do
++      expect(exec_in_container(@container, 'readlink /opt/logstash').chomp).to eql '/usr/share/logstash'
++    end
++
++    it 'should have all files owned by the logstash user' do
++      expect(exec_in_container(@container, 'find /usr/share/logstash ! -user logstash')).to be_nil
++      expect(exec_in_container(@container, 'find /usr/share/logstash -user logstash')).not_to be_nil
++    end
++
++    it 'should have a logstash user with uid 1000' do
++      expect(exec_in_container(@container, 'id -u logstash').chomp).to eql '1000'
++    end
++
++    it 'should have a logstash user with gid 1000' do
++      expect(exec_in_container(@container, 'id -g logstash').chomp).to eql '1000'
++    end
++
++    it 'should not have a RollingFile appender' do
++      expect(exec_in_container(@container, 'cat /usr/share/logstash/config/log4j2.properties')).not_to match /RollingFile/
++    end
++  end
++
++  context 'the java process' do
++    it 'should be running under the logstash user' do
++      expect(java_process(@container, "user")).to eql 'logstash'
++    end
++
++    it 'should be running under the logstash group' do
++      expect(java_process(@container, "group")).to eql 'logstash'
++    end
++
++    it 'should have cgroup overrides set' do
++      expect(java_process(@container, "args")).to match /-Dls.cgroup.cpu.path.override=/
++      expect(java_process(@container, "args")).to match /-Dls.cgroup.cpuacct.path.override=/
++    end
++
++    it 'should have a pid of 1' do
++      expect(java_process(@container, "pid")).to eql '1'
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/qa/docker/shared_examples/container_config.rb b/qa/docker/shared_examples/container_config.rb
+new file mode 100644
+index 00000000000..c2ae2705071
+--- /dev/null
++++ b/qa/docker/shared_examples/container_config.rb
+@@ -0,0 +1,37 @@
++shared_examples_for 'it runs with different configurations' do |flavor|
++
++  before do
++    @image = find_image(flavor)
++    @container = start_container(@image, options)
++  end
++
++  after do
++    cleanup_container(@container)
++  end
++
++  context 'when a single pipeline is configured via volume bind' do
++    let(:options) { {"HostConfig" => { "Binds" => ["#{FIXTURES_DIR}/simple_pipeline/:/usr/share/logstash/pipeline/"] } } }
++
++    it 'should show the stats for that pipeline' do
++      expect(get_node_stats(@container)['pipelines']['main']['plugins']['inputs'][0]['id']).to eq 'simple_pipeline'
++    end
++  end
++
++  context 'when multiple pipelines are configured via volume bind' do
++    let(:options) { {"HostConfig" => { "Binds" => ["#{FIXTURES_DIR}/multiple_pipelines/pipelines/:/usr/share/logstash/pipeline/",
++                                                   "#{FIXTURES_DIR}/multiple_pipelines/config/pipelines.yml:/usr/share/logstash/config/pipelines.yml"] } } }
++
++    it "should show stats for both pipelines" do
++      expect(get_node_stats(@container)['pipelines']['pipeline_one']['plugins']['inputs'][0]['id']).to eq 'multi_pipeline1'
++      expect(get_node_stats(@container)['pipelines']['pipeline_two']['plugins']['inputs'][0]['id']).to eq 'multi_pipeline2'
++    end
++  end
++
++  context 'when a custom `logstash.yml` is configured via volume bind' do
++    let(:options) { {"HostConfig" => { "Binds" => ["#{FIXTURES_DIR}/custom_logstash_yml/logstash.yml:/usr/share/logstash/config/logstash.yml"] } } }
++
++    it 'should change the value of pipeline.batch.size' do
++      expect(get_node_info(@container)['pipelines']['main']['batch_size']).to eq 200
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/qa/docker/shared_examples/container_options.rb b/qa/docker/shared_examples/container_options.rb
+new file mode 100644
+index 00000000000..eeb4d67691a
+--- /dev/null
++++ b/qa/docker/shared_examples/container_options.rb
+@@ -0,0 +1,59 @@
++shared_examples_for 'it applies settings correctly' do |flavor|
++
++  before do
++    @image = find_image(flavor)
++    @container = start_container(@image, options)
++  end
++
++  after do
++    cleanup_container(@container)
++  end
++
++  context 'when setting pipeline workers shell style' do
++    let(:options) { { 'ENV' => ['PIPELINE_WORKERS=32'] } }
++
++    it "should correctly set the number of pipeline workers" do
++      expect(get_node_info(@container)['pipelines']['main']['workers']).to eql 32
++    end
++  end
++
++  context 'when setting pipeline workers dot style' do
++    let(:options) { { 'ENV' => ['pipeline.workers=64'] } }
++
++    it "should correctly set the number of pipeline workers" do
++      expect(get_node_info(@container)['pipelines']['main']['workers']).to eql 64
++    end
++  end
++
++  context 'when setting pipeline batch size' do
++    let(:options) { { 'ENV' => ['pipeline.batch.size=123'] } }
++
++    it "should correctly set the batch size" do
++      expect(get_node_info(@container)['pipelines']['main']['batch_size']).to eql 123
++    end
++  end
++
++  context 'when setting pipeline batch delay' do
++    let(:options) { { 'ENV' => ['pipeline.batch.delay=36'] } }
++
++    it 'should correctly set batch delay' do
++      expect(get_node_info(@container)['pipelines']['main']['batch_delay']).to eql 36
++    end
++  end
++
++  context 'when setting unsafe shutdown to true shell style' do
++    let(:options) { { 'ENV' => ['pipeline.unsafe_shutdown=true'] } }
++
++    it 'should set unsafe shutdown to true' do
++      expect(get_settings(@container)['pipeline.unsafe_shutdown']).to be_truthy
++    end
++  end
++
++  context 'when setting unsafe shutdown to true dot style' do
++    let(:options) { { 'ENV' => ['pipeline.unsafe_shutdown=true'] } }
++
++    it 'should set unsafe shutdown to true' do
++      expect(get_settings(@container)['pipeline.unsafe_shutdown']).to be_truthy
++    end
++  end
++end
+diff --git a/qa/docker/shared_examples/image_metadata.rb b/qa/docker/shared_examples/image_metadata.rb
+new file mode 100644
+index 00000000000..d19aa3f5fad
+--- /dev/null
++++ b/qa/docker/shared_examples/image_metadata.rb
+@@ -0,0 +1,39 @@
++shared_examples_for 'the metadata is set correctly' do |flavor|
++  before do
++    @image = find_image(flavor)
++    @image_config = @image.json['Config']
++    @labels = @image_config['Labels']
++  end
++
++  it 'should have the correct working directory' do
++    expect(@image_config['WorkingDir']).to eql '/usr/share/logstash'
++  end
++
++  it 'should have the correct Architecture' do
++    expect(@image.json['Architecture']).to have_correct_architecture_for_flavor(flavor)
++  end
++
++  %w(license org.label-schema.license org.opencontainers.image.licenses).each do |label|
++    it "should set the license label #{label} correctly" do
++      expect(@labels[label]).to have_correct_license_label(flavor)
++    end
++  end
++
++  %w(org.label-schema.name org.opencontainers.image.title).each do |label|
++    it "should set the name label #{label} correctly" do
++      expect(@labels[label]).to eql "logstash"
++    end
++  end
++
++  %w(org.opencontainers.image.vendor).each do |label|
++    it "should set the vendor label #{label} correctly" do
++      expect(@labels[label]).to eql "Elastic"
++    end
++  end
++
++  %w(org.label-schema.version org.opencontainers.image.version).each do |label|
++    it "should set the version label #{label} correctly" do
++      expect(@labels[label]).to eql qualified_version
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/qa/docker/spec/full/container_spec.rb b/qa/docker/spec/full/container_spec.rb
+new file mode 100644
+index 00000000000..63cc9dc176b
+--- /dev/null
++++ b/qa/docker/spec/full/container_spec.rb
+@@ -0,0 +1,47 @@
++require_relative '../spec_helper'
++require_relative '../../shared_examples/container_config'
++require_relative '../../shared_examples/container_options'
++require_relative '../../shared_examples/container'
++
++describe 'A container running the full image' do
++  it_behaves_like 'the container is configured correctly', 'full'
++  it_behaves_like 'it runs with different configurations', 'full'
++  it_behaves_like 'it applies settings correctly', 'full'
++
++  context 'when configuring xpack settings' do
++    before do
++      @image = find_image('full')
++      @container = start_container(@image, {'ENV' => env})
++    end
++
++    after do
++      cleanup_container(@container)
++    end
++
++    context 'when disabling xpack monitoring' do
++      let(:env) {['xpack.monitoring.enabled=false']}
++
++      it 'should set monitoring to false' do
++        expect(get_settings(@container)['xpack.monitoring.enabled']).to be_falsey
++      end
++    end
++
++    context 'when enabling xpack monitoring' do
++      let(:env) {['xpack.monitoring.enabled=true']}
++
++      it 'should set monitoring to true' do
++        expect(get_settings(@container)['xpack.monitoring.enabled']).to be_truthy
++      end
++    end
++
++    context 'when setting elasticsearch urls as an array' do
++      let(:env) { ['xpack.monitoring.elasticsearch.hosts=["http://node1:9200","http://node2:9200"]']}
++
++      it 'should set set the hosts property correctly' do
++        expect(get_settings(@container)['xpack.monitoring.elasticsearch.hosts']).to be_an(Array)
++        expect(get_settings(@container)['xpack.monitoring.elasticsearch.hosts']).to include('http://node1:9200')
++        expect(get_settings(@container)['xpack.monitoring.elasticsearch.hosts']).to include('http://node2:9200')
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/qa/docker/spec/full/image_spec.rb b/qa/docker/spec/full/image_spec.rb
+new file mode 100644
+index 00000000000..e222d59d35d
+--- /dev/null
++++ b/qa/docker/spec/full/image_spec.rb
+@@ -0,0 +1,6 @@
++require_relative '../spec_helper'
++require_relative '../../shared_examples/image_metadata'
++
++describe 'An image with the full distribution' do
++  it_behaves_like 'the metadata is set correctly', 'full'
++end
+\ No newline at end of file
+diff --git a/qa/docker/spec/oss/container_spec.rb b/qa/docker/spec/oss/container_spec.rb
+new file mode 100644
+index 00000000000..d3662f44bc5
+--- /dev/null
++++ b/qa/docker/spec/oss/container_spec.rb
+@@ -0,0 +1,10 @@
++require_relative '../spec_helper'
++require_relative '../../shared_examples/container_config'
++require_relative '../../shared_examples/container_options'
++require_relative '../../shared_examples/container'
++
++describe 'A container running the oss image' do
++  it_behaves_like 'the container is configured correctly', 'oss'
++  it_behaves_like 'it applies settings correctly', 'oss'
++  it_behaves_like 'it runs with different configurations', 'oss'
++end
+\ No newline at end of file
+diff --git a/qa/docker/spec/oss/image_spec.rb b/qa/docker/spec/oss/image_spec.rb
+new file mode 100644
+index 00000000000..18e228452d9
+--- /dev/null
++++ b/qa/docker/spec/oss/image_spec.rb
+@@ -0,0 +1,6 @@
++require_relative '../spec_helper'
++require_relative '../../shared_examples/image_metadata'
++
++describe 'An image with the oss distribution' do
++  it_behaves_like 'the metadata is set correctly', 'oss'
++end
+\ No newline at end of file
+diff --git a/qa/docker/spec/spec_helper.rb b/qa/docker/spec/spec_helper.rb
+new file mode 100644
+index 00000000000..c98961d8781
+--- /dev/null
++++ b/qa/docker/spec/spec_helper.rb
+@@ -0,0 +1,122 @@
++ROOT = File.expand_path(File.join(File.dirname(__FILE__), '..', '..', '..'))
++$LOAD_PATH.unshift File.join(ROOT, 'logstash-core/lib')
++FIXTURES_DIR = File.expand_path(File.join("..", "..", "fixtures"), __FILE__)
++
++require 'logstash/version'
++require 'json'
++require 'stud/try'
++require 'docker-api'
++
++def version
++  @version ||= LOGSTASH_VERSION
++end
++
++def qualified_version
++  qualifier = ENV['VERSION_QUALIFIER']
++  qualified_version = qualifier ? [version, qualifier].join("-") : version
++  ENV["RELEASE"] == "1" ? qualified_version : [qualified_version, "SNAPSHOT"].join("-")
++end
++
++def find_image(flavor)
++  Docker::Image.all.detect{
++      |image| image.info['RepoTags'].detect{
++        |tag| tag == "docker.elastic.co/logstash/logstash-#{flavor}:#{qualified_version}"
++    }}
++end
++
++def create_container(image, options = {})
++  image.run(nil, options)
++end
++
++def start_container(image, options={})
++  container = create_container(image, options)
++  wait_for_logstash(container)
++  container
++end
++
++def wait_for_logstash(container)
++  Stud.try(40.times, RSpec::Expectations::ExpectationNotMetError) do
++    expect(container.exec(['curl', '-s', 'http://localhost:9600/_node'])[0][0]).not_to be_empty
++  end
++end
++
++def cleanup_container(container)
++  unless container.nil?
++    container.kill
++    container.delete(:force=>true)
++  end
++end
++
++def license_label_for_flavor(flavor)
++  flavor.match(/oss/) ? 'Apache 2.0' : 'Elastic License'
++end
++
++def license_agreement_for_flavor(flavor)
++  flavor.match(/oss/) ? 'Apache License' : 'ELASTIC LICENSE AGREEMENT!'
++end
++
++def get_logstash_status(container)
++  JSON.parse(container.exec(['curl', '-s', 'http://localhost:9600'])[0][0])['status']
++end
++
++
++def get_node_info(container)
++  JSON.parse(container.exec(['curl', '-s', 'http://localhost:9600/_node'])[0][0])
++end
++
++def get_node_stats(container)
++  JSON.parse(container.exec(['curl', '-s', 'http://localhost:9600/_node/stats'])[0][0])
++end
++
++def get_settings(container)
++  YAML.load(container.read_file('/usr/share/logstash/config/logstash.yml'))
++end
++
++def java_process(container, column)
++  exec_in_container(container, "ps -C java -o #{column}=").strip
++end
++
++def exec_in_container(container, command)
++  container.exec(command.split)[0][0]
++end
++
++def architecture_for_flavor(flavor)
++  flavor.match(/aarch64/) ? 'arm64' : 'amd64'
++end
++
++RSpec::Matchers.define :have_correct_license_label do |expected|
++  match do |actual|
++    values_match? license_label_for_flavor(expected), actual
++  end
++  failure_message do |actual|
++    "expected License:#{actual} to eq #{license_label_for_flavor(expected)}"
++  end
++end
++
++RSpec::Matchers.define :have_correct_license_agreement do |expected|
++  match do |actual|
++    values_match? /#{license_agreement_for_flavor(expected)}/, actual
++    true
++  end
++  failure_message do |actual|
++    "expected License Agreement:#{actual} to contain #{license_agreement_for_flavor(expected)}"
++  end
++end
++
++RSpec::Matchers.define :have_correct_architecture_for_flavor do |expected|
++  match do |actual|
++    values_match? architecture_for_flavor(expected), actual
++    true
++  end
++  failure_message do |actual|
++    "expected Architecture: #{actual} to be #{architecture_for_flavor(expected)}"
++  end
++end
++
++shared_context 'image_context' do |flavor|
++  before do
++    @image = find_image(flavor)
++    @image_config = @image.json['Config']
++    @labels = @image_config['Labels']
++  end
++end
+diff --git a/rakelib/artifacts.rake b/rakelib/artifacts.rake
+index f91b2fe6740..da14d613ea3 100644
+--- a/rakelib/artifacts.rake
++++ b/rakelib/artifacts.rake
+@@ -122,6 +122,7 @@ namespace "artifact" do
+ 
+   desc "Generate rpm, deb, tar and zip artifacts"
+   task "all" => ["prepare", "build"]
++  task "docker_only" => ["prepare", "build_docker_full", "build_docker_oss"]
+ 
+   desc "Build a tar.gz of default logstash plugins with all dependencies"
+   task "tar" => ["prepare", "generate_build_metadata"] do
+@@ -207,12 +208,26 @@ namespace "artifact" do
+     build_docker(true)
+   end
+ 
+-  desc "Generate Dockerfile for default and oss images"
++  desc "Generate Dockerfiles for full and oss images"
+   task "dockerfiles" => ["prepare", "generate_build_metadata"] do
+     puts("[dockerfiles] Building Dockerfiles")
+-    build_dockerfiles
++    build_dockerfile('oss')
++    build_dockerfile('full')
+   end
+ 
++  desc "Generate Dockerfile for oss images"
++  task "dockerfile_oss" => ["prepare", "generate_build_metadata"] do
++    puts("[dockerfiles] Building oss Dockerfile")
++    build_dockerfile('oss')
++  end
++
++  desc "Generate Dockerfile for full images"
++  task "dockerfile_full" => ["prepare", "generate_build_metadata"] do
++    puts("[dockerfiles] Building default Dockerfiles")
++    build_dockerfile('full')
++  end
++
++
+   # Auxiliary tasks
+   task "build" => [:generate_build_metadata] do
+     Rake::Task["artifact:gems"].invoke unless SNAPSHOT_BUILD
+@@ -231,6 +246,16 @@ namespace "artifact" do
+     end
+   end
+ 
++  task "build_docker_full" => [:generate_build_metadata] do
++    Rake::Task["artifact:docker"].invoke
++    Rake::Task["artifact:dockerfile_full"].invoke
++  end
++
++  task "build_docker_oss" => [:generate_build_metadata] do
++    Rake::Task["artifact:docker_oss"].invoke
++    Rake::Task["artifact:dockerfile_oss"].invoke
++  end
++
+   task "generate_build_metadata" do
+     return if defined?(BUILD_METADATA_FILE)
+     BUILD_METADATA_FILE = Tempfile.new('build.rb')
+@@ -570,14 +595,14 @@ namespace "artifact" do
+     end
+   end
+ 
+-  def build_dockerfiles
++  def build_dockerfile(flavor)
+     env = {
+       "ARTIFACTS_DIR" => ::File.join(Dir.pwd, "build"),
+       "RELEASE" => ENV["RELEASE"],
+       "VERSION_QUALIFIER" => VERSION_QUALIFIER
+     }
+     Dir.chdir("docker") do |dir|
+-      system(env, "make public-dockerfiles")
++      system(env, "make public-dockerfiles_#{flavor}")
+       puts "Dockerfiles created in #{::File.join(env['ARTIFACTS_DIR'], 'docker')}"
+     end
+   end

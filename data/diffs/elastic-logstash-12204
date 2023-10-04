@@ -1,0 +1,138 @@
+diff --git a/logstash-core/spec/logstash/java_pipeline_spec.rb b/logstash-core/spec/logstash/java_pipeline_spec.rb
+index ac7f0f2099e..9181dac67e8 100644
+--- a/logstash-core/spec/logstash/java_pipeline_spec.rb
++++ b/logstash-core/spec/logstash/java_pipeline_spec.rb
+@@ -776,8 +776,9 @@ def flush(options)
+   end
+ 
+   context "Periodic Flush" do
+-    let(:config) do
+-      <<-EOS
++    shared_examples 'it flushes correctly' do
++      let(:config) do
++        <<-EOS
+       input {
+         dummy_input {}
+       }
+@@ -787,37 +788,48 @@ def flush(options)
+       output {
+         dummy_output {}
+       }
+-      EOS
+-    end
+-    let(:output) { ::LogStash::Outputs::DummyOutput.new }
+-
+-    before do
+-      allow(::LogStash::Outputs::DummyOutput).to receive(:new).with(any_args).and_return(output)
+-      allow(LogStash::Plugin).to receive(:lookup).with("input", "dummy_input").and_return(LogStash::Inputs::DummyBlockingInput)
+-      allow(LogStash::Plugin).to receive(:lookup).with("filter", "dummy_flushing_filter").and_return(DummyFlushingFilterPeriodic)
+-      allow(LogStash::Plugin).to receive(:lookup).with("output", "dummy_output").and_return(::LogStash::Outputs::DummyOutput)
+-      allow(LogStash::Plugin).to receive(:lookup).with("codec", "plain").and_return(LogStash::Codecs::Plain)
+-    end
++        EOS
++      end
++      let(:output) { ::LogStash::Outputs::DummyOutput.new }
+ 
+-    it "flush periodically" do
+-      Thread.abort_on_exception = true
+-      pipeline = mock_java_pipeline_from_string(config, pipeline_settings_obj)
+-      Timeout.timeout(timeout) do
+-        pipeline.start
++      before do
++        allow(::LogStash::Outputs::DummyOutput).to receive(:new).with(any_args).and_return(output)
++        allow(LogStash::Plugin).to receive(:lookup).with("input", "dummy_input").and_return(LogStash::Inputs::DummyBlockingInput)
++        allow(LogStash::Plugin).to receive(:lookup).with("filter", "dummy_flushing_filter").and_return(DummyFlushingFilterPeriodic)
++        allow(LogStash::Plugin).to receive(:lookup).with("output", "dummy_output").and_return(::LogStash::Outputs::DummyOutput)
++        allow(LogStash::Plugin).to receive(:lookup).with("codec", "plain").and_return(LogStash::Codecs::Plain)
+       end
+-      Stud.try(max_retry.times, [StandardError, RSpec::Expectations::ExpectationNotMetError]) do
+-        wait(10).for do
+-          # give us a bit of time to flush the events
+-          output.events.empty?
+-        end.to be_falsey
++
++      it "flush periodically" do
++        Thread.abort_on_exception = true
++        pipeline = mock_java_pipeline_from_string(config, pipeline_settings_obj)
++        Timeout.timeout(timeout) do
++          pipeline.start
++        end
++        Stud.try(max_retry.times, [StandardError, RSpec::Expectations::ExpectationNotMetError]) do
++          wait(10).for do
++            # give us a bit of time to flush the events
++            output.events.empty?
++          end.to be_falsey
++        end
++
++        expect(output.events.any? {|e| e.get("message") == "dummy_flush"}).to eq(true)
++
++        pipeline.shutdown
+       end
+ 
+-      expect(output.events.any? {|e| e.get("message") == "dummy_flush"}).to eq(true)
++    end
+ 
+-      pipeline.shutdown
++    it_behaves_like 'it flushes correctly'
++
++    context 'with pipeline ordered' do
++      before do
++        pipeline_settings_obj.set("pipeline.workers", 1)
++        pipeline_settings_obj.set("pipeline.ordered", true)
++      end
++      it_behaves_like 'it flushes correctly'
+     end
+   end
+-
+   context "Periodic Flush that intermittently returns nil" do
+     let(:config) do
+       <<-EOS
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java b/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
+index b351c0612a5..092e1c0e578 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
+@@ -306,6 +306,8 @@ private boolean isOutput(final Vertex vertex) {
+ 
+     public final class CompiledOrderedExecution extends CompiledExecution {
+ 
++        @SuppressWarnings({"unchecked"})  private final RubyArray<RubyEvent> EMPTY_ARRAY = RubyUtil.RUBY.newEmptyArray();
++
+         @Override
+         public void compute(final QueueBatch batch, final boolean flush, final boolean shutdown) {
+            compute(batch.events(), flush, shutdown);
+@@ -313,16 +315,26 @@ public void compute(final QueueBatch batch, final boolean flush, final boolean s
+ 
+         @Override
+         public void compute(final Collection<RubyEvent> batch, final boolean flush, final boolean shutdown) {
+-            @SuppressWarnings({"unchecked"}) final RubyArray<RubyEvent> outputBatch = RubyUtil.RUBY.newArray();
+-            // send batch one-by-one as single-element batches down the filters
+-            @SuppressWarnings({"unchecked"}) final RubyArray<RubyEvent> filterBatch = RubyUtil.RUBY.newArray(1);
+-            for (final RubyEvent e : batch) {
+-                filterBatch.set(0, e);
+-                final Collection<RubyEvent> result = compiledFilters.compute(filterBatch, flush, shutdown);
+-                copyNonCancelledEvents(result, outputBatch);
+-                compiledFilters.clear();
++            if (!batch.isEmpty()) {
++                @SuppressWarnings({"unchecked"}) final RubyArray<RubyEvent> outputBatch = RubyUtil.RUBY.newArray();
++                @SuppressWarnings({"unchecked"}) final RubyArray<RubyEvent> filterBatch = RubyUtil.RUBY.newArray(1);
++                // send batch one-by-one as single-element batches down the filters
++                for (final RubyEvent e : batch) {
++                    filterBatch.set(0, e);
++                    _compute(filterBatch, outputBatch, flush, shutdown);
++                }
++                compiledOutputs.compute(outputBatch, flush, shutdown);
++            } else if (flush || shutdown) {
++                @SuppressWarnings({"unchecked"}) final RubyArray<RubyEvent> outputBatch = RubyUtil.RUBY.newArray();
++                _compute(EMPTY_ARRAY, outputBatch, flush, shutdown);
++                compiledOutputs.compute(outputBatch, flush, shutdown);
+             }
+-            compiledOutputs.compute(outputBatch, flush, shutdown);
++        }
++
++        private void _compute(final RubyArray<RubyEvent> batch, final RubyArray<RubyEvent> outputBatch, final boolean flush, final boolean shutdown) {
++            final Collection<RubyEvent> result = compiledFilters.compute(batch, flush, shutdown);
++            copyNonCancelledEvents(result, outputBatch);
++            compiledFilters.clear();
+         }
+     }
+ 

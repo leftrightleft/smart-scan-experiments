@@ -1,0 +1,1242 @@
+diff --git a/lib/logstash/codecs/ha.rb b/lib/logstash/codecs/ha.rb
+new file mode 100644
+index 00000000000..13e25e0c1e6
+--- /dev/null
++++ b/lib/logstash/codecs/ha.rb
+@@ -0,0 +1,40 @@
++# encoding: utf-8
++require "logstash/codecs/base"
++
++class LogStash::Codecs::HA < LogStash::Codecs::Base
++  public
++  def initialize(codec)
++    @codec = codec
++    @bundle = []
++  end
++
++  def on_event(&on_event)
++    @codec.on_event do |message|
++      success = on_event.call message
++
++      if success
++        @bundle.each do |event|
++          event.trigger "output_sent"
++        end
++      else
++        # Nacks generally indicate an intent to clear the queue,
++        # So get the client to resend by not acking.
++      end
++      @bundle.clear
++    end
++  end
++
++  def encode(event)
++    event.on "output_send" do
++      @codec.encode(event)
++    end
++
++    @bundle.push event
++
++    event.trigger "filter_processed"
++  end
++
++  def flush(&block)
++    @codec.flush(&block)
++  end
++end
+diff --git a/lib/logstash/event.rb b/lib/logstash/event.rb
+index 1604ad60346..f91e153e6ec 100644
+--- a/lib/logstash/event.rb
++++ b/lib/logstash/event.rb
+@@ -41,6 +41,7 @@ def inspect
+ #       "@version": "1",
+ #       message: "hello world"
+ #     }
++
+ class LogStash::Event
+   class DeprecatedMethod < StandardError; end
+ 
+@@ -51,6 +52,7 @@ class DeprecatedMethod < StandardError; end
+ 
+   public
+   def initialize(data={})
++    @logger = Cabin::Channel.get(LogStash)
+     @cancelled = false
+ 
+     @data = data
+@@ -65,6 +67,32 @@ def initialize(data={})
+     else
+       data[TIMESTAMP] = ::Time.now.utc
+     end
++
++    # Used to store proc callbacks given to the event class
++    # event.on("some_event", &my_proc)
++    @change_listeners = {}
++
++    @default_change_listeners = {
++      # When an event has gone through all filters and are pretty much ready to be sent
++      "filter_processed" => [Proc.new {
++        trigger("output_send")
++      }],
++
++      # After an input has seen enough filter_processed events for a batch of messages to be 'ready'
++      "output_send" => [Proc.new {
++        trigger("output_sent")
++      }],
++
++      # After an output has confirmed the message has been sent to an HA store
++      "output_sent" => [Proc.new {
++        trigger("input_acknowledged")
++      }],
++
++      # After an input has acked back to a batch of messages
++      "input_acknowledged" => [Proc.new {
++        #@logger.debug "acked message"
++      }],
++    }
+   end # def initialize
+ 
+   public
+@@ -251,4 +279,120 @@ def tag(value)
+     self["tags"] ||= []
+     self["tags"] << value unless self["tags"].include?(value)
+   end
++
++  # State change notifications
++  def trigger(state_change)
++    callbacks = (
++      @change_listeners[state_change] or
++      @default_change_listeners[state_change]
++    )
++
++    callbacks.each do |callback|
++      callback.call(self)
++    end
++  end
++
++  def on(state_change, &callback)
++    # Initialize state_change if it's not set already
++    @change_listeners[state_change] ||= []
++    @change_listeners[state_change].push(callback)
++  end
+ end # class LogStash::Event
++
++class LogStash::EventBundle
++  def initialize
++    @logger = Cabin::Channel.get(LogStash)
++    @events = []
++    @ready = false
++  end
++
++  def ready(ack_sequence)
++    ack_sequence.call
++    @ready = true
++  end
++
++  def add(event)
++    throw "Cannot add event to ready bundle" if @ready
++    @events.push(event)
++  end
++
++  def bail()
++    # Unless it's an HA output, we've already acked
++    # so do nothing here :)
++  end
++
++  class HA < LogStash::EventBundle
++    def initialize
++      super()
++      @processed_count = 0
++      @sent_count = 0
++      @semaphore = Mutex.new
++      @bailing = false
++    end
++
++    def ready(ack_sequence)
++      @ack_sequence = ack_sequence
++
++      all_processed = @semaphore.synchronize do
++        @ready = true
++        not @bailing and @processed_count == @events.size
++      end
++
++      broadcast "output_send" if all_processed
++    end
++
++    def bail()
++      @semaphore.synchronize do
++        @events.each do |e| e.cancel end
++        @bailing = true
++      end
++    end
++
++    def setup_callbacks(event)
++      event.on('filter_processed') do
++        all_processed = @semaphore.synchronize do
++          @processed_count += 1
++          not @bailing and @ready and @processed_count == @events.size
++        end
++
++        broadcast "output_send" if all_processed
++      end
++
++      event.on("output_sent") do
++        if not @ready
++          # Would be triggered in race condition
++          #   Make sure you added the event object to the bundle _before_ allowing it to be processed
++          #   Default actions inside the event may have triggered output_send sooner than add()
++          throw "Triggered output_send on bundled event when bundle is not ready"
++        end
++
++        ack_ready = @semaphore.synchronize do
++          @sent_count += 1
++          not @bailing and @sent_count == @events.size
++        end
++
++        if ack_ready
++          begin
++            # Try to ack sequence, but if this fails there's nothing we can do anyway
++            @ack_sequence.call
++            broadcast "input_acknowledged"
++          rescue
++            @logger.info "Failed to ack sequence, perhaps the connection is closing?"
++          end
++        end
++      end
++    end
++
++    def add(event)
++      setup_callbacks(event)
++      super(event) # add event to @events, et al
++    end
++
++    private
++    def broadcast(state)
++      @events.each do |e|
++        e.trigger state
++      end
++    end
++  end
++end
+diff --git a/lib/logstash/inputs/lumberjack.rb b/lib/logstash/inputs/lumberjack.rb
+index c4c5cfc1fcd..1eb27b3dd75 100644
+--- a/lib/logstash/inputs/lumberjack.rb
++++ b/lib/logstash/inputs/lumberjack.rb
+@@ -1,6 +1,7 @@
+ # encoding: utf-8
+ require "logstash/inputs/base"
+ require "logstash/namespace"
++require "logstash/event"
+ 
+ # Receive events using the lumberjack protocol.
+ #
+@@ -29,6 +30,13 @@ class LogStash::Inputs::Lumberjack < LogStash::Inputs::Base
+   # SSL key passphrase to use.
+   config :ssl_key_passphrase, :validate => :password
+ 
++  # A flag to signal that we want messages to ack only when they've gone into an
++  # ha output.
++  #
++  # This only works if you flag an output with provides_ha
++  # e.g. elasticsearch with 3 nodes, and it's output declaring provides_ha => true
++  config :needs_ha, :validate => :boolean, :default => false
++
+   # TODO(sissel): Add CA to authenticate clients with.
+ 
+   public
+@@ -42,13 +50,36 @@ def register
+   end # def register
+ 
+   public
+-  def run(output_queue)
+-    @lumberjack.run do |l|
+-      @codec.decode(l.delete("line")) do |event|
+-        decorate(event)
+-        l.each { |k,v| event[k] = v; v.force_encoding(Encoding::UTF_8) }
+-        output_queue << event
++  def run(output_queue)            # Run lumberjack with output queue
++    @lumberjack.run do |client|    # ...using lumberjack server (gem)
++      Thread.new(client) do |fd|   # ...then we wrap client connections inside threads
++        bundle_class = if @needs_ha then LogStash::EventBundle::HA else LogStash::EventBundle end
++        bundle = bundle_class.new
++
++        Lumberjack::Connection.new(fd).run() do |map, &ack_sequence|
++          @codec.decode(map.delete("line")) do |event|
++            # Add logstash required fields (type+tags) and re-add keys from map
++            decorate(event)
++            map.each { |k,v| event[k] = v; v.force_encoding(Encoding::UTF_8) }
++
++            # Process and record record events
++            bundle.add(event) # Register bundle callbacks before defaults get triggered.
++            output_queue << event
++
++            # Close bundle, bundle will ack when sequence has ended
++            if ack_sequence != nil
++              bundle.ready(ack_sequence)
++              bundle = bundle_class.new
++            end
++          end
++        end
++
++        # run loop only exits when the connection closes, tidyup time
++        if @needs_ha
++          @logger.info("Dropped connection, tidying up messages to avoid dups on resend")
++          bundle.bail()
++        end
+       end
+     end
+-  end # def run
++  end
+ end # class LogStash::Inputs::Lumberjack
+diff --git a/lib/logstash/inputs/rabbitmq.rb b/lib/logstash/inputs/rabbitmq.rb
+index 41924738874..0b8dac95a35 100644
+--- a/lib/logstash/inputs/rabbitmq.rb
++++ b/lib/logstash/inputs/rabbitmq.rb
+@@ -82,6 +82,10 @@ class LogStash::Inputs::RabbitMQ < LogStash::Inputs::Threadable
+   # Passive queue creation? Useful for checking queue existance without modifying server state
+   config :passive, :validate => :boolean, :default => false
+ 
++  # Indicates that acknowledgements should be deferred until after the output has sent it.
++  # Implies the ack flag when set.
++  config :needs_ha, :validate => :boolean, :default => false
++
+ 
+ 
+   #
+diff --git a/lib/logstash/inputs/rabbitmq/march_hare.rb b/lib/logstash/inputs/rabbitmq/march_hare.rb
+index d2f0f0bc59f..85231bb2365 100644
+--- a/lib/logstash/inputs/rabbitmq/march_hare.rb
++++ b/lib/logstash/inputs/rabbitmq/march_hare.rb
+@@ -6,6 +6,9 @@ def register
+       require "hot_bunnies"
+       require "java"
+ 
++      # @needs_ha implies @ack
++      @ack = true if @needs_ha
++
+       @vhost       ||= "127.0.0.1"
+       # 5672. Will be switched to 5671 by Bunny if TLS is enabled.
+       @port        ||= 5672
+@@ -108,14 +111,21 @@ def setup
+     def consume
+       return if terminating?
+ 
++      bundle_class = if @needs_ha then LogStash::EventBundle::HA else LogStash::EventBundle end
++
+       # we manually build a consumer here to be able to keep a reference to it
+       # in an @ivar even though we use a blocking version of HB::Queue#subscribe
+       @consumer = @q.build_consumer(:block => true) do |metadata, data|
++        bundle = bundle_class.new
+         @codec.decode(data) do |event|
+           decorate(event)
++          bundle.add(event)
+           @output_queue << event if event
+         end
+-        @ch.ack(metadata.delivery_tag) if @ack
++        acknowledge_message = Proc.new do
++          @ch.ack(metadata.delivery_tag) if @ack
++        end
++        bundle.ready(acknowledge_message)
+       end
+       @q.subscribe_with(@consumer, :manual_ack => @ack, :block => true)
+     end
+diff --git a/lib/logstash/outputs/elasticsearch.rb b/lib/logstash/outputs/elasticsearch.rb
+index 11852e4807b..d8272b0825f 100644
+--- a/lib/logstash/outputs/elasticsearch.rb
++++ b/lib/logstash/outputs/elasticsearch.rb
+@@ -173,6 +173,11 @@ class LogStash::Outputs::ElasticSearch < LogStash::Outputs::Base
+   # For more details on actions, check out the [Elasticsearch bulk API documentation](http://www.elasticsearch.org/guide/en/elasticsearch/reference/current/docs-bulk.html)
+   config :action, :validate => :string, :default => "index"
+ 
++  # A flag to signal that your Elasticsearch setup is Highly Available
++  #
++  # i.e. you have at least 3 nodes running
++  config :provides_ha, :validate => :boolean, :default => false
++
+   public
+   def register
+     client_settings = {}
+@@ -291,7 +296,12 @@ def start_local_elasticsearch
+ 
+   public
+   def receive(event)
+-    return unless output?(event)
++    unless output?(event)
++      # Drop, but first let listening inputs know it got this far
++      # Defaults will handle the rest
++      event.trigger "filter_processed" if @provides_ha
++      return
++    end
+ 
+     # Set the 'type' value for the index.
+     if @index_type
+@@ -303,11 +313,46 @@ def receive(event)
+     index = event.sprintf(@index)
+ 
+     document_id = @document_id ? event.sprintf(@document_id) : nil
+-    buffer_receive([event.sprintf(@action), { :_id => document_id, :_index => index, :_type => type }, event.to_hash])
++
++    # Used to signal to the input that generated the message that
++    # it's been sent. Delay calling this till flush().
++    trigger_output_sent = Proc.new {
++      event.trigger "output_sent" if @provides_ha
++    }
++
++    # Used to delay putting this into the buffer till the input triggers
++    # output_send
++    save_to_elasticsearch = Proc.new {
++      buffer_receive({
++        :on_complete => trigger_output_sent,
++        :action => [
++          event.sprintf(@action),
++          { :_id => document_id, :_index => index, :_type => type },
++          event.to_hash,
++        ],
++      })
++    }
++
++    if @provides_ha
++      # Triggered by inputs or defaults
++      event.on("output_send", &save_to_elasticsearch)
++      event.trigger "filter_processed"
++    else
++      save_to_elasticsearch.call()
++    end
+   end # def receive
+ 
+-  def flush(actions, teardown=false)
+-    @client.bulk(actions)
++  def flush(buff, teardown=false)
++    es_actions = buff.map { |b| b[:action] }
++    ack_callbacks = buff.map { |b| b[:on_complete] }
++
++    @client.bulk(es_actions)
++
++    # Ack all processed messages
++    ack_callbacks.each do |trigger_output_sent|
++       trigger_output_sent.call
++    end
++
+     # TODO(sissel): Handle errors. Since bulk requests could mostly succeed
+     # (aka partially fail), we need to figure out what documents need to be
+     # retried.
+diff --git a/lib/logstash/outputs/rabbitmq.rb b/lib/logstash/outputs/rabbitmq.rb
+index 7b52baf2a7a..c9917197a7e 100644
+--- a/lib/logstash/outputs/rabbitmq.rb
++++ b/lib/logstash/outputs/rabbitmq.rb
+@@ -69,6 +69,8 @@ class LogStash::Outputs::RabbitMQ < LogStash::Outputs::Base
+   # Should RabbitMQ persist messages to disk?
+   config :persistent, :validate => :boolean, :default => true
+ 
++  # A flag to signal that your RabbitMQ setup is Highly Available
++  config :provides_ha, :validate => :boolean, :default => false
+ 
+ 
+   def initialize(params)
+diff --git a/lib/logstash/outputs/rabbitmq/march_hare.rb b/lib/logstash/outputs/rabbitmq/march_hare.rb
+index cdee3cf4bd9..0b57e38cf6c 100644
+--- a/lib/logstash/outputs/rabbitmq/march_hare.rb
++++ b/lib/logstash/outputs/rabbitmq/march_hare.rb
+@@ -1,4 +1,6 @@
+ # encoding: utf-8
++require "logstash/codecs/ha"
++
+ class LogStash::Outputs::RabbitMQ
+   module MarchHareImpl
+ 
+@@ -20,6 +22,9 @@ def register
+ 
+       @connected.set(true)
+ 
++      # Decorate the codec to add HA support.
++      @codec = LogStash::Codecs::HA.new(@codec) if @provides_ha
++
+       @codec.on_event(&method(:publish_serialized))
+     end
+ 
+@@ -41,6 +46,13 @@ def publish_serialized(message)
+           @x.publish(message, :routing_key => @key, :properties => {
+             :persistent => @persistent
+           })
++
++          if @provides_ha
++            success = @ch.wait_for_confirms
++
++            # The server may reply with a 'nack', which we report to Codecs::HA
++            return success
++          end
+         else
+           @logger.warn("Tried to send a message, but not connected to RabbitMQ.")
+         end
+@@ -133,6 +145,17 @@ def declare_exchange
+                     :durable => @durable)
+       @x = @ch.exchange(@exchange, :type => @exchange_type.to_sym, :durable => @durable)
+ 
++      if @provides_ha
++        @ch.confirm_select
++
++        # todo(alcinnz): would be nice to verify we succeeded in enabling server acknowledgements
++        # as not all queue servers may support it,
++        # but this method apparently doesn't exist although it is documented in:
++        #     http://rubymarchhare.info/articles/extensions.html#how-to-use-it-with-march-hare
++##        if !@ch.using_publisher_confirmations?
++##          @logger.error("Failed to enable HA on RabbitMQ server #{@connection_url}")
++##        end
++      end
+       # sets @connected to true during recovery. MK.
+       @connected.set(true)
+ 
+diff --git a/lib/logstash/pipeline.rb b/lib/logstash/pipeline.rb
+index 8ed9c7b5a52..f45e8926d14 100644
+--- a/lib/logstash/pipeline.rb
++++ b/lib/logstash/pipeline.rb
+@@ -30,6 +30,8 @@ def initialize(configstr)
+       raise
+     end
+ 
++    validate_ha
++
+     @input_to_filter = SizedQueue.new(20)
+ 
+     # If no filters, pipe inputs directly to outputs
+@@ -51,6 +53,58 @@ def started?
+     return @started
+   end
+ 
++  # Validates that the plugins that have been configured for HA correctly
++  # Or that there is no HA configuration specified
++  #
++  # If there are multiple HA outputs, this raises an exception
++  # If there are HA inputs but no HA outputs, this raises an exception
++  # If there are HA outputs but no HA inputs, this prints a warning
++  def validate_ha
++    ha_inputs = @inputs.select do |input|
++      if input.class.method_defined? :needs_ha
++        input.needs_ha
++      else
++        false
++      end
++    end
++
++    ha_outputs = @outputs.select do |output|
++      if output.class.method_defined? :provides_ha
++        output.provides_ha
++      else
++        false
++      end
++    end
++
++    if ha_outputs.size > 1 # Can only have 1 critical path through
++      plugins = ha_outputs.map{|f|f.class.config_name}.join(', ')
++      raise LogStash::ConfigurationError,
++        "Configuration specifies more than one Highly Available output which is unsupported. " +
++        "Please choose _one_ of these: #{plugins}"
++
++    elsif ha_outputs.size == 0 and ha_inputs.size > 0 # Don't have an HA path but do have the need for one
++      plugins = ha_inputs.map{|f|f.class.config_name}.join(', ')
++      raise LogStash::ConfigurationError,
++        "Configuration specifies that you need Highly Available outputs for some of your " +
++        "inputs, but there are no HA outputs set. Please set provides_ha on an output, or " +
++        "remove needs_ha from these plugins: #{plugins}"
++
++    elsif ha_outputs.size == 1 and ha_inputs.size == 0
++      plugin = ha_outputs[0].class.config_name
++      @logger.warn(
++        "You have configured a Highly Available output (#{plugin}), but there are no HA " +
++        "inputs set (so you may still loose messages). If you have inputs that can't loose " +
++        "messages, please set needs_ha => true on them."
++      );
++
++    else
++      # Either
++      # 1. We have no HA setup (inputs or outputs)
++      # 2. We have HA in one place, and 1 to many needs for it
++      # ...and both are fine
++    end
++  end
++
+   def configure(setting, value)
+     if setting == "filter-workers"
+       # Abort if we have any filters that aren't threadsafe
+diff --git a/spec/codecs/ha.rb b/spec/codecs/ha.rb
+new file mode 100644
+index 00000000000..7c38169af58
+--- /dev/null
++++ b/spec/codecs/ha.rb
+@@ -0,0 +1,147 @@
++# encoding: utf-8
++require "test_utils"
++require "logstash/codecs/ha"
++require "logstash/event"
++
++describe LogStash::Codecs::HA do
++  it "Should handle bundles of 1" do
++    codec = double("codec")
++    ha_codec = LogStash::Codecs::HA.new(codec)
++    event = LogStash::Event.new("sna" => "fu")
++
++    callback = nil
++    expect(codec).to receive(:on_event) do |&block|
++      callback = block
++    end
++    expect(codec).to receive(:encode) do |event_received|
++      insist { event_received } == event
++      callback.call "Hello"
++    end
++
++    # monitor state changes
++    actions = []
++    event.on "filter_processed" do
++      actions.push "filter_processed"
++    end
++    event.on "output_sent" do
++      actions.push "output_sent"
++    end
++
++    message = nil
++    ha_codec.on_event do |message_received|
++      message = message_received
++      true # <- returned
++    end
++    ha_codec.encode(event)
++
++    insist { actions } == ["filter_processed"]
++    event.trigger "output_send"
++
++    insist { message } == "Hello"
++    insist { actions } == ["filter_processed", "output_sent"]
++  end
++
++  it "Should handle bundles of multiple events" do
++    codec = double("codec")
++    ha_codec = LogStash::Codecs::HA.new(codec)
++    event1 = LogStash::Event.new("fu" => "bar")
++    event2 = LogStash::Event.new("sna" => "fu")
++    event3 = LogStash::Event.new("Hello" => "World")
++
++    callback = nil
++    expect(codec).to receive(:on_event) do |&block|
++      callback = block
++    end
++    expect(codec).to receive(:encode).with(event1)
++    expect(codec).to receive(:encode).with(event2)
++    expect(codec).to receive(:encode) do |event_received|
++      insist { event_received } == event3
++      callback.call "World"
++    end
++
++    # Handle state changes
++    actions = []
++    event1.on "filter_processed" do
++      actions.push "filter_processed"
++    end
++    event2.on "filter_processed" do
++      actions.push "filter_processed"
++    end
++    event3.on "filter_processed" do
++      actions.push "filter_processed"
++    end
++    event1.on "output_sent" do
++      actions.push "output_sent"
++    end
++    event2.on "output_sent" do
++      actions.push "output_sent"
++    end
++    event3.on "output_sent" do
++      actions.push "output_sent"
++    end
++
++    message = nil
++    ha_codec.on_event do |message_received|
++      message = message_received
++      true # <- returned
++    end
++    ha_codec.encode(event1)
++    ha_codec.encode(event2)
++    ha_codec.encode(event3)
++
++    insist { actions } == ["filter_processed", "filter_processed", "filter_processed"]
++
++    insist { message } == nil
++    insist { actions } == ["filter_processed", "filter_processed", "filter_processed"]
++    event1.trigger "output_send"
++    insist { message } == nil
++    insist { actions } == ["filter_processed", "filter_processed", "filter_processed"]
++    event2.trigger "output_send"
++    insist { message } == nil
++    insist { actions } == ["filter_processed", "filter_processed", "filter_processed"]
++    event3.trigger "output_send"
++    insist { message } == "World"
++
++    insist { actions } == ["filter_processed", "filter_processed", "filter_processed",
++                           "output_sent", "output_sent", "output_sent"]
++  end
++
++  it "should not trigger output_sent for messages that fail to be sent" do
++    # todo(alcinnz): Should we specify that it resends or let the client resend?
++    #   Here I'm letting client resend, but it might be better to have the server do it instead.
++    codec = double("codec")
++    ha_codec = LogStash::Codecs::HA.new(codec)
++    event = LogStash::Event.new("sna" => "fu")
++
++    callback = nil
++    expect(codec).to receive(:on_event) do |&block|
++      callback = block
++    end
++    expect(codec).to receive(:encode) do |event_received|
++      insist { event_received } == event
++      callback.call "Hello"
++    end
++
++    # monitor state changes
++    actions = []
++    event.on "filter_processed" do
++      actions.push "filter_processed"
++    end
++    event.on "output_sent" do
++      actions.push "output_sent"
++    end
++
++    message = nil
++    ha_codec.on_event do |message_received|
++      message = message_received
++      false # <- returned
++    end
++    ha_codec.encode(event)
++
++    insist { actions } == ["filter_processed"]
++    event.trigger "output_send"
++
++    insist { message } == "Hello"
++    insist { actions } == ["filter_processed"]
++  end
++end
+diff --git a/spec/event.rb b/spec/event.rb
+index 17a283da038..618e49007da 100644
+--- a/spec/event.rb
++++ b/spec/event.rb
+@@ -247,4 +247,47 @@
+       end
+     end
+   end
++
++  context LogStash::EventBundle::HA do
++    it "should acknowledge only when done" do
++      bundle_closed = false
++      bundle = LogStash::EventBundle::HA.new
++
++      20.times do
++        event = LogStash::Event.new
++        bundle.add(event)
++        event.trigger "filter_processed"
++      end
++
++      bundle_closed = true
++      bundle.ready(Proc.new do
++        insist { bundle_closed } == true
++      end)
++    end
++    it "should be able to acknowledge after garbage collect" do
++      passed = false
++      bundle = LogStash::EventBundle::HA.new
++
++      event = LogStash::Event.new
++      bundle.add(event)
++      bundle.ready(Proc.new do
++        passed = true
++      end)
++      bundle = nil
++      GC.start
++
++      event.trigger "filter_processed"
++      insist { passed } == true
++    end
++  end
++  context LogStash::EventBundle do
++    it "should acknowledge when closed" do
++      passed = false
++      bundle = LogStash::EventBundle.new
++      bundle.ready(Proc.new do
++        passed = true
++      end)
++      insist { passed } == true
++    end
++  end
+ end
+diff --git a/spec/inputs/lumberjack.rb b/spec/inputs/lumberjack.rb
+new file mode 100644
+index 00000000000..53c82113173
+--- /dev/null
++++ b/spec/inputs/lumberjack.rb
+@@ -0,0 +1,160 @@
++# encoding: utf-8
++require "test_utils"
++require "tempfile"
++
++require "logstash/inputs/lumberjack"
++
++# Mocked Lumberjack::Connection
++module Lumberjack
++  class Connection
++    @@objects = []
++    def initialize(_)
++      @ack_queue = SizedQueue.new 1
++      @@objects.push self
++    end
++
++    def run(&block)
++      block.call({"line" => "fubar"}, nil)
++      block.call({"line" => "snafu"}, nil)
++      block.call({"line" => "hello world"}) do
++        @ack_queue.push true
++      end
++    end
++
++    def acked?
++      return @ack_queue.pop
++    end
++
++    def self.acked?
++      ret = @@objects.all? do |obj| obj.acked? end
++      @@objects.clear
++      return ret
++    end
++  end
++end
++
++describe LogStash::Inputs::Lumberjack do
++  extend LogStash::RSpec
++
++  describe "(non High Availability)" do
++    it "should acknowledge" do
++      cert = Tempfile.new "logstash-spec-input-lumberjack-cert"
++      key = Tempfile.new "logstash-spec-input-lumberjack-key"
++
++      # Mock lumberjack server so it doesn't connect to the network
++      mock_lumberjack = double()
++      expect(mock_lumberjack).to receive(:run) do |&block|
++        block.call nil
++      end
++
++      # setup input
++      input = LogStash::Inputs::Lumberjack.new "port" => 8000, "ssl_certificate" => cert.path, "ssl_key" => key.path
++      input.instance_variable_set :@lumberjack, mock_lumberjack
++
++      queue = SizedQueue.new 10
++      input_thread = Thread.new do input.run(queue) end
++
++      # check the acknowledged events got through
++      insist { queue.pop["message"] } == "fubar"
++      insist { queue.pop["message"] } == "snafu"
++      insist { queue.pop["message"] } == "hello world"
++
++      insist { Lumberjack::Connection.acked? } == true
++      input_thread.exit
++    end
++    it "should handle multiple connections" do
++      cert = Tempfile.new "logstash-spec-input-lumberjack-cert"
++      key = Tempfile.new "logstash-spec-input-lumberjack-key"
++
++      # Mock lumberjack server so it doesn't connect to the network
++      mock_lumberjack = double()
++      expect(mock_lumberjack).to receive(:run) do |&block|
++        3.times do block.call nil end
++      end
++
++      # setup input
++      input = LogStash::Inputs::Lumberjack.new "port" => 8000, "ssl_certificate" => cert.path, "ssl_key" => key.path
++      input.instance_variable_set :@lumberjack, mock_lumberjack
++
++      queue = SizedQueue.new(10)
++      input_thread = Thread.new do input.run(queue) end
++
++      # check we got nine events (3 connections, 3 messages each)
++      9.times do queue.pop end
++      insist { queue.length } == 0
++
++      insist { Lumberjack::Connection.acked? } == true
++      input_thread.exit
++    end
++  end
++
++  describe "(High Availability)" do
++    it "should acknowledge" do
++      cert = Tempfile.new "logstash-spec-input-lumberjack-cert"
++      key = Tempfile.new "logstash-spec-input-lumberjack-key"
++
++      # Mock lumberjack server so it doesn't connect to the network
++      mock_lumberjack = double()
++      expect(mock_lumberjack).to receive(:run) do |&block|
++        block.call nil
++      end
++
++      # setup input
++      input = LogStash::Inputs::Lumberjack.new "port" => 8000,
++        "ssl_certificate" => cert.path,
++        "ssl_key" => key.path,
++        "needs_ha" => true
++      input.instance_variable_set :@lumberjack, mock_lumberjack
++
++      queue = SizedQueue.new(10)
++      input_thread = Thread.new do input.run(queue) end
++
++      # check we got our events
++      event = queue.pop
++      event.trigger "filter_processed"
++      insist { event["message"] } == "fubar"
++      event = queue.pop
++      event.trigger "filter_processed"
++      insist { event["message"] } == "snafu"
++      event = queue.pop
++      event.trigger "filter_processed"
++      insist { event["message"] } == "hello world"
++
++      # input_thread may or may not have a bit more left to do now,
++      # but we can't join it since it's an infinite loop.
++      insist { Lumberjack::Connection.acked? } == true
++      input_thread.exit
++    end
++    it "should handle multiple connections" do
++      cert = Tempfile.new "logstash-spec-input-lumberjack-cert"
++      key = Tempfile.new "logstash-spec-input-lumberjack-key"
++
++      # Mock lumberjack server so it doesn't connect to the network
++      mock_lumberjack = double()
++      expect(mock_lumberjack).to receive(:run) do |&block|
++        3.times do block.call nil end
++      end
++
++      # setup input
++      input = LogStash::Inputs::Lumberjack.new "port" => 8000,
++        "ssl_certificate" => cert.path,
++        "ssl_key" => key.path,
++        "needs_ha" => true
++      input.instance_variable_set :@lumberjack, mock_lumberjack
++
++      queue = SizedQueue.new(10)
++      input_thread = Thread.new do input.run(queue) end
++
++      # wait then check and acknowledge the events.
++      9.times do
++        queue.pop.trigger "filter_processed"
++      end
++      insist { queue.length } == 0
++
++      # input_thread may or may not have a bit more left to do now,
++      # but we can't join it since it's an infinite loop.
++      insist { Lumberjack::Connection.acked? } == true
++      input_thread.exit
++    end
++  end
++end
+diff --git a/spec/outputs/rabbitmq.rb b/spec/outputs/rabbitmq.rb
+new file mode 100644
+index 00000000000..6d7cce857a4
+--- /dev/null
++++ b/spec/outputs/rabbitmq.rb
+@@ -0,0 +1,305 @@
++# encoding: utf-8
++require "test_utils"
++require "logstash/outputs/rabbitmq"
++require "march_hare"
++
++describe LogStash::Outputs::RabbitMQ do
++  extend LogStash::RSpec
++
++  describe "Without HA" do
++    config <<-CONFIG
++      input {
++        generator {
++          count => 1
++        }
++      }
++      output {
++        rabbitmq {
++          host => "host"
++          exchange_type => "topic"
++          exchange => "fu"
++          key => "bar"
++        }
++      }
++    CONFIG
++
++    it "should publish data to RabbitMQ" do
++      exchange = double("exchange")
++      conn = double("conn")
++      channel = double("channel")
++
++      expect(MarchHare).to receive(:connect).with({
++         :vhost => "/",
++         :host => "host",
++         :port => 5672,
++         :user => "guest",
++         :pass => "guest",
++         :automatic_recovery => false
++      }).and_return conn
++      expect(conn).to receive(:create_channel).and_return channel
++      expect(channel).to receive(:exchange).with("fu", {
++        :type => :topic,
++        :durable => true
++      }).and_return exchange
++
++      expect(exchange).to receive(:publish).with(an_instance_of(String), {
++        :routing_key => "bar",
++        :properties => { :persistent => true }
++      })
++
++      expect(conn).to receive(:open?).and_return true
++      expect(conn).to receive(:close)
++
++      # Run this scenario
++      pipeline = LogStash::Pipeline.new(config)
++      pipeline.run
++    end
++  end
++
++  describe "with HA" do
++    config <<-CONFIG
++      input {
++        generator {
++          count => 1
++        }
++      }
++      output {
++        rabbitmq {
++          host => "host"
++          exchange_type => "topic"
++          exchange => "fu"
++          key => "bar"
++          provides_ha => true
++        }
++      }
++    CONFIG
++
++    it "should publish data to RabbitMQ" do
++      exchange = double("exchange")
++      conn = double("conn")
++      channel = double("channel")
++
++      expect(MarchHare).to receive(:connect).with({
++        :vhost => "/",
++        :host => "host",
++        :port => 5672,
++        :user => "guest",
++        :pass => "guest",
++        :automatic_recovery => false
++      }).and_return conn
++      expect(conn).to receive(:create_channel).and_return channel
++      expect(channel).to receive(:exchange).with("fu", {
++        :type => :topic,
++        :durable => true
++      }).and_return exchange
++      # This call enables HA in RabbitMQ
++      expect(channel).to receive(:confirm_select)
++##      # This call confirms that HA is enabled.
++##      expect(channel).to receive(:using_publisher_confirmations?).and_return true
++
++      expect(exchange).to receive(:publish).with(an_instance_of(String), {
++        :routing_key => "bar",
++        :properties => { :persistent => true }
++      })
++      # This call blocks until the acknowledgements come back.
++      expect(channel).to receive(:wait_for_confirms).and_return true
++
++      expect(conn).to receive(:open?).and_return true
++      expect(conn).to receive(:close)
++
++      # Run this scenario
++      pipeline = LogStash::Pipeline.new(config)
++      pipeline.run
++    end
++  end
++
++  describe "HA state changes" do
++    it "should not be triggered for non-HA RabbitMQ output." do
++      # Create the output.
++      output = LogStash::Outputs::RabbitMQ.new(
++        "host" => "host",
++        "exchange_type" => "topic",
++        "exchange" => "fu",
++        "key" => "bar",
++      )
++
++      # Setup expected MarchHare calls.
++      exchange = double("exchange")
++      conn = double("conn")
++      channel = double("channel")
++
++      expect(MarchHare).to receive(:connect).with({
++        :vhost => "/",
++        :host => "host",
++        :port => 5672,
++        :user => "guest",
++        :pass => "guest",
++        :automatic_recovery => false
++      }).and_return conn
++      expect(conn).to receive(:create_channel).and_return channel
++      expect(channel).to receive(:exchange).with("fu", {
++        :type => :topic,
++        :durable => true
++      }).and_return exchange
++
++      expect(exchange).to receive(:publish).with(an_instance_of(String), {
++        :routing_key => "bar",
++        :properties => { :persistent => true }
++      })
++
++      expect(conn).to receive(:open?).and_return true
++      expect(conn).to receive(:close)
++
++      # Setup event
++      event = LogStash::Event.new("Hello" => "World")
++      passed = true
++      event.on "filter_processed" do
++        passed = false
++      end
++      event.on "output_sent" do
++        passed = false
++      end
++
++      # Run the scenario manually.
++      output.register
++      output.receive(event)
++
++
++      insist { passed } == true
++      output.teardown
++    end
++
++    it "should be triggered for HA RabbitMQ output." do
++      # Create the output.
++      output = LogStash::Outputs::RabbitMQ.new(
++        "host" => "host",
++        "exchange_type" => "topic",
++        "exchange" => "fu",
++        "key" => "bar",
++        "provides_ha" => "true"
++      )
++
++      # Setup expected MarchHare calls.
++      exchange = double("exchange")
++      conn = double("conn")
++      channel = double("channel")
++
++      expect(MarchHare).to receive(:connect).with({
++        :vhost => "/",
++        :host => "host",
++        :port => 5672,
++        :user => "guest",
++        :pass => "guest",
++        :automatic_recovery => false
++      }).and_return conn
++      expect(conn).to receive(:create_channel).and_return channel
++      expect(channel).to receive(:exchange).with("fu", {
++        :type => :topic,
++        :durable => true
++      }).and_return exchange
++      # This call enables HA in RabbitMQ
++      expect(channel).to receive(:confirm_select)
++##      # This call confirms that HA is enabled.
++##      expect(channel).to receive(:using_publisher_confirmations?).and_return true
++
++      expect(exchange).to receive(:publish).with(an_instance_of(String), {
++        :routing_key => "bar",
++        :properties => { :persistent => true }
++      })
++      # This call blocks until the acknowledgements come back.
++      expect(channel).to receive(:wait_for_confirms).and_return true
++
++      expect(conn).to receive(:open?).and_return true
++      expect(conn).to receive(:close)
++
++      # Setup event
++      event = LogStash::Event.new("Hello" => "World")
++      actions = []
++      event.on "filter_processed" do
++        actions.push "filter_processed"
++      end
++      event.on "output_sent" do
++        actions.push "output_sent"
++      end
++
++      # Run the scenario manually.
++      output.register
++      output.receive(event)
++
++      # Expected event behaviour
++      insist { actions } == ["filter_processed"]
++      event.trigger "output_send"
++      insist { actions } == ["filter_processed", "output_sent"]
++
++
++      output.teardown
++    end
++    it "should not be triggered for failed send" do
++      # Create the output.
++      output = LogStash::Outputs::RabbitMQ.new(
++        "host" => "host",
++        "exchange_type" => "topic",
++        "exchange" => "fu",
++        "key" => "bar",
++        "provides_ha" => "true"
++      )
++
++      # Setup expected MarchHare calls.
++      exchange = double("exchange")
++      conn = double("conn")
++      channel = double("channel")
++
++      expect(MarchHare).to receive(:connect).with({
++        :vhost => "/",
++        :host => "host",
++        :port => 5672,
++        :user => "guest",
++        :pass => "guest",
++        :automatic_recovery => false
++      }).and_return conn
++      expect(conn).to receive(:create_channel).and_return channel
++      expect(channel).to receive(:exchange).with("fu", {
++        :type => :topic,
++        :durable => true
++      }).and_return exchange
++      # This call enables HA in RabbitMQ
++      expect(channel).to receive(:confirm_select)
++##      # This call confirms that HA is enabled.
++##      expect(channel).to receive(:using_publisher_confirmations?).and_return true
++
++      expect(exchange).to receive(:publish).with(an_instance_of(String), {
++        :routing_key => "bar",
++        :properties => { :persistent => true }
++      })
++      # This call blocks until the acknowledgements come back.
++      # Returning false indicates that the message has been nacked.
++      expect(channel).to receive(:wait_for_confirms).and_return false
++
++      expect(conn).to receive(:open?).and_return true
++      expect(conn).to receive(:close)
++
++      # Setup event
++      event = LogStash::Event.new("Hello" => "World")
++      actions = []
++      event.on "filter_processed" do
++        actions.push "filter_processed"
++      end
++      event.on "output_sent" do
++        actions.push "output_sent"
++      end
++
++      # Run the scenario manually.
++      output.register
++      output.receive(event)
++
++      # Expected event behaviour
++      insist { actions } == ["filter_processed"]
++      event.trigger "output_send"
++      # Output sent should never be called since send failed.
++      insist { actions } == ["filter_processed"]
++
++
++      output.teardown
++    end
++  end
++end

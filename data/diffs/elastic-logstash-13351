@@ -1,0 +1,162 @@
+diff --git a/lib/bootstrap/bundler.rb b/lib/bootstrap/bundler.rb
+index 1e12459bbfc..da879db943a 100644
+--- a/lib/bootstrap/bundler.rb
++++ b/lib/bootstrap/bundler.rb
+@@ -128,11 +128,17 @@ def invoke!(options = {})
+       ::Bundler.settings.set_local(:gemfile, LogStash::Environment::GEMFILE_PATH)
+       ::Bundler.settings.set_local(:without, options[:without])
+       ::Bundler.settings.set_local(:force, options[:force])
++
+       # This env setting avoids the warning given when bundler is run as root, as is required
+       # to update plugins when logstash is run as a service
+-      # Note: Using an `ENV` here because ::Bundler.settings.set_local(:silence_root_warning, true)
+-      # does not work (set_global *does*, but that seems too drastic a change)
+-      with_env("BUNDLE_SILENCE_ROOT_WARNING" => "true") do
++      # Note: Using `ENV`s here because ::Bundler.settings.set_local or `bundle config`
++      # is not being respected with `Bundler::CLI.start`?
++      # (set_global *does*, but that seems too drastic a change)
++      with_env({"BUNDLE_PATH" => LogStash::Environment::BUNDLE_DIR,
++                "BUNDLE_GEMFILE" => LogStash::Environment::GEMFILE_PATH,
++                "BUNDLE_SILENCE_ROOT_WARNING" => "true",
++                "BUNDLE_WITHOUT" => options[:without].join(":")}) do
++
+         if !debug?
+           # Will deal with transient network errors
+           execute_bundler_with_retry(options)
+@@ -247,6 +253,9 @@ def bundler_arguments(options = {})
+           arguments << "--local"
+           arguments << "--no-prune" # From bundler docs: Don't remove stale gems from the cache.
+         end
++        if options[:force]
++          arguments << "--redownload"
++        end
+       elsif options[:update]
+         arguments << "update"
+         arguments << expand_logstash_mixin_dependencies(options[:update])
+diff --git a/qa/acceptance/spec/lib/artifact_composition_spec.rb b/qa/acceptance/spec/lib/artifact_composition_spec.rb
+new file mode 100644
+index 00000000000..6fcf3900370
+--- /dev/null
++++ b/qa/acceptance/spec/lib/artifact_composition_spec.rb
+@@ -0,0 +1,45 @@
++# Licensed to Elasticsearch B.V. under one or more contributor
++# license agreements. See the NOTICE file distributed with
++# this work for additional information regarding copyright
++# ownership. Elasticsearch B.V. licenses this file to you under
++# the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#  http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++
++require_relative '../spec_helper'
++
++describe "artifacts composition" do
++  config = ServiceTester.configuration
++  config.servers.each do |address|
++    logstash = ServiceTester::Artifact.new(address, config.lookup[address])
++
++    before(:each) do
++      logstash.install({:version => LOGSTASH_VERSION})
++    end
++
++    after(:each) do
++      logstash.uninstall
++    end
++
++    context 'prohibited gem dependencies' do
++      it 'does not vendor any version of kramdown' do
++        expect(logstash.gem_vendored?('kramdown')).to be false
++      end
++    end
++
++    context 'necessary gem dependencies (sanity check)' do
++      it 'vendors concurrent-ruby' do
++        expect(logstash.gem_vendored?('concurrent-ruby')).to be true
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/qa/rspec/commands.rb b/qa/rspec/commands.rb
+index 0822b49eda2..557d7084a8d 100644
+--- a/qa/rspec/commands.rb
++++ b/qa/rspec/commands.rb
+@@ -98,6 +98,10 @@ def plugin_installed?(name, version = nil)
+       client.plugin_installed?(host, name, version)
+     end
+ 
++    def gem_vendored?(gem_name)
++      client.gem_vendored?(host, gem_name)
++    end
++
+     def download(from, to)
+       client.download(from, to , host)
+     end
+diff --git a/qa/rspec/commands/base.rb b/qa/rspec/commands/base.rb
+index 1229f66beae..dbb216d3ca5 100644
+--- a/qa/rspec/commands/base.rb
++++ b/qa/rspec/commands/base.rb
+@@ -75,6 +75,29 @@ def plugin_installed?(host, plugin_name, version = nil)
+       plugins_list.include?(search_token)
+     end
+ 
++    ##
++    # Determines whether a specific gem is included in the vendored distribution.
++    #
++    # Returns `true` if _any version_ of the gem is vendored.
++    #
++    # @param host [???]
++    # @param gem_name [String]
++    # @return [Boolean]
++    #   - the block should emit `true` iff the yielded gemspec meets the requirement, and `false` otherwise
++    def gem_vendored?(host, gem_name)
++      cmd = run_command("find /usr/share/logstash/vendor/bundle/jruby/*/specifications -name '#{gem_name}-*.gemspec'", host)
++      matches = cmd.stdout.lines
++      matches.map do |path_to_gemspec|
++        filename = path_to_gemspec.split('/').last
++        gemspec_contents = run_command("cat #{path_to_gemspec}", host).stdout
++        Tempfile.create(filename) do |tempfile|
++          tempfile.write(gemspec_contents)
++          tempfile.flush
++          Gem::Specification::load(tempfile.path)
++        end
++      end.select { |gemspec| gemspec.name == gem_name }.any?
++    end
++
+     def download(from, to, host)
+       run_command("wget #{from} -O #{to}", host)
+     end
+diff --git a/spec/unit/bootstrap/bundler_spec.rb b/spec/unit/bootstrap/bundler_spec.rb
+index 0f8e0e2eccd..5e6fee05274 100644
+--- a/spec/unit/bootstrap/bundler_spec.rb
++++ b/spec/unit/bootstrap/bundler_spec.rb
+@@ -68,7 +68,21 @@
+     end
+ 
+     it 'should call Bundler::CLI.start with the correct arguments' do
++      allow(ENV).to receive(:replace)
+       expect(::Bundler::CLI).to receive(:start).with(bundler_args)
++      expect(ENV).to receive(:replace) do |args|
++        expect(args).to include("BUNDLE_PATH" => LogStash::Environment::BUNDLE_DIR,
++                                                            "BUNDLE_GEMFILE" => LogStash::Environment::GEMFILE_PATH,
++                                                            "BUNDLE_SILENCE_ROOT_WARNING" => "true",
++                                                            "BUNDLE_WITHOUT" => "development")
++      end
++      expect(ENV).to receive(:replace) do |args|
++        expect(args).not_to include(
++                                "BUNDLE_PATH" => LogStash::Environment::BUNDLE_DIR,
++                                "BUNDLE_SILENCE_ROOT_WARNING" => "true",
++                                "BUNDLE_WITHOUT" => "development")
++      end
++
+       LogStash::Bundler.invoke!(options)
+     end
+ 

@@ -1,0 +1,438 @@
+diff --git a/logstash-core-event-java/build.gradle b/logstash-core-event-java/build.gradle
+index b4cc6aa38e6..b2a4a55ec43 100644
+--- a/logstash-core-event-java/build.gradle
++++ b/logstash-core-event-java/build.gradle
+@@ -92,8 +92,8 @@ idea {
+ }
+ 
+ dependencies {
+-    compile 'org.codehaus.jackson:jackson-mapper-asl:1.9.13'
+-    compile 'org.codehaus.jackson:jackson-core-asl:1.9.13'
++    compile 'com.fasterxml.jackson.core:jackson-core:2.7.1'
++    compile 'com.fasterxml.jackson.core:jackson-databind:2.7.1-1'
+     provided 'org.jruby:jruby-core:1.7.22'
+     testCompile 'junit:junit:4.12'
+     testCompile 'net.javacrumbs.json-unit:json-unit:1.9.0'
+diff --git a/logstash-core-event-java/lib/logstash-core-event-java_jars.rb b/logstash-core-event-java/lib/logstash-core-event-java_jars.rb
+index 7c584fcffba..143d7a3e068 100644
+--- a/logstash-core-event-java/lib/logstash-core-event-java_jars.rb
++++ b/logstash-core-event-java/lib/logstash-core-event-java_jars.rb
+@@ -1,5 +1,6 @@
+ # this is a generated file, to avoid over-writing it just delete this comment
+ require 'jar_dependencies'
+ 
+-require_jar( 'org.codehaus.jackson', 'jackson-core-asl', '1.9.13' )
+-require_jar( 'org.codehaus.jackson', 'jackson-mapper-asl', '1.9.13' )
++require_jar( 'com.fasterxml.jackson.core', 'jackson-core', '2.7.1' )
++require_jar( 'com.fasterxml.jackson.core', 'jackson-annotations', '2.7.0' )
++require_jar( 'com.fasterxml.jackson.core', 'jackson-databind', '2.7.1-1' )
+diff --git a/logstash-core-event-java/logstash-core-event-java.gemspec b/logstash-core-event-java/logstash-core-event-java.gemspec
+index d20ffd575df..10beff6d4bb 100644
+--- a/logstash-core-event-java/logstash-core-event-java.gemspec
++++ b/logstash-core-event-java/logstash-core-event-java.gemspec
+@@ -26,7 +26,6 @@ Gem::Specification.new do |gem|
+   # which does not have this problem.
+   gem.add_runtime_dependency "ruby-maven", "~> 3.3.9"
+ 
+-  gem.requirements << "jar org.codehaus.jackson:jackson-mapper-asl, 1.9.13"
+-  gem.requirements << "jar org.codehaus.jackson:jackson-core-asl, 1.9.13"
++  gem.requirements << "jar com.fasterxml.jackson.core:jackson-core, 2.7.1"
++  gem.requirements << "jar com.fasterxml.jackson.core:jackson-databind, 2.7.1-1"
+ end
+-
+diff --git a/logstash-core-event-java/spec/event_spec.rb b/logstash-core-event-java/spec/event_spec.rb
+index c42440370ab..e06d2eeaa04 100644
+--- a/logstash-core-event-java/spec/event_spec.rb
++++ b/logstash-core-event-java/spec/event_spec.rb
+@@ -233,4 +233,46 @@ def self.warn(message)
+       expect(h).to eq(source_hash_with_matada)
+     end
+   end
++
++  context "from_json" do
++    let (:source_json) { "{\"foo\":1, \"bar\":\"baz\"}" }
++    let (:blank_strings) {["", "  ",  "   "]}
++    let (:bare_strings) {["aa", "  aa", "aa  "]}
++
++    it "should produce a new event from json" do
++      expect(LogStash::Event.from_json(source_json).size).to eq(1)
++
++      event = LogStash::Event.from_json(source_json)[0]
++      expect(event["[foo]"]).to eq(1)
++      expect(event["[bar]"]).to eq("baz")
++    end
++
++    it "should consistently handle blank string" do
++      blank_strings.each do |s|
++        t = LogStash::Timestamp.new
++        expect(LogStash::Event.from_json(s).size).to eq(1)
++
++        event1 = LogStash::Event.from_json(s)[0]
++        event2 = LogStash::Event.new(LogStash::Json.load(s))
++        event1.timestamp = t
++        event2.timestamp = t
++
++        expect(event1.to_hash).to eq(event2.to_hash)
++      end
++    end
++
++    it "should consistently handle nil" do
++      blank_strings.each do |s|
++        expect{LogStash::Event.from_json(nil)}.to raise_error
++        expect{LogStash::Event.new(LogStash::Json.load(nil))}.to raise_error
++      end
++    end
++
++    it "should consistently handle bare string" do
++      bare_strings.each do |s|
++        expect{LogStash::Event.from_json(s)}.to raise_error LogStash::Json::ParserError
++        expect{LogStash::Event.new(LogStash::Json.load(s))}.to raise_error LogStash::Json::ParserError
++       end
++    end
++  end
+ end
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/Event.java b/logstash-core-event-java/src/main/java/com/logstash/Event.java
+index cc51f011c26..a9653156f6b 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/Event.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/Event.java
+@@ -1,7 +1,7 @@
+ package com.logstash;
+ 
++import com.fasterxml.jackson.databind.ObjectMapper;
+ import com.logstash.ext.JrubyTimestampExtLibrary;
+-import org.codehaus.jackson.map.ObjectMapper;
+ import org.joda.time.DateTime;
+ import org.jruby.RubySymbol;
+ 
+@@ -153,10 +153,40 @@ public boolean includes(String reference) {
+         }
+     }
+ 
+-    public String toJson() throws IOException {
++    public String toJson()
++            throws IOException
++    {
+         return mapper.writeValueAsString((Map<String, Object>)this.data);
+     }
+ 
++    public static Event[] fromJson(String json)
++            throws IOException
++    {
++        Event[] result;
++
++        if (json == null || json.trim().isEmpty()) {
++            return new Event[]{ new Event() };
++        }
++
++        Object o = mapper.readValue(json, Object.class);
++        // we currently only support Map or Array json objects
++        if (o instanceof Map) {
++            result = new Event[]{ new Event((Map)o) };
++        } else if (o instanceof List) {
++            result = new Event[((List) o).size()];
++            int i = 0;
++            for (Object e : (List)o) {
++                if (!(e instanceof Map)) {
++                    throw new IOException("incompatible inner json array object type=" + e.getClass().getName() + " , only hash map is suppoted");
++                }
++                result[i++] = new Event((Map)e);
++            }
++        } else {
++            throw new IOException("incompatible json object type=" + o.getClass().getName() + " , only hash map or arrays are suppoted");
++        }
++        return result;
++    }
++
+     public Map toMap() {
+         return this.data;
+     }
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/KeyNode.java b/logstash-core-event-java/src/main/java/com/logstash/KeyNode.java
+index c43d694e661..cfc46861f69 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/KeyNode.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/KeyNode.java
+@@ -1,7 +1,6 @@
+ package com.logstash;
+ 
+-import org.codehaus.jackson.JsonGenerationException;
+-import org.codehaus.jackson.map.ObjectMapper;
++import com.fasterxml.jackson.databind.ObjectMapper;
+ 
+ import java.io.IOException;
+ import java.util.List;
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/TemplateNode.java b/logstash-core-event-java/src/main/java/com/logstash/TemplateNode.java
+index c71dbd33e71..942bbc1ee03 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/TemplateNode.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/TemplateNode.java
+@@ -1,7 +1,5 @@
+ package com.logstash;
+ 
+-import org.codehaus.jackson.JsonGenerationException;
+-
+ import java.io.IOException;
+ 
+ /**
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/Timestamp.java b/logstash-core-event-java/src/main/java/com/logstash/Timestamp.java
+index 3900d05d26d..6385f3fd6ab 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/Timestamp.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/Timestamp.java
+@@ -1,6 +1,6 @@
+ package com.logstash;
+ 
+-import org.codehaus.jackson.map.annotate.JsonSerialize;
++import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+ import org.joda.time.DateTime;
+ import org.joda.time.DateTimeZone;
+ import org.joda.time.LocalDateTime;
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/TimestampSerializer.java b/logstash-core-event-java/src/main/java/com/logstash/TimestampSerializer.java
+index 51385986cad..c90afdd9227 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/TimestampSerializer.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/TimestampSerializer.java
+@@ -1,8 +1,8 @@
+ package com.logstash;
+ 
+-import org.codehaus.jackson.JsonGenerator;
+-import org.codehaus.jackson.map.JsonSerializer;
+-import org.codehaus.jackson.map.SerializerProvider;
++import com.fasterxml.jackson.core.JsonGenerator;
++import com.fasterxml.jackson.databind.JsonSerializer;
++import com.fasterxml.jackson.databind.SerializerProvider;
+ 
+ import java.io.IOException;
+ 
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyEventExtLibrary.java b/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyEventExtLibrary.java
+index 896a37c900b..1cb630d5a75 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyEventExtLibrary.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyEventExtLibrary.java
+@@ -35,6 +35,10 @@
+ 
+ public class JrubyEventExtLibrary implements Library {
+ 
++    private static RubyClass PARSER_ERROR = null;
++    private static RubyClass GENERATOR_ERROR = null;
++    private static RubyClass LOGSTASH_ERROR = null;
++
+     public void load(Ruby runtime, boolean wrap) throws IOException {
+         RubyModule module = runtime.defineModule("LogStash");
+ 
+@@ -54,6 +58,19 @@ public IRubyObject allocate(Ruby runtime, RubyClass rubyClass) {
+         clazz.setConstant("VERSION_ONE", runtime.newString(Event.VERSION_ONE));
+         clazz.defineAnnotatedMethods(RubyEvent.class);
+         clazz.defineAnnotatedConstants(RubyEvent.class);
++
++        PARSER_ERROR = runtime.getModule("LogStash").defineOrGetModuleUnder("Json").getClass("ParserError");
++        if (PARSER_ERROR == null) {
++            throw new RaiseException(runtime, runtime.getClass("StandardError"), "Could not find LogStash::Json::ParserError class", true);
++        }
++        GENERATOR_ERROR = runtime.getModule("LogStash").defineOrGetModuleUnder("Json").getClass("GeneratorError");
++        if (GENERATOR_ERROR == null) {
++            throw new RaiseException(runtime, runtime.getClass("StandardError"), "Could not find LogStash::Json::GeneratorError class", true);
++        }
++        LOGSTASH_ERROR = runtime.getModule("LogStash").getClass("Error");
++        if (LOGSTASH_ERROR == null) {
++            throw new RaiseException(runtime, runtime.getClass("StandardError"), "Could not find LogStash::Error class", true);
++        }
+     }
+ 
+     public static class ProxyLogger implements Logger {
+@@ -107,7 +124,7 @@ public IRubyObject ruby_initialize(ThreadContext context, IRubyObject[] args)
+             args = Arity.scanArgs(context.runtime, args, 0, 1);
+             IRubyObject data = args[0];
+ 
+-            if (data.isNil()) {
++            if (data == null || data.isNil()) {
+                 this.event = new Event();
+             } else if (data instanceof RubyHash) {
+                 HashMap<String, Object>  newObj = Javafier.deep((RubyHash) data);
+@@ -215,7 +232,7 @@ public IRubyObject ruby_sprintf(ThreadContext context, IRubyObject format) throw
+             try {
+                 return RubyString.newString(context.runtime, event.sprintf(format.toString()));
+             } catch (IOException e) {
+-                throw new RaiseException(getRuntime(), (RubyClass)getRuntime().getModule("LogStash").getClass("Error"), "timestamp field is missing", true);
++                throw new RaiseException(getRuntime(), LOGSTASH_ERROR, "timestamp field is missing", true);
+             }
+         }
+ 
+@@ -251,9 +268,38 @@ public IRubyObject ruby_to_java(ThreadContext context)
+ 
+         @JRubyMethod(name = "to_json", rest = true)
+         public IRubyObject ruby_to_json(ThreadContext context, IRubyObject[] args)
+-            throws IOException
+         {
+-            return RubyString.newString(context.runtime, event.toJson());
++            try {
++                return RubyString.newString(context.runtime, event.toJson());
++            } catch (Exception e) {
++                throw new RaiseException(context.runtime, GENERATOR_ERROR, e.getMessage(), true);
++            }
++        }
++
++        // @param value [String] the json string. A json object/map will convert to an array containing a single Event.
++        // and a json array will convert each element into individual Event
++        // @return Array<Event> array of events
++        @JRubyMethod(name = "from_json", required = 1, meta = true)
++        public static IRubyObject ruby_from_json(ThreadContext context, IRubyObject recv, RubyString value)
++        {
++            Event[] events;
++            try {
++                events = Event.fromJson(value.asJavaString());
++            } catch (Exception e) {
++                throw new RaiseException(context.runtime, PARSER_ERROR, e.getMessage(), true);
++            }
++
++            RubyArray result = RubyArray.newArray(context.runtime, events.length);
++
++            if (events.length == 1) {
++                // micro optimization for the 1 event more common use-case.
++                result.set(0, RubyEvent.newRubyEvent(context.runtime, events[0]));
++            } else {
++                for (int i = 0; i < events.length; i++) {
++                    result.set(i, RubyEvent.newRubyEvent(context.runtime, events[i]));
++                }
++            }
++            return result;
+         }
+ 
+         @JRubyMethod(name = "validate_value", required = 1, meta = true)
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyTimestampExtLibrary.java b/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyTimestampExtLibrary.java
+index 30296f4324e..4b523a52cc7 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyTimestampExtLibrary.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyTimestampExtLibrary.java
+@@ -1,7 +1,6 @@
+ package com.logstash.ext;
+ 
+ import com.logstash.*;
+-import org.codehaus.jackson.map.annotate.JsonSerialize;
+ import org.jruby.*;
+ import org.jruby.anno.JRubyClass;
+ import org.jruby.anno.JRubyMethod;
+diff --git a/logstash-core-event-java/src/test/java/com/logstash/EventTest.java b/logstash-core-event-java/src/test/java/com/logstash/EventTest.java
+index 1450bf3c7c4..08e8715c4e6 100644
+--- a/logstash-core-event-java/src/test/java/com/logstash/EventTest.java
++++ b/logstash-core-event-java/src/test/java/com/logstash/EventTest.java
+@@ -1,6 +1,8 @@
+ package com.logstash;
+ 
+ import org.junit.Test;
++
++import java.io.IOException;
+ import java.util.*;
+ import static org.junit.Assert.*;
+ import static net.javacrumbs.jsonunit.JsonAssert.assertJsonEquals;
+@@ -116,4 +118,84 @@ public void testAppend() throws Exception {
+ 
+         assertEquals(Arrays.asList("original1", "original2"), e.getField("field1"));
+     }
+-}
+\ No newline at end of file
++
++    @Test
++    public void testFromJsonWithNull() throws Exception {
++        Map data1 = Event.fromJson(null)[0].toMap();
++        data1.remove("@timestamp");
++        Map data2 = new Event().toMap();
++        data2.remove("@timestamp");
++
++        assertEquals(data1, data2);
++    }
++
++    @Test
++    public void testFromJsonWithEmptyString() throws Exception {
++        Map data1 = Event.fromJson("")[0].toMap();
++        data1.remove("@timestamp");
++        Map data2 = new Event().toMap();
++        data2.remove("@timestamp");
++
++        assertEquals(data1, data2);
++    }
++
++    @Test
++    public void testFromJsonWithBlankString() throws Exception {
++        Map data1 = Event.fromJson("   ")[0].toMap();
++        data1.remove("@timestamp");
++        Map data2 = new Event().toMap();
++        data2.remove("@timestamp");
++
++        assertEquals(data1, data2);
++    }
++
++    @Test
++    public void testFromJsonWithValidJsonMap() throws Exception {
++        Event e = Event.fromJson("{\"@timestamp\":\"2015-05-28T23:02:05.350Z\",\"foo\":\"bar\"}")[0];
++
++        assertEquals("bar", e.getField("[foo]"));
++        assertEquals("2015-05-28T23:02:05.350Z", e.getTimestamp().toIso8601());
++    }
++
++    @Test
++    public void testFromJsonWithValidJsonArrayOfMap() throws Exception {
++        Event[] l = Event.fromJson("[{\"@timestamp\":\"2015-05-28T23:02:05.350Z\",\"foo\":\"bar\"}]");
++
++        assertEquals(1, l.length);
++        assertEquals("bar", l[0].getField("[foo]"));
++        assertEquals("2015-05-28T23:02:05.350Z", l[0].getTimestamp().toIso8601());
++
++        l = Event.fromJson("[{}]");
++
++        assertEquals(1, l.length);
++        assertEquals(null, l[0].getField("[foo]"));
++
++        l = Event.fromJson("[{\"@timestamp\":\"2015-05-28T23:02:05.350Z\",\"foo\":\"bar\"}, {\"@timestamp\":\"2016-05-28T23:02:05.350Z\",\"foo\":\"baz\"}]");
++
++        assertEquals(2, l.length);
++        assertEquals("bar", l[0].getField("[foo]"));
++        assertEquals("2015-05-28T23:02:05.350Z", l[0].getTimestamp().toIso8601());
++        assertEquals("baz", l[1].getField("[foo]"));
++        assertEquals("2016-05-28T23:02:05.350Z", l[1].getTimestamp().toIso8601());
++    }
++
++    @Test(expected=IOException.class)
++    public void testFromJsonWithInvalidJsonString() throws Exception {
++        Event.fromJson("gabeutch");
++    }
++
++    @Test(expected=IOException.class)
++    public void testFromJsonWithInvalidJsonArray1() throws Exception {
++        Event.fromJson("[1,2]");
++    }
++
++    @Test(expected=IOException.class)
++    public void testFromJsonWithInvalidJsonArray2() throws Exception {
++        Event.fromJson("[\"gabeutch\"]");
++    }
++
++    @Test(expected=IOException.class)
++    public void testFromJsonWithPartialInvalidJsonArray() throws Exception {
++        Event.fromJson("[{\"foo\":\"bar\"}, 1]");
++    }
++}
+diff --git a/logstash-core/spec/logstash/json_spec.rb b/logstash-core/spec/logstash/json_spec.rb
+index f0304f219c8..68a1a6811eb 100644
+--- a/logstash-core/spec/logstash/json_spec.rb
++++ b/logstash-core/spec/logstash/json_spec.rb
+@@ -18,6 +18,9 @@
+   let(:multi) {
+     [
+       {:ruby => "foo bar baz", :json => "\"foo bar baz\""},
++      {:ruby => "foo   ", :json => "\"foo   \""},
++      {:ruby => " ", :json => "\" \""},
++      {:ruby => "   ", :json => "\"   \""},
+       {:ruby => "1", :json => "\"1\""},
+       {:ruby => {"a" => true}, :json => "{\"a\":true}"},
+       {:ruby => {"a" => nil}, :json => "{\"a\":null}"},
+@@ -93,4 +96,16 @@
+   it "should raise Json::ParserError on invalid json" do
+     expect{LogStash::Json.load("abc")}.to raise_error LogStash::Json::ParserError
+   end
++
++  it "should return nil on empty string" do
++    o = LogStash::Json.load("")
++    expect(o).to be_nil
++  end
++
++  it "should return nil on blank string" do
++    o = LogStash::Json.load(" ")
++    expect(o).to be_nil
++    o = LogStash::Json.load("  ")
++    expect(o).to be_nil
++  end
+ end

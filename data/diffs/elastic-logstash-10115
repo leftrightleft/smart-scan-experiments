@@ -1,0 +1,147 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index ad1b418ef22..ddb00ec7668 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -33,6 +33,10 @@ def initialize(settings = LogStash::SETTINGS, source_loader = nil)
+     @auto_reload = setting("config.reload.automatic")
+     @ephemeral_id = SecureRandom.uuid
+ 
++    # Mutex to synchonize in the exclusive method
++    # Initial usage for the Ruby pipeline initialization which is not thread safe
++    @exclusive_lock = Mutex.new
++
+     # Special bus object for inter-pipelines communications. Used by the `pipeline` input/output
+     @pipeline_bus = org.logstash.plugins.pipeline.PipelineBus.new
+ 
+@@ -84,6 +88,10 @@ def initialize(settings = LogStash::SETTINGS, source_loader = nil)
+     @running = Concurrent::AtomicBoolean.new(false)
+   end
+ 
++  def exclusive(&block)
++    @exclusive_lock.synchronize { block.call }
++  end
++
+   def execute
+     @thread = Thread.current # this var is implicitly used by Stud.stop?
+     logger.debug("Starting agent")
+diff --git a/logstash-core/lib/logstash/pipeline_action/create.rb b/logstash-core/lib/logstash/pipeline_action/create.rb
+index b16dd665a6b..138a41a522d 100644
+--- a/logstash-core/lib/logstash/pipeline_action/create.rb
++++ b/logstash-core/lib/logstash/pipeline_action/create.rb
+@@ -35,7 +35,12 @@ def execute(agent, pipelines)
+         if @pipeline_config.settings.get_value("pipeline.java_execution")
+           LogStash::JavaPipeline.new(@pipeline_config, @metric, agent)
+         else
+-          LogStash::Pipeline.new(@pipeline_config, @metric, agent)
++          agent.exclusive do
++            # The Ruby pipeline initialization is not thread safe because of the module level
++            # shared state in LogsStash::Config::AST. When using multiple pipelines this gets
++            # executed simultaneously in different threads and we need to synchonize this initialization.
++            LogStash::Pipeline.new(@pipeline_config, @metric, agent)
++          end
+         end
+ 
+       status = nil
+diff --git a/logstash-core/lib/logstash/pipeline_action/reload.rb b/logstash-core/lib/logstash/pipeline_action/reload.rb
+index 504f4fce4e9..0de57481bf4 100644
+--- a/logstash-core/lib/logstash/pipeline_action/reload.rb
++++ b/logstash-core/lib/logstash/pipeline_action/reload.rb
+@@ -32,7 +32,12 @@ def execute(agent, pipelines)
+           if @pipeline_config.settings.get_value("pipeline.java_execution")
+             LogStash::JavaBasePipeline.new(@pipeline_config, nil, logger, nil)
+           else
+-            LogStash::BasePipeline.new(@pipeline_config)
++            agent.exclusive do
++              # The Ruby pipeline initialization is not thread safe because of the module level
++              # shared state in LogsStash::Config::AST. When using multiple pipelines this can gets
++              # executed simultaneously in different threads and we need to synchonize this initialization.
++              LogStash::BasePipeline.new(@pipeline_config)
++            end
+           end
+       rescue => e
+         return LogStash::ConvergeResult::FailedAction.from_exception(e)
+diff --git a/logstash-core/spec/logstash/pipeline_action/create_spec.rb b/logstash-core/spec/logstash/pipeline_action/create_spec.rb
+index 18b8c36b475..33eba97a702 100644
+--- a/logstash-core/spec/logstash/pipeline_action/create_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_action/create_spec.rb
+@@ -33,21 +33,25 @@
+     let(:pipeline_config) { mock_pipeline_config(:main, "input { generator { count => 1 } } output { null {} }") }
+ 
+     it "returns a successful execution status" do
++      allow(agent).to receive(:exclusive) { |&arg| arg.call }
+       expect(subject.execute(agent, pipelines)).to be_truthy
+     end
+   end
+ 
+   context "when the pipeline successfully start" do
+     it "adds the pipeline to the current pipelines" do
++      allow(agent).to receive(:exclusive) { |&arg| arg.call }
+       expect { subject.execute(agent, pipelines) }.to change(pipelines, :size).by(1)
+     end
+ 
+     it "starts the pipeline" do
++      allow(agent).to receive(:exclusive) { |&arg| arg.call }
+       subject.execute(agent, pipelines)
+       expect(pipelines[:main].running?).to be_truthy
+     end
+ 
+     it "returns a successful execution status" do
++      allow(agent).to receive(:exclusive) { |&arg| arg.call }
+       expect(subject.execute(agent, pipelines)).to be_truthy
+     end
+   end
+@@ -65,6 +69,7 @@
+       let(:pipeline_config) { mock_pipeline_config(:main, "input { generator { id => '123' } } filter { ruby { init => '1/0' code => '1+2' } } output { null {} }") }
+ 
+       it "returns false" do
++        allow(agent).to receive(:exclusive) { |&arg| arg.call }
+         expect(subject.execute(agent, pipelines)).not_to be_a_successful_action
+       end
+     end
+diff --git a/logstash-core/spec/logstash/pipeline_action/reload_spec.rb b/logstash-core/spec/logstash/pipeline_action/reload_spec.rb
+index c1e11d7485c..23b55796756 100644
+--- a/logstash-core/spec/logstash/pipeline_action/reload_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_action/reload_spec.rb
+@@ -33,15 +33,18 @@
+ 
+   context "when existing pipeline and new pipeline are both reloadable" do
+     it "stop the previous pipeline" do
++      allow(agent).to receive(:exclusive) { |&arg| arg.call }
+       expect { subject.execute(agent, pipelines) }.to change(pipeline, :running?).from(true).to(false)
+     end
+ 
+     it "start the new pipeline" do
++      allow(agent).to receive(:exclusive) { |&arg| arg.call }
+       subject.execute(agent, pipelines)
+       expect(pipelines[pipeline_id].running?).to be_truthy
+     end
+ 
+     it "run the new pipeline code" do
++      allow(agent).to receive(:exclusive) { |&arg| arg.call }
+       subject.execute(agent, pipelines)
+       expect(pipelines[pipeline_id].config_hash).to eq(new_pipeline_config.config_hash)
+     end
+@@ -61,6 +64,7 @@
+     let(:new_pipeline_config) { mock_pipeline_config(pipeline_id, "input { generator { id => 'new' } } output { null {} }", { "pipeline.reloadable" => false}) }
+ 
+     it "cannot successfully execute the action" do
++      allow(agent).to receive(:exclusive) { |&arg| arg.call }
+       expect(subject.execute(agent, pipelines)).not_to be_a_successful_action
+     end
+   end
+@@ -69,6 +73,7 @@
+     let(:new_pipeline_config) { mock_pipeline_config(pipeline_id, "input generator { id => 'new' } } output { null {} }", { "pipeline.reloadable" => false}) }
+ 
+     it "cannot successfully execute the action" do
++      allow(agent).to receive(:exclusive) { |&arg| arg.call }
+       expect(subject.execute(agent, pipelines)).not_to be_a_successful_action
+     end
+   end
+@@ -79,6 +84,7 @@
+     end
+ 
+     it "cannot successfully execute the action" do
++      allow(agent).to receive(:exclusive) { |&arg| arg.call }
+       expect(subject.execute(agent, pipelines)).not_to be_a_successful_action
+     end
+   end

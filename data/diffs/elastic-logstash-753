@@ -1,0 +1,278 @@
+diff --git a/lib/logstash/inputs/s3.rb b/lib/logstash/inputs/s3.rb
+index dc6e08fc994..f8a66ff6bae 100644
+--- a/lib/logstash/inputs/s3.rb
++++ b/lib/logstash/inputs/s3.rb
+@@ -1,5 +1,6 @@
+ require "logstash/inputs/base"
+ require "logstash/namespace"
++require "logstash/plugin_mixins/aws_config"
+ 
+ require "aws-sdk"
+ require "time"
+@@ -10,6 +11,8 @@
+ # Each line from each file generates an event.
+ # Files ending in '.gz' are handled as gzip'ed files.
+ class LogStash::Inputs::S3 < LogStash::Inputs::Base
++  include LogStash::PluginMixins::AwsConfig
++
+   config_name "s3"
+   milestone 1
+ 
+@@ -17,27 +20,9 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
+   # support and readline usage). Support gzip through a gzip codec! ;)
+   default :codec, "plain"
+ 
+-  # The credentials of the AWS account used to access the bucket.
+-  # Credentials can be specified:
+-  # - As an ["id","secret"] array
+-  # - As a path to a file containing AWS_ACCESS_KEY_ID=... and AWS_SECRET_ACCESS_KEY=...
+-  # - In the environment (variables AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)
+-  config :credentials, :validate => :array, :default => nil
+-
+   # The name of the S3 bucket.
+   config :bucket, :validate => :string, :required => true
+ 
+-  # The AWS region for your bucket.
+-  config :region, :validate => ["us-east-1", "us-west-1", "us-west-2",
+-                                "eu-west-1", "ap-southeast-1", "ap-southeast-2",
+-                                "ap-northeast-1", "sa-east-1", "us-gov-west-1"],
+-                                :deprecated => "'region' has been deprecated in favor of 'region_endpoint'"
+-
+-  # The AWS region for your bucket.
+-  config :region_endpoint, :validate => ["us-east-1", "us-west-1", "us-west-2",
+-                                "eu-west-1", "ap-southeast-1", "ap-southeast-2",
+-                                "ap-northeast-1", "sa-east-1", "us-gov-west-1"], :default => "us-east-1"
+-
+   # If specified, the prefix the filenames in the bucket must match (not a regexp)
+   config :prefix, :validate => :string, :default => nil
+ 
+@@ -63,42 +48,7 @@ class LogStash::Inputs::S3 < LogStash::Inputs::Base
+   def register
+     require "digest/md5"
+ 
+-    @region_endpoint = @region if !@region.empty?
+-
+-    @region_endpoint == 'us-east-1' ? @region_endpoint = 's3.amazonaws.com' : @region_endpoint = 's3-'+@region_endpoint+'.amazonaws.com'
+-
+-    @logger.info("Registering s3 input", :bucket => @bucket, :region_endpoint => @region_endpoint)
+-
+-    if @credentials.nil?
+-      @access_key_id = ENV['AWS_ACCESS_KEY_ID']
+-      @secret_access_key = ENV['AWS_SECRET_ACCESS_KEY']
+-    elsif @credentials.is_a? Array
+-      if @credentials.length ==1
+-        File.open(@credentials[0]) { |f| f.each do |line|
+-          unless (/^\#/.match(line))
+-            if(/\s*=\s*/.match(line))
+-              param, value = line.split('=', 2)
+-              param = param.chomp().strip()
+-              value = value.chomp().strip()
+-              if param.eql?('AWS_ACCESS_KEY_ID')
+-                @access_key_id = value
+-              elsif param.eql?('AWS_SECRET_ACCESS_KEY')
+-                @secret_access_key = value
+-              end
+-            end
+-          end
+-        end
+-        }
+-      elsif @credentials.length == 2
+-        @access_key_id = @credentials[0]
+-        @secret_access_key = @credentials[1]
+-      else
+-        raise ArgumentError.new('Credentials must be of the form "/path/to/file" or ["id", "secret"]')
+-      end
+-    end
+-    if @access_key_id.nil? or @secret_access_key.nil?
+-      raise ArgumentError.new('Missing AWS credentials')
+-    end
++    @logger.info("Registering s3 input", :bucket => @bucket, :region => @region)
+ 
+     if @bucket.nil?
+       raise ArgumentError.new('Missing AWS bucket')
+@@ -111,11 +61,7 @@ def register
+       @sincedb_path = File.join(ENV["HOME"], ".sincedb_" + Digest::MD5.hexdigest("#{@bucket}+#{@prefix}"))
+     end
+ 
+-    s3 = AWS::S3.new(
+-      :access_key_id => @access_key_id,
+-      :secret_access_key => @secret_access_key,
+-      :region => @region_endpoint
+-    )
++    s3 = AWS::S3.new(aws_options_hash)
+ 
+     @s3bucket = s3.buckets[@bucket]
+ 
+diff --git a/lib/logstash/inputs/sqs.rb b/lib/logstash/inputs/sqs.rb
+index e2d425b609b..7648188e7e9 100644
+--- a/lib/logstash/inputs/sqs.rb
++++ b/lib/logstash/inputs/sqs.rb
+@@ -74,13 +74,6 @@ class LogStash::Inputs::SQS < LogStash::Inputs::Threadable
+   # Name of the event field in which to store the  SQS message Sent Timestamp
+   config :sent_timestamp_field, :validate => :string
+ 
+-  public
+-  def aws_service_endpoint(region)
+-    return {
+-        :sqs_endpoint => "sqs.#{region}.amazonaws.com"
+-    }
+-  end
+-
+   public
+   def register
+     @logger.info("Registering SQS input", :queue => @queue)
+diff --git a/lib/logstash/outputs/s3.rb b/lib/logstash/outputs/s3.rb
+index 857c4392ef0..ab5b99433cf 100644
+--- a/lib/logstash/outputs/s3.rb
++++ b/lib/logstash/outputs/s3.rb
+@@ -1,8 +1,8 @@
++require "fileutils"
++
+ require "logstash/outputs/base"
+ require "logstash/namespace"
+-
+-# TODO integrate aws_config in the future 
+-#require "logstash/plugin_mixins/aws_config"
++require "logstash/plugin_mixins/aws_config"
+ 
+ # INFORMATION:
+ 
+@@ -47,7 +47,6 @@
+ # I tried to comment the class at best i could do. 
+ # I think there are much thing to improve, but if you want some points to develop here a list:
+ 
+-# TODO Integrate aws_config in the future 
+ # TODO Find a method to push them all files when logtstash close the session.
+ # TODO Integrate @field on the path file
+ # TODO Permanent connection or on demand? For now on demand, but isn't a good implementation. 
+@@ -64,7 +63,7 @@
+ #    s3{ 
+ #      access_key_id => "crazy_key"             (required)
+ #      secret_access_key => "monkey_access_key" (required)
+-#      endpoint_region => "eu-west-1"           (required)
++#      region => "eu-west-1"                    (required)
+ #      bucket => "boss_please_open_your_bucket" (required)         
+ #      size_file => 2048                        (optional)
+ #      time_file => 5                           (optional)
+@@ -103,26 +102,14 @@
+ # LET'S ROCK AND ROLL ON THE CODE!
+ 
+ class LogStash::Outputs::S3 < LogStash::Outputs::Base
+- #TODO integrate aws_config in the future 
+- #  include LogStash::PluginMixins::AwsConfig
++  include LogStash::PluginMixins::AwsConfig
+ 
+  config_name "s3"
+  milestone 1
+ 
+- # Aws access_key.
+- config :access_key_id, :validate => :string
+- 
+- # Aws secret_access_key
+- config :secret_access_key, :validate => :string
+-
+  # S3 bucket
+  config :bucket, :validate => :string
+ 
+- # Aws endpoint_region
+- config :endpoint_region, :validate => ["us-east-1", "us-west-1", "us-west-2",
+-                                        "eu-west-1", "ap-southeast-1", "ap-southeast-2",
+-                                        "ap-northeast-1", "sa-east-1", "us-gov-west-1"], :default => "us-east-1"
+-
+  # Set the size of file in KB, this means that files on bucket when have dimension > file_size, they are stored in two or more file. 
+  # If you have tags then it will generate a specific size file for every tags
+  ##NOTE: define size of file is the better thing, because generate a local temporary file on disk and then put it in bucket. 
+@@ -150,16 +137,9 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
+  # Method to set up the aws configuration and establish connection
+  def aws_s3_config
+ 
+-  @endpoint_region == 'us-east-1' ? @endpoint_region = 's3.amazonaws.com' : @endpoint_region = 's3-'+@endpoint_region+'.amazonaws.com'
+-
+   @logger.info("Registering s3 output", :bucket => @bucket, :endpoint_region => @endpoint_region)
+ 
+-  AWS.config(
+-    :access_key_id => @access_key_id,
+-    :secret_access_key => @secret_access_key,
+-    :s3_endpoint => @endpoint_region
+-  )
+-  @s3 = AWS::S3.new 
++  @s3 = AWS::S3.new(aws_options_hash)
+ 
+  end
+ 
+@@ -234,7 +214,7 @@ def upFile(flag, name)
+ 
+  # This method is used for create new empty temporary files for use. Flag is needed for indicate new subsection time_file.
+  def newFile (flag)
+-  
++   
+    if (flag == true)
+      @current_final_path = getFinalPath
+      @sizeCounter = 0
+@@ -262,7 +242,7 @@ def register
+ 
+    if !(File.directory? @temp_directory)
+     @logger.debug "S3: Directory "+@temp_directory+" doesn't exist, let's make it!"
+-    Dir.mkdir(@temp_directory)
++    FileUtils.mkdir_p @temp_directory
+    else
+     @logger.debug "S3: Directory "+@temp_directory+" exist, nothing to do"
+    end 
+@@ -345,7 +325,7 @@ def receive(event)
+  def self.format_message(event)
+     message = "Date: #{event["@timestamp"]}\n"
+     message << "Source: #{event["source"]}\n"
+-    message << "Tags: #{event["tags"].join(', ')}\n"
++    message << "Tags: #{event["tags"].join(', ')}\n" if event["tags"]
+     message << "Fields: #{event.to_hash.inspect}\n"
+     message << "Message: #{event["message"]}"
+  end
+diff --git a/lib/logstash/outputs/sns.rb b/lib/logstash/outputs/sns.rb
+index 2a8c368bba1..7aebed53558 100644
+--- a/lib/logstash/outputs/sns.rb
++++ b/lib/logstash/outputs/sns.rb
+@@ -46,13 +46,6 @@ class LogStash::Outputs::Sns < LogStash::Outputs::Base
+   #
+   config :publish_boot_message_arn, :validate => :string
+ 
+-  public
+-  def aws_service_endpoint(region)
+-    return {
+-        :sns_endpoint => "sns.#{region}.amazonaws.com"
+-    }
+-  end
+-
+   public
+   def register
+     require "aws-sdk"
+@@ -113,7 +106,7 @@ def self.json_message(event)
+   def self.format_message(event)
+     message =  "Date: #{event["@timestamp"]}\n"
+     message << "Source: #{event["source"]}\n"
+-    message << "Tags: #{event["tags"].join(', ')}\n"
++    message << "Tags: #{event["tags"].join(', ')}\n" if event["tags"]
+     message << "Fields: #{event.to_hash.inspect}\n"
+     message << "Message: #{event["message"]}"
+ 
+diff --git a/lib/logstash/plugin_mixins/aws_config.rb b/lib/logstash/plugin_mixins/aws_config.rb
+index 3ff515eb9b4..27ac888c3ba 100644
+--- a/lib/logstash/plugin_mixins/aws_config.rb
++++ b/lib/logstash/plugin_mixins/aws_config.rb
+@@ -75,16 +75,7 @@ def aws_options_hash
+       opts[:proxy_uri] = @proxy_uri
+     end
+ 
+-    # The AWS SDK for Ruby doesn't know how to make an endpoint hostname from a region
+-    # for example us-west-1 -> foosvc.us-west-1.amazonaws.com
+-    # So our plugins need to know how to generate their endpoints from a region
+-    # Furthermore, they need to know the symbol required to set that value in the AWS SDK
+-    # Classes using this module must implement aws_service_endpoint(region:string)
+-    # which must return a hash with one key, the aws sdk for ruby config symbol of the service
+-    # endpoint, which has a string value of the service endpoint hostname
+-    # for example, CloudWatch, { :cloud_watch_endpoint => "monitoring.#{region}.amazonaws.com" }
+-    # For a list, see https://github.com/aws/aws-sdk-ruby/blob/master/lib/aws/core/configuration.rb
+-    opts.merge!(self.aws_service_endpoint(@region))
++    opts[:region] = @region
+     
+     return opts
+   end # def aws_options_hash

@@ -1,0 +1,393 @@
+diff --git a/lib/pluginmanager/utils/downloader.rb b/lib/pluginmanager/utils/downloader.rb
+index 0d520febfaa..d2092f22188 100644
+--- a/lib/pluginmanager/utils/downloader.rb
++++ b/lib/pluginmanager/utils/downloader.rb
+@@ -68,7 +68,7 @@ def fetch(redirect_count = 0)
+           downloaded_file.path
+         end
+       rescue => e
+-        downloaded_file.close rescue nil
++        downloaded_file.close unless downloaded_file.closed?
+         FileUtils.rm_rf(download_to)
+         raise e
+       end
+diff --git a/logstash-core/lib/logstash/config/source/local.rb b/logstash-core/lib/logstash/config/source/local.rb
+index 4dc46414e2f..897738e12f6 100644
+--- a/logstash-core/lib/logstash/config/source/local.rb
++++ b/logstash-core/lib/logstash/config/source/local.rb
+@@ -71,7 +71,8 @@ def read
+           end
+ 
+           config_string = ::File.read(file)
+-
++          config_string.force_encoding("UTF-8")
++          
+           if config_string.valid_encoding?
+             part = org.logstash.common.SourceWithMetadata.new("file", file, 0, 0, config_string)
+             config_parts << part
+diff --git a/logstash-core/lib/logstash/pipeline_action/stop.rb b/logstash-core/lib/logstash/pipeline_action/stop.rb
+index 79298b7e47f..7ee45f76af1 100644
+--- a/logstash-core/lib/logstash/pipeline_action/stop.rb
++++ b/logstash-core/lib/logstash/pipeline_action/stop.rb
+@@ -14,6 +14,7 @@ def initialize(pipeline_id)
+     def execute(agent, pipelines)
+       pipeline = pipelines[pipeline_id]
+       pipeline.shutdown { LogStash::ShutdownWatcher.start(pipeline) }
++      pipeline.thread.join
+       pipelines.delete(pipeline_id)
+       # If we reach this part of the code we have succeeded because
+       # the shutdown call will block.
+diff --git a/logstash-core/spec/logstash/agent_spec.rb b/logstash-core/spec/logstash/agent_spec.rb
+index 49752a22579..77c277e537c 100644
+--- a/logstash-core/spec/logstash/agent_spec.rb
++++ b/logstash-core/spec/logstash/agent_spec.rb
+@@ -35,7 +35,7 @@
+     # This MUST run first, before `subject` is invoked to ensure clean state
+     clear_data_dir
+ 
+-    File.open(config_file, "w") { |f| f.puts config_file_txt }
++    File.open(config_file, "w") { |f| f.puts(config_file_txt) }
+ 
+     agent_args.each do |key, value|
+       agent_settings.set(key, value)
+@@ -52,8 +52,9 @@
+   after :each do
+     subject.shutdown
+     LogStash::SETTINGS.reset
+-    File.unlink(config_file)
+-    File.unlink(subject.id_path)
++
++    FileUtils.rm(config_file)
++    FileUtils.rm_rf(subject.id_path)
+   end
+ 
+   it "fallback to hostname when no name is provided" do
+@@ -324,8 +325,10 @@
+   context "metrics after config reloading" do
+ 
+     let(:initial_generator_threshold) { 1000 }
+-    let(:temporary_file) { Stud::Temporary.file.path }
+-    let(:config_file_txt) { "input { generator { count => #{initial_generator_threshold*2} } } output { file { path => '#{temporary_file}'} }" }
++    let(:original_config_output) { Stud::Temporary.pathname }
++    let(:new_config_output) { Stud::Temporary.pathname }
++
++    let(:config_file_txt) { "input { generator { count => #{initial_generator_threshold*2} } } output { file { path => '#{original_config_output}'} }" }
+ 
+     let(:agent_args) do
+       {
+@@ -336,15 +339,24 @@
+ 
+     subject { described_class.new(agent_settings, default_source_loader) }
+ 
++    let(:agent_thread) do
++      # subject has to be called for the first time outside the thread because it could create a race condition
++      # with subsequent subject calls
++      s = subject
++      Thread.new { s.execute }
++    end
++
+     before(:each) do
+       @abort_on_exception = Thread.abort_on_exception
+       Thread.abort_on_exception = true
+ 
+-      @t = Thread.new { subject.execute }
++      agent_thread
+ 
+       # wait for some events to reach the dummy_output
+       Timeout.timeout(timeout) do
+-        sleep(0.01) until IO.readlines(temporary_file).size > initial_generator_threshold
++        # wait for file existence otherwise it will raise exception on Windows
++        sleep(0.1) until ::File.exist?(original_config_output)
++        sleep(0.1) until IO.readlines(original_config_output).size > initial_generator_threshold
+       end
+ 
+       # write new config
+@@ -353,10 +365,12 @@
+ 
+     after :each do
+       begin
++        Stud.stop!(agent_thread) rescue nil # it may be dead already
++        agent_thread.join
+         subject.shutdown
+-        Stud.stop!(@t) rescue nil # it may be dead already
+-        @t.join
+-        File.unlink(temporary_file)
++
++        FileUtils.rm(original_config_output)
++        FileUtils.rm(new_config_output) if File.exist?(new_config_output)
+       rescue
+           #don't care about errors here.
+       ensure
+@@ -366,21 +380,20 @@
+ 
+     context "when reloading a good config" do
+       let(:new_config_generator_counter) { 500 }
+-      let(:new_file) { Stud::Temporary.file.path }
+-      let(:new_config) { "input { generator { count => #{new_config_generator_counter} } } output { file { path => '#{new_file}'} }" }
++      let(:new_config) { "input { generator { count => #{new_config_generator_counter} } } output { file { path => '#{new_config_output}'} }" }
+ 
+       before :each do
+         subject.converge_state_and_update
+         Timeout.timeout(timeout) do
+-          sleep(0.01) while ::File.read(new_file).chomp.empty?
++          # wait for file existence otherwise it will raise exception on Windows
++          sleep(0.1) until ::File.exist?(new_config_output)
++          sleep(0.1) while ::File.read(new_config_output).chomp.empty?
+         end
+         # ensure the converge_state_and_update method has updated metrics by
+         # invoking the mutex
+         subject.running_pipelines?
+       end
+ 
+-      after(:each) { File.unlink(new_file) }
+-
+       it "resets the pipeline metric collector" do
+         snapshot = subject.metric.collector.snapshot_metric
+         value = snapshot.metric_store.get_with_path("/stats/pipelines")[:stats][:pipelines][:main][:events][:in].value
+diff --git a/logstash-core/spec/logstash/api/modules/node_stats_spec.rb b/logstash-core/spec/logstash/api/modules/node_stats_spec.rb
+index 340c680f3a4..729f9aee901 100644
+--- a/logstash-core/spec/logstash/api/modules/node_stats_spec.rb
++++ b/logstash-core/spec/logstash/api/modules/node_stats_spec.rb
+@@ -69,7 +69,7 @@
+       "cpu"=>{
+         "total_in_millis"=>Numeric,
+         "percent"=>Numeric,
+-        "load_average" => { "1m" => Numeric }
++        # load_average is not supported on Windows, set it below
+       }
+     },
+    "pipelines" => {
+@@ -89,5 +89,9 @@
+    }
+   }
+ 
++  unless LogStash::Environment.windows?
++    root_structure["process"]["cpu"]["load_average"] = { "1m" => Numeric }
++  end
++
+   test_api_and_resources(root_structure)
+ end
+diff --git a/logstash-core/spec/logstash/config/source/local_spec.rb b/logstash-core/spec/logstash/config/source/local_spec.rb
+index 9e3bf8659ab..2d557483938 100644
+--- a/logstash-core/spec/logstash/config/source/local_spec.rb
++++ b/logstash-core/spec/logstash/config/source/local_spec.rb
+@@ -79,7 +79,7 @@
+ 
+         parts.each do |part|
+           basename = ::File.basename(part.id)
+-          file_path = ::File.join(directory, basename)
++          file_path = ::File.expand_path(::File.join(directory, basename))
+           content = files[basename]
+           expect(part).to be_a_source_with_metadata("file", file_path, content)
+         end
+@@ -99,7 +99,8 @@
+       end
+ 
+       it "raises an exception" do
+-        expect { subject.read(file_path) }.to raise_error LogStash::ConfigLoadingError, /#{file_path}/
++        # check against base name because on Windows long paths are shrinked in the exception message
++        expect { subject.read(file_path) }.to raise_error LogStash::ConfigLoadingError, /.+#{::File.basename(file_path)}/
+       end
+     end
+ 
+diff --git a/logstash-core/spec/logstash/pipeline_action/create_spec.rb b/logstash-core/spec/logstash/pipeline_action/create_spec.rb
+index 90627a47814..b5918813014 100644
+--- a/logstash-core/spec/logstash/pipeline_action/create_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_action/create_spec.rb
+@@ -19,7 +19,10 @@
+   subject { described_class.new(pipeline_config, metric) }
+ 
+   after do
+-    pipelines.each { |_, pipeline| pipeline.shutdown }
++    pipelines.each do |_, pipeline| 
++      pipeline.shutdown 
++      pipeline.thread.join
++    end
+   end
+ 
+   it "returns the pipeline_id" do
+diff --git a/logstash-core/spec/logstash/pipeline_action/reload_spec.rb b/logstash-core/spec/logstash/pipeline_action/reload_spec.rb
+index fc2db33bb60..60bb59686d8 100644
+--- a/logstash-core/spec/logstash/pipeline_action/reload_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_action/reload_spec.rb
+@@ -22,7 +22,10 @@
+   end
+ 
+   after do
+-    pipelines.each { |_, pipeline| pipeline.shutdown }
++    pipelines.each do |_, pipeline| 
++      pipeline.shutdown
++      pipeline.thread.join
++    end
+   end
+ 
+   it "returns the pipeline_id" do
+diff --git a/logstash-core/spec/logstash/pipeline_dlq_commit_spec.rb b/logstash-core/spec/logstash/pipeline_dlq_commit_spec.rb
+index 83d1e5d16de..c8643c52877 100644
+--- a/logstash-core/spec/logstash/pipeline_dlq_commit_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_dlq_commit_spec.rb
+@@ -67,7 +67,7 @@ def close() end
+   end
+ 
+   after(:each) do
+-    FileUtils.remove_entry pipeline_settings["path.dead_letter_queue"]
++    FileUtils.rm_rf(pipeline_settings["path.dead_letter_queue"])
+   end
+ 
+   context "dlq is enabled" do
+@@ -85,6 +85,7 @@ def close() end
+       entry = dlq_reader.pollEntry(40)
+       expect(entry).to_not be_nil
+       expect(entry.reason).to eq("my reason")
++      subject.shutdown
+     end
+   end
+ 
+@@ -101,6 +102,7 @@ def close() end
+       subject.run
+       dlq_path = java.nio.file.Paths.get(pipeline_settings_obj.get("path.dead_letter_queue"), pipeline_id)
+       expect(java.nio.file.Files.exists(dlq_path)).to eq(false)
++      subject.shutdown
+     end
+   end
+ 
+diff --git a/logstash-core/spec/logstash/settings/writable_directory_spec.rb b/logstash-core/spec/logstash/settings/writable_directory_spec.rb
+index 4463ca82db1..be00ce9f04f 100644
+--- a/logstash-core/spec/logstash/settings/writable_directory_spec.rb
++++ b/logstash-core/spec/logstash/settings/writable_directory_spec.rb
+@@ -3,17 +3,17 @@
+ require "logstash/settings"
+ require "tmpdir"
+ require "socket" # for UNIXSocket
++require "fileutils"
+ 
+ describe LogStash::Setting::WritableDirectory do
+-  let(:mode_rx) { 0555 }
+   # linux is 108, Macos is 104, so use a safe value
+   # Stud::Temporary.pathname, will exceed that size without adding anything
+   let(:parent) { File.join(Dir.tmpdir, Time.now.to_f.to_s) }
+   let(:path) { File.join(parent, "fancy") }
+ 
+   before { Dir.mkdir(parent) }
+-  after { Dir.exist?(path) && Dir.unlink(path) rescue nil }
+-  after { Dir.unlink(parent) }
++  after { Dir.exist?(path) && FileUtils.rm_rf(path)}
++  after { FileUtils.rm_rf(parent) }
+ 
+   shared_examples "failure" do
+     before { subject.set(path) }
+@@ -44,8 +44,9 @@
+       end
+ 
+       context "and the directory cannot be created" do
+-        before { File.chmod(mode_rx, parent) }
+         it "should fail" do
++          # using chmod does not work on Windows better mock and_raise("message")
++          expect(FileUtils).to receive(:mkdir_p).and_raise("foobar")
+           expect { subject.value }.to raise_error
+         end
+       end
+@@ -66,7 +67,8 @@
+       end
+ 
+       context "but is not writable" do
+-        before { File.chmod(0, path) }
++        # chmod does not work on Windows, mock writable? instead
++        before { expect(File).to receive(:writable?).and_return(false) }
+         it_behaves_like "failure"
+       end
+     end
+@@ -84,12 +86,13 @@
+         before { socket } # realize `socket` value
+         after { socket.close }
+         it_behaves_like "failure"
+-      end
++      end unless LogStash::Environment.windows?
+ 
++      
+       context "but is a symlink" do
+-        before { File::symlink("whatever", path) }
++        before { FileUtils.symlink("whatever", path) }
+         it_behaves_like "failure"
+-      end
++      end unless LogStash::Environment.windows?
+     end
+ 
+     context "when the directory is missing" do
+@@ -114,8 +117,8 @@
+ 
+       context "and cannot be created" do
+         before do
+-          # Remove write permission on the parent
+-          File.chmod(mode_rx, parent)
++          # chmod does not work on Windows, mock writable? instead
++          expect(File).to receive(:writable?).and_return(false)
+         end
+ 
+         it_behaves_like "failure"
+diff --git a/spec/unit/plugin_manager/pack_fetch_strategy/uri_spec.rb b/spec/unit/plugin_manager/pack_fetch_strategy/uri_spec.rb
+index 09effdb909c..210b32d5b9c 100644
+--- a/spec/unit/plugin_manager/pack_fetch_strategy/uri_spec.rb
++++ b/spec/unit/plugin_manager/pack_fetch_strategy/uri_spec.rb
+@@ -32,10 +32,12 @@
+     let(:temporary_file) do
+       f = Stud::Temporary.file
+       f.write("hola")
++      f.close
+       f.path
+     end
+ 
+-    let(:plugin_path) { "file://#{temporary_file}" }
++    # Windows safe way to produce a file: URI.
++    let(:plugin_path) { URI.join("file:///" + File.absolute_path(temporary_file)).to_s }
+ 
+     it "returns a `LocalInstaller`" do
+       expect(subject.get_installer_for(plugin_path)).to be_kind_of(LogStash::PluginManager::PackInstaller::Local)
+diff --git a/spec/unit/plugin_manager/prepare_offline_pack_spec.rb b/spec/unit/plugin_manager/prepare_offline_pack_spec.rb
+index aa9376c91cf..9c55457d0dd 100644
+--- a/spec/unit/plugin_manager/prepare_offline_pack_spec.rb
++++ b/spec/unit/plugin_manager/prepare_offline_pack_spec.rb
+@@ -79,6 +79,10 @@
+         expect(LogStash::PluginManager::OfflinePluginPackager).not_to receive(:package).with(anything)
+       end
+ 
++      after do
++        FileUtils.rm_rf(tmp_zip_file)
++      end
++
+       it "fails to do any action" do
+         expect { subject.run(cmd_args) }.to raise_error Clamp::ExecutionError, /you must specify a filename/
+       end
+@@ -101,13 +105,18 @@
+         FileUtils.touch(tmp_zip_file)
+       end
+ 
++      after do
++        FileUtils.rm_f(tmp_zip_file)
++      end
++
+       context "without `--overwrite`" do
+         before do
+           expect(LogStash::PluginManager::OfflinePluginPackager).not_to receive(:package).with(anything)
+         end
+ 
+         it "should fails" do
+-          expect { subject.run(cmd_args) }.to raise_error Clamp::ExecutionError, /output file destination #{tmp_zip_file} already exist/
++          # ignore the first path part of tmp_zip_file because on Windows the long path is shrinked in the exception message 
++          expect { subject.run(cmd_args) }.to raise_error Clamp::ExecutionError, /output file destination .+#{::File.basename(tmp_zip_file)} already exist/
+         end
+       end
+ 
+diff --git a/spec/unit/plugin_manager/utils/downloader_spec.rb b/spec/unit/plugin_manager/utils/downloader_spec.rb
+index e08e731af01..2f7a105eb95 100644
+--- a/spec/unit/plugin_manager/utils/downloader_spec.rb
++++ b/spec/unit/plugin_manager/utils/downloader_spec.rb
+@@ -56,7 +56,7 @@
+       let(:temporary_path) { Stud::Temporary.pathname }
+ 
+       before do
+-        expect_any_instance_of(::File).to receive(:close).at_least(:twice).and_raise("Didn't work")
++        expect(Net::HTTP::Get).to receive(:new).once.and_raise("Didn't work")
+         expect(Stud::Temporary).to receive(:pathname).and_return(temporary_path)
+       end
+ 

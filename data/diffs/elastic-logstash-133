@@ -1,0 +1,254 @@
+diff --git a/Gemfile b/Gemfile
+index 14c651a00bf..4371fb0eb1b 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -11,6 +11,7 @@ gem "onstomp" # for stomp protocol, Apache 2.0 License
+ gem "json" # Ruby license
+ #gem "awesome_print" # MIT License
+ gem "jruby-openssl", :platforms => :jruby # For enabling SSL support, CPL/GPL 2.0
++gem "xml-simple" # unknown license: http://xml-simple.rubyforge.org/
+ 
+ gem "minitest" # License: Ruby
+ gem "rack" # License: MIT
+diff --git a/lib/logstash/filters/xml.rb b/lib/logstash/filters/xml.rb
+new file mode 100644
+index 00000000000..f6693f3efc3
+--- /dev/null
++++ b/lib/logstash/filters/xml.rb
+@@ -0,0 +1,127 @@
++require "logstash/filters/base"
++require "logstash/namespace"
++require "xmlsimple"
++require "rexml/document"
++include REXML
++
++# XML filter. Takes a field that contains XML and expands it into
++# an actual datastructure.
++class LogStash::Filters::Xml < LogStash::Filters::Base
++
++  config_name "xml"
++  plugin_status "experimental"
++
++  # Config for xml to hash is:
++  #
++  #   source => dest
++  #
++  # XML in the value of the source field will be expanded into a
++  # datastructure in the "dest" field. Note: if the "dest" field
++  # already exists, it will be overridden.
++  config /[A-Za-z0-9_-]+/, :validate => :string
++
++  # xpath will additionally select string values (.to_s on whatever is selected)
++  # from parsed XML (using each source field defined using the method above)
++  # and place those values in the destination fields. Configuration:
++  #
++  # xpath => [ "xpath-syntax", "destination-field" ]
++  #
++  # Values returned by XPath parsring from xpath-synatx will be put in the 
++  # destination field. Multiple values returned will be pushed onto the
++  # destination field as an array. As such, multiple matches across
++  # multiple source fields will produce duplicate entries in the field
++  #
++  # More on xpath: http://www.w3schools.com/xpath/
++  # 
++  # The xpath functions are particularly powerful:
++  # http://www.w3schools.com/xpath/xpath_functions.asp
++  # 
++  config :xpath, :validate => :hash, :default => {}
++
++  # By default the filter will store the whole parsed xml in the destination
++  # field as described above. Setting this to false will prevent that.
++  config :store_xml, :validate => :boolean, :default => true
++
++  public
++  def register
++    @xml = {}
++
++    @config.each do |field, dest|
++      next if ( RESERVED + ["xpath","store_xml"] ).member?(field)
++
++      @xml[field] = dest
++    end
++  end # def register
++
++  public
++  def filter(event)
++    return unless filter?(event)
++
++    matched = false
++
++    @logger.debug("Running xml filter", :event => event)
++
++    @xml.each do |key, dest|
++      if event.fields[key]
++        if event.fields[key].is_a?(String)
++          event.fields[key] = [event.fields[key]]
++        end
++
++        if event.fields[key].length > 1
++          @logger.warn("XML filter only works on fields of length 1",
++                       :key => key, :value => event.fields[key])
++          next
++        end
++
++        raw = event.fields[key].first
++
++        # for some reason, an empty string is considered valid XML
++        next if raw.strip.length == 0
++
++        if @xpath
++          begin
++            doc = Document.new(raw)
++          rescue => e
++            event.tags << "_xmlparsefailure"
++            @logger.warn("Trouble parsing xml with REXML::Document", :key => key, :raw => raw,
++                          :exception => e, :backtrace => e.backtrace)
++            next
++          end
++
++          @xpath.each do |xpath_src, xpath_dest|
++
++            XPath.each(doc, xpath_src).each do |value|
++              # some XPath functions return empty arrays as string
++              if value.is_a?(Array)
++                next if value.length == 0
++              end
++
++              unless value.nil?
++                matched = true
++                event[xpath_dest] ||= []
++                event[xpath_dest] << value.to_s
++              end
++            end
++          end
++        end
++
++        if @store_xml
++          begin
++            event[dest] = XmlSimple.xml_in(raw)
++            matched = true
++          rescue => e
++            event.tags << "_xmlparsefailure"
++            @logger.warn("Trouble parsing xml with XmlSimple", :key => key, :raw => raw,
++                          :exception => e, :backtrace => e.backtrace)
++            next
++          end
++        end
++
++        filter_matched(event) if matched
++
++      end
++    end
++
++    @logger.debug("Event after xml filter", :event => event)
++  end # def filter
++end # class LogStash::Filters::Xml
+diff --git a/test/logstash/filters/test_xml.rb b/test/logstash/filters/test_xml.rb
+new file mode 100644
+index 00000000000..aba2b2faedb
+--- /dev/null
++++ b/test/logstash/filters/test_xml.rb
+@@ -0,0 +1,103 @@
++require "rubygems"
++require File.join(File.dirname(__FILE__), "..", "minitest")
++
++require "logstash/loadlibs"
++require "logstash"
++require "logstash/filters"
++require "logstash/filters/xml"
++require "logstash/event"
++
++describe LogStash::Filters::Xml do
++  before do
++    @filter = LogStash::Filters.from_name("xml", {})
++    @typename = "xml"
++  end
++
++  def config(cfg)
++    cfg["type"] = @typename
++    cfg.each_key do |key|
++      if cfg[key].is_a?(String)
++        cfg[key] = [cfg[key]]
++      end
++    end
++
++    @filter = LogStash::Filters::Xml.new(cfg)
++    @filter.register
++  end # def config
++
++  test "parse standard xml" do
++    config "raw" => "data"
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["raw"] = '<foo key="value"/>'
++    @filter.filter(event)
++    assert_equal(event["data"], {"key" => "value"})
++  end # parse standard xml
++
++  test "parse xml but do not store" do
++    config "raw" => "data",
++           "store_xml" => "false"
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["raw"] = '<foo key="value"/>'
++    @filter.filter(event)
++    assert_equal(event["data"], nil)
++  end # parse xml but do not store
++
++  test "parse xml with array as a value" do
++    config "raw" => "data"
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["raw"] = '<foo><key>value1</key><key>value2</key></foo>'
++    @filter.filter(event)
++    assert_equal(event["data"], {"key" => ["value1", "value2"]})
++  end # parse xml with array as a value
++
++  test "parse xml with hash as a value" do
++    config "raw" => "data"
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["raw"] = '<foo><key1><key2>value</key2></key1></foo>'
++    @filter.filter(event)
++    assert_equal(event["data"], {"key1" => [{"key2" => ["value"]}]})
++  end # parse xml with array as a value
++
++  test "bad xml" do
++    config "raw" => "data"
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["raw"] = '<foo /'
++    @filter.filter(event)
++    assert_equal(event.tags, ["_xmlparsefailure"])
++  end # bad xml
++
++  test "parse xml and store single value with xpath" do
++    config "raw" => "data",
++           "xpath" => [ "/foo/key/text()", "xpath_field" ]
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["raw"] = '<foo><key>value</key></foo>'
++    @filter.filter(event)
++    assert_equal(event["xpath_field"].length, 1)
++    assert_equal(event["xpath_field"], ["value"])
++  end # parse xml and store single value with xpath
++
++  test "parse xml and store mulitple values with xpath" do
++    config "raw" => "data",
++           "xpath" => [ "/foo/key/text()", "xpath_field" ]
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["raw"] = '<foo><key>value1</key><key>value2</key></foo>'
++    @filter.filter(event)
++    assert_equal(event["xpath_field"].length, 2)
++    assert_equal(event["xpath_field"], ["value1","value2"])
++  end # parse xml and store mulitple values with xpath
++
++end # Test 'xml' filter

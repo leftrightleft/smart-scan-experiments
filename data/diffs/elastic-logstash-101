@@ -1,0 +1,191 @@
+diff --git a/Makefile b/Makefile
+index 25c10db68a8..8c7f405d2ea 100644
+--- a/Makefile
++++ b/Makefile
+@@ -27,9 +27,9 @@ CURL=$(shell which curl 2>/dev/null)
+ TARCHECK=$(shell tar --help|grep wildcard|wc -l|tr -d ' ')
+ ifeq (0, $(TARCHECK))
+ TAR_OPTS=
+-else
+-TAR_OPTS=--wildcards
+-endif
++#else
++#TAR_OPTS=--wildcards
++#endif
+ 
+ default: jar
+ 
+diff --git a/lib/logstash/event.rb b/lib/logstash/event.rb
+index f2a3e45e999..78cadba6310 100644
+--- a/lib/logstash/event.rb
++++ b/lib/logstash/event.rb
+@@ -206,6 +206,15 @@ def sprintf(format)
+         end
+         datetime = @@date_parser.parseDateTime(self.timestamp)
+         (datetime.getMillis / 1000).to_i
++      elsif key == "+%ss"
++        # Got %{+%ss}, support for unix epoch time in milliseconds
++        if RUBY_ENGINE != "jruby"
++          # TODO(sissel): LOGSTASH-217
++          raise Exception.new("LogStash::Event#sprintf('+%s') is not " \
++                              "supported yet in this version of ruby")
++        end
++        datetime = @@date_parser.parseDateTime(self.timestamp)
++        (datetime.getMillis.to_f)
+       elsif key[0,1] == "+"
+         # We got a %{+TIMEFORMAT} so use joda to format it.
+         if RUBY_ENGINE != "jruby"
+diff --git a/lib/logstash/filters/date.rb b/lib/logstash/filters/date.rb
+index 0b40dd6d7cb..5786259d374 100644
+--- a/lib/logstash/filters/date.rb
++++ b/lib/logstash/filters/date.rb
+@@ -23,6 +23,13 @@ class LogStash::Filters::Date < LogStash::Filters::Base
+   config_name "date"
+   plugin_status "stable"
+ 
++  # specify a locale to be used for date parsing. If this is not specified the platform default will be
++  # used
++  #
++  # The locale is mostly necessary to be set for parsing month names and weekday names
++  #
++  config :locale, :validate => :string
++
+   # Config for date is:
+   #   fieldname => dateformat
+   #
+@@ -78,12 +85,26 @@ def initialize(config = {})
+     @parsers = Hash.new { |h,k| h[k] = [] }
+   end # def initialize
+ 
++  
++
++
++  private
++  def parseLocale(localeString)
++    return nil if localeString == nil
++    matches = localeString.match(/(?<lang>.+?)(?:_(?<country>.+?))?(?:_(?<variant>.+))?/)
++    lang = matches['lang'] == nil ? "" : matches['lang'].strip()
++    country = matches['country'] == nil ? "" : matches['country'].strip()
++    variant = matches['variant'] == nil ? "" : matches['variant'].strip()
++    return lang.length > 0 ? java.util.Locale.new(lang, country, variant) : nil
++  end
++
+   public
+   def register
+     require "java"
+     # TODO(sissel): Need a way of capturing regexp configs better.
++    locale = parseLocale(@config["locale"][0]) if @config["locale"] != nil and @config["locale"][0] != nil 
+     @config.each do |field, value|
+-      next if RESERVED.include?(field)
++      next if (RESERVED + ["locale"]).include?(field)
+ 
+       # values here are an array of format strings for the given field.
+       missing = []
+@@ -98,6 +119,9 @@ def register
+           parser = lambda { |date| org.joda.time.Instant.new(date.to_i).toDateTime }
+         else
+           joda_parser = org.joda.time.format.DateTimeFormat.forPattern(format).withOffsetParsed
++          if(locale != nil) 
++            joda_parser = joda_parser.withLocale(locale)
++          end
+           parser = lambda { |date| joda_parser.parseDateTime(date) }
+ 
+           # Joda's time parser doesn't assume 'current time' for unparsed values.
+diff --git a/lib/logstash/filters/mutate.rb b/lib/logstash/filters/mutate.rb
+index ba252d35684..ec4b58b71d1 100644
+--- a/lib/logstash/filters/mutate.rb
++++ b/lib/logstash/filters/mutate.rb
+@@ -60,6 +60,26 @@ class LogStash::Filters::Mutate < LogStash::Filters::Base
+   #     }
+   config :convert, :validate => :hash
+ 
++  # Convert a string field by applying a regular expression and a replacement
++  # if the field is not a string, no action will be taken
++  # 
++  # this configuration takes an array consisting of 3 elements per field/substitution
++  #
++  # be aware of escaping any backslash in the config file
++  #
++  # for example:
++  #
++  #    mutate {
++  #       …
++  #      gsub => [
++  #        "fieldname", "\\/", "_",      #replace all forward slashes with underscore
++  #        "fieldname", "[\\?#-]", "_"   #replace backslashes, question marks, hashes and minuses with underscore
++  #      ]
++  #       …
++  #    }
++  #
++  config :gsub, :validate => :array
++
+   public
+   def register
+     valid_conversions = %w(string integer float)
+@@ -73,6 +93,18 @@ def register
+         raise "Bad configuration, aborting."
+       end
+     end # @convert.each
++    
++    @gsub_parsed = []
++    @gsub.nil? or @gsub.each_slice(3) do |field, needle, replacement|
++      if [field, needle, replacement].any? {|n| n.nil?}
++        @logger.error("Invalid gsub configuration. gsub has to define 3 elements per config entry", :file => file, :needle => needle, :replacement => replacement)
++      end
++      @gsub_parsed << {
++        :field        => field,
++        :needle       => Regexp.new(needle),
++        :replacement  => replacement
++      }
++    end
+   end # def register
+ 
+   public
+@@ -83,6 +115,7 @@ def filter(event)
+     remove(event) if @remove
+     replace(event) if @replace
+     convert(event) if @convert
++    gsub(event) if @gsub
+ 
+     filter_matched(event)
+   end # def filter
+@@ -143,4 +176,31 @@ def convert_integer(value)
+   def convert_float(value)
+     return value.to_f
+   end # def convert_float
++
++  private
++  def gsub(event)
++    @gsub_parsed.each do |config|
++      field = config[:field]
++      needle = config[:needle]
++      replacement = config[:replacement]
++
++      if(event[field].is_a? Array)
++        event[field] = event[field].map do |v| 
++          if not v.is_a? String
++            @logger.debug("gsub mutation is only applicable for Strings, skipping",
++                          :field => field, :value => event[field])
++            next
++          end
++          v.gsub(needle, replacement) 
++        end
++      else
++        if not event[field].is_a? String
++          @logger.debug("gsub mutation is only applicable for Strings, skipping",
++                        :field => field, :value => event[field])
++          next
++        end
++        event[field] = event[field].gsub(needle, replacement)
++      end
++    end # @gsub_parsed.each
++  end # def gsub
+ end # class LogStash::Filters::Mutate
+diff --git a/lib/logstash/version.rb b/lib/logstash/version.rb
+index 54fd828df88..406a8c7a9b0 100644
+--- a/lib/logstash/version.rb
++++ b/lib/logstash/version.rb
+@@ -1 +1 @@
+-LOGSTASH_VERSION = "1.1.1-pre"
++LOGSTASH_VERSION = "1.1.1-pre-CBFIX"
+\ No newline at end of file

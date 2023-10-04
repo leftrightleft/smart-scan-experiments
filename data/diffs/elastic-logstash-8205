@@ -1,0 +1,566 @@
+diff --git a/logstash-core/src/main/java/org/logstash/Javafier.java b/logstash-core/src/main/java/org/logstash/Javafier.java
+index ab26979daee..c80348195a3 100644
+--- a/logstash-core/src/main/java/org/logstash/Javafier.java
++++ b/logstash-core/src/main/java/org/logstash/Javafier.java
+@@ -1,12 +1,16 @@
+ package org.logstash;
+ 
++import java.math.BigDecimal;
++import java.math.BigInteger;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
++import org.jruby.RubyBignum;
+ import org.jruby.RubyBoolean;
+ import org.jruby.RubyFixnum;
+ import org.jruby.RubyFloat;
+ import org.jruby.RubyString;
+ import org.jruby.RubySymbol;
++import org.jruby.ext.bigdecimal.RubyBigDecimal;
+ import org.logstash.bivalues.BiValue;
+ import org.logstash.bivalues.BiValues;
+ import org.logstash.ext.JrubyTimestampExtLibrary;
+@@ -57,11 +61,17 @@ private static Map<Class<?>, Valuefier.Converter> initConverters() {
+         converters.put(Long.class, Valuefier.IDENTITY);
+         converters.put(Integer.class, Valuefier.IDENTITY);
+         converters.put(Boolean.class, Valuefier.IDENTITY);
++        converters.put(BigInteger.class, Valuefier.IDENTITY);
++        converters.put(BigDecimal.class, Valuefier.IDENTITY);
+         converters.put(Timestamp.class, Valuefier.IDENTITY);
+         // Explicitly casting to RubyString or RubySymbol when we know its type for sure is faster
+         // than having the JVM look up the type.
+         converters.put(RubyString.class, value -> ((RubyString) value).toString());
+         converters.put(RubySymbol.class, value -> ((RubySymbol) value).toString());
++        converters.put(RubyBignum.class, value -> ((RubyBignum) value).getBigIntegerValue());
++        converters.put(
++            RubyBigDecimal.class, value -> ((RubyBigDecimal) value).getBigDecimalValue()
++        );
+         converters.put(RubyBoolean.class, value -> ((RubyBoolean) value).isTrue());
+         converters.put(BiValue.class, value -> ((BiValue<?, ?>) value).javaValue());
+         converters.put(RubyFixnum.class, value -> ((RubyFixnum) value).getLongValue());
+diff --git a/logstash-core/src/main/java/org/logstash/ObjectMappers.java b/logstash-core/src/main/java/org/logstash/ObjectMappers.java
+index a3012a29881..ff284804764 100644
+--- a/logstash-core/src/main/java/org/logstash/ObjectMappers.java
++++ b/logstash-core/src/main/java/org/logstash/ObjectMappers.java
+@@ -14,12 +14,15 @@
+ import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
+ import com.fasterxml.jackson.dataformat.cbor.CBORGenerator;
+ import java.io.IOException;
++import java.math.BigDecimal;
+ import java.util.HashMap;
++import org.jruby.RubyBignum;
+ import org.jruby.RubyBoolean;
+ import org.jruby.RubyFixnum;
+ import org.jruby.RubyFloat;
+ import org.jruby.RubyString;
+ import org.jruby.RubySymbol;
++import org.jruby.ext.bigdecimal.RubyBigDecimal;
+ import org.logstash.ext.JrubyTimestampExtLibrary;
+ 
+ public final class ObjectMappers {
+@@ -30,14 +33,22 @@ public final class ObjectMappers {
+             .addSerializer(RubySymbol.class, new RubySymbolSerializer())
+             .addSerializer(RubyFloat.class, new RubyFloatSerializer())
+             .addSerializer(RubyBoolean.class, new RubyBooleanSerializer())
+-            .addSerializer(RubyFixnum.class, new RubyFixnumSerializer());
++            .addSerializer(RubyFixnum.class, new RubyFixnumSerializer())
++            .addSerializer(RubyBigDecimal.class, new RubyBigDecimalSerializer())
++            .addSerializer(RubyBignum.class, new RubyBignumSerializer());
++
++    private static final SimpleModule CBOR_DESERIALIZERS =
++        new SimpleModule("CborRubyDeserializers")
++            .addDeserializer(RubyBigDecimal.class, new RubyBigDecimalDeserializer())
++            .addDeserializer(RubyBignum.class, new RubyBignumDeserializer());
+ 
+     public static final ObjectMapper JSON_MAPPER = 
+         new ObjectMapper().registerModule(RUBY_SERIALIZERS);
+ 
+     public static final ObjectMapper CBOR_MAPPER = new ObjectMapper(
+         new CBORFactory().configure(CBORGenerator.Feature.WRITE_MINIMAL_INTS, false)
+-    ).registerModule(RUBY_SERIALIZERS).enableDefaultTyping(ObjectMapper.DefaultTyping.NON_FINAL);
++    ).registerModules(RUBY_SERIALIZERS, CBOR_DESERIALIZERS)
++        .enableDefaultTyping(ObjectMapper.DefaultTyping.NON_FINAL);
+ 
+     /**
+      * {@link JavaType} for the {@link HashMap} that {@link Event} is serialized as.
+@@ -179,6 +190,84 @@ public Timestamp deserialize(final JsonParser p, final DeserializationContext ct
+         }
+     }
+ 
++    /**
++     * Serializer for {@link RubyBignum} since Jackson can't handle that type natively, so we
++     * simply serialize it as if it were a {@code String} and wrap it in type arguments, so that
++     * deserialization happens via {@link ObjectMappers.RubyBignumDeserializer}.
++     */
++    private static final class RubyBignumSerializer extends StdSerializer<RubyBignum> {
++
++        RubyBignumSerializer() {
++            super(RubyBignum.class);
++        }
++
++        @Override
++        public void serialize(final RubyBignum value, final JsonGenerator jgen,
++            final SerializerProvider provider) throws IOException {
++            jgen.writeString(value.toString());
++        }
++
++        @Override
++        public void serializeWithType(final RubyBignum value, final JsonGenerator jgen,
++            final SerializerProvider serializers, final TypeSerializer typeSer) throws IOException {
++            typeSer.writeTypePrefixForScalar(value, jgen, RubyBignum.class);
++            jgen.writeString(value.toString());
++            typeSer.writeTypeSuffixForScalar(value, jgen);
++        }
++    }
++
++    private static final class RubyBignumDeserializer extends StdDeserializer<RubyBignum> {
++
++        RubyBignumDeserializer() {
++            super(RubyBignum.class);
++        }
++
++        @Override
++        public RubyBignum deserialize(final JsonParser p, final DeserializationContext ctxt)
++            throws IOException {
++            return RubyBignum.newBignum(RubyUtil.RUBY, p.getText());
++        }
++    }
++
++    /**
++     * Serializer for {@link RubyBigDecimal} since Jackson can't handle that type natively, so we
++     * simply serialize it as if it were a {@code String} and wrap it in type arguments, so that
++     * deserialization happens via {@link ObjectMappers.RubyBigDecimalDeserializer}.
++     */
++    private static final class RubyBigDecimalSerializer extends StdSerializer<RubyBigDecimal> {
++
++        RubyBigDecimalSerializer() {
++            super(RubyBigDecimal.class);
++        }
++
++        @Override
++        public void serialize(final RubyBigDecimal value, final JsonGenerator jgen,
++            final SerializerProvider provider) throws IOException {
++            jgen.writeString(value.getBigDecimalValue().toString());
++        }
++
++        @Override
++        public void serializeWithType(final RubyBigDecimal value, final JsonGenerator jgen,
++            final SerializerProvider serializers, final TypeSerializer typeSer) throws IOException {
++            typeSer.writeTypePrefixForScalar(value, jgen, RubyBigDecimal.class);
++            jgen.writeString(value.getBigDecimalValue().toString());
++            typeSer.writeTypeSuffixForScalar(value, jgen);
++        }
++    }
++
++    private static final class RubyBigDecimalDeserializer extends StdDeserializer<RubyBigDecimal> {
++
++        RubyBigDecimalDeserializer() {
++            super(RubyBigDecimal.class);
++        }
++
++        @Override
++        public RubyBigDecimal deserialize(final JsonParser p, final DeserializationContext ctxt)
++            throws IOException {
++            return new RubyBigDecimal(RubyUtil.RUBY, new BigDecimal(p.getText()));
++        }
++    }
++
+     /**
+      * Serializer for {@link JrubyTimestampExtLibrary.RubyTimestamp} that serializes it exactly the
+      * same way {@link ObjectMappers.TimestampSerializer} serializes
+diff --git a/logstash-core/src/main/java/org/logstash/Rubyfier.java b/logstash-core/src/main/java/org/logstash/Rubyfier.java
+index e9f21d5a047..97f391f09ab 100644
+--- a/logstash-core/src/main/java/org/logstash/Rubyfier.java
++++ b/logstash-core/src/main/java/org/logstash/Rubyfier.java
+@@ -1,16 +1,20 @@
+ package org.logstash;
+ 
++import java.math.BigDecimal;
++import java.math.BigInteger;
+ import java.util.Collection;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
+ import org.jruby.Ruby;
+ import org.jruby.RubyArray;
++import org.jruby.RubyBignum;
+ import org.jruby.RubyBoolean;
+ import org.jruby.RubyFixnum;
+ import org.jruby.RubyFloat;
+ import org.jruby.RubyHash;
+ import org.jruby.RubyString;
+ import org.jruby.RubySymbol;
++import org.jruby.ext.bigdecimal.RubyBigDecimal;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.logstash.bivalues.BiValue;
+ import org.logstash.bivalues.BiValues;
+@@ -76,6 +80,8 @@ private static Map<Class<?>, Rubyfier.Converter> initConverters() {
+             new ConcurrentHashMap<>(50, 0.2F, 1);
+         converters.put(RubyString.class, IDENTITY);
+         converters.put(RubySymbol.class, IDENTITY);
++        converters.put(RubyBignum.class, IDENTITY);
++        converters.put(RubyBigDecimal.class, IDENTITY);
+         converters.put(RubyFloat.class, IDENTITY);
+         converters.put(RubyFixnum.class, IDENTITY);
+         converters.put(RubyBoolean.class, IDENTITY);
+@@ -84,6 +90,12 @@ private static Map<Class<?>, Rubyfier.Converter> initConverters() {
+         converters.put(Double.class, FLOAT_CONVERTER);
+         converters.put(Float.class, FLOAT_CONVERTER);
+         converters.put(Integer.class, LONG_CONVERTER);
++        converters.put(
++            BigInteger.class, (runtime, value) -> RubyBignum.newBignum(runtime, (BigInteger) value)
++        );
++        converters.put(
++            BigDecimal.class, (runtime, value) -> new RubyBigDecimal(runtime, (BigDecimal) value)
++        );
+         converters.put(Long.class, LONG_CONVERTER);
+         converters.put(Boolean.class, (runtime, input) -> runtime.newBoolean((Boolean) input));
+         converters.put(
+diff --git a/logstash-core/src/main/java/org/logstash/Valuefier.java b/logstash-core/src/main/java/org/logstash/Valuefier.java
+index db638f37bbd..3d4f0c63c1c 100644
+--- a/logstash-core/src/main/java/org/logstash/Valuefier.java
++++ b/logstash-core/src/main/java/org/logstash/Valuefier.java
+@@ -1,11 +1,14 @@
+ package org.logstash;
+ 
++import java.math.BigDecimal;
++import java.math.BigInteger;
+ import java.util.Collection;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
+ import org.joda.time.DateTime;
+ import org.jruby.RubyArray;
++import org.jruby.RubyBignum;
+ import org.jruby.RubyBoolean;
+ import org.jruby.RubyFixnum;
+ import org.jruby.RubyFloat;
+@@ -13,6 +16,7 @@
+ import org.jruby.RubyString;
+ import org.jruby.RubySymbol;
+ import org.jruby.RubyTime;
++import org.jruby.ext.bigdecimal.RubyBigDecimal;
+ import org.jruby.java.proxies.ArrayJavaProxy;
+ import org.jruby.java.proxies.ConcreteJavaProxy;
+ import org.jruby.java.proxies.JavaProxy;
+@@ -107,10 +111,18 @@ private static Map<Class<?>, Valuefier.Converter> initConverters() {
+         converters.put(ConvertedMap.class, IDENTITY);
+         converters.put(ConvertedList.class, IDENTITY);
+         converters.put(RubyBoolean.class, IDENTITY);
++        converters.put(RubyBignum.class, IDENTITY);
++        converters.put(RubyBigDecimal.class, IDENTITY);
+         converters.put(BiValue.class, IDENTITY);
+         converters.put(String.class, input -> RubyUtil.RUBY.newString((String) input));
+         converters.put(Float.class, FLOAT_CONVERTER);
+         converters.put(Double.class, FLOAT_CONVERTER);
++        converters.put(
++            BigInteger.class, value -> RubyBignum.newBignum(RubyUtil.RUBY, (BigInteger) value)
++        );
++        converters.put(
++            BigDecimal.class, value -> new RubyBigDecimal(RubyUtil.RUBY, (BigDecimal) value)
++        );
+         converters.put(Long.class, LONG_CONVERTER);
+         converters.put(Integer.class, LONG_CONVERTER);
+         converters.put(Boolean.class, input -> RubyUtil.RUBY.newBoolean((Boolean) input));
+diff --git a/logstash-core/src/main/java/org/logstash/bivalues/BiValues.java b/logstash-core/src/main/java/org/logstash/bivalues/BiValues.java
+index d52f318ff7f..5a19b747a0b 100644
+--- a/logstash-core/src/main/java/org/logstash/bivalues/BiValues.java
++++ b/logstash-core/src/main/java/org/logstash/bivalues/BiValues.java
+@@ -1,12 +1,8 @@
+ package org.logstash.bivalues;
+ 
+-import java.math.BigDecimal;
+-import java.math.BigInteger;
+ import java.util.HashMap;
+ import java.util.Map;
+-import org.jruby.RubyBignum;
+ import org.jruby.RubyNil;
+-import org.jruby.ext.bigdecimal.RubyBigDecimal;
+ import org.jruby.java.proxies.ConcreteJavaProxy;
+ import org.jruby.java.proxies.JavaProxy;
+ 
+@@ -41,11 +37,7 @@ private interface BiValueType {
+ 
+     private static Map<Class<?>, BiValues.BiValueType> initCache() {
+         final Map<Class<?>, BiValues.BiValueType> hm = new HashMap<>(50, 0.2F);
+-        hm.put(BigDecimal.class, value -> new BigDecimalBiValue((BigDecimal) value));
+-        hm.put(BigInteger.class, value -> new BigIntegerBiValue((BigInteger) value));
+-        hm.put(RubyBignum.class, value -> new BigIntegerBiValue((RubyBignum) value));
+         hm.put(RubyNil.class, value -> NULL_BI_VALUE);
+-        hm.put(RubyBigDecimal.class, value -> new BigDecimalBiValue((RubyBigDecimal) value));
+         hm.put(ConcreteJavaProxy.class, value -> {
+             if (value instanceof JavaProxy) {
+                 return new JavaProxyBiValue((JavaProxy) value);
+diff --git a/logstash-core/src/main/java/org/logstash/bivalues/BigDecimalBiValue.java b/logstash-core/src/main/java/org/logstash/bivalues/BigDecimalBiValue.java
+deleted file mode 100644
+index 71e99ec6e38..00000000000
+--- a/logstash-core/src/main/java/org/logstash/bivalues/BigDecimalBiValue.java
++++ /dev/null
+@@ -1,36 +0,0 @@
+-package org.logstash.bivalues;
+-
+-import org.jruby.Ruby;
+-import org.jruby.ext.bigdecimal.RubyBigDecimal;
+-
+-import java.io.ObjectStreamException;
+-import java.math.BigDecimal;
+-
+-public class BigDecimalBiValue extends BiValue<RubyBigDecimal, BigDecimal> {
+-
+-    public BigDecimalBiValue(RubyBigDecimal rubyValue) {
+-        this.rubyValue = rubyValue;
+-        javaValue = null;
+-    }
+-
+-    public BigDecimalBiValue(BigDecimal javaValue) {
+-        this.javaValue = javaValue;
+-        rubyValue = null;
+-    }
+-
+-    private BigDecimalBiValue() {
+-    }
+-
+-    protected void addRuby(Ruby runtime) {
+-        rubyValue = new RubyBigDecimal(runtime, runtime.getClass("BigDecimal"), javaValue);
+-    }
+-
+-    protected void addJava() {
+-        javaValue = rubyValue.getBigDecimalValue();
+-    }
+-
+-    // Called when object is to be serialized on a stream to allow the object to substitute a proxy for itself.
+-    private Object writeReplace() throws ObjectStreamException {
+-        return newProxy(this);
+-    }
+-}
+diff --git a/logstash-core/src/main/java/org/logstash/bivalues/BigIntegerBiValue.java b/logstash-core/src/main/java/org/logstash/bivalues/BigIntegerBiValue.java
+deleted file mode 100644
+index 5156477ec68..00000000000
+--- a/logstash-core/src/main/java/org/logstash/bivalues/BigIntegerBiValue.java
++++ /dev/null
+@@ -1,36 +0,0 @@
+-package org.logstash.bivalues;
+-
+-import org.jruby.Ruby;
+-import org.jruby.RubyBignum;
+-
+-import java.io.ObjectStreamException;
+-import java.math.BigInteger;
+-
+-public class BigIntegerBiValue extends BiValue<RubyBignum, BigInteger> {
+-
+-    public BigIntegerBiValue(RubyBignum rubyValue) {
+-        this.rubyValue = rubyValue;
+-        javaValue = null;
+-    }
+-
+-    public BigIntegerBiValue(BigInteger javaValue) {
+-        this.javaValue = javaValue;
+-        rubyValue = null;
+-    }
+-
+-    private BigIntegerBiValue() {
+-    }
+-
+-    protected void addRuby(Ruby runtime) {
+-        rubyValue = new RubyBignum(runtime, javaValue);
+-    }
+-
+-    protected void addJava() {
+-        javaValue = rubyValue.getValue();
+-    }
+-
+-    // Called when object is to be serialized on a stream to allow the object to substitute a proxy for itself.
+-    private Object writeReplace() throws ObjectStreamException {
+-        return newProxy(this);
+-    }
+-}
+diff --git a/logstash-core/src/test/java/org/logstash/EventTest.java b/logstash-core/src/test/java/org/logstash/EventTest.java
+index 59a7ae4629a..be1d16ee3c1 100644
+--- a/logstash-core/src/test/java/org/logstash/EventTest.java
++++ b/logstash-core/src/test/java/org/logstash/EventTest.java
+@@ -1,6 +1,8 @@
+ package org.logstash;
+ 
+ import java.io.IOException;
++import java.math.BigDecimal;
++import java.math.BigInteger;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -28,10 +30,16 @@ public void queueableInterfaceRoundTrip() throws Exception {
+         e.setField("symbol", symbol);
+         inner.put("innerQuux", 42.42);
+         e.setField("baz", inner);
++        final BigInteger bigint = BigInteger.valueOf(Long.MAX_VALUE).multiply(BigInteger.TEN);
++        final BigDecimal bigdecimal = BigDecimal.valueOf(10L);
++        e.setField("biginteger", bigint);
++        e.setField("bigdecimal", bigdecimal);
+         e.setField("[@metadata][foo]", 42L);
+         byte[] binary = e.serialize();
+         Event er = Event.deserialize(binary);
+         assertEquals(symbol.toString(), er.getField("symbol"));
++        assertEquals(bigint, er.getField("biginteger"));
++        assertEquals(bigdecimal, er.getField("bigdecimal"));
+         assertEquals(42L, er.getField("foo"));
+         assertEquals(42L, er.getField("bar"));
+         assertEquals(42L, er.getField("[baz][innerFoo]"));
+diff --git a/logstash-core/src/test/java/org/logstash/bivalues/BiValueTest.java b/logstash-core/src/test/java/org/logstash/bivalues/BiValueTest.java
+index 35db8059c0f..c701d78b261 100644
+--- a/logstash-core/src/test/java/org/logstash/bivalues/BiValueTest.java
++++ b/logstash-core/src/test/java/org/logstash/bivalues/BiValueTest.java
+@@ -1,40 +1,13 @@
+ package org.logstash.bivalues;
+ 
+-import java.io.ByteArrayInputStream;
+-import java.io.ByteArrayOutputStream;
+-import java.io.ObjectInputStream;
+-import java.io.ObjectOutputStream;
+-import java.math.BigDecimal;
+-import java.math.BigInteger;
+-import org.jruby.RubyBignum;
+-import org.jruby.ext.bigdecimal.RubyBigDecimal;
+ import org.junit.Test;
+ import org.logstash.TestBase;
+ 
+ import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
+ 
+ public class BiValueTest extends TestBase {
+ 
+-    @Test
+-    public void testBigDecimalBiValueFromRuby() {
+-        BigDecimal s = BigDecimal.valueOf(12345.678D);
+-        BigDecimalBiValue subject = new BigDecimalBiValue(new RubyBigDecimal(ruby, s));
+-        assertTrue(subject.hasRubyValue());
+-        assertFalse(subject.hasJavaValue());
+-        assertEquals(s, subject.javaValue());
+-    }
+-
+-    @Test
+-    public void testBigDecimalBiValueFromJava() {
+-        RubyBigDecimal v = new RubyBigDecimal(ruby, new BigDecimal(12345.678D));
+-        BigDecimalBiValue subject = new BigDecimalBiValue(new BigDecimal(12345.678D));
+-        assertFalse(subject.hasRubyValue());
+-        assertTrue(subject.hasJavaValue());
+-        assertEquals(v, subject.rubyValue(ruby));
+-    }
+-
+     @Test
+     public void testNullBiValueFromJava() {
+         NullBiValue subject = NullBiValue.newNullBiValue();
+@@ -42,39 +15,4 @@ public void testNullBiValueFromJava() {
+         assertTrue(subject.hasJavaValue());
+         assertEquals(ruby.getNil(), subject.rubyValue(ruby));
+     }
+-
+-    @Test
+-    public void testBigIntegerBiValueFromRuby() {
+-        BigInteger s = BigInteger.valueOf(12345678L);
+-        BigIntegerBiValue subject = new BigIntegerBiValue(new RubyBignum(ruby, s));
+-        assertTrue(subject.hasRubyValue());
+-        assertFalse(subject.hasJavaValue());
+-        assertEquals(s, subject.javaValue());
+-    }
+-
+-    @Test
+-    public void testBigIntegerBiValueFromJava() {
+-        RubyBignum v = new RubyBignum(ruby, BigInteger.valueOf(12345678L));
+-        BigIntegerBiValue subject = new BigIntegerBiValue(BigInteger.valueOf(12345678L));
+-        assertFalse(subject.hasRubyValue());
+-        assertTrue(subject.hasJavaValue());
+-        assertEquals(v, subject.rubyValue(ruby));
+-    }
+-
+-    @Test
+-    public void testSerialization() throws Exception {
+-        RubyBignum v = RubyBignum.newBignum(ruby, "-9223372036854776000");
+-        BiValue original = BiValues.newBiValue(v);
+-
+-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+-        ObjectOutputStream oos = new ObjectOutputStream(baos);
+-        oos.writeObject(original);
+-        oos.close();
+-
+-        ByteArrayInputStream bais = new ByteArrayInputStream(baos.toByteArray());
+-        ObjectInputStream ois = new ObjectInputStream(bais);
+-        BiValue copy = (BiValue) ois.readObject();
+-        assertEquals(original, copy);
+-        assertFalse(copy.hasRubyValue());
+-    }
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/bivalues/BiValuesTest.java b/logstash-core/src/test/java/org/logstash/bivalues/BiValuesTest.java
+index dbf65c87a17..e53e6341382 100644
+--- a/logstash-core/src/test/java/org/logstash/bivalues/BiValuesTest.java
++++ b/logstash-core/src/test/java/org/logstash/bivalues/BiValuesTest.java
+@@ -1,10 +1,6 @@
+ package org.logstash.bivalues;
+ 
+-import java.math.BigDecimal;
+-import java.math.BigInteger;
+-import org.jruby.RubyBignum;
+ import org.jruby.RubyNil;
+-import org.jruby.ext.bigdecimal.RubyBigDecimal;
+ import org.junit.Test;
+ import org.logstash.TestBase;
+ 
+@@ -13,30 +9,6 @@
+ 
+ public class BiValuesTest extends TestBase {
+ 
+-    @Test
+-    public void testBiValuesBigDecimalRuby() {
+-        BigDecimal jo = BigDecimal.valueOf(12345.678D);
+-        RubyBigDecimal ro = new RubyBigDecimal(ruby, ruby.getClass("BigDecimal"), jo);
+-        BiValue subject = BiValues.newBiValue(ro);
+-
+-        assertEquals(ro, subject.rubyValueUnconverted());
+-        assertEquals(ro.getClass(), subject.rubyValue(ruby).getClass());
+-        assertEquals(jo, subject.javaValue());
+-        assertEquals(BigDecimal.class, subject.javaValue().getClass());
+-    }
+-
+-    @Test
+-    public void testBiValuesBigDecimalJava() {
+-        BigDecimal jo = BigDecimal.valueOf(12345.678D);
+-        RubyBigDecimal ro = new RubyBigDecimal(ruby, ruby.getClass("BigDecimal"), jo);
+-        BiValue subject = BiValues.newBiValue(jo);
+-
+-        assertEquals(jo, subject.javaValue());
+-        assertEquals(BigDecimal.class, subject.javaValue().getClass());
+-        assertEquals(ro, subject.rubyValue(ruby));
+-        assertEquals(ro.getClass(), subject.rubyValue(ruby).getClass());
+-    }
+-
+     @Test
+     public void testBiValuesNilRuby() {
+         RubyNil ro = (RubyNil) ruby.getNil();
+@@ -56,29 +28,4 @@ public void testBiValuesNullJava() {
+         assertEquals(ro, subject.rubyValue(ruby));
+         assertEquals(ro.getClass(), subject.rubyValue(ruby).getClass());
+     }
+-
+-    @Test
+-    public void testBiValuesBigIntegerRuby() {
+-        BigInteger jo = BigInteger.valueOf(12345678L);
+-        RubyBignum ro = new RubyBignum(ruby, jo);
+-        BiValue subject = BiValues.newBiValue(ro);
+-
+-        assertEquals(BigIntegerBiValue.class, subject.getClass());
+-        assertEquals(ro, subject.rubyValueUnconverted());
+-        assertEquals(ro.getClass(), subject.rubyValue(ruby).getClass());
+-        assertEquals(jo, subject.javaValue());
+-        assertEquals(BigInteger.class, subject.javaValue().getClass());
+-    }
+-
+-    @Test
+-    public void testBiValuesBigIntegerJava() {
+-        BigInteger jo = BigInteger.valueOf(12345678L);
+-        RubyBignum ro = new RubyBignum(ruby, jo);
+-        BiValue subject = BiValues.newBiValue(jo);
+-
+-        assertEquals(jo, subject.javaValue());
+-        assertEquals(BigInteger.class, subject.javaValue().getClass());
+-        assertEquals(ro, subject.rubyValue(ruby));
+-        assertEquals(ro.getClass(), subject.rubyValue(ruby).getClass());
+-    }
+ }

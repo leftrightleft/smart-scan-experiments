@@ -1,0 +1,176 @@
+diff --git a/docs/static/cross-plugin-concepts.asciidoc b/docs/static/cross-plugin-concepts.asciidoc
+new file mode 100644
+index 00000000000..c6765397f2c
+--- /dev/null
++++ b/docs/static/cross-plugin-concepts.asciidoc
+@@ -0,0 +1,17 @@
++[[plugin-concepts]]
++=== Cross-plugin concepts and features
++
++New section for concepts, features, and behaviours that apply to multiple plugins.
++
++[[space-delimited-uris-in-list-params]]
++==== Space-deliminated URIs in list-type params
++
++List-type URI parameters will automatically expand strings that contain multiple
++whitespace-delimited URIs into separate entries. This behaviour enables the expansion
++of an arbitrary list of URIs from a single Environment- or Keystore-variable.
++
++Examples of plugins and options that support this functionality:
++
++* <<plugins-inputs-elasticsearch-hosts,Elasticsearch input plugin - `hosts`>>
++* <<plugins-outputs-elasticsearch-hosts,Elasticsearch output plugin - `hosts`>>
++* <<plugins-filters-elasticsearch-hosts,Elasticsearch filter plugin - `hosts`>>
+diff --git a/docs/static/plugin-manager.asciidoc b/docs/static/plugin-manager.asciidoc
+index d32ec3d5104..50703b44e6a 100644
+--- a/docs/static/plugin-manager.asciidoc
++++ b/docs/static/plugin-manager.asciidoc
+@@ -153,6 +153,8 @@ bin/logstash-plugin install logstash-output-kafka
+ 
+ Once set, plugin commands install, update can be used through this proxy.
+ 
++include::cross-plugin-concepts.asciidoc[]
++
+ include::plugin-generator.asciidoc[]
+ 
+ include::offline-plugins.asciidoc[]
+diff --git a/logstash-core/lib/logstash/config/mixin.rb b/logstash-core/lib/logstash/config/mixin.rb
+index 57de589bcb4..a8febea0b0e 100644
+--- a/logstash-core/lib/logstash/config/mixin.rb
++++ b/logstash-core/lib/logstash/config/mixin.rb
+@@ -342,6 +342,8 @@ def process_parameter_value(value, config_settings)
+         # Empty lists are converted to nils
+         return true, [] if value.empty?
+ 
++        return validate_value(value, :uri_list) if config_val == :uri
++
+         validated_items = value.map {|v| validate_value(v, config_val)}
+         is_valid = validated_items.all? {|sr| sr[0] }
+         processed_value = validated_items.map {|sr| sr[1]}
+@@ -528,6 +530,15 @@ def validate_value(value, validator)
+             end
+ 
+             result = value.first.is_a?(::LogStash::Util::SafeURI) ? value.first : ::LogStash::Util::SafeURI.new(value.first)
++          when :uri_list
++            # expand entries that have space-delimited URIs in strings.
++            # This validator is considered private, and can be accessed
++            # by specifying `:validate => :uri` and `:list => true`
++            result = value.flat_map do |entry|
++              entry.kind_of?(String) ? entry.split(' ') : entry
++            end.map do |expanded_entry|
++              ::LogStash::Util::SafeURI.from(expanded_entry)
++            end
+           when :path
+             if value.size > 1 # Only 1 value wanted
+               return false, "Expected path (one value), got #{value.size} values?"
+diff --git a/logstash-core/lib/logstash/util/safe_uri.rb b/logstash-core/lib/logstash/util/safe_uri.rb
+index f2f095432ce..c73a0a46859 100644
+--- a/logstash-core/lib/logstash/util/safe_uri.rb
++++ b/logstash-core/lib/logstash/util/safe_uri.rb
+@@ -45,6 +45,17 @@ def initialize(arg)
+     raise ArgumentError, "URI is not valid - host is not specified" if @uri.host.nil?
+   end
+ 
++  ##
++  # Attempts to efficiently return an instance of `SafeURI` from the given object.
++  # @param object [Object]: an object that may or may not already be a `SafeURI`.
++  # @return [SafeURI]: if the given `object` was a `SafeURI`, returns it unmodified.
++  #                    otherwise, a new `SafeURI` is initialized using the `object`.
++  def self.from(object)
++    return object if object.kind_of?(self)
++
++    new(object)
++  end
++
+   def to_s
+     sanitized.to_s
+   end
+diff --git a/logstash-core/spec/logstash/config/mixin_spec.rb b/logstash-core/spec/logstash/config/mixin_spec.rb
+index 2cddf4f7d13..3fa8f09659e 100644
+--- a/logstash-core/spec/logstash/config/mixin_spec.rb
++++ b/logstash-core/spec/logstash/config/mixin_spec.rb
+@@ -115,28 +115,76 @@
+   context "when validating lists of items" do
+     let(:klass) do
+       Class.new(LogStash::Filters::Base)  do
+-        config_name "multiuri"
+-        config :uris, :validate => :uri, :list => true
++        config_name "list_validator_spec"
+         config :strings, :validate => :string, :list => true
+         config :required_strings, :validate => :string, :list => true, :required => true
+       end
+     end
+ 
+-    let(:uris) { ["http://example.net/1", "http://example.net/2"] }
+-    let(:safe_uris) { uris.map {|str| ::LogStash::Util::SafeURI.new(str) } }
+     let(:strings) { ["I am a", "modern major general"] }
+     let(:required_strings) { ["required", "strings"] }
+ 
+-    subject { klass.new("uris" => uris, "strings" => strings, "required_strings" => required_strings) }
+-
+-    it "a URI list should return an array of URIs" do
+-      expect(subject.uris).to match_array(safe_uris)
++    let(:config) do
++      {"strings" => strings, "required_strings" => required_strings}
+     end
+ 
++    subject(:instance) { klass.new(config) }
++
+     it "a string list should return an array of strings" do
+       expect(subject.strings).to match_array(strings)
+     end
+ 
++    context 'URI lists' do
++      let(:klass) do
++        Class.new(LogStash::Filters::Base) do
++          config_name 'list_uri_validator_spec'
++          config :uris, :validate => :uri, :list => true
++        end
++      end
++      subject(:instance) { klass.new(config) }
++
++      let(:uri_1) { "http://example.net/1" }
++      let(:uri_2) { "http://example.net/2" }
++      let(:uri_3) { "http://example.net:9201/3" }
++
++      let(:uris) { [uri_1, uri_2, uri_3] }
++      let(:config) { Hash["uris" => uris_parameter] }
++
++      let(:safe_uris) { uris.map {|str| ::LogStash::Util::SafeURI.new(str) } }
++
++      shared_examples ':validate => :uri_list' do
++        it 'should normalize to a flat list containing all extracted URIs from the input' do
++          expect(instance.uris).to match_array(safe_uris)
++        end
++      end
++
++      context 'when given a single string containing exactly one uri' do
++        let(:uris_parameter) { "#{uri_1}" }
++        let(:uris) { [uri_1] }
++        include_examples ':validate => :uri_list'
++      end
++
++      context 'when given an array of strings, each containing exactly one uri' do
++        let(:uris_parameter) { uris }
++        include_examples ':validate => :uri_list'
++      end
++
++      context 'when given a single string containing multiple whitespace-delimited uris' do
++        let(:uris_parameter) { "#{uri_1} #{uri_2} #{uri_3}" }
++        include_examples ':validate => :uri_list'
++      end
++
++      context 'when given an array containing a single entry that has multiple whitespace-delimited uris' do
++        let(:uris_parameter) { ["#{uri_1} #{uri_2} #{uri_3}"] }
++        include_examples ':validate => :uri_list'
++      end
++
++      context 'when given an array containing multiple entries, one of which has multiple whitespace-delimited uris' do
++        let(:uris_parameter) { ["#{uri_1} #{uri_2}", "#{uri_3}"] }
++        include_examples ':validate => :uri_list'
++      end
++    end
++
+     context "with a scalar value" do
+       let(:strings) { "foo" }
+ 

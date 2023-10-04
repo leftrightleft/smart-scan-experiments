@@ -1,0 +1,98 @@
+diff --git a/logstash-core/lib/logstash/api/lib/app.rb b/logstash-core/lib/logstash/api/lib/app.rb
+index 7a3be0255a1..72946ec6707 100644
+--- a/logstash-core/lib/logstash/api/lib/app.rb
++++ b/logstash-core/lib/logstash/api/lib/app.rb
+@@ -25,6 +25,13 @@ def initialize(app=nil)
+       @factory = CommandFactory.new(settings.service)
+     end
+ 
++    not_found do
++      status 404
++      as   = params.has_key?("human") ? :string : :json
++      text = as == :string ? "" : {}
++      respond_with(text, :as => as)
++    end
++
+     error do
+       logger.error(env['sinatra.error'].message, :url => request.url, :ip => request.ip, :params => request.params)
+     end
+diff --git a/logstash-core/lib/logstash/api/lib/app/commands/stats/hotthreads_command.rb b/logstash-core/lib/logstash/api/lib/app/commands/stats/hotthreads_command.rb
+index 36f8a39277a..0c3f4ee2ef7 100644
+--- a/logstash-core/lib/logstash/api/lib/app/commands/stats/hotthreads_command.rb
++++ b/logstash-core/lib/logstash/api/lib/app/commands/stats/hotthreads_command.rb
+@@ -18,7 +18,7 @@ def run(options={})
+   class ThreadDump
+ 
+     SKIPPED_THREADS             = [ "Finalizer", "Reference Handler", "Signal Dispatcher" ].freeze
+-    THREADS_COUNT_DEFAULT       = 10.freeze
++    THREADS_COUNT_DEFAULT       = 3.freeze
+     IGNORE_IDLE_THREADS_DEFAULT = true.freeze
+ 
+     attr_reader :top_count, :ignore, :dump
+@@ -73,14 +73,37 @@ def each(&block)
+       dump.each_pair do |thread_name, _hash|
+         break if i >= top_count
+         if ignore
+-          next if SKIPPED_THREADS.include?(thread_name)
+-          next if thread_name.match(/Ruby-\d+-JIT-\d+/)
++          next if idle_thread?(thread_name, _hash)
+         end
+         block.call(thread_name, _hash)
+         i += 1
+       end
+     end
+ 
++    def idle_thread?(thread_name, data)
++      idle = false
++      if SKIPPED_THREADS.include?(thread_name)
++        # these are likely JVM dependent
++        idle = true
++      elsif thread_name.match(/Ruby-\d+-JIT-\d+/)
++        # This are internal JRuby JIT threads, 
++        # see java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor for details.
++        idle = true
++      elsif thread_name.match(/pool-\d+-thread-\d+/)
++        # This are threads used by the internal JRuby implementation to dispatch
++        # calls and tasks, see prg.jruby.internal.runtime.methods.DynamicMethod.call
++        idle = true
++      else
++        data["thread.stacktrace"].each do |trace|
++          if trace.start_with?("java.util.concurrent.ThreadPoolExecutor.getTask")
++            idle = true
++            break
++          end
++        end
++      end
++      idle
++    end
++
+     def hostname
+       @cmd.hostname
+     end
+diff --git a/logstash-core/lib/logstash/api/lib/app/modules/node.rb b/logstash-core/lib/logstash/api/lib/app/modules/node.rb
+index 21d877f1164..3edfb0de5a1 100644
+--- a/logstash-core/lib/logstash/api/lib/app/modules/node.rb
++++ b/logstash-core/lib/logstash/api/lib/app/modules/node.rb
+@@ -14,6 +14,8 @@ class Node < BaseApp
+         :ignore_idle_threads => as_boolean(ignore_idle_threads),
+         :human => params.has_key?("human")
+       }
++      options[:threads] = params["threads"].to_i if params.has_key?("threads")
++
+       command = factory.build(:hot_threads_command)
+       as    = options[:human] ? :string : :json
+       respond_with(command.run(options), {:as => as})
+diff --git a/logstash-core/lib/logstash/webserver.rb b/logstash-core/lib/logstash/webserver.rb
+index 29a5a3c291c..bbd4f773a7f 100644
+--- a/logstash-core/lib/logstash/webserver.rb
++++ b/logstash-core/lib/logstash/webserver.rb
+@@ -62,7 +62,8 @@ def stop(options={})
+         @runner.stop_blocked
+       else
+         @runner.stop
+-      end
++      end rescue nil
++
+       @status = :stop
+       log "=== puma shutdown: #{Time.now} ==="
+     end

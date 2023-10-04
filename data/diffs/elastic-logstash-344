@@ -1,0 +1,165 @@
+diff --git a/lib/logstash/filters/translate.rb b/lib/logstash/filters/translate.rb
+new file mode 100644
+index 00000000000..ea16592511a
+--- /dev/null
++++ b/lib/logstash/filters/translate.rb
+@@ -0,0 +1,71 @@
++require "logstash/filters/base"
++require "logstash/namespace"
++
++# Originally written to translate HTTP response codes 
++# but turned into a general translation tool which uses
++# .yaml files as a dictionary.
++# response codes in default dictionary were scraped from 
++# 'gem install cheat; cheat status_codes'
++
++class LogStash::Filters::Translate < LogStash::Filters::Base
++  config_name "translate"
++  plugin_status "experimental"
++
++
++  # The field containing a response code If this field is an
++  # array, only the first value will be used.
++  config :field, :validate => :string, :required => true
++
++  # name with full path of external dictionary file.    
++  # format of the table should be a YAML file. 
++  # make sure you encase any integer based keys in quotes.
++  # For simple string search and replacements for just a few values
++  # use the gsub function of the mutate filter.
++  config :dictionary_path, :validate => :string, :required => true
++
++  # The destination you wish to populate with the response code.    
++  # default is http_response_code.  set to the same value as source
++  # if you want to do a substitution.
++  config :destination, :validate => :string, :default => "translation"
++
++  # set to false if you want to match multiple terms.   
++  # a large dictionary could get expensive if set to false.
++  config :exact, :validate => :boolean, :default => true
++
++
++
++  public
++  def register
++    if File.exists?(@dictionary_path)
++      begin
++        @dictionary = YAML.load_file(@dictionary_path)
++      rescue Exception => e
++        raise "Bad Syntax in dictionary file" 
++      end
++    end # if File.exists?
++    @logger.info("Dictionary - ", :dictionary => @dictionary)
++    if @exact
++      @logger.info("Dictionary translation method - Exact")
++    else 
++      @logger.info("Dictionary translation method - Fuzzy")
++    end # if @exact
++  end # def register
++
++  public
++  def filter(event)
++    return unless filter?(event)
++      begin
++        source = event[@field]
++        source = source.first if source.is_a? Array # if array,  just use first value 
++        source = source.to_s # make sure its a string.  Is this really needed?
++        if @exact
++          translation = @dictionary[source] if @dictionary.include?(source)
++        else 
++          translation = source.gsub(Regexp.union(@dictionary.keys), @dictionary)
++        end # if @exact
++      rescue Exception => e
++          @logger.error("Something went wrong when attempting to translate from dictionary", :exception => e, :field => @field, :event => event)
++      end
++      event[@destination] = translation
++  end # def filter
++end # class LogStash::Filters::Translate
+diff --git a/lib/logstash/inputs/snmptrap.rb b/lib/logstash/inputs/snmptrap.rb
+new file mode 100644
+index 00000000000..ca166a44cdc
+--- /dev/null
++++ b/lib/logstash/inputs/snmptrap.rb
+@@ -0,0 +1,70 @@
++require "logstash/inputs/base"
++require "logstash/namespace"
++require "snmp"
++
++# Read snmp trap messages as events
++#
++# Resulting @message looks like :
++#   #<SNMP::SNMPv1_Trap:0x6f1a7a4 @varbind_list=[#<SNMP::VarBind:0x2d7bcd8f @value="teststring", 
++#   @name=[1.11.12.13.14.15]>], @timestamp=#<SNMP::TimeTicks:0x1af47e9d @value=55>, @generic_trap=6, 
++#   @enterprise=[1.2.3.4.5.6], @source_ip="127.0.0.1", @agent_addr=#<SNMP::IpAddress:0x29a4833e @value="\xC0\xC1\xC2\xC3">, 
++#   @specific_trap=99>
++#
++# TODO : work out how to break it down into field.keys.   looks like varbind_list can have multiple entries which might 
++#        mean multiple events per trap ?
++
++class LogStash::Inputs::Snmptrap < LogStash::Inputs::Base
++  config_name "snmptrap"
++  plugin_status "experimental"
++
++  # The address to listen on
++  config :host, :validate => :string, :default => "0.0.0.0"
++
++  # The port to listen on. Remember that ports less than 1024 (privileged
++  # ports) may require root to use.
++  config :port, :validate => :number, :default => 1062
++
++  # SNMP Community String to listen for.
++  config :community, :validate => :string, :default => "public"
++
++
++  def initialize(*args)
++    super(*args)
++  end # def initialize
++
++  public
++  def register
++    @snmptrap = nil
++  end # def register
++
++  public
++  def run(output_queue)
++    LogStash::Util::set_thread_name("input|snmptrap|#{@community}")
++    begin
++      # snmp trap server
++      snmptrap_listener(output_queue)
++    rescue => e
++      @logger.warn("SNMP Trap listener died", :exception => e, :backtrace => e.backtrace)
++      sleep(5)
++      retry
++    end # begin
++  end # def run
++
++  private
++  def snmptrap_listener(output_queue)
++    @logger.info("It's a Trap!", :host => @host, :port => @port, :community => @community)
++    @snmptrap = SNMP::TrapListener.new(:Port => @port, :Community => @community, :Host => @host) 
++    loop do
++      @snmptrap.on_trap_default do |trap|
++        begin
++          event = to_event(trap.inspect, trap.source_ip)
++          @logger.info("SNMP Trap received: ", :trap_object => trap.inspect)
++          output_queue << event if event
++        rescue => event
++          @logger.error("Failed to create event", :trap_object => trap.inspect)
++        end
++      end
++    end
++  end # def snmptrap_listener
++
++end # class LogStash::Inputs::Snmptrap
+diff --git a/logstash.gemspec b/logstash.gemspec
+index 69ecbbd5936..23a1ce3ba0b 100644
+--- a/logstash.gemspec
++++ b/logstash.gemspec
+@@ -61,6 +61,7 @@ Gem::Specification.new do |gem|
+   gem.add_runtime_dependency "php-serialize" # For input drupal_dblog
+   gem.add_runtime_dependency "murmurhash3"
+   gem.add_runtime_dependency "rufus-scheduler"
++  gem.add_runtime_dependency "snmp"
+ 
+   if RUBY_PLATFORM == 'java'
+     gem.platform = RUBY_PLATFORM

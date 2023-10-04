@@ -1,0 +1,680 @@
+diff --git a/logstash-core/lib/logstash/instrument/periodic_poller/cgroup.rb b/logstash-core/lib/logstash/instrument/periodic_poller/cgroup.rb
+index 28199b2a5cc..2778f5300a0 100644
+--- a/logstash-core/lib/logstash/instrument/periodic_poller/cgroup.rb
++++ b/logstash-core/lib/logstash/instrument/periodic_poller/cgroup.rb
+@@ -1,5 +1,4 @@
+ # encoding: utf-8
+-require "pathname"
+ require "logstash/util/loggable"
+ 
+ # Logic from elasticsearch/core/src/main/java/org/elasticsearch/monitor/os/OsProbe.java
+@@ -7,130 +6,214 @@
+ module LogStash module Instrument module PeriodicPoller
+   class Cgroup
+     include LogStash::Util::Loggable
++    class Override
++      attr_reader :key, :value
++      def initialize(key)
++        @key = key
++        @value = java.lang.System.getProperty(@key)
++      end
+ 
+-    CONTROL_GROUP_RE = Regexp.compile("\\d+:([^:,]+(?:,[^:,]+)?):(/.*)");
+-    CONTROLLER_SEPARATOR_RE = ","
+-
+-    PROC_SELF_CGROUP_FILE = Pathname.new("/proc/self/cgroup")
+-    PROC_CGROUP_CPU_DIR = Pathname.new("/sys/fs/cgroup/cpu")
+-    PROC_CGROUP_CPUACCT_DIR = Pathname.new("/sys/fs/cgroup/cpuacct")
+-
+-    GROUP_CPUACCT = "cpuacct"
+-    CPUACCT_USAGE_FILE = "cpuacct.usage"
+-
+-    GROUP_CPU = "cpu"
+-    CPU_FS_PERIOD_US_FILE = "cpu.cfs_period_us"
+-    CPU_FS_QUOTA_US_FILE = "cpu.cfs_quota_us"
++      def nil?
++        value.nil?
++      end
+ 
+-    CPU_STATS_FILE = "cpu.stat"
++      def override(other)
++        nil? ? other : value
++      end
++    end
+ 
+-    class << self
+-      def are_cgroup_available?
+-        [::File.exist?(PROC_SELF_CGROUP_FILE),
+-         Dir.exist?(PROC_CGROUP_CPU_DIR),
+-         Dir.exist?(PROC_CGROUP_CPUACCT_DIR)].all?
++    ## `/proc/self/cgroup` contents look like this
++    # 5:cpu,cpuacct:/
++    # 4:cpuset:/
++    # 2:net_cls,net_prio:/
++    # 0::/user.slice/user-1000.slice/session-932.scope
++    ## e.g. N:controller:/path-to-info
++    # we find the controller and path
++    # we skip the line without a controller e.g. 0::/path
++    # we assume there are these symlinks:
++    # `/sys/fs/cgroup/cpu` -> `/sys/fs/cgroup/cpu,cpuacct
++    # `/sys/fs/cgroup/cpuacct` -> `/sys/fs/cgroup/cpu,cpuacct
++
++    CGROUP_FILE = "/proc/self/cgroup"
++    CPUACCT_DIR = "/sys/fs/cgroup/cpuacct"
++    CPU_DIR = "/sys/fs/cgroup/cpu"
++    CRITICAL_PATHS = [CGROUP_FILE, CPUACCT_DIR, CPU_DIR]
++
++    CONTROLLER_CPUACCT_LABEL = "cpuacct"
++    CONTROLLER_CPU_LABEL = "cpu"
++
++    class CGroupResources
++      CONTROL_GROUP_RE = Regexp.compile("\\d+:([^:,]+(?:,[^:,]+)?):(/.*)")
++      CONTROLLER_SEPARATOR_RE = ","
++
++      def cgroup_available?
++        # don't cache to ivar, in case the files are mounted after logstash starts??
++        CRITICAL_PATHS.all?{|path| ::File.exist?(path)}
+       end
+ 
+-      def control_groups
++      def controller_groups
+         response = {}
+-
+-        read_proc_self_cgroup_lines.each do |line|
++        IO.readlines(CGROUP_FILE).each do |line|
+           matches = CONTROL_GROUP_RE.match(line)
++          next if matches.nil?
+           # multiples controls, same hierarchy
+           controllers = matches[1].split(CONTROLLER_SEPARATOR_RE)
+-          controllers.each_with_object(response) { |controller| response[controller] = matches[2] }
++          controllers.each do |controller|
++            case controller
++            when CONTROLLER_CPU_LABEL
++              response[controller] = CpuResource.new(matches[2])
++            when CONTROLLER_CPUACCT_LABEL
++              response[controller] = CpuAcctResource.new(matches[2])
++            else
++              response[controller] = UnimplementedResource.new(controller, matches[2])
++            end
++          end
+         end
+-
+         response
+       end
++    end
+ 
+-      def read_first_line(path)
+-        IO.readlines(path).first
++    module ControllerResource
++      attr_reader :base_path, :override, :offset_path
++      def implemented?
++        true
+       end
+-
+-      def cgroup_cpuacct_usage_nanos(control_group)
+-        read_first_line(::File.join(PROC_CGROUP_CPUACCT_DIR, control_group, CPUACCT_USAGE_FILE)).to_i
++      private
++      def common_initialize(base, override_key, original_path)
++        @base_path = base
++        # override is needed here for the logging statements
++        @override = Override.new(override_key)
++        @offset_path = @override.override(original_path)
++        @procs = {}
++        @procs[:read_int] = lambda {|path| IO.readlines(path).first.to_i }
++        @procs[:read_lines] = lambda {|path| IO.readlines(path) }
+       end
+-
+-      def cgroup_cpu_fs_period_micros(control_group)
+-        read_first_line(::File.join(PROC_CGROUP_CPUACCT_DIR, control_group, CPU_FS_PERIOD_US_FILE)).to_i
++      def call_if_file_exists(call_key, file, not_found_value)
++        path = ::File.join(@base_path, @offset_path, file)
++        if ::File.exist?(path)
++          @procs[call_key].call(path)
++        else
++          message = "File #{path} cannot be found, "
++          if override.nil?
++            message.concat("try providing an override '#{override.key}' in the Logstash JAVA_OPTS environment variable")
++          else
++            message.concat("even though the '#{override.key}' override is: '#{override.value}'")
++          end
++          logger.debug(message)
++          not_found_value
++        end
+       end
++    end
+ 
+-      def cgroup_cpu_fs_quota_micros(control_group)
+-        read_first_line(::File.join(PROC_CGROUP_CPUACCT_DIR, control_group,  CPU_FS_QUOTA_US_FILE)).to_i
++    class CpuAcctResource
++      include LogStash::Util::Loggable
++      include ControllerResource
++      def initialize(original_path)
++        common_initialize(CPUACCT_DIR, "ls.cgroup.cpuacct.path.override", original_path)
+       end
+-
+-      def read_proc_self_cgroup_lines
+-        IO.readlines(PROC_SELF_CGROUP_FILE)
++      def to_hash
++        {:control_group => offset_path, :usage_nanos => cpuacct_usage}
+       end
+-
+-      class CpuStats
+-        attr_reader :number_of_elapsed_periods, :number_of_times_throttled, :time_throttled_nanos
+-
+-        def initialize(number_of_elapsed_periods, number_of_times_throttled, time_throttled_nanos)
+-          @number_of_elapsed_periods = number_of_elapsed_periods
+-          @number_of_times_throttled = number_of_times_throttled
+-          @time_throttled_nanos = time_throttled_nanos
+-        end
++      private
++      def cpuacct_usage
++        call_if_file_exists(:read_int, "cpuacct.usage", -1)
+       end
++    end
+ 
+-      def read_sys_fs_cgroup_cpuacct_cpu_stat(control_group)
+-        IO.readlines(::File.join(PROC_CGROUP_CPU_DIR, control_group, CPU_STATS_FILE))
++    class CpuResource
++      include LogStash::Util::Loggable
++      include ControllerResource
++      def initialize(original_path)
++        common_initialize(CPU_DIR, "ls.cgroup.cpu.path.override", original_path)
+       end
++      def to_hash
++        {
++          :control_group => offset_path,
++          :cfs_period_micros => cfs_period_us,
++          :cfs_quota_micros => cfs_quota_us,
++          :stat => build_cpu_stats_hash
++        }
++      end
++      private
++      def cfs_period_us
++        call_if_file_exists(:read_int, "cpu.cfs_period_us", -1)
++      end
++      def cfs_quota_us
++        call_if_file_exists(:read_int, "cpu.cfs_quota_us", -1)
++      end
++      def build_cpu_stats_hash
++        stats = CpuStats.new
++        lines = call_if_file_exists(:read_lines, "cpu.stat", [])
++        stats.update(lines)
++        stats.to_hash
++      end
++    end
+ 
+-      def cgroup_cpuacct_cpu_stat(control_group)
+-        lines = read_sys_fs_cgroup_cpuacct_cpu_stat(control_group);
+-
+-        number_of_elapsed_periods = -1;
+-        number_of_times_throttled = -1;
+-        time_throttled_nanos = -1;
++    class UnimplementedResource
++      attr_reader :controller, :original_path
++      def initialize(controller, original_path)
++        @controller, @original_path = controller, original_path
++      end
++      def implemented?
++        false
++      end
++    end
+ 
++    class CpuStats
++      def initialize
++        @number_of_elapsed_periods = -1
++        @number_of_times_throttled = -1
++        @time_throttled_nanos = -1
++      end
++      def update(lines)
+         lines.each do |line|
+           fields = line.split(/\s+/)
++          next unless fields.size > 1
+           case fields.first
+-          when "nr_periods" then number_of_elapsed_periods = fields[1].to_i
+-          when "nr_throttled" then number_of_times_throttled= fields[1].to_i
+-          when "throttled_time" then time_throttled_nanos = fields[1].to_i
++          when "nr_periods" then @number_of_elapsed_periods = fields[1].to_i
++          when "nr_throttled" then @number_of_times_throttled = fields[1].to_i
++          when "throttled_time" then @time_throttled_nanos = fields[1].to_i
+           end
+         end
+-
+-        CpuStats.new(number_of_elapsed_periods, number_of_times_throttled, time_throttled_nanos)
+       end
++      def to_hash
++        {
++          :number_of_elapsed_periods => @number_of_elapsed_periods,
++          :number_of_times_throttled => @number_of_times_throttled,
++          :time_throttled_nanos => @time_throttled_nanos
++        }
++      end
++    end
+ 
+-      def get_all
+-       groups = control_groups
+-       return if groups.empty?
+-
+-       cgroups_stats = {
+-         :cpuacct => {},
+-         :cpu => {}
+-       }
+-
+-       cpuacct_group = groups[GROUP_CPUACCT]
+-       cgroups_stats[:cpuacct][:control_group] = cpuacct_group
+-       cgroups_stats[:cpuacct][:usage_nanos] = cgroup_cpuacct_usage_nanos(cpuacct_group)
++    CGROUP_RESOURCES = CGroupResources.new
+ 
+-       cpu_group = groups[GROUP_CPU]
+-       cgroups_stats[:cpu][:control_group] = cpu_group
+-       cgroups_stats[:cpu][:cfs_period_micros] = cgroup_cpu_fs_period_micros(cpu_group)
+-       cgroups_stats[:cpu][:cfs_quota_micros] = cgroup_cpu_fs_quota_micros(cpu_group)
++    class << self
++      def get_all
++        unless CGROUP_RESOURCES.cgroup_available?
++          logger.debug("One or more required cgroup files or directories not found: #{CRITICAL_PATHS.join(', ')}")
++          return
++        end
+ 
+-       cpu_stats = cgroup_cpuacct_cpu_stat(cpu_group)
++        groups = CGROUP_RESOURCES.controller_groups
+ 
+-       cgroups_stats[:cpu][:stat] = {
+-         :number_of_elapsed_periods => cpu_stats.number_of_elapsed_periods,
+-         :number_of_times_throttled => cpu_stats.number_of_times_throttled,
+-         :time_throttled_nanos => cpu_stats.time_throttled_nanos
+-       }
++        if groups.empty?
++          logger.debug("The main cgroup file did not have any controllers: #{CGROUP_FILE}")
++          return
++        end
+ 
+-       cgroups_stats
++        cgroups_stats = {}
++        groups.each do |name, controller|
++          next unless controller.implemented?
++          cgroups_stats[name.to_sym] = controller.to_hash
++        end
++        cgroups_stats
+       rescue => e
+-        logger.debug("Error, cannot retrieve cgroups information", :exception => e.class.name, :message => e.message) if logger.debug?
++        logger.debug("Error, cannot retrieve cgroups information", :exception => e.class.name, :message => e.message, :backtrace => e.backtrace.take(4)) if logger.debug?
+         nil
+       end
+ 
+       def get
+-        are_cgroup_available? ? get_all : nil
++        get_all
+       end
+     end
+   end
+diff --git a/logstash-core/spec/logstash/instrument/periodic_poller/cgroup_spec.rb b/logstash-core/spec/logstash/instrument/periodic_poller/cgroup_spec.rb
+index 639ab0d8a9d..4a8eab8ebe3 100644
+--- a/logstash-core/spec/logstash/instrument/periodic_poller/cgroup_spec.rb
++++ b/logstash-core/spec/logstash/instrument/periodic_poller/cgroup_spec.rb
+@@ -2,127 +2,258 @@
+ require "logstash/instrument/periodic_poller/cgroup"
+ require "spec_helper"
+ 
+-describe LogStash::Instrument::PeriodicPoller::Cgroup do
+-  subject { described_class }
++LogStash::Logging::Logger::configure_logging("DEBUG")
+ 
+-  context ".are_cgroup_available?" do
+-    context "all the file exist" do
++module LogStash module Instrument module PeriodicPoller
++describe "cgroup stats" do
++  let(:relative_path) { "/docker/a1f61" }
++  let(:proc_self_cgroup_content) do
++    %W(14:name=systemd,holaunlimited:#{relative_path}
++        13:pids:#{relative_path}
++        12:hugetlb:#{relative_path}
++        11:net_prio:#{relative_path}
++        10:perf_event:#{relative_path}
++        9:net_cls:#{relative_path}
++        8:freezer:#{relative_path}
++        7:devices:#{relative_path}
++        6:memory:#{relative_path}
++        5:blkio:#{relative_path}
++        4:cpuacct:#{relative_path}
++        3:cpu:#{relative_path}
++        2:cpuset:#{relative_path}
++        1:name=openrc:/docker
++        0::/docker)
++  end
++  describe Cgroup::CGroupResources do
++    subject(:cgroup_resources) { described_class.new }
++    context "method: cgroup_available?" do
++      context "resources exist" do
++        before do
++          allow(::File).to receive(:exist?).and_return(true)
++        end
++        it "returns true" do
++          expect(cgroup_resources.cgroup_available?).to be_truthy
++        end
++      end
++      context "resources do not exist" do
++        subject { described_class.new }
++        before do
++          allow(::File).to receive(:exist?).and_return(true)
++          allow(::File).to receive(:exist?).with("/proc/self/cgroup").and_return(false)
++        end
++        it "returns false" do
++          expect(cgroup_resources.cgroup_available?).to be_falsey
++        end
++      end
++    end
++
++    context "method: controller_groups" do
+       before do
+-        allow(::File).to receive(:exist?).with(subject::PROC_SELF_CGROUP_FILE).and_return(true)
+-        allow(::Dir).to receive(:exist?).with(subject::PROC_CGROUP_CPU_DIR).and_return(true)
+-        allow(::Dir).to receive(:exist?).with(subject::PROC_CGROUP_CPUACCT_DIR).and_return(true)
++        allow(IO).to receive(:readlines).with("/proc/self/cgroup").and_return(proc_self_cgroup_content)
+       end
+ 
+-      it "returns true" do
+-        expect(subject.are_cgroup_available?).to be_truthy
++      it "returns the control groups" do
++        controllers = cgroup_resources.controller_groups
++
++        controller = controllers["cpuacct"]
++        expect(controller).to be_a(Cgroup::CpuAcctResource)
++        expect(controller.base_path).to eq("/sys/fs/cgroup/cpuacct")
++        expect(controller.offset_path).to eq(relative_path)
++        expect(controller.override).to be_a(Cgroup::Override)
++        expect(controller.override.nil?).to be_truthy
++
++        controller = controllers["cpu"]
++        expect(controller).to be_a(Cgroup::CpuResource)
++        expect(controller.base_path).to eq("/sys/fs/cgroup/cpu")
++        expect(controller.offset_path).to eq(relative_path)
++        expect(controller.override).to be_a(Cgroup::Override)
++        expect(controller.override.nil?).to be_truthy
++
++        controller = controllers["name=systemd"]
++        expect(controller).to be_a(Cgroup::UnimplementedResource)
++        expect(controller.controller).to eq("name=systemd")
++        expect(controller.original_path).to eq(relative_path)
++
++        controller = controllers["holaunlimited"]
++        expect(controller).to be_a(Cgroup::UnimplementedResource)
++        expect(controller.controller).to eq("holaunlimited")
++        expect(controller.original_path).to eq(relative_path)
++
++        controller = controllers["pids"]
++        expect(controller).to be_a(Cgroup::UnimplementedResource)
++        expect(controller.controller).to eq("pids")
++        expect(controller.original_path).to eq(relative_path)
++
++        controller = controllers["hugetlb"]
++        expect(controller).to be_a(Cgroup::UnimplementedResource)
++        expect(controller.controller).to eq("hugetlb")
++        expect(controller.original_path).to eq(relative_path)
++
++        controller = controllers["net_prio"]
++        expect(controller).to be_a(Cgroup::UnimplementedResource)
++        expect(controller.controller).to eq("net_prio")
++        expect(controller.original_path).to eq(relative_path)
++
++        controller = controllers["perf_event"]
++        expect(controller).to be_a(Cgroup::UnimplementedResource)
++        expect(controller.controller).to eq("perf_event")
++        expect(controller.original_path).to eq(relative_path)
++
++        controller = controllers["net_cls"]
++        expect(controller).to be_a(Cgroup::UnimplementedResource)
++        expect(controller.controller).to eq("net_cls")
++        expect(controller.original_path).to eq(relative_path)
++
++        controller = controllers["freezer"]
++        expect(controller).to be_a(Cgroup::UnimplementedResource)
++        expect(controller.controller).to eq("freezer")
++        expect(controller.original_path).to eq(relative_path)
++
++        controller = controllers["devices"]
++        expect(controller).to be_a(Cgroup::UnimplementedResource)
++        expect(controller.controller).to eq("devices")
++        expect(controller.original_path).to eq(relative_path)
++
++        controller = controllers["memory"]
++        expect(controller).to be_a(Cgroup::UnimplementedResource)
++        expect(controller.controller).to eq("memory")
++        expect(controller.original_path).to eq(relative_path)
++
++        controller = controllers["blkio"]
++        expect(controller).to be_a(Cgroup::UnimplementedResource)
++        expect(controller.controller).to eq("blkio")
++        expect(controller.original_path).to eq(relative_path)
++
++        controller = controllers["cpuset"]
++        expect(controller).to be_a(Cgroup::UnimplementedResource)
++        expect(controller.controller).to eq("cpuset")
++        expect(controller.original_path).to eq(relative_path)
++
++        controller = controllers["name=openrc"]
++        expect(controller).to be_a(Cgroup::UnimplementedResource)
++        expect(controller.controller).to eq("name=openrc")
++        expect(controller.original_path).to eq("/docker")
+       end
+     end
+ 
+-    context "not all the file exist" do
++    context "method: controller_groups with override" do
+       before do
+-        allow(::File).to receive(:exist?).with(subject::PROC_SELF_CGROUP_FILE).and_return(true)
+-        allow(::Dir).to receive(:exist?).with(subject::PROC_CGROUP_CPU_DIR).and_return(false)
+-        allow(::Dir).to receive(:exist?).with(subject::PROC_CGROUP_CPUACCT_DIR).and_return(true)
++        java.lang.System.setProperty("ls.cgroup.cpu.path.override", "/foo")
++        java.lang.System.setProperty("ls.cgroup.cpuacct.path.override", "/bar")
++        allow(IO).to receive(:readlines).with("/proc/self/cgroup").and_return(proc_self_cgroup_content)
+       end
++      after do
++        java.lang.System.clearProperty("ls.cgroup.cpu.path.override")
++        java.lang.System.clearProperty("ls.cgroup.cpuacct.path.override")
++      end
++      it "returns overridden control groups" do
++        controllers = cgroup_resources.controller_groups
++        controller = controllers["cpuacct"]
++        expect(controller).to be_a(Cgroup::CpuAcctResource)
++        expect(controller.override.nil?).to be_falsey
++        expect(controller.base_path).to eq("/sys/fs/cgroup/cpuacct")
++        expect(controller.offset_path).to eq("/bar")
++        expect(controller.override).to be_a(Cgroup::Override)
++
++        controller = controllers["cpu"]
++        expect(controller).to be_a(Cgroup::CpuResource)
++        expect(controller.override.nil?).to be_falsey
++        expect(controller.base_path).to eq("/sys/fs/cgroup/cpu")
++        expect(controller.offset_path).to eq("/foo")
++        expect(controller.override).to be_a(Cgroup::Override)
+ 
+-      it "returns false" do
+-        expect(subject.are_cgroup_available?).to be_falsey
++        controller = controllers["cpuset"]
++        expect(controller).to be_a(Cgroup::UnimplementedResource)
++        expect(controller.controller).to eq("cpuset")
++        expect(controller.original_path).to eq(relative_path)
+       end
+     end
+   end
+ 
+-  context ".control_groups" do
+-    let(:proc_self_cgroup_content) {
+-      %w(14:name=systemd,holaunlimited:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-13:pids:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-12:hugetlb:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-11:net_prio:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-10:perf_event:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-9:net_cls:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-8:freezer:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-7:devices:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-6:memory:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-5:blkio:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-4:cpuacct:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-3:cpu:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-2:cpuset:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-1:name=openrc:/docker) }
+-
+-    before do
+-      allow(subject).to receive(:read_proc_self_cgroup_lines).and_return(proc_self_cgroup_content)
++  describe Cgroup::CpuAcctResource do
++    subject(:cpuacct_resource) { described_class.new("/bar") }
++    describe "method: to_hash, without override" do
++      context "when the files cannot be found" do
++        it "fills in the hash with minus one" do
++          expect(cpuacct_resource.base_path).to eq("/sys/fs/cgroup/cpuacct")
++          expect(cpuacct_resource.offset_path).to eq("/bar")
++          expect(cpuacct_resource.to_hash).to eq({:control_group=>"/bar", :usage_nanos=>-1})
++        end
++      end
++    end
++    describe "method: to_hash, with override" do
++      before do
++        java.lang.System.setProperty("ls.cgroup.cpuacct.path.override", "/quux")
++      end
++      after do
++        java.lang.System.clearProperty("ls.cgroup.cpuacct.path.override")
++      end
++      context "when the files cannot be found" do
++        it "fills in the hash with minus one" do
++          expect(cpuacct_resource.base_path).to eq("/sys/fs/cgroup/cpuacct")
++          expect(cpuacct_resource.offset_path).to eq("/quux")
++          expect(cpuacct_resource.to_hash).to eq({:control_group=>"/quux", :usage_nanos=>-1})
++        end
++      end
+     end
++  end
+ 
+-    it "returns the control groups" do
+-      expect(subject.control_groups).to match({
+-        "name=systemd" => "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61",
+-        "holaunlimited" => "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61",
+-        "pids" => "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61",
+-        "hugetlb" => "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61",
+-        "net_prio" => "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61",
+-        "perf_event" => "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61",
+-        "net_cls" => "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61",
+-        "freezer" => "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61",
+-        "devices" => "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61",
+-        "memory" => "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61",
+-        "blkio" => "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61",
+-        "cpuacct" => "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61",
+-        "cpu" => "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61",
+-        "cpuset" => "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61",
+-        "name=openrc" => "/docker"
+-      })
++  describe Cgroup::CpuResource do
++    subject(:cpu_resource) { described_class.new("/bar") }
++    describe "method: fill, without override" do
++      context "when the files cannot be found" do
++        it "fills in the hash with minus one" do
++          expect(cpu_resource.base_path).to eq("/sys/fs/cgroup/cpu")
++          expect(cpu_resource.offset_path).to eq("/bar")
++          expect(cpu_resource.to_hash).to eq({:cfs_period_micros=>-1, :cfs_quota_micros=>-1, :control_group=>"/bar", :stat=>{:number_of_elapsed_periods=>-1, :number_of_times_throttled=>-1, :time_throttled_nanos=>-1}})
++        end
++      end
++    end
++    describe "method: fill, with override" do
++      before do
++        java.lang.System.setProperty("ls.cgroup.cpu.path.override", "/quux")
++      end
++      after do
++        java.lang.System.clearProperty("ls.cgroup.cpu.path.override")
++      end
++      let(:target) { Hash.new }
++      context "when the files cannot be found" do
++        it "fills in the hash with minus one" do
++          expect(cpu_resource.base_path).to eq("/sys/fs/cgroup/cpu")
++          expect(cpu_resource.offset_path).to eq("/quux")
++          expect(cpu_resource.to_hash).to eq({:cfs_period_micros=>-1, :cfs_quota_micros=>-1, :control_group=>"/quux", :stat=>{:number_of_elapsed_periods=>-1, :number_of_times_throttled=>-1, :time_throttled_nanos=>-1}})
++        end
++      end
+     end
+   end
+ 
+-  context ".get_all" do
+-    context "when we can retrieve the stats" do
+-      let(:cpuacct_control_group) { "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61" }
++  describe Cgroup do
++    describe "class method: get_all" do
+       let(:cpuacct_usage) { 1982 }
+-      let(:cpu_control_group) { "/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61" }
+       let(:cfs_period_micros) { 500 }
+       let(:cfs_quota_micros) { 98 }
+       let(:cpu_stats_number_of_periods) { 1 }
+       let(:cpu_stats_number_of_time_throttled) { 2 }
+       let(:cpu_stats_time_throttled_nanos) { 3 }
+-      let(:proc_self_cgroup_content) {
+-        %W(14:name=systemd,holaunlimited:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-13:pids:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-12:hugetlb:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-11:net_prio:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-10:perf_event:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-9:net_cls:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-8:freezer:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-7:devices:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-6:memory:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-5:blkio:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-4:cpuacct:#{cpuacct_control_group}
+-3:cpu:#{cpu_control_group}
+-2:cpuset:/docker/a10687343f90e97bbb1f7181bd065a42de96c40c4aa91764a9d526ea30475f61
+-1:name=openrc:/docker) }
+-      let(:cpu_stat_file_content) {
+-        [
+-          "nr_periods #{cpu_stats_number_of_periods}",
+-          "nr_throttled #{cpu_stats_number_of_time_throttled}",
+-          "throttled_time #{cpu_stats_time_throttled_nanos}"
+-        ]
+-      }
+-
++      let(:cpu_stat_file_content) do
++        ["nr_periods #{cpu_stats_number_of_periods}", "nr_throttled #{cpu_stats_number_of_time_throttled}", "throttled_time #{cpu_stats_time_throttled_nanos}"]
++      end
+       before do
+-        allow(subject).to receive(:read_proc_self_cgroup_lines).and_return(proc_self_cgroup_content)
+-        allow(subject).to receive(:read_sys_fs_cgroup_cpuacct_cpu_stat).and_return(cpu_stat_file_content)
+-
+-        allow(subject).to receive(:cgroup_cpuacct_usage_nanos).with(cpuacct_control_group).and_return(cpuacct_usage)
+-        allow(subject).to receive(:cgroup_cpu_fs_period_micros).with(cpu_control_group).and_return(cfs_period_micros)
+-        allow(subject).to receive(:cgroup_cpu_fs_quota_micros).with(cpu_control_group).and_return(cfs_quota_micros)
++        allow(::File).to receive(:exist?).and_return(true)
++        allow(IO).to receive(:readlines).with("/sys/fs/cgroup/cpuacct#{relative_path}/cpuacct.usage").and_return([cpuacct_usage])
++        allow(IO).to receive(:readlines).with("/sys/fs/cgroup/cpu#{relative_path}/cpu.cfs_period_us").and_return([cfs_period_micros])
++        allow(IO).to receive(:readlines).with("/sys/fs/cgroup/cpu#{relative_path}/cpu.cfs_quota_us").and_return([cfs_quota_micros])
++        allow(IO).to receive(:readlines).with("/sys/fs/cgroup/cpu#{relative_path}/cpu.stat").and_return(cpu_stat_file_content)
++        allow(IO).to receive(:readlines).with("/proc/self/cgroup").and_return(proc_self_cgroup_content)
+       end
+-
+       it "returns all the stats" do
+-        expect(subject.get_all).to match(
++        expect(described_class.get_all).to match(
+           :cpuacct => {
+-            :control_group => cpuacct_control_group,
++            :control_group => relative_path,
+             :usage_nanos => cpuacct_usage,
+           },
+           :cpu => {
+-            :control_group => cpu_control_group,
++            :control_group => relative_path,
+             :cfs_period_micros => cfs_period_micros,
+             :cfs_quota_micros => cfs_quota_micros,
+             :stat => {
+@@ -137,12 +268,14 @@
+ 
+     context "when an exception is raised" do
+       before do
+-        allow(subject).to receive(:control_groups).and_raise("Something went wrong")
++        allow(::File).to receive(:exist?).and_return(true)
++        allow(Cgroup::CGROUP_RESOURCES).to receive(:controller_groups).and_raise("Something went wrong")
+       end
+ 
+-      it "returns nil" do
+-        expect(subject.get_all).to be_nil
++      it "method: get_all returns nil" do
++        expect(described_class.get_all).to be_nil
+       end
+     end
+   end
+ end
++end end end
+\ No newline at end of file

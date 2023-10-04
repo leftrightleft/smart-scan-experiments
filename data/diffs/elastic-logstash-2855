@@ -1,0 +1,994 @@
+diff --git a/CHANGELOG b/CHANGELOG
+index f050f172abf..8c55f513fcf 100644
+--- a/CHANGELOG
++++ b/CHANGELOG
+@@ -1,3 +1,18 @@
++1.4.2 (June 24, 2014)
++  # general
++  - fixed path issues when invoking bin/logstash outside its home directory
++
++  # input
++  - bugfix: generator: fixed stdin option support
++  - bugfix: file: fixed debian 7 path issue
++
++  # codecs
++  - improvement: stdin/tcp: automatically select json_line and line codecs with the tcp and stdin streaming imputs
++  - improvement: collectd: add support for NaN values
++
++  # outputs
++  - improvement: nagios_nsca: fix external command invocation to avoid shell escaping
++
+ 1.4.1 (May 6, 2014)
+   # General
+   - bumped Elasticsearch to 1.1.1 and Kibana to 3.0.1
+diff --git a/gembag.rb b/gembag.rb
+index 9f03c8c9bfd..2962624404e 100644
+--- a/gembag.rb
++++ b/gembag.rb
+@@ -65,7 +65,7 @@ def default_lockfile
+ # Try installing a few times in case we hit the "bad_record_mac" ssl error during installation.
+ 10.times do
+   begin
+-    Bundler::CLI.start(["install", "--gemfile=tools/Gemfile", "--path", target, "--clean"])
++    Bundler::CLI.start(["install", "--gemfile=tools/Gemfile", "--path", target, "--clean", "--without", "development"])
+     break
+   rescue Gem::RemoteFetcher::FetchError => e
+     puts e.message
+diff --git a/lib/logstash/codecs/collectd.rb b/lib/logstash/codecs/collectd.rb
+index 2e7bf9afdf3..770dc58a295 100644
+--- a/lib/logstash/codecs/collectd.rb
++++ b/lib/logstash/codecs/collectd.rb
+@@ -2,6 +2,7 @@
+ require "date"
+ require "logstash/codecs/base"
+ require "logstash/namespace"
++require "logstash/errors"
+ require "tempfile"
+ require "time"
+ 
+@@ -39,6 +40,7 @@
+ class ProtocolError < LogStash::Error; end
+ class HeaderError < LogStash::Error; end
+ class EncryptionError < LogStash::Error; end
++class NaNError < LogStash::Error; end
+ 
+ class LogStash::Codecs::Collectd < LogStash::Codecs::Base
+   config_name "collectd"
+@@ -75,20 +77,21 @@ class LogStash::Codecs::Collectd < LogStash::Codecs::Base
+ 
+   COLLECTD_TYPE_FIELDS = {
+     'host' => true,
+-    '@timestamp' => true, 
+-    'plugin' => true, 
++    '@timestamp' => true,
++    'plugin' => true,
+     'plugin_instance' => true,
++    'type_instance' => true,
+   }
+ 
+   INTERVAL_VALUES_FIELDS = {
+-    "interval" => true, 
++    "interval" => true,
+     "values" => true,
+   }
+ 
+   INTERVAL_BASE_FIELDS = {
+     'host' => true,
+     'collectd_type' => true,
+-    'plugin' => true, 
++    'plugin' => true,
+     'plugin_instance' => true,
+     '@timestamp' => true,
+     'type_instance' => true,
+@@ -115,6 +118,20 @@ class LogStash::Codecs::Collectd < LogStash::Codecs::Base
+   # collectd [Network plugin](https://collectd.org/wiki/index.php/Plugin:Network)
+   config :security_level, :validate => [SECURITY_NONE, SECURITY_SIGN, SECURITY_ENCR],
+     :default => "None"
++  
++  # What to do when a value in the event is NaN (Not a Number)
++  # - change_value (default): Change the NaN to the value of the nan_value option and add nan_tag as a tag
++  # - warn: Change the NaN to the value of the nan_value option, print a warning to the log and add nan_tag as a tag
++  # - drop: Drop the event containing the NaN (this only drops the single event, not the whole packet)
++  config :nan_handling, :validate => ['change_value','warn','drop'], :default => 'change_value'
++  
++  # Only relevant when nan_handeling is set to 'change_value'
++  # Change NaN to this configured value
++  config :nan_value, :validate => :number, :default => 0
++  
++  # The tag to add to the event if a NaN value was found
++  # Set this to an empty string ('') if you don't want to tag
++  config :nan_tag, :validate => :string, :default => '_collectdNaN'
+ 
+   # Path to the authentication file. This file should have the same format as
+   # the [AuthFile](http://collectd.org/documentation/manpages/collectd.conf.5.shtml#authfile_filename)
+@@ -125,6 +142,7 @@ class LogStash::Codecs::Collectd < LogStash::Codecs::Base
+   public
+   def register
+     @logger.info("Starting Collectd codec...")
++    init_lambdas!
+     if @typesdb.nil?
+       @typesdb = LogStash::Environment.vendor_path("collectd/types.db")
+       if !File.exists?(@typesdb)
+@@ -167,103 +185,121 @@ def get_types(paths)
+     return types
+   end # def get_types
+ 
+-  # Lambdas for hash + closure methodology
+-  # This replaces when statements for fixed values and is much faster
+-  string_decoder = lambda { |body| body.pack("C*")[0..-2] }
+-  numeric_decoder = lambda { |body| body.slice!(0..7).pack("C*").unpack("E")[0] }
+-  counter_decoder = lambda { |body| body.slice!(0..7).pack("C*").unpack("Q>")[0] }
+-  gauge_decoder   = lambda { |body| body.slice!(0..7).pack("C*").unpack("E")[0] }
+-  derive_decoder  = lambda { |body| body.slice!(0..7).pack("C*").unpack("q>")[0] }
+-  # For Low-Resolution time
+-  time_decoder = lambda do |body|
+-    byte1, byte2 = body.pack("C*").unpack("NN")
+-    Time.at(( ((byte1 << 32) + byte2))).utc
+-  end
+-  # Hi-Resolution time
+-  hirestime_decoder = lambda do |body|
+-    byte1, byte2 = body.pack("C*").unpack("NN")
+-    Time.at(( ((byte1 << 32) + byte2) * (2**-30) )).utc
+-  end
+-  # Hi resolution intervals
+-  hiresinterval_decoder = lambda do |body|
+-    byte1, byte2 = body.pack("C*").unpack("NN")
+-    Time.at(( ((byte1 << 32) + byte2) * (2**-30) )).to_i
+-  end
+-  # Values decoder
+-  values_decoder = lambda do |body|
+-    body.slice!(0..1)       # Prune the header
+-    if body.length % 9 == 0 # Should be 9 fields
+-      count = 0
+-      retval = []
+-      # Iterate through and take a slice each time
+-      types = body.slice!(0..((body.length/9)-1))
+-      while body.length > 0
+-        # Use another hash + closure here...
+-        retval << VALUES_DECODER[types[count]].call(body)
+-        count += 1
++  def init_lambdas!
++    # Lambdas for hash + closure methodology
++    # This replaces when statements for fixed values and is much faster
++    string_decoder  = lambda { |body| body.pack("C*")[0..-2] }
++    numeric_decoder = lambda { |body| body.slice!(0..7).pack("C*").unpack("E")[0] }
++    counter_decoder = lambda { |body| body.slice!(0..7).pack("C*").unpack("Q>")[0] }
++    gauge_decoder   = lambda { |body| body.slice!(0..7).pack("C*").unpack("E")[0] }
++    derive_decoder  = lambda { |body| body.slice!(0..7).pack("C*").unpack("q>")[0] }
++    # For Low-Resolution time
++    time_decoder = lambda do |body|
++      byte1, byte2 = body.pack("C*").unpack("NN")
++      Time.at(( ((byte1 << 32) + byte2))).utc
++    end
++    # Hi-Resolution time
++    hirestime_decoder = lambda do |body|
++      byte1, byte2 = body.pack("C*").unpack("NN")
++      Time.at(( ((byte1 << 32) + byte2) * (2**-30) )).utc
++    end
++    # Hi resolution intervals
++    hiresinterval_decoder = lambda do |body|
++      byte1, byte2 = body.pack("C*").unpack("NN")
++      Time.at(( ((byte1 << 32) + byte2) * (2**-30) )).to_i
++    end
++    # Value type decoder
++    value_type_decoder = lambda do |body|
++      body.slice!(0..1)       # Prune the header
++      if body.length % 9 == 0 # Should be 9 fields
++        count = 0
++        retval = []
++        # Iterate through and take a slice each time
++        types = body.slice!(0..((body.length/9)-1))
++        while body.length > 0
++          # Use another hash + closure here...
++          v = @values_decoder[types[count]].call(body)
++          if types[count] == 1 && v.nan?
++            case @nan_handling
++            when 'drop'; drop = true
++            else
++              v = @nan_value
++              add_nan_tag = true
++              @nan_handling == 'warn' && @logger.warn("NaN replaced by #{@nan_value}")
++            end
++          end
++          retval << v
++          count += 1
++        end
++      else
++        @logger.error("Incorrect number of data fields for collectd record", :body => body.to_s)
+       end
+-    else
+-      @logger.error("Incorrect number of data fields for collectd record", :body => body.to_s)
++      return retval, drop, add_nan_tag
+     end
+-    return retval
+-  end
+-  # Signature
+-  signature_decoder = lambda do |body|
+-    if body.length < 32
+-      @logger.warning("SHA256 signature too small (got #{body.length} bytes instead of 32)")
+-    elsif body.length < 33
+-      @logger.warning("Received signature without username")
+-    else
++    # Signature
++    signature_decoder = lambda do |body|
++      if body.length < 32
++        @logger.warning("SHA256 signature too small (got #{body.length} bytes instead of 32)")
++      elsif body.length < 33
++        @logger.warning("Received signature without username")
++      else
++        retval = []
++        # Byte 32 till the end contains the username as chars (=unsigned ints)
++        retval << body[32..-1].pack('C*')
++        # Byte 0 till 31 contain the signature
++        retval << body[0..31].pack('C*')
++      end
++      return retval
++    end
++    # Encryption
++    encryption_decoder = lambda do |body|
+       retval = []
+-      # Byte 32 till the end contains the username as chars (=unsigned ints)
+-      retval << body[32..-1].pack('C*')
+-      # Byte 0 till 31 contain the signature
+-      retval << body[0..31].pack('C*')
++      user_length = (body.slice!(0) << 8) + body.slice!(0)
++      retval << body.slice!(0..user_length-1).pack('C*') # Username
++      retval << body.slice!(0..15).pack('C*')            # IV
++      retval << body.pack('C*')
++      return retval
+     end
+-    return retval
+-  end
+-  # Encryption
+-  encryption_decoder = lambda do |body|
+-    retval = []
+-    user_length = (body.slice!(0) << 8) + body.slice!(0)
+-    retval << body.slice!(0..user_length-1).pack('C*') # Username
+-    retval << body.slice!(0..15).pack('C*')            # IV
+-    retval << body.pack('C*')
+-    return retval
+-  end
+-  # Lambda Hashes
+-  ID_DECODER = {
+-    0 => string_decoder,
+-    1 => time_decoder,
+-    2 => string_decoder,
+-    3 => string_decoder,
+-    4 => string_decoder,
+-    5 => string_decoder,
+-    6 => values_decoder,
+-    7 => numeric_decoder,
+-    8 => hirestime_decoder,
+-    9 => hiresinterval_decoder,
+-    256 => string_decoder,
+-    257 => numeric_decoder,
+-    512 => signature_decoder,
+-    528 => encryption_decoder
+-  }
+-  # TYPE VALUES:
+-  # 0: COUNTER
+-  # 1: GAUGE
+-  # 2: DERIVE
+-  # 3: ABSOLUTE
+-  VALUES_DECODER = {
+-    0 => counter_decoder,
+-    1 => gauge_decoder,
+-    2 => derive_decoder,
+-    3 => counter_decoder
+-  }
++    @id_decoder = {
++      0 => string_decoder,
++      1 => time_decoder,
++      2 => string_decoder,
++      3 => string_decoder,
++      4 => string_decoder,
++      5 => string_decoder,
++      6 => value_type_decoder,
++      7 => numeric_decoder,
++      8 => hirestime_decoder,
++      9 => hiresinterval_decoder,
++      256 => string_decoder,
++      257 => numeric_decoder,
++      512 => signature_decoder,
++      528 => encryption_decoder
++    }
++    # TYPE VALUES:
++    # 0: COUNTER
++    # 1: GAUGE
++    # 2: DERIVE
++    # 3: ABSOLUTE
++    @values_decoder = {
++      0 => counter_decoder,
++      1 => gauge_decoder,
++      2 => derive_decoder,
++      3 => counter_decoder
++    }
++  end # def init_lambdas!
+ 
+   public
+   def get_values(id, body)
++    drop = false
++    add_tag = false
++    if id == 6
++      retval, drop, add_nan_tag = @id_decoder[id].call(body)
+     # Use hash + closure/lambda to speed operations
+-    ID_DECODER[id].call(body)
++    else
++      retval = @id_decoder[id].call(body)
++    end
++    return retval, drop, add_nan_tag
+   end
+ 
+   private
+@@ -369,7 +405,7 @@ def decode(payload)
+         next
+       end
+ 
+-      values = get_values(typenum, body)
++      values, drop, add_nan_tag = get_values(typenum, body)
+ 
+       case typenum
+       when SIGNATURE_TYPE
+@@ -424,9 +460,17 @@ def decode(payload)
+           # This is better than looping over all keys every time.
+           collectd.delete('type_instance') if collectd['type_instance'] == ""
+           collectd.delete('plugin_instance') if collectd['plugin_instance'] == ""
++          if add_nan_tag
++            collectd['tags'] ||= []
++            collectd['tags'] << @nan_tag
++          end
+           # This ugly little shallow-copy hack keeps the new event from getting munged by the cleanup
+           # With pass-by-reference we get hosed (if we pass collectd, then clean it up rapidly, values can disappear)
+-          yield LogStash::Event.new(collectd.dup)
++          if !drop # Drop the event if it's flagged true
++            yield LogStash::Event.new(collectd.dup)
++          else
++            raise(NaNError)
++          end
+         end
+         # Clean up the event
+         collectd.each_key do |k|
+@@ -434,8 +478,8 @@ def decode(payload)
+         end
+       end
+     end # while payload.length > 0 do
+-  rescue EncryptionError, ProtocolError, HeaderError
++  rescue EncryptionError, ProtocolError, HeaderError, NaNError
+     # basically do nothing, we just want out
+   end # def decode
+ 
+-end # class LogStash::Codecs::Collectd
++end # class LogStash::Codecs::Collectd
+\ No newline at end of file
+diff --git a/lib/logstash/codecs/netflow.rb b/lib/logstash/codecs/netflow.rb
+index 9e2d99de1c2..278cd214d89 100644
+--- a/lib/logstash/codecs/netflow.rb
++++ b/lib/logstash/codecs/netflow.rb
+@@ -45,7 +45,7 @@ def register
+     @templates = Vash.new()
+ 
+     # Path to default Netflow v9 field definitions
+-    filename = File.join(File.dirname(__FILE__), "netflow/netflow.yaml")
++    filename = LogStash::Environment.plugin_path("codecs/netflow/netflow.yaml")
+ 
+     begin
+       @fields = YAML.load_file(filename)
+@@ -162,7 +162,7 @@ def decode(payload, &block)
+               # Purge any expired templates
+               @templates.cleanup!
+             end
+-          end 
++          end
+         when 256..65535
+           # Data flowset
+           #key = "#{flowset.source_id}|#{event["source"]}|#{record.flowset_id}"
+@@ -180,7 +180,7 @@ def decode(payload, &block)
+           # Template shouldn't be longer than the record and there should
+           # be at most 3 padding bytes
+           if template.num_bytes > length or ! (length % template.num_bytes).between?(0, 3)
+-            @logger.warn("Template length doesn't fit cleanly into flowset", :template_id => record.flowset_id, :template_length => template.num_bytes, :record_length => length) 
++            @logger.warn("Template length doesn't fit cleanly into flowset", :template_id => record.flowset_id, :template_length => template.num_bytes, :record_length => length)
+             next
+           end
+ 
+diff --git a/lib/logstash/environment.rb b/lib/logstash/environment.rb
+index fd234644cf1..f8c12ef59be 100644
+--- a/lib/logstash/environment.rb
++++ b/lib/logstash/environment.rb
+@@ -31,5 +31,13 @@ def jruby?
+     def vendor_path(path)
+       return ::File.join(LOGSTASH_HOME, "vendor", path)
+     end
++
++    def plugin_path(path)
++      return ::File.join(LOGSTASH_HOME, "lib/logstash", path)
++    end
++
++    def pattern_path(path)
++      return ::File.join(LOGSTASH_HOME, "patterns", path)
++    end
+   end
+ end
+diff --git a/lib/logstash/filters/grok.rb b/lib/logstash/filters/grok.rb
+index e992ccd5a2d..c438fa95ade 100644
+--- a/lib/logstash/filters/grok.rb
++++ b/lib/logstash/filters/grok.rb
+@@ -1,6 +1,7 @@
+ # encoding: utf-8
+ require "logstash/filters/base"
+ require "logstash/namespace"
++require "logstash/environment"
+ require "set"
+ 
+ # Parse arbitrary text and structure it.
+@@ -99,7 +100,7 @@
+ #
+ #     (?<queue_id>[0-9A-F]{10,11})
+ #
+-# Alternately, you can create a custom patterns file. 
++# Alternately, you can create a custom patterns file.
+ #
+ # * Create a directory called `patterns` with a file in it called `extra`
+ #   (the file name doesn't matter, but name it meaningfully for yourself)
+@@ -202,7 +203,7 @@ class LogStash::Filters::Grok < LogStash::Filters::Base
+   #
+   #     filter {
+   #       grok {
+-  #         match => [ 
++  #         match => [
+   #           "message",
+   #           "%{SYSLOGBASE} %{DATA:message}"
+   #         ]
+@@ -216,7 +217,7 @@ class LogStash::Filters::Grok < LogStash::Filters::Base
+ 
+   # Detect if we are running from a jarfile, pick the right path.
+   @@patterns_path ||= Set.new
+-  @@patterns_path += ["#{File.dirname(__FILE__)}/../../../patterns/*"]
++  @@patterns_path += [LogStash::Environment.pattern_path("*")]
+ 
+   public
+   def initialize(params)
+@@ -342,7 +343,7 @@ def compile_capture_handler(capture)
+     syntax, semantic, coerce = capture.split(":")
+ 
+     # each_capture do |fullname, value|
+-    #   capture_handlers[fullname].call(value, event) 
++    #   capture_handlers[fullname].call(value, event)
+     # end
+ 
+     code = []
+@@ -350,7 +351,7 @@ def compile_capture_handler(capture)
+     code << "lambda do |value, event|"
+     #code << "  p :value => value, :event => event"
+     if semantic.nil?
+-      if @named_captures_only 
++      if @named_captures_only
+         # Abort early if we are only keeping named (semantic) captures
+         # and this capture has no semantic name.
+         code << "  return"
+diff --git a/lib/logstash/filters/multiline.rb b/lib/logstash/filters/multiline.rb
+index bcee5757aeb..239952b986a 100644
+--- a/lib/logstash/filters/multiline.rb
++++ b/lib/logstash/filters/multiline.rb
+@@ -1,6 +1,7 @@
+ # encoding: utf-8
+ require "logstash/filters/base"
+ require "logstash/namespace"
++require "logstash/environment"
+ require "set"
+ #
+ # This filter will collapse multiline messages from a single source into one Logstash event.
+@@ -102,7 +103,7 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
+ 
+   # Detect if we are running from a jarfile, pick the right path.
+   @@patterns_path = Set.new
+-  @@patterns_path += ["#{File.dirname(__FILE__)}/../../../patterns/*"]
++  @@patterns_path += [LogStash::Environment.pattern_path("*")]
+ 
+   public
+   def initialize(config = {})
+diff --git a/lib/logstash/inputs/base.rb b/lib/logstash/inputs/base.rb
+index 68afca36f30..fb404d50b4d 100644
+--- a/lib/logstash/inputs/base.rb
++++ b/lib/logstash/inputs/base.rb
+@@ -118,4 +118,20 @@ def decorate(event)
+       event[field] = value
+     end
+   end
++
++  protected
++  def fix_streaming_codecs
++    require "logstash/codecs/plain"
++    require "logstash/codecs/line"
++    require "logstash/codecs/json"
++    require "logstash/codecs/json_lines"
++    case @codec
++      when LogStash::Codecs::Plain
++        @logger.info("Automatically switching from #{@codec.class.config_name} to line codec", :plugin => self.class.config_name)
++        @codec = LogStash::Codecs::Line.new
++      when LogStash::Codecs::JSON
++        @logger.info("Automatically switching from #{@codec.class.config_name} to json_lines codec", :plugin => self.class.config_name)
++        @codec = LogStash::Codecs::JSONLines.new
++    end
++  end
+ end # class LogStash::Inputs::Base
+diff --git a/lib/logstash/inputs/generator.rb b/lib/logstash/inputs/generator.rb
+index 18813f2b3fb..45f50ed77fe 100644
+--- a/lib/logstash/inputs/generator.rb
++++ b/lib/logstash/inputs/generator.rb
+@@ -39,7 +39,7 @@ class LogStash::Inputs::Generator < LogStash::Inputs::Threadable
+   #       }
+   #     }
+   #
+-  # The above will emit "line 1" then "line 2" then "line", then "line 1", etc... 
++  # The above will emit "line 1" then "line 2" then "line", then "line 1", etc...
+   config :lines, :validate => :array
+ 
+   # Set how many messages should be generated.
+@@ -51,7 +51,6 @@ class LogStash::Inputs::Generator < LogStash::Inputs::Threadable
+   def register
+     @host = Socket.gethostname
+     @count = @count.first if @count.is_a?(Array)
+-    @lines = [@message] if @lines.nil?
+   end # def register
+ 
+   def run(queue)
+@@ -62,6 +61,7 @@ def run(queue)
+       @message = $stdin.readline
+       @logger.debug("Generator line read complete", :message => @message)
+     end
++    @lines = [@message] if @lines.nil?
+ 
+     while !finished? && (@count <= 0 || number < @count)
+       @lines.each do |line|
+diff --git a/lib/logstash/inputs/pipe.rb b/lib/logstash/inputs/pipe.rb
+index 143b8ef1418..933c602102c 100644
+--- a/lib/logstash/inputs/pipe.rb
++++ b/lib/logstash/inputs/pipe.rb
+@@ -46,6 +46,8 @@ def run(queue)
+             queue << event
+           end
+         end
++      rescue LogStash::ShutdownSignal => e
++        break
+       rescue Exception => e
+         @logger.error("Exception while running command", :e => e, :backtrace => e.backtrace)
+       end
+diff --git a/lib/logstash/inputs/stdin.rb b/lib/logstash/inputs/stdin.rb
+index bc9756fffd7..d065e2b09ee 100644
+--- a/lib/logstash/inputs/stdin.rb
++++ b/lib/logstash/inputs/stdin.rb
+@@ -16,6 +16,7 @@ class LogStash::Inputs::Stdin < LogStash::Inputs::Base
+   public
+   def register
+     @host = Socket.gethostname
++    fix_streaming_codecs
+   end # def register
+ 
+   def run(queue) 
+diff --git a/lib/logstash/inputs/tcp.rb b/lib/logstash/inputs/tcp.rb
+index 07cdf46738b..41e3a9c6706 100644
+--- a/lib/logstash/inputs/tcp.rb
++++ b/lib/logstash/inputs/tcp.rb
+@@ -59,6 +59,7 @@ def initialize(*args)
+ 
+   public
+   def register
++    fix_streaming_codecs
+     require "socket"
+     require "timeout"
+     require "openssl"
+diff --git a/lib/logstash/outputs/elasticsearch.rb b/lib/logstash/outputs/elasticsearch.rb
+index 6b92e346626..2e6458b094d 100644
+--- a/lib/logstash/outputs/elasticsearch.rb
++++ b/lib/logstash/outputs/elasticsearch.rb
+@@ -269,15 +269,9 @@ def register
+   public
+   def get_template
+     if @template.nil?
+-      if File.exists?("elasticsearch-template.json")
+-        @template = "elasticsearch-template.json"
+-      else
+-        path = File.join(File.dirname(__FILE__), "elasticsearch/elasticsearch-template.json")
+-        if File.exists?(path)
+-          @template = path
+-        else
+-          raise "You must specify 'template => ...' in your elasticsearch_http output"
+-        end
++      @template = LogStash::Environment.plugin_path("outputs/elasticsearch/elasticsearch-template.json")
++      if !File.exists?(@template)
++        raise "You must specify 'template => ...' in your elasticsearch output (I looked for '#{@template}')"
+       end
+     end
+     template_json = IO.read(@template).gsub(/\n/,'')
+diff --git a/lib/logstash/outputs/elasticsearch_http.rb b/lib/logstash/outputs/elasticsearch_http.rb
+index 32a85d0f27f..496e108e809 100644
+--- a/lib/logstash/outputs/elasticsearch_http.rb
++++ b/lib/logstash/outputs/elasticsearch_http.rb
+@@ -173,17 +173,14 @@ def template_action(command)
+   public
+   def get_template_json
+     if @template.nil?
+-      if File.exists?("elasticsearch-template.json")
+-        @template = "elasticsearch-template.json"
+-      elsif File.exists?("lib/logstash/outputs/elasticsearch/elasticsearch-template.json")
+-        @template = "lib/logstash/outputs/elasticsearch/elasticsearch-template.json"
+-      else
+-        raise "You must specify 'template => ...' in your elasticsearch_http output"
++      @template = LogStash::Environment.plugin_path("outputs/elasticsearch/elasticsearch-template.json")
++      if !File.exists?(@template)
++        raise "You must specify 'template => ...' in your elasticsearch_http output (I looked for '#{@template}')"
+       end
+     end
+     @template_json = IO.read(@template).gsub(/\n/,'')
+     @logger.info("Using mapping template", :template => @template_json)
+-  end # def get_template
++  end # def get_template_json
+ 
+   public
+   def receive(event)
+diff --git a/lib/logstash/outputs/nagios_nsca.rb b/lib/logstash/outputs/nagios_nsca.rb
+index 3e721de953f..90f761e0fa5 100644
+--- a/lib/logstash/outputs/nagios_nsca.rb
++++ b/lib/logstash/outputs/nagios_nsca.rb
+@@ -1,6 +1,7 @@
+ # encoding: utf-8
+ require "logstash/outputs/base"
+ require "logstash/namespace"
++require "open3"
+ 
+ # The nagios_nsca output is used for sending passive check results to Nagios
+ # through the NSCA protocol.
+@@ -105,19 +106,27 @@ def receive(event)
+     # build the command
+     # syntax: echo '<server>!<nagios_service>!<status>!<text>'  | \
+     #           /usr/sbin/send_nsca -H <nagios_host> -d '!' -c <nsca_config>"
+-    cmd = %(echo '#{nagios_host}~#{nagios_service}~#{status}~#{msg}' |)
+-    cmd << %( #{@send_nsca_bin} -H #{@host} -p #{@port} -d '~')
+-    cmd << %( -c #{@send_nsca_config}) if @send_nsca_config
+-    cmd << %( 2>/dev/null >/dev/null)
+-    @logger.debug("Running send_nsca command", "nagios_nsca_command" => cmd)
++
++    cmd = [@send_nsca_bin, "-H", @host, "-p", @port, "-d", "~"]
++    cmd = cmd + ["-c", @send_nsca_config]  if @send_nsca_config
++    message = "#{nagios_host}~#{nagios_service}~#{status}~#{msg}"
++
++    @logger.debug("Running send_nsca command", :nagios_nsca_command => cmd.join(" "), :message => message)
+ 
+     begin
+-      system cmd
++      Open3.popen3(*cmd) do |i, o, e|
++        i.puts(message)
++        i.close
++      end
+     rescue => e
+-      @logger.warn("Skipping nagios_nsca output; error calling send_nsca",
+-                   "error" => $!, "nagios_nsca_command" => cmd,
+-                   "missed_event" => event)
+-      @logger.debug("Backtrace", e.backtrace)
++      @logger.warn(
++        "Skipping nagios_nsca output; error calling send_nsca",
++        :error => $!,
++        :nagios_nsca_command => cmd.join(" "),
++        :message => message,
++        :missed_event => event
++      )
++      @logger.debug("Backtrace", :backtrace => e.backtrace)
+     end
+   end # def receive
+ end # class LogStash::Outputs::NagiosNsca
+diff --git a/lib/logstash/outputs/redis.rb b/lib/logstash/outputs/redis.rb
+index ef274591c64..425b6de5fb5 100644
+--- a/lib/logstash/outputs/redis.rb
++++ b/lib/logstash/outputs/redis.rb
+@@ -7,7 +7,7 @@
+ # The RPUSH command is supported in Redis v0.0.7+. Using
+ # PUBLISH to a channel requires at least v1.3.8+.
+ # While you may be able to make these Redis versions work,
+-# the best performance and stability will be found in more 
++# the best performance and stability will be found in more
+ # recent stable versions.  Versions 2.6.0+ are recommended.
+ #
+ # For more information about Redis, see <http://redis.io/>
+@@ -96,6 +96,9 @@ class LogStash::Outputs::Redis < LogStash::Outputs::Base
+   # Zero means to check on every event.
+   config :congestion_interval, :validate => :number, :default => 1
+ 
++  # How many times to try reconnecting before giving up. Default is 0.
++  # Zero means to try reconnecting forever.
++  config :reconnection_threshold, :validate => :number, :default => 0
+   def register
+     require 'redis'
+ 
+@@ -163,6 +166,7 @@ def receive(event)
+       return
+     end
+ 
++    @reconnection_tries = 0
+     begin
+       @redis ||= connect
+       if @data_type == 'list'
+@@ -175,8 +179,12 @@ def receive(event)
+       @logger.warn("Failed to send event to Redis", :event => event,
+                    :identity => identity, :exception => e,
+                    :backtrace => e.backtrace)
++      if @reconnection_threshold != 0 and @reconnection_tries > @reconnection_threshold
++        raise e
++      end
+       sleep @reconnect_interval
+       @redis = nil
++      @reconnection_tries += 1
+       retry
+     end
+   end # def receive
+diff --git a/lib/logstash/version.rb b/lib/logstash/version.rb
+index 4094d0f02d5..0ce025d0f7d 100644
+--- a/lib/logstash/version.rb
++++ b/lib/logstash/version.rb
+@@ -1,6 +1,6 @@
+ # encoding: utf-8
+ # The version of logstash.
+-LOGSTASH_VERSION = "1.4.1"
++LOGSTASH_VERSION = "1.4.2"
+ 
+ # Note to authors: this should not include dashes because 'gem' barfs if
+ # you include a dash in the version string.
+diff --git a/pkg/logstash.sysv b/pkg/logstash.sysv
+index bb7555e1ab1..fddc14d5ed9 100755
+--- a/pkg/logstash.sysv
++++ b/pkg/logstash.sysv
+@@ -48,6 +48,7 @@ start() {
+ 
+ 
+   JAVA_OPTS=${LS_JAVA_OPTS}
++  HOME=${LS_HOME}
+   export PATH HOME JAVA_OPTS LS_HEAP_SIZE LS_JAVA_OPTS LS_USE_GC_LOGGING
+ 
+   # set ulimit as (root, presumably) first, before we drop privileges
+diff --git a/spec/codecs/collectd.rb b/spec/codecs/collectd.rb
+index 0233e4427b1..fb638a95090 100644
+--- a/spec/codecs/collectd.rb
++++ b/spec/codecs/collectd.rb
+@@ -56,8 +56,99 @@
+       # One of these will fail because I altered the payload from the normal packet
+       insist { counter } == 27
+     end # it "should drop a part with an header length"
++
++    # This payload contains a NaN value
++    it "should replace a NaN with a zero and add tag '_collectdNaN' by default" do
++      payload = ["00000015746573742e6578616d706c652e636f6d000008000c14dc4c81831ef78b0009000c00000000400000000002000970696e67000004000970696e67000005001c70696e672d7461726765742e6578616d706c652e636f6d000006000f000101000000000000f87f"].pack('H*')
++      counter = 0
++      subject.decode(payload) do |event|
++        case counter
++        when 0
++          insist { event['host'] } == "test.example.com"
++          insist { event['plugin'] } == "ping"
++          insist { event['type_instance'] } == "ping-target.example.com"
++          insist { event['collectd_type'] } == "ping"
++          insist { event['value'] } == 0   # Not a NaN
++          insist { event['tags'] } == ["_collectdNaN"]
++        end
++        counter += 1
++      end
++      insist { counter } == 1
++    end # it "should replace a NaN with a zero and add tag '_collectdNaN' by default"
+   end # context "None"
+ 
++  context "Replace nan_value and nan_tag with non-default values" do
++    subject do
++      next LogStash::Codecs::Collectd.new({"nan_value" => 1,
++                                           "nan_tag" => "NaN_encountered"})
++    end
++    # This payload contains a NaN value
++    it "should replace a NaN with the specified value and tag 'NaN_encountered'" do
++      payload = ["00000015746573742e6578616d706c652e636f6d000008000c14dc4c81831ef78b0009000c00000000400000000002000970696e67000004000970696e67000005001c70696e672d7461726765742e6578616d706c652e636f6d000006000f000101000000000000f87f"].pack('H*')
++      counter = 0
++      subject.decode(payload) do |event|
++        case counter
++        when 0
++          insist { event['host'] } == "test.example.com"
++          insist { event['plugin'] } == "ping"
++          insist { event['type_instance'] } == "ping-target.example.com"
++          insist { event['collectd_type'] } == "ping"
++          insist { event['value'] } == 1   # Not a NaN
++          insist { event['tags'] } == ["NaN_encountered"]
++        end
++        counter += 1
++      end
++      insist { counter } == 1
++    end # it "should replace a NaN with the specified value and tag 'NaN_encountered'"
++  end # context "Replace nan_value and nan_tag with non-default values"
++
++  context "Warn on NaN event" do
++    subject do
++      next LogStash::Codecs::Collectd.new({"nan_handling" => "warn"})
++    end
++    # This payload contains a NaN value
++    it "should replace a NaN with a zero and receive a warning when 'nan_handling' set to warn" do
++      payload = ["00000015746573742e6578616d706c652e636f6d000008000c14dc4c81831ef78b0009000c00000000400000000002000970696e67000004000970696e67000005001c70696e672d7461726765742e6578616d706c652e636f6d000006000f000101000000000000f87f"].pack('H*')
++      counter = 0
++      subject.logger.should_receive(:warn).with("NaN replaced by 0")
++      subject.decode(payload) do |event|
++        case counter
++        when 0
++          insist { event['host'] } == "test.example.com"
++          insist { event['plugin'] } == "ping"
++          insist { event['type_instance'] } == "ping-target.example.com"
++          insist { event['collectd_type'] } == "ping"
++          insist { event['value'] } == 0   # Not a NaN
++        end
++        counter += 1
++      end
++      insist { counter } == 1
++    end # it "should replace a NaN with a zero and receive a warning when 'nan_handling' set to warn"
++  end # context "Warn on NaN event"
++
++  context "Drop NaN event" do
++    subject do
++      next LogStash::Codecs::Collectd.new({"nan_handling" => "drop"})
++    end
++    # This payload contains a NaN value
++    it "should drop an event with a NaN value when 'nan_handling' set to drop" do
++      payload = ["00000015746573742e6578616d706c652e636f6d000008000c14dc4c81831ef78b0009000c00000000400000000002000970696e67000004000970696e67000005001c70696e672d7461726765742e6578616d706c652e636f6d000006000f000101000000000000f87f"].pack('H*')
++      counter = 0
++      subject.decode(payload) do |event|
++        case counter
++        when 0
++          insist { event['host'] } == "test.example.com"
++          insist { event['plugin'] } == "ping"
++          insist { event['type_instance'] } == "ping-target.example.com"
++          insist { event['collectd_type'] } == "ping"
++          insist { event['value'] } == NaN   # NaN
++        end
++        counter += 1 # Because we're dropping this, it should not increment
++      end
++      insist { counter } == 0 # We expect no increment
++    end # it "should drop an event with a NaN value when 'nan_handling' set to drop"
++  end # context "Drop NaN event"
++
+   # Create an authfile for the next tests
+   authfile = Tempfile.new('logstash-collectd-authfile')
+   File.open(authfile.path, "a") do |fd|
+diff --git a/spec/inputs/generator.rb b/spec/inputs/generator.rb
+index 45579f620d2..b21ffaeb77f 100644
+--- a/spec/inputs/generator.rb
++++ b/spec/inputs/generator.rb
+@@ -1,9 +1,9 @@
+ require "test_utils"
+ 
+-describe "inputs/generator", :performance => true do
++describe "inputs/generator" do
+   extend LogStash::RSpec
+ 
+-  describe "generate events" do
++  context "performance", :performance => true do
+     event_count = 100000 + rand(50000)
+ 
+     config <<-CONFIG
+@@ -27,4 +27,60 @@
+       pipeline.shutdown
+     end # input
+   end
++
++  context "generate configured message" do
++    config <<-CONFIG
++      input {
++        generator {
++          count => 2
++          message => "foo"
++        }
++      }
++    CONFIG
++
++    input do |pipeline, queue|
++      Thread.new { pipeline.run }
++      event = queue.pop
++      insist { event["sequence"] } == 0
++      insist { event["message"] } == "foo"
++
++      event = queue.pop
++      insist { event["sequence"] } == 1
++      insist { event["message"] } == "foo"
++
++      insist { queue.size } == 0
++      pipeline.shutdown
++    end # input
++
++    context "generate message from stdin" do
++      config <<-CONFIG
++        input {
++          generator {
++            count => 2
++            message => "stdin"
++          }
++        }
++      CONFIG
++
++      input do |pipeline, queue|
++        saved_stdin = $stdin
++        stdin_mock = StringIO.new
++        $stdin = stdin_mock
++        stdin_mock.should_receive(:readline).once.and_return("bar")
++
++        Thread.new { pipeline.run }
++        event = queue.pop
++        insist { event["sequence"] } == 0
++        insist { event["message"] } == "bar"
++
++        event = queue.pop
++        insist { event["sequence"] } == 1
++        insist { event["message"] } == "bar"
++
++        insist { queue.size } == 0
++        pipeline.shutdown
++        $stdin = saved_stdin
++      end # input
++    end
++  end
+ end
+diff --git a/spec/inputs/pipe.rb b/spec/inputs/pipe.rb
+new file mode 100644
+index 00000000000..067937b4a75
+--- /dev/null
++++ b/spec/inputs/pipe.rb
+@@ -0,0 +1,60 @@
++# encoding: utf-8
++require "test_utils"
++require "tempfile"
++
++describe "inputs/pipe" do
++  extend LogStash::RSpec
++
++  describe "echo" do
++    event_count = 1
++    tmp_file = Tempfile.new('logstash-spec-input-pipe')
++
++    config <<-CONFIG
++    input {
++      pipe {
++        command => "echo ☹"
++      }
++    }
++    CONFIG
++
++    input do |pipeline, queue|
++      Thread.new { pipeline.run }
++      sleep 0.1 while !pipeline.ready?
++
++      events = event_count.times.collect { queue.pop }
++      event_count.times do |i|
++        insist { events[i]["message"] } == "☹"
++      end
++    end # input
++  end
++
++  describe "tail -f" do
++    event_count = 10
++    tmp_file = Tempfile.new('logstash-spec-input-pipe')
++
++    config <<-CONFIG
++    input {
++      pipe {
++        command => "tail -f #{tmp_file.path}"
++      }
++    }
++    CONFIG
++
++    input do |pipeline, queue|
++      Thread.new { pipeline.run }
++      sleep 0.1 while !pipeline.ready?
++
++      File.open(tmp_file, "a") do |fd|
++        event_count.times do |i|
++          # unicode smiley for testing unicode support!
++          fd.puts("#{i} ☹")
++        end
++      end
++      events = event_count.times.collect { queue.pop }
++      event_count.times do |i|
++        insist { events[i]["message"] } == "#{i} ☹"
++      end
++    end # input
++  end
++
++end

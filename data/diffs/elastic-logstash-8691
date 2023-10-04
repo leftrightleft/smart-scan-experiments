@@ -1,0 +1,2701 @@
+diff --git a/logstash-core/lib/logstash/java_pipeline.rb b/logstash-core/lib/logstash/java_pipeline.rb
+index 5960d5cf28d..36916b2261a 100644
+--- a/logstash-core/lib/logstash/java_pipeline.rb
++++ b/logstash-core/lib/logstash/java_pipeline.rb
+@@ -371,6 +371,9 @@ def start_workers
+ 
+       pipeline_workers.times do |t|
+         batched_execution = @lir_execution.buildExecution
++        if t.eql? 0
++          @logger.debug ("Generated Java pipeline entry class: " + batched_execution.class.to_s)
++        end
+         thread = Thread.new(self, batched_execution) do |_pipeline, _batched_execution|
+           _pipeline.worker_loop(_batched_execution)
+         end
+@@ -378,6 +381,12 @@ def start_workers
+         @worker_threads << thread
+       end
+ 
++      if @logger.debug? || @logger.trace?
++        @lir_execution.getGeneratedSource.each do |line|
++          @logger.debug line
++        end
++      end
++
+       # inputs should be started last, after all workers
+       begin
+         start_inputs
+diff --git a/logstash-core/spec/logstash/java_pipeline_spec.rb b/logstash-core/spec/logstash/java_pipeline_spec.rb
+index 07c240764de..86795583199 100644
+--- a/logstash-core/spec/logstash/java_pipeline_spec.rb
++++ b/logstash-core/spec/logstash/java_pipeline_spec.rb
+@@ -355,7 +355,7 @@ class JavaTestPipeline < LogStash::JavaPipeline
+       after do
+         pipeline.shutdown
+       end
+-      
++
+       it "should call close of output without output-workers" do
+         pipeline.run
+ 
+@@ -380,7 +380,7 @@ class JavaTestPipeline < LogStash::JavaPipeline
+       # cause the suite to fail :(
+       pipeline.close
+     end
+-    
++
+     it "should use LIR provided IDs" do
+       expect(pipeline.inputs.first.id).to eq(pipeline.lir.input_plugin_vertices.first.id)
+       expect(pipeline.filters.first.id).to eq(pipeline.lir.filter_plugin_vertices.first.id)
+@@ -642,6 +642,48 @@ class JavaTestPipeline < LogStash::JavaPipeline
+     end
+   end
+ 
++  context "with multiple outputs" do
++    let(:config) do
++      <<-EOS
++      input {
++        generator { count => 10 }
++      }
++      filter {
++       clone {
++          add_field => { 
++            'cloned' =>  'cloned' 
++          }
++          clones => ["clone1"]
++        }
++      }
++      output {
++        dummy_output {}
++        dummy_output {}
++        dummy_output {}
++      }
++      EOS
++    end
++    let(:output) { ::LogStash::Outputs::DummyOutput.new }
++
++    before do
++      allow(::LogStash::Outputs::DummyOutput).to receive(:new).with(any_args).and_return(output)
++      allow(LogStash::Plugin).to receive(:lookup).with("input", "generator").and_call_original
++      allow(LogStash::Plugin).to receive(:lookup).with("filter", "clone").and_call_original
++      3.times {
++        allow(LogStash::Plugin).to receive(:lookup).with("output", "dummy_output").and_return(::LogStash::Outputs::DummyOutput)
++        allow(LogStash::Plugin).to receive(:lookup).with("codec", "plain").and_return(LogStash::Codecs::Plain)
++      }
++    end
++
++    it "correctly distributes events" do
++      pipeline = mock_java_pipeline_from_string(config, pipeline_settings_obj)
++      pipeline.run
++      pipeline.shutdown
++      expect(output.events.size).to eq(60)
++      expect(output.events.count {|e| e.get("cloned") == "cloned"}).to eq(30)
++    end
++  end
++
+   context "#started_at" do
+     # use a run limiting count to shutdown the pipeline automatically
+     let(:config) do
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java b/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
+index 52a9c4099f0..64ed5bc16d3 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
+@@ -1,10 +1,10 @@
+ package org.logstash.config.ir;
+ 
+-import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.stream.Collectors;
+@@ -17,6 +17,7 @@
+ import org.logstash.config.ir.compiler.DatasetCompiler;
+ import org.logstash.config.ir.compiler.EventCondition;
+ import org.logstash.config.ir.compiler.RubyIntegration;
++import org.logstash.config.ir.compiler.SplitDataset;
+ import org.logstash.config.ir.graph.IfVertex;
+ import org.logstash.config.ir.graph.PluginVertex;
+ import org.logstash.config.ir.graph.Vertex;
+@@ -92,6 +93,14 @@ public Dataset buildExecution() {
+         return new CompiledPipeline.CompiledExecution().toDataset();
+     }
+ 
++    /**
++     * Get the generated source
++     * @return sorted and formatted lines of generated code
++     */
++    public List<String> getGeneratedSource(){
++        return DatasetCompiler.getGeneratedSource();
++    }
++
+     /**
+      * Sets up all Ruby outputs learnt from {@link PipelineIR}.
+      */
+@@ -198,18 +207,9 @@ private boolean isOutput(final Vertex vertex) {
+         return outputs.containsKey(vertex.getId());
+     }
+ 
+-    /**
+-     * Compiles an {@link IfVertex} into an {@link EventCondition}.
+-     * @param iff IfVertex to build condition for
+-     * @return EventCondition for given {@link IfVertex}
+-     */
+-    private static EventCondition buildCondition(final IfVertex iff) {
+-        return EventCondition.Compiler.buildCondition(iff.getBooleanExpression());
+-    }
+-
+     /**
+      * Instances of this class represent a fully compiled pipeline execution. Note that this class
+-     * has a separate lifecycle from {@link CompiledPipeline} because it holds per (worker-thread) 
++     * has a separate lifecycle from {@link CompiledPipeline} because it holds per (worker-thread)
+      * state and thus needs to be instantiated once per thread.
+      */
+     private final class CompiledExecution {
+@@ -217,7 +217,7 @@ private final class CompiledExecution {
+         /**
+          * Compiled {@link IfVertex, indexed by their ID as returned by {@link Vertex#getId()}.
+          */
+-        private final Map<String, Dataset.SplitDataset> iffs = new HashMap<>(5);
++        private final Map<String, SplitDataset> iffs = new HashMap<>(5);
+ 
+         /**
+          * Cached {@link Dataset} compiled from {@link PluginVertex} indexed by their ID as returned
+@@ -240,38 +240,31 @@ Dataset toDataset() {
+          * @return Compiled {@link Dataset} representing the pipeline.
+          */
+         private Dataset compile() {
+-            final Collection<Dataset> datasets = new ArrayList<>();
+-            pipelineIR.getGraph()
+-                .allLeaves()
+-                .filter(CompiledPipeline.this::isOutput)
+-                .forEach(leaf -> datasets.add(
+-                    outputDataset(leaf.getId(), flatten(Dataset.ROOT_DATASETS, leaf))
+-                    )
+-                );
+-            return DatasetCompiler.terminalDataset(datasets);
++            final Collection<Vertex> outputs = pipelineIR.getGraph()
++                .allLeaves().filter(CompiledPipeline.this::isOutput)
++                .collect(Collectors.toList());
++            if (outputs.isEmpty()) {
++                return DatasetCompiler.ROOT_DATASETS.iterator().next();
++            } else {
++                return DatasetCompiler.terminalDataset(outputs.stream().map(
++                    leaf ->
++                        outputDataset(leaf.getId(), getConfigSource(leaf), flatten(DatasetCompiler.ROOT_DATASETS, leaf))
++                ).collect(Collectors.toList()));
++            }
+         }
+ 
+         /**
+          * Build a {@link Dataset} representing the {@link JrubyEventExtLibrary.RubyEvent}s after
+          * the application of the given filter.
+-         * @param vertex Vertex Id of the filter to create this {@link Dataset} for
++         * @param vertexId Vertex Id of the filter to create this {@link Dataset}
++         * @param configSource The Logstash configuration that maps to the returned Dataset
+          * @param datasets All the datasets that pass through this filter
+          * @return Filter {@link Dataset}
+          */
+-        private Dataset filterDataset(final String vertex, final Collection<Dataset> datasets) {
+-            return plugins.computeIfAbsent(vertex, v -> {
+-                final Dataset filter;
+-                final RubyIntegration.Filter ruby = filters.get(v);
+-                final IRubyObject base = ruby.toRuby();
+-                if (ruby.hasFlush()) {
+-                    filter = DatasetCompiler.flushingFilterDataset(
+-                        datasets, base, !ruby.periodicFlush()
+-                    );
+-                    } else {
+-                    filter = DatasetCompiler.filterDataset(datasets, base);
+-                }
+-                return filter;
+-            });
++        private Dataset filterDataset(final String vertexId, String configSource, final Collection<Dataset> datasets) {
++            return plugins.computeIfAbsent(
++                vertexId, v -> DatasetCompiler.filterDataset(datasets, filters.get(v), configSource)
++            );
+         }
+ 
+         /**
+@@ -279,13 +272,14 @@ private Dataset filterDataset(final String vertex, final Collection<Dataset> dat
+          * the application of the given output.
+          * @param vertexId Vertex Id of the filter to create this {@link Dataset} for
+          * filter node in the topology once
++         * @param configSource The Logstash configuration that maps to the returned Dataset
+          * @param datasets All the datasets that are passed into this output
+          * @return Output {@link Dataset}
+          */
+-        private Dataset outputDataset(final String vertexId, final Collection<Dataset> datasets) {
++        private Dataset outputDataset(final String vertexId, String configSource, final Collection<Dataset> datasets) {
+             return plugins.computeIfAbsent(
+                 vertexId, v -> DatasetCompiler.outputDataset(
+-                    datasets, outputs.get(v), outputs.size() == 1
++                    datasets, outputs.get(v), configSource, outputs.size() == 1
+                 )
+             );
+         }
+@@ -296,12 +290,14 @@ private Dataset outputDataset(final String vertexId, final Collection<Dataset> d
+          * @param datasets Datasets to split
+          * @param condition Condition that must be fulfilled
+          * @param index Vertex id to cache the resulting {@link Dataset} under
++         * @param configSource The Logstash configuration that maps to the returned Dataset
+          * @return The half of the datasets contents that fulfils the condition
+          */
+-        private Dataset.SplitDataset split(final Collection<Dataset> datasets,
+-            final EventCondition condition, final String index) {
+-            return iffs
+-                .computeIfAbsent(index, ind -> new Dataset.SplitDataset(datasets, condition));
++        private SplitDataset split(final Collection<Dataset> datasets,
++            final EventCondition condition, final String index, String configSource) {
++            return iffs.computeIfAbsent(
++                index, ind -> DatasetCompiler.splitDataset(datasets, condition, configSource)
++            );
+         }
+ 
+         /**
+@@ -334,26 +330,47 @@ private Collection<Dataset> compileDependencies(final Vertex start,
+             return dependencies.stream().map(
+                 dependency -> {
+                     final Collection<Dataset> transientDependencies = flatten(datasets, dependency);
++                    final String id = dependency.getId();
+                     if (isFilter(dependency)) {
+-                        return filterDataset(dependency.getId(), transientDependencies);
++                        return filterDataset(id, getConfigSource(dependency), transientDependencies);
+                     } else if (isOutput(dependency)) {
+-                        return outputDataset(dependency.getId(), transientDependencies);
++                        return outputDataset(id, getConfigSource(dependency), transientDependencies);
+                     } else {
+-                        // We know that it's an if vertex since the the input children are either 
++                        // We know that it's an if vertex since the the input children are either
+                         // output, filter or if in type.
+                         final IfVertex ifvert = (IfVertex) dependency;
+-                        final EventCondition iff = buildCondition(ifvert);
+-                        final String index = ifvert.getId();
++                        final SplitDataset ifDataset = split(
++                            transientDependencies,
++                            EventCondition.Compiler.buildCondition(ifvert.getBooleanExpression()),
++                            id, getConfigSource(dependency)
++                        );
+                         // It is important that we double check that we are actually dealing with the
+                         // positive/left branch of the if condition
+                         if (ifvert.getOutgoingBooleanEdgesByType(true).stream()
+                             .anyMatch(edge -> Objects.equals(edge.getTo(), start))) {
+-                            return split(transientDependencies, iff, index);
++                            return ifDataset;
+                         } else {
+-                            return split(transientDependencies, iff, index).right();
++                            return ifDataset.right();
+                         }
+                     }
+                 }).collect(Collectors.toList());
+         }
+     }
++
++    /**
++     * Gets the configuration source for debugging purposes. Uses the metadata text if it exists, else the vertex toString method
++     * @param vertex The {@link Vertex} to read the Logstash configuration source
++     * @return A String that can be useful for debugging the Logstash configuration to generated Dataset/code
++     */
++    private String getConfigSource(Vertex vertex){
++        if( vertex == null){
++            return "(vertex is null, this is likely a bug)";
++        }
++        //conditionals will use this
++        if(vertex.getSourceWithMetadata() == null){
++            return vertex.toString();
++        }
++        String text  = vertex.getSourceWithMetadata().getText();
++        return text == null ? "(vertex.getSourceWithMetadata().getText() is null, this is likely a bug)" : text;
++    }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/ClassFields.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/ClassFields.java
+new file mode 100644
+index 00000000000..a906db50089
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/ClassFields.java
+@@ -0,0 +1,78 @@
++package org.logstash.config.ir.compiler;
++
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.stream.Collectors;
++
++/**
++ * All fields in a Java class. Manages correctly naming and typing fields to avoid collisions and
++ * manual naming in generated code.
++ */
++final class ClassFields {
++
++    private final Collection<FieldDefinition> definitions;
++
++    ClassFields() {
++        definitions = new ArrayList<>();
++    }
++
++    /**
++     * Add a field of given type that is initialized by the given {@link SyntaxElement} that will
++     * be executed in the class body.
++     * Renders as e.g. {@code private final Ruby field5 = RubyUtil.RUBY}.
++     * @param type Type of the field
++     * @param initializer Syntax to initialize it in-line.
++     * @return The field's syntax element that can be used in method bodies
++     */
++    public ValueSyntaxElement add(final Class<?> type, final SyntaxElement initializer) {
++        return addField(FieldDefinition.withInitializer(definitions.size(), type, initializer));
++    }
++
++    /**
++     * Adds a field holding the given {@link Object}.
++     * @param obj Object to add field for
++     * @return The field's syntax element that can be used in method bodies
++     */
++    public ValueSyntaxElement add(final Object obj) {
++        return addField(FieldDefinition.fromValue(definitions.size(), obj));
++    }
++
++    /**
++     * Adds a mutable field of the given type, that doesn't have a default value and is not
++     * initialized by a constructor assignment.
++     * Renders as e.g. {@code private boolean field7}
++     * @param type Type of the mutable field.
++     * @return The field's syntax element that can be used in method bodies
++     */
++    public ValueSyntaxElement add(final Class<?> type) {
++        return addField(FieldDefinition.mutableUnassigned(definitions.size(), type));
++    }
++
++    /**
++     * Returns the subset of fields that are assigned in the constructor.
++     * @return Subset of fields to be assigned by the constructor
++     */
++    public FieldDeclarationGroup ctorAssigned() {
++        return new FieldDeclarationGroup(
++            definitions.stream().filter(field -> field.getCtorArgument() != null)
++                .collect(Collectors.toList())
++        );
++    }
++
++    /**
++     * Returns the subset of fields that are not assigned in the constructor.
++     * They are either mutable without a default value or assigned inline in the class body.
++     * @return Subset of fields not assigned by the constructor
++     */
++    public FieldDeclarationGroup inlineAssigned() {
++        return new FieldDeclarationGroup(
++            definitions.stream().filter(field -> field.getCtorArgument() == null)
++                .collect(Collectors.toList())
++        );
++    }
++
++    private ValueSyntaxElement addField(final FieldDefinition field) {
++        this.definitions.add(field);
++        return field.asVariable().access();
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/Closure.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/Closure.java
+new file mode 100644
+index 00000000000..f017606d236
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/Closure.java
+@@ -0,0 +1,123 @@
++package org.logstash.config.ir.compiler;
++
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.List;
++import java.util.stream.Collectors;
++import org.jruby.Ruby;
++import org.jruby.runtime.ThreadContext;
++
++/**
++ * A syntactic closure.
++ */
++final class Closure implements MethodLevelSyntaxElement {
++
++    /**
++     * Empty and immutable {@link Closure}.
++     */
++    public static final Closure EMPTY = new Closure(Collections.emptyList());
++
++    /**
++     * Variable declaration for the Ruby thread-context,
++     * renders as {@code final ThreadContext context}.
++     */
++    private static final VariableDefinition RUBY_THREAD_CONTEXT =
++        new VariableDefinition(ThreadContext.class, "context");
++
++    /**
++     * Variable declaration for the Ruby thread-context,
++     * renders as {@code final ThreadContext context = RubyUtil.RUBY.getCurrentContext()}.
++     */
++    private static final MethodLevelSyntaxElement CACHE_RUBY_THREADCONTEXT =
++        SyntaxFactory.definition(
++            RUBY_THREAD_CONTEXT, ValueSyntaxElement.GET_RUBY_THREAD_CONTEXT
++        );
++
++    /**
++     * Variable referencing the current Ruby thread context.
++     */
++    private static final ValueSyntaxElement CACHED_RUBY_THREADCONTEXT =
++        RUBY_THREAD_CONTEXT.access();
++
++    private final List<MethodLevelSyntaxElement> statements;
++
++    public static Closure wrap(final MethodLevelSyntaxElement... statements) {
++        final Closure closure = new Closure();
++        for (final MethodLevelSyntaxElement statement : statements) {
++            if (statement instanceof Closure) {
++                closure.add((Closure) statement);
++            } else {
++                closure.add(statement);
++            }
++        }
++        return closure;
++    }
++
++    Closure() {
++        this(new ArrayList<>());
++    }
++
++    private Closure(final List<MethodLevelSyntaxElement> statements) {
++        this.statements = statements;
++    }
++
++    public Closure add(final Closure statement) {
++        statements.addAll(statement.statements);
++        return this;
++    }
++
++    public Closure add(final MethodLevelSyntaxElement statement) {
++        statements.add(statement);
++        return this;
++    }
++
++    @Override
++    public String generateCode() {
++        final Collection<MethodLevelSyntaxElement> optimized =
++            this.optimizeRubyThreadContexts().statements;
++        return optimized.isEmpty() ? "" : SyntaxFactory.join(
++            optimized.stream().map(MethodLevelSyntaxElement::generateCode).collect(
++                Collectors.joining(";")
++            ), ";"
++        );
++    }
++
++    /**
++     * Removes duplicate calls to {@link Ruby#getCurrentContext()} by caching them to a variable.
++     * @return Copy of this Closure without redundant calls to {@link Ruby#getCurrentContext()}
++     */
++    private Closure optimizeRubyThreadContexts() {
++        final ArrayList<Integer> rubyCalls = new ArrayList<>();
++        for (int i = 0; i < statements.size(); ++i) {
++            if (statements.get(i).count(ValueSyntaxElement.GET_RUBY_THREAD_CONTEXT) > 0) {
++                rubyCalls.add(i);
++            }
++        }
++        final Closure optimized;
++        if (rubyCalls.size() > 1) {
++            optimized = (Closure) new Closure().add(this).replace(
++                ValueSyntaxElement.GET_RUBY_THREAD_CONTEXT, CACHED_RUBY_THREADCONTEXT
++            );
++            optimized.statements.add(rubyCalls.get(0), CACHE_RUBY_THREADCONTEXT);
++        } else {
++            optimized = this;
++        }
++        return optimized;
++    }
++
++    @Override
++    public MethodLevelSyntaxElement replace(final MethodLevelSyntaxElement search,
++        final MethodLevelSyntaxElement replacement) {
++        final Closure result = new Closure();
++        for (final MethodLevelSyntaxElement element : this.statements) {
++            result.add(element.replace(search, replacement));
++        }
++        return result;
++    }
++
++    @Override
++    public int count(final MethodLevelSyntaxElement search) {
++        return statements.stream().mapToInt(child -> child.count(search)).sum();
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/ComputeStepSyntaxElement.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/ComputeStepSyntaxElement.java
+new file mode 100644
+index 00000000000..3b749fed082
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/ComputeStepSyntaxElement.java
+@@ -0,0 +1,239 @@
++package org.logstash.config.ir.compiler;
++
++import java.io.IOException;
++import java.io.StringReader;
++import java.lang.reflect.InvocationTargetException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Comparator;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Optional;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.stream.Collectors;
++import java.util.stream.StreamSupport;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import org.codehaus.commons.compiler.CompileException;
++import org.codehaus.janino.ClassBodyEvaluator;
++
++/**
++ * One step a compiled pipeline. In the current implementation each step compiles to a
++ * {@link Dataset}.
++ */
++final class ComputeStepSyntaxElement implements SyntaxElement {
++
++    private static final Logger LOGGER = LogManager.getLogger(ComputeStepSyntaxElement.class);
++    private static final DynamicClassLoader CLASS_LOADER = new DynamicClassLoader();
++
++    /**
++     * Cache of runtime compiled classes to prevent duplicate classes being compiled.
++     */
++    private static final Map<ComputeStepSyntaxElement, Class<? extends Dataset>> CLASS_CACHE
++        = new HashMap<>();
++
++    private static final Map<String, String> SOURCE_CACHE = new HashMap<>();
++
++    private static final Map<String, String> CONFIG_SOURCE_CACHE = new HashMap<>();
++
++    /**
++     * Sequence number to ensure unique naming for runtime compiled classes.
++     */
++    private static final AtomicInteger SEQUENCE = new AtomicInteger(0);
++
++    private static final int INDENT_WIDTH = 4;
++
++    private final String name;
++
++    private final Iterable<MethodSyntaxElement> methods;
++
++    private final ClassFields fields;
++
++    private final String configSource;
++
++     /**
++     * Get the generated source
++     * @return sorted and formatted lines of generated code
++     */
++    public static List<String> getGeneratedSource() {
++        List<String> output = new ArrayList<>();
++
++        output.add("/******************************************************************************************");
++        CONFIG_SOURCE_CACHE.forEach((k, v) -> {
++            output.add("* " +  v + " <==> " + k.replaceAll("[\\t\\n\\r\\s]+",""));
++        });
++        output.add("******************************************************************************************/");
++
++        SOURCE_CACHE.forEach((k, v) -> {
++            output.add(String.format("class %s {", k));
++            LOGGER.trace("{}:{}", k, v);
++            getFormattedLines(v, output, INDENT_WIDTH);
++            output.add("}");
++        });
++
++        return output;
++    }
++
++    private static List<String> getFormattedLines(String input, List<String> output, int indent) {
++        int curlyOpen = input.indexOf("{");
++        int curlyClose = input.indexOf("}");
++        int semiColon = input.indexOf(";");
++
++        List<Integer> positions = Arrays.asList(curlyOpen, curlyClose, semiColon);
++        positions.sort(Comparator.naturalOrder());
++        Optional<Integer> firstMatch = positions.stream().filter(i -> i >= 0).findFirst();
++
++        if (firstMatch.isPresent()) {
++            int pos = firstMatch.get();
++            int preIndent = indent;
++            int postIndent = indent;
++            if (pos == curlyOpen) {
++                postIndent += INDENT_WIDTH;
++            } else if (pos == curlyClose) {
++                preIndent -= INDENT_WIDTH;
++                postIndent = preIndent;
++            }
++
++            if (input.trim().length() > 0) {
++                String sub = input.substring(0, pos + 1);
++                if (!sub.equals(";")) {
++                    output.add(String.format("%" + preIndent + "s%s", " ", sub));
++                }
++            }
++            return getFormattedLines(input.substring(pos + 1), output, postIndent);
++        }
++
++        if (input.trim().equals("}")) {
++            indent -= INDENT_WIDTH;
++        }
++
++        if (input.trim().length() > 0 && !input.trim().equals(";")) {
++            output.add(String.format("%" + indent + "s%s", " ", input));
++        }
++        return output;
++    }
++
++    ComputeStepSyntaxElement(final Iterable<MethodSyntaxElement> methods,
++        final ClassFields fields, DatasetCompiler.DatasetFlavor datasetFlavor, String configSource) {
++        this(String.format("Generated%d_" + datasetFlavor.getDisplay() + "Dataset", SEQUENCE.incrementAndGet()), methods, fields, configSource);
++    }
++
++    private ComputeStepSyntaxElement(final String name, final Iterable<MethodSyntaxElement> methods,
++        final ClassFields fields, String configSource) {
++        this.name = name;
++        this.methods = methods;
++        this.fields = fields;
++        this.configSource = configSource;
++    }
++
++    public <T extends Dataset> T instantiate(final Class<T> interfce) {
++        try {
++
++            final Class<? extends Dataset> clazz;
++            if (CLASS_CACHE.containsKey(this)) {
++                clazz = CLASS_CACHE.get(this);
++            } else {
++                final ClassBodyEvaluator se = new ClassBodyEvaluator();
++                se.setParentClassLoader(CLASS_LOADER);
++                se.setImplementedInterfaces(new Class[]{interfce});
++                se.setClassName(name);
++                String code = generateCode();
++                SOURCE_CACHE.put(name, generateCode());
++                se.cook(new StringReader(code));
++                se.toString();
++                clazz = (Class<T>) se.getClazz();
++                CLASS_LOADER.addClass(clazz);
++                CLASS_CACHE.put(this, clazz);
++            }
++            CONFIG_SOURCE_CACHE.putIfAbsent(configSource, clazz.getName());
++            return (T) clazz.<T>getConstructor(ctorTypes()).newInstance(ctorArguments());
++        } catch (final CompileException | IOException | NoSuchMethodException
++            | InvocationTargetException | InstantiationException | IllegalAccessException ex) {
++            throw new IllegalStateException(ex);
++        }
++    }
++
++    /**
++     * @return Array of constructor argument types with the same ordering that is used by
++     * {@link #ctorArguments()}.
++     */
++    private Class<?>[] ctorTypes() {
++        return fields.ctorAssigned().getFields().stream()
++            .map(FieldDefinition::asVariable)
++            .map(typedVar -> typedVar.type).toArray(Class<?>[]::new);
++    }
++
++    /**
++     * @return Array of constructor arguments
++     */
++    private Object[] ctorArguments() {
++        return fields.ctorAssigned().getFields().stream()
++            .map(FieldDefinition::getCtorArgument).toArray();
++    }
++
++    @Override
++    public String generateCode() {
++        return SyntaxFactory.join(
++            combine(
++                StreamSupport.stream(methods.spliterator(), false)
++                    .toArray(SyntaxElement[]::new)
++            ), fields.inlineAssigned().generateCode(), fieldsAndCtor()
++        );
++    }
++
++    @Override
++    public int hashCode() {
++        return normalizedSource().hashCode();
++    }
++
++    @Override
++    public boolean equals(final Object other) {
++        return other instanceof ComputeStepSyntaxElement &&
++            normalizedSource().equals(((ComputeStepSyntaxElement) other).normalizedSource());
++    }
++
++    /**
++     * Normalizes away the name of the class so that two classes of different name but otherwise
++     * equivalent syntax get correctly compared by {@link #equals(Object)}.
++     * @return Source of this class, with its name set to {@code CONSTANT}.
++     */
++    private String normalizedSource() {
++        return new ComputeStepSyntaxElement("CONSTANT", methods, fields, "")
++            .generateCode();
++    }
++
++    /**
++     * Generates the Java code for defining one field and constructor argument for each given value.
++     * constructor for
++     * @return Java Source String
++     */
++    private String fieldsAndCtor() {
++        final Closure constructor = new Closure();
++        final FieldDeclarationGroup ctorFields = fields.ctorAssigned();
++        final Collection<VariableDefinition> ctor = new ArrayList<>();
++        for (final FieldDefinition field : ctorFields.getFields()) {
++            if (field.getCtorArgument() != null) {
++                final String fieldName = field.getName();
++                final VariableDefinition fieldVar = field.asVariable();
++                final VariableDefinition argVar =
++                    fieldVar.rename(SyntaxFactory.join(fieldName, "argument"));
++                constructor.add(SyntaxFactory.assignment(fieldVar.access(), argVar.access()));
++                ctor.add(argVar);
++            }
++        }
++        return combine(ctorFields, MethodSyntaxElement.constructor(name, constructor, ctor));
++    }
++
++    /**
++     * Renders the string concatenation of the given {@link SyntaxElement}
++     * @param parts Elements to concatenate
++     * @return Java source
++     */
++    private static String combine(final SyntaxElement... parts) {
++        return Arrays.stream(parts).map(SyntaxElement::generateCode)
++            .collect(Collectors.joining(""));
++    }
++
++}
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/Dataset.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/Dataset.java
+index d17a94352a5..3946cb64c03 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/Dataset.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/Dataset.java
+@@ -1,8 +1,6 @@
+ package org.logstash.config.ir.compiler;
+ 
+-import java.util.ArrayList;
+ import java.util.Collection;
+-import java.util.Collections;
+ import org.jruby.RubyArray;
+ import org.logstash.ext.JrubyEventExtLibrary;
+ 
+@@ -38,126 +36,4 @@ Collection<JrubyEventExtLibrary.RubyEvent> compute(RubyArray batch,
+      * use with a new set of input data.
+      */
+     void clear();
+-
+-    /**
+-     * Root {@link Dataset}s at the beginning of the execution tree that simply pass through
+-     * the given set of {@link JrubyEventExtLibrary.RubyEvent} and have no state.
+-     */
+-    Collection<Dataset> ROOT_DATASETS = Collections.singleton(
+-        DatasetCompiler.compile("return batch;", "")
+-    );
+-
+-    /**
+-     * {@link Dataset} that results from the {@code if} branch of its backing
+-     * {@link EventCondition} being applied to all of its dependencies.
+-     */
+-    final class SplitDataset implements Dataset {
+-
+-        private final Collection<Dataset> parents;
+-
+-        private final EventCondition func;
+-
+-        private final Collection<JrubyEventExtLibrary.RubyEvent> trueData;
+-
+-        private final Collection<JrubyEventExtLibrary.RubyEvent> falseData;
+-
+-        private final Dataset opposite;
+-
+-        private boolean done;
+-
+-        public SplitDataset(final Collection<Dataset> parents,
+-            final EventCondition eventCondition) {
+-            this.parents = parents;
+-            this.func = eventCondition;
+-            done = false;
+-            trueData = new ArrayList<>(5);
+-            falseData = new ArrayList<>(5);
+-            opposite = new Dataset.SplitDataset.Complement(this, falseData);
+-        }
+-
+-        @Override
+-        public Collection<JrubyEventExtLibrary.RubyEvent> compute(final RubyArray batch,
+-            final boolean flush, final boolean shutdown) {
+-            if (done) {
+-                return trueData;
+-            }
+-            for (final Dataset set : parents) {
+-                for (final JrubyEventExtLibrary.RubyEvent event
+-                    : set.compute(batch, flush, shutdown)) {
+-                    if (func.fulfilled(event)) {
+-                        trueData.add(event);
+-                    } else {
+-                        falseData.add(event);
+-                    }
+-                }
+-            }
+-            done = true;
+-            return trueData;
+-        }
+-
+-        @Override
+-        public void clear() {
+-            for (final Dataset parent : parents) {
+-                parent.clear();
+-            }
+-            trueData.clear();
+-            falseData.clear();
+-            done = false;
+-        }
+-
+-        public Dataset right() {
+-            return opposite;
+-        }
+-
+-        /**
+-         * Complementary {@link Dataset} to a {@link Dataset.SplitDataset} representing the
+-         * negative branch of the {@code if} statement.
+-         */
+-        private static final class Complement implements Dataset {
+-
+-            /**
+-             * Positive branch of underlying {@code if} statement.
+-             */
+-            private final Dataset parent;
+-
+-            /**
+-             * This collection is shared with {@link Dataset.SplitDataset.Complement#parent} and
+-             * mutated when calling its {@code compute} method. This class does not directly compute
+-             * it.
+-             */
+-            private final Collection<JrubyEventExtLibrary.RubyEvent> data;
+-
+-            private boolean done;
+-
+-            /**
+-             * Ctor.
+-             * @param left Positive Branch {@link Dataset.SplitDataset}
+-             * @param complement Collection of {@link JrubyEventExtLibrary.RubyEvent}s that did
+-             * not match {@code left}
+-             */
+-            private Complement(
+-                final Dataset left, final Collection<JrubyEventExtLibrary.RubyEvent> complement) {
+-                this.parent = left;
+-                data = complement;
+-            }
+-
+-            @Override
+-            public Collection<JrubyEventExtLibrary.RubyEvent> compute(
+-                final RubyArray batch, final boolean flush, final boolean shutdown) {
+-                if (done) {
+-                    return data;
+-                }
+-                parent.compute(batch, flush, shutdown);
+-                done = true;
+-                return data;
+-            }
+-
+-            @Override
+-            public void clear() {
+-                parent.clear();
+-                done = false;
+-            }
+-        }
+-    }
+-
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
+index 887be13ada5..a1a37b03033 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
+@@ -1,18 +1,11 @@
+ package org.logstash.config.ir.compiler;
+ 
+-import java.io.IOException;
+-import java.io.StringReader;
+-import java.lang.reflect.InvocationTargetException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+-import java.util.HashMap;
+-import java.util.Map;
+-import java.util.concurrent.atomic.AtomicInteger;
+-import java.util.stream.Stream;
+-import org.codehaus.commons.compiler.CompileException;
+-import org.codehaus.janino.ClassBodyEvaluator;
++import java.util.List;
++import java.util.stream.Collectors;
+ import org.jruby.RubyArray;
+ import org.jruby.RubyHash;
+ import org.jruby.internal.runtime.methods.DynamicMethod;
+@@ -36,61 +29,42 @@ public final class DatasetCompiler {
+      */
+     public static final IRubyObject[] FLUSH_NOT_FINAL = {flushOpts(false)};
+ 
+-    /**
+-     * Sequence number to ensure unique naming for runtime compiled classes.
+-     */
+-    private static final AtomicInteger SEQUENCE = new AtomicInteger(0);
+-
+-    /**
+-     * Cache of runtime compiled classes to prevent duplicate classes being compiled.
+-     */
+-    private static final Map<String, Class<?>> CLASS_CACHE = new HashMap<>();
+-
+-    private static final String RETURN_NULL = "return null;";
+-    /**
+-     * Trivial {@link Dataset} that simply returns an empty collection of elements.
+-     */
+-    private static final Dataset EMPTY_DATASET = DatasetCompiler.compile(RETURN_NULL, "");
+-
+-    private static final String MULTI_FILTER = "multi_filter";
+-
+     private static final String MULTI_RECEIVE = "multi_receive";
+ 
+     private static final String FLUSH = "flush";
+ 
+-    /**
+-     * Relative offset of the field holding the cached arguments used to invoke the
+-     * primary callsite of a dataset.
+-     */
+-    private static final int ARG_ARRAY_OFFSET = 0;
++    public static final SyntaxFactory.IdentifierStatement FLUSH_ARG =
++        SyntaxFactory.identifier("flushArg");
+ 
+-    /**
+-     * Relative offset of the primary (either multi_filter or multi_receive) {@link DynamicMethod}
+-     * callsite in generated code.
+-     */
+-    private static final int PRIMARY_CALLSITE_OFFSET = 1;
++    public static final SyntaxFactory.IdentifierStatement SHUTDOWN_ARG =
++        SyntaxFactory.identifier("shutdownArg");
+ 
+-    /**
+-     * Relative offset of the field holding a wrapped Ruby plugin.
+-     */
+-    private static final int PLUGIN_FIELD_OFFSET = 2;
++    public static final SyntaxFactory.IdentifierStatement BATCH_ARG =
++        SyntaxFactory.identifier("batchArg");
+ 
+     /**
+-     * Relative offset of the field holding the collection used to buffer input
+-     * {@link JrubyEventExtLibrary.RubyEvent}.
++     * Hint to the intended purpose of a Dataset.
+      */
+-    private static final int INPUT_BUFFER_OFFSET = 3;
++    enum DatasetFlavor {
++        ROOT("Root"), FILTER("Filter"), OUTPUT("Output"), CONDITIONAL("Conditional");
++        private final String display;
+ 
+-    /**
+-     * Relative offset of the field holding the collection used to buffer computed
+-     * {@link JrubyEventExtLibrary.RubyEvent}.
+-     */
+-    private static final int RESULT_BUFFER_OFFSET = 4;
++        DatasetFlavor(final String display) {
++            this.display = display;
++        }
++
++        String getDisplay() {
++            return display;
++        }
++    }
+ 
+     /**
+-     * Relative offset of the field holding the filter flush method callsite.
++     * Root {@link Dataset}s at the beginning of the execution tree that simply pass through
++     * the given set of {@link JrubyEventExtLibrary.RubyEvent} and have no state.
+      */
+-    private static final int FLUSH_CALLSITE_OFFSET = 5;
++    public static final Collection<Dataset> ROOT_DATASETS = Collections.singleton(
++        compile(Closure.wrap(SyntaxFactory.ret(BATCH_ARG)), Closure.EMPTY, new ClassFields(), DatasetFlavor.ROOT, "(root)")
++    );
+ 
+     private DatasetCompiler() {
+         // Utility Class
+@@ -103,87 +77,112 @@ private DatasetCompiler() {
+      * @param compute Method body of {@link Dataset#compute(RubyArray, boolean, boolean)}
+      * @param clear Method body of {@link Dataset#clear()}
+      * @param fieldValues Constructor Arguments
++     * @param datasetFlavor The flavor of {@link Dataset} to compile.
++     * @param configSource The Logstash configuration that maps to the returned Dataset
++     * This is only helpful for human debugging to differentiate between the intended usage of the {@link Dataset}
+      * @return Dataset Instance
+      */
+-    public static synchronized Dataset compile(final String compute, final String clear,
+-        final Object... fieldValues) {
+-        try {
+-            final Class<?> clazz;
+-            final String source = String.format(
+-                "public Collection compute(RubyArray batch, boolean flush, boolean shutdown) { %s } public void clear() { %s }",
+-                compute, clear
+-            );
+-            if (CLASS_CACHE.containsKey(source)) {
+-                clazz = CLASS_CACHE.get(source);
+-            } else {
+-                final ClassBodyEvaluator se = new ClassBodyEvaluator();
+-                se.setImplementedInterfaces(new Class[]{Dataset.class});
+-                final String classname =
+-                    String.format("CompiledDataset%d", SEQUENCE.incrementAndGet());
+-                se.setClassName(classname);
+-                se.setDefaultImports(
+-                    Stream.of(
+-                        Collection.class, Collections.class, Dataset.class,
+-                        JrubyEventExtLibrary.class, RubyUtil.class, DatasetCompiler.class,
+-                        Block.class, RubyArray.class
+-                    ).map(Class::getName).toArray(String[]::new)
+-                );
+-                se.cook(new StringReader(join(fieldsAndCtor(classname, fieldValues), source)));
+-                clazz = se.getClazz();
+-                CLASS_CACHE.put(source, clazz);
+-            }
+-            final Class<?>[] args = new Class[fieldValues.length];
+-            Arrays.fill(args, Object.class);
+-            return (Dataset) clazz.getConstructor(args).newInstance(fieldValues);
+-        } catch (final CompileException | IOException | NoSuchMethodException
+-            | InvocationTargetException | InstantiationException | IllegalAccessException ex) {
+-            throw new IllegalStateException(ex);
+-        }
++    public static synchronized Dataset compile(final Closure compute, final Closure clear,
++        final ClassFields fieldValues, final DatasetFlavor datasetFlavor, String configSource) {
++        return new ComputeStepSyntaxElement(
++            Arrays.asList(MethodSyntaxElement.compute(compute), MethodSyntaxElement.clear(clear)),
++            fieldValues, datasetFlavor, configSource
++        ).instantiate(Dataset.class);
+     }
+ 
+-    /**
+-     * Compiles a {@link Dataset} representing a filter plugin without flush behaviour.
+-     * @param parents Parent {@link Dataset} to aggregate for this filter
+-     * @param filter Filter Plugin
+-     * @return Dataset representing the filter plugin
+-     */
+-    public static Dataset filterDataset(final Collection<Dataset> parents,
+-        final IRubyObject filter) {
+-        final Object[] parentArr = parents.toArray();
+-        final int offset = parentArr.length;
+-        final Object[] allArgs = new Object[offset + 5];
+-        setupFilterFields(filter, parentArr, allArgs);
+-        return compileFilterDataset(offset, filterBody(offset), allArgs);
++    public static SplitDataset splitDataset(final Collection<Dataset> parents,
++        final EventCondition condition, String configSource) {
++        final ClassFields fields = new ClassFields();
++        final Collection<ValueSyntaxElement> parentFields =
++            parents.stream().map(fields::add).collect(Collectors.toList());
++        final SyntaxElement arrayInit =
++            SyntaxFactory.constant(RubyUtil.class, "RUBY").call("newArray");
++        final ValueSyntaxElement ifData = fields.add(RubyArray.class, arrayInit);
++        final ValueSyntaxElement elseData = fields.add(RubyArray.class, arrayInit);
++        final ValueSyntaxElement buffer = fields.add(RubyArray.class, arrayInit);
++        final ValueSyntaxElement done = fields.add(boolean.class);
++        final VariableDefinition event =
++            new VariableDefinition(JrubyEventExtLibrary.RubyEvent.class, "event");
++        final ValueSyntaxElement eventVal = event.access();
++        return new ComputeStepSyntaxElement(
++            Arrays.asList(
++                MethodSyntaxElement.compute(
++                    returnBuffer(ifData, done)
++                        .add(bufferParents(parentFields, buffer))
++                        .add(
++                            SyntaxFactory.forLoop(event, buffer,
++                                Closure.wrap(
++                                    SyntaxFactory.ifCondition(
++                                        fields.add(condition).call("fulfilled", eventVal),
++                                        Closure.wrap(ifData.call("add", eventVal)),
++                                        Closure.wrap(elseData.call("add", eventVal))
++                                    )
++                                )
++                            )
++                        ).add(clear(buffer))
++                        .add(SyntaxFactory.assignment(done, SyntaxFactory.TRUE))
++                        .add(SyntaxFactory.ret(ifData))
++                ),
++                MethodSyntaxElement.clear(
++                    clearSyntax(parentFields).add(clear(ifData)).add(clear(elseData))
++                        .add(SyntaxFactory.assignment(done, SyntaxFactory.FALSE))
++                ),
++                MethodSyntaxElement.right(elseData)
++            ), fields, DatasetFlavor.CONDITIONAL, configSource
++        ).instantiate(SplitDataset.class);
+     }
+ 
+     /**
+-     * Compiles a {@link Dataset} representing a filter plugin with flush behaviour.
++     * Compiles a {@link Dataset} representing a filter plugin without flush behaviour.
+      * @param parents Parent {@link Dataset} to aggregate for this filter
+-     * @param filter Filter Plugin
+-     * @param shutdownFlushOnly True iff plugin only flushes on shutdown
++     * @param plugin Filter Plugin
++     * @param configSource The Logstash configuration that maps to the returned Dataset
+      * @return Dataset representing the filter plugin
+      */
+-    public static Dataset flushingFilterDataset(final Collection<Dataset> parents,
+-        final IRubyObject filter, final boolean shutdownFlushOnly) {
+-        final Object[] parentArr = parents.toArray();
+-        final int offset = parentArr.length;
+-        final Object[] allArgs = new Object[offset + 6];
+-        setupFilterFields(filter, parentArr, allArgs);
+-        allArgs[offset + FLUSH_CALLSITE_OFFSET] = rubyCallsite(filter, FLUSH);
+-        return compileFilterDataset(
+-            offset, join(filterBody(offset), callFilterFlush(offset, shutdownFlushOnly)), allArgs
++    public static Dataset filterDataset(final Collection<Dataset> parents,
++        final RubyIntegration.Filter plugin, String configSource) {
++        final ClassFields fields = new ClassFields();
++        final Collection<ValueSyntaxElement> parentFields =
++            parents.stream().map(fields::add).collect(Collectors.toList());
++        final RubyArray inputBuffer = RubyUtil.RUBY.newArray();
++        final ValueSyntaxElement inputBufferField = fields.add(inputBuffer);
++        final ValueSyntaxElement outputBuffer = fields.add(new ArrayList<>());
++        final IRubyObject filter = plugin.toRuby();
++        final ValueSyntaxElement filterField = fields.add(filter);
++        final ValueSyntaxElement done = fields.add(boolean.class);
++        final String multiFilter = "multi_filter";
++        final Closure body = returnBuffer(outputBuffer, done).add(
++            bufferParents(parentFields, inputBufferField)
++                .add(
++                    buffer(
++                        outputBuffer,
++                        SyntaxFactory.cast(
++                            RubyArray.class,
++                            callRubyCallsite(
++                                fields.add(rubyCallsite(filter, multiFilter)),
++                                fields.add(new IRubyObject[]{inputBuffer}), filterField,
++                                multiFilter
++                            )
++                        )
++                    )
++                ).add(clear(inputBufferField))
++        );
++        if (plugin.hasFlush()) {
++            body.add(
++                callFilterFlush(
++                    outputBuffer, fields.add(rubyCallsite(filter, FLUSH)), filterField,
++                    !plugin.periodicFlush()
++                )
++            );
++        }
++        return compile(
++            body.add(SyntaxFactory.assignment(done, SyntaxFactory.TRUE))
++                .add(SyntaxFactory.ret(outputBuffer)),
++            Closure.wrap(
++                clearSyntax(parentFields), clear(outputBuffer),
++                SyntaxFactory.assignment(done, SyntaxFactory.FALSE)
++            ), fields, DatasetFlavor.FILTER, configSource
+         );
+-    }
+-
+-    private static void setupFilterFields(final IRubyObject filter, final Object[] parentArr,
+-        final Object[] allArgs) {
+-        final RubyArray buffer = RubyUtil.RUBY.newArray();
+-        final int offset = parentArr.length;
+-        System.arraycopy(parentArr, 0, allArgs, 0, offset);
+-        allArgs[offset + INPUT_BUFFER_OFFSET] = buffer;
+-        allArgs[offset + PRIMARY_CALLSITE_OFFSET] = rubyCallsite(filter, MULTI_FILTER);
+-        allArgs[offset + ARG_ARRAY_OFFSET] = new IRubyObject[]{buffer};
+-        allArgs[offset + PLUGIN_FIELD_OFFSET] = filter;
+     }
+ 
+     /**
+@@ -199,19 +198,23 @@ public static Dataset terminalDataset(final Collection<Dataset> parents) {
+         final int count = parents.size();
+         final Dataset result;
+         if (count > 1) {
+-            final Object[] parentArr = parents.toArray();
+-            final int offset = parentArr.length;
+-            final StringBuilder syntax = new StringBuilder();
+-            for (int i = 0; i < offset; ++i) {
+-                syntax.append(computeDataset(i)).append(';');
+-            }
+-            result = compileOutput(join(syntax.toString(), clearSyntax(offset)), "", parentArr);
++            final ClassFields fields = new ClassFields();
++            final Collection<ValueSyntaxElement> parentFields =
++                parents.stream().map(fields::add).collect(Collectors.toList());
++            result = compileOutput(
++                Closure.wrap(
++                    parentFields.stream().map(DatasetCompiler::computeDataset)
++                        .toArray(MethodLevelSyntaxElement[]::new)
++                ).add(clearSyntax(parentFields)), Closure.EMPTY, fields, "(terminal)"
++            );
+         } else if (count == 1) {
+             // No need for a terminal dataset here, if there is only a single parent node we can
+             // call it directly.
+             result = parents.iterator().next();
+         } else {
+-            result = EMPTY_DATASET;
++            throw new IllegalArgumentException(
++                "Cannot create Terminal Dataset for an empty number of parent datasets"
++            );
+         }
+         return result;
+     }
+@@ -229,101 +232,89 @@ public static Dataset terminalDataset(final Collection<Dataset> parents) {
+      * every call to {@code compute}.
+      * @param parents Parent Datasets
+      * @param output Output Plugin (of Ruby type OutputDelegator)
++     * @param configSource The Logstash configuration that maps to the output Dataset
+      * @param terminal Set to true if this output is the only output in the pipeline
+      * @return Output Dataset
+      */
+-    public static Dataset outputDataset(final Collection<Dataset> parents, final IRubyObject output,
++    public static Dataset outputDataset(final Collection<Dataset> parents, final IRubyObject output, String configSource,
+         final boolean terminal) {
+         final DynamicMethod method = rubyCallsite(output, MULTI_RECEIVE);
+         // Short-circuit trivial case of only output(s) in the pipeline
+-        if (parents == Dataset.ROOT_DATASETS) {
+-            return outputDatasetFromRoot(output, method);
++        if (parents == ROOT_DATASETS) {
++            return outputDatasetFromRoot(output, method, configSource);
+         }
++        final ClassFields fields = new ClassFields();
++        final Collection<ValueSyntaxElement> parentFields =
++            parents.stream().map(fields::add).collect(Collectors.toList());
+         final RubyArray buffer = RubyUtil.RUBY.newArray();
+-        final Object[] parentArr = parents.toArray();
+-        final int offset = parentArr.length;
+-        final Object[] allArgs = new Object[offset + 4];
+-        System.arraycopy(parentArr, 0, allArgs, 0, offset);
+-        allArgs[offset + INPUT_BUFFER_OFFSET] = buffer;
+-        allArgs[offset + PRIMARY_CALLSITE_OFFSET] = method;
+-        allArgs[offset + ARG_ARRAY_OFFSET] = new IRubyObject[]{buffer};
+-        allArgs[offset + PLUGIN_FIELD_OFFSET] = output;
+-        final String clearSyntax;
+-        final String inlineClear;
++        final ValueSyntaxElement inputBuffer = fields.add(buffer);
++        final Closure clearSyntax;
++        final Closure inlineClear;
+         if (terminal) {
+-            clearSyntax = "";
+-            inlineClear = clearSyntax(offset);
++            clearSyntax = Closure.EMPTY;
++            inlineClear = clearSyntax(parentFields);
+         } else {
+-            inlineClear = "";
+-            clearSyntax = clearSyntax(offset);
++            inlineClear = Closure.EMPTY;
++            clearSyntax = clearSyntax(parentFields);
+         }
+         return compileOutput(
+-            join(
+-                join(
+-                    bufferForOutput(offset), callOutput(offset), clear(offset + INPUT_BUFFER_OFFSET)
+-                ), inlineClear
+-            ), clearSyntax, allArgs
++            Closure.wrap(
++                bufferParents(parentFields, inputBuffer),
++                callRubyCallsite(
++                    fields.add(method), fields.add(new IRubyObject[]{buffer}),
++                    fields.add(output), MULTI_RECEIVE
++                ),
++                clear(inputBuffer),
++                inlineClear
++            ),
++            clearSyntax, fields, configSource
++        );
++    }
++
++    private static Closure returnBuffer(final MethodLevelSyntaxElement ifData,
++        final MethodLevelSyntaxElement done) {
++        return Closure.wrap(
++            SyntaxFactory.ifCondition(done, Closure.wrap(SyntaxFactory.ret(ifData)))
+         );
+     }
+ 
+-    private static String callFilterFlush(final int offset, final boolean shutdownOnly) {
+-        final String condition;
+-        final String flushArgs;
++    private static MethodLevelSyntaxElement callFilterFlush(final ValueSyntaxElement resultBuffer,
++        final ValueSyntaxElement flushMethod, final ValueSyntaxElement filterPlugin,
++        final boolean shutdownOnly) {
++        final MethodLevelSyntaxElement condition;
++        final ValueSyntaxElement flushArgs;
++        final ValueSyntaxElement flushFinal =
++            SyntaxFactory.constant(DatasetCompiler.class, "FLUSH_FINAL");
+         if (shutdownOnly) {
+-            condition = "flush && shutdown";
+-            flushArgs = "DatasetCompiler.FLUSH_FINAL";
++            condition = SyntaxFactory.and(FLUSH_ARG, SHUTDOWN_ARG);
++            flushArgs = flushFinal;
+         } else {
+-            condition = "flush";
+-            flushArgs = "shutdown ? DatasetCompiler.FLUSH_FINAL : DatasetCompiler.FLUSH_NOT_FINAL";
++            condition = FLUSH_ARG;
++            flushArgs = SyntaxFactory.ternary(
++                SHUTDOWN_ARG, flushFinal,
++                SyntaxFactory.constant(DatasetCompiler.class, "FLUSH_NOT_FINAL")
++            );
+         }
+-        return join(
+-            "if(", condition, "){", field(offset + RESULT_BUFFER_OFFSET), ".addAll((RubyArray)",
+-            callRubyCallsite(FLUSH_CALLSITE_OFFSET, flushArgs, offset, FLUSH), ");}"
++        return SyntaxFactory.ifCondition(
++            condition,
++            Closure.wrap(
++                buffer(
++                    resultBuffer,
++                    SyntaxFactory.cast(
++                        RubyArray.class,
++                        callRubyCallsite(flushMethod, flushArgs, filterPlugin, FLUSH)
++                    )
++                )
++            )
+         );
+     }
+ 
+-    private static String clear(final int fieldIndex) {
+-        return String.format("%s.clear();", field(fieldIndex));
+-    }
+-
+-    private static String computeDataset(final int fieldIndex) {
+-        return String.format("%s.compute(batch, flush, shutdown)", field(fieldIndex));
++    private static MethodLevelSyntaxElement clear(final ValueSyntaxElement field) {
++        return field.call("clear");
+     }
+ 
+-    private static String field(final int id) {
+-        return String.format("field%d", id);
+-    }
+-
+-    /**
+-     * Generates the Java code for defining one field and constructor argument for each given value.
+-     * @param classname Classname to generate constructor for
+-     * @param values Values to store in instance fields and to generate assignments in the
+-     * constructor for
+-     * @return Java Source String
+-     */
+-    private static String fieldsAndCtor(final String classname, final Object... values) {
+-        final StringBuilder result = new StringBuilder();
+-        int i = 0;
+-        for (final Object fieldValue : values) {
+-            result.append(join("private final ", typeName(fieldValue), " ", field(i), ";"));
+-            ++i;
+-        }
+-        result.append(join("public ", classname, "("));
+-        for (int k = 0; k < i; ++k) {
+-            if (k > 0) {
+-                result.append(',');
+-            }
+-            result.append(join("Object ", field(k)));
+-        }
+-        result.append(") {");
+-        int j = 0;
+-        for (final Object fieldValue : values) {
+-            final String fieldName = field(j);
+-            result.append(join("this.", fieldName, "=", castToOwnType(fieldValue), fieldName, ";"));
+-            ++j;
+-        }
+-        result.append('}');
+-        return result.toString();
++    private static ValueSyntaxElement computeDataset(final ValueSyntaxElement parent) {
++        return parent.call("compute", BATCH_ARG, FLUSH_ARG, SHUTDOWN_ARG);
+     }
+ 
+     private static IRubyObject flushOpts(final boolean fin) {
+@@ -332,148 +323,145 @@ private static IRubyObject flushOpts(final boolean fin) {
+         return res;
+     }
+ 
+-    private static String bufferForOutput(final int offset) {
+-        final StringBuilder syntax = new StringBuilder();
+-        for (int i = 0; i < offset; ++i) {
+-            syntax.append(
+-                join(
+-                    "for (JrubyEventExtLibrary.RubyEvent e : ", computeDataset(i), ") {",
+-                    "if (!e.getEvent().isCancelled()) { ", field(offset + INPUT_BUFFER_OFFSET),
+-                    ".add(e); } }"
++    private static Closure bufferParents(final Collection<ValueSyntaxElement> parents,
++        final ValueSyntaxElement buffer) {
++        final VariableDefinition event =
++            new VariableDefinition(JrubyEventExtLibrary.RubyEvent.class, "e");
++        final ValueSyntaxElement eventVar = event.access();
++        return Closure.wrap(
++            parents.stream().map(par ->
++                SyntaxFactory.forLoop(
++                    event, computeDataset(par),
++                    Closure.wrap(
++                        SyntaxFactory.ifCondition(
++                            SyntaxFactory.not(
++                                eventVar.call("getEvent").call("isCancelled")
++                            ), Closure.wrap(buffer.call("add", eventVar))
++                        )
++                    )
+                 )
+-            );
+-        }
+-        return syntax.toString();
++            ).toArray(MethodLevelSyntaxElement[]::new)
++        );
+     }
+ 
+     /**
+      * Special case optimization for when the output plugin is directly connected to the Queue
+      * without any filters or conditionals in between. This special case does not arise naturally
+-     * from {@link DatasetCompiler#outputDataset(Collection, IRubyObject, boolean)} since it saves
++     * from {@link DatasetCompiler#outputDataset(Collection, IRubyObject, String, boolean)} since it saves
+      * the internal buffering of events and instead forwards events directly from the batch to the
+      * Output plugin.
+      * @param output Output Plugin
++     * @param configSource The Logstash configuration that maps to the returned Dataset
+      * @return Dataset representing the Output
+      */
+     private static Dataset outputDatasetFromRoot(final IRubyObject output,
+-        final DynamicMethod method) {
+-        final Object[] allArgs = new Object[3];
+-        allArgs[PRIMARY_CALLSITE_OFFSET] = method;
+-        allArgs[ARG_ARRAY_OFFSET] = new IRubyObject[1];
+-        allArgs[PLUGIN_FIELD_OFFSET] = output;
++        final DynamicMethod method, String configSource) {
++        final ClassFields fields = new ClassFields();
++        final ValueSyntaxElement args = fields.add(new IRubyObject[1]);
+         return compileOutput(
+-            join(field(ARG_ARRAY_OFFSET), "[0] = batch;", callOutput(0)), "",
+-            allArgs
++            Closure.wrap(
++                SyntaxFactory.assignment(SyntaxFactory.arrayField(args, 0), BATCH_ARG),
++                callRubyCallsite(fields.add(method), args, fields.add(output), MULTI_RECEIVE)
++            ),
++            Closure.EMPTY, fields, configSource
+         );
+     }
+ 
+-    private static Dataset compileOutput(final String syntax, final String clearSyntax,
+-        final Object[] allArgs) {
+-        return compile(join(syntax, RETURN_NULL), clearSyntax, allArgs);
+-    }
+-
+     /**
+-     * Generates the code for invoking the Output plugin's `multi_receive` method.
+-     * @param offset Number of Parent Dataset Fields
+-     * @return Java Code String
++     * Get the generated source
++     * @return sorted and formatted lines of generated code
+      */
+-    private static String callOutput(final int offset) {
+-        return join(
+-            callRubyCallsite(
+-                PRIMARY_CALLSITE_OFFSET, field(offset + ARG_ARRAY_OFFSET), offset, MULTI_RECEIVE
+-            ), ";"
+-        );
++    public static List<String> getGeneratedSource() {
++        return ComputeStepSyntaxElement.getGeneratedSource();
+     }
+ 
+-    private static String callFilter(final int offset) {
+-        return join(
+-            field(offset + RESULT_BUFFER_OFFSET), ".addAll((RubyArray)",
+-            callRubyCallsite(
+-                PRIMARY_CALLSITE_OFFSET, field(offset + ARG_ARRAY_OFFSET), offset, MULTI_FILTER
+-            ), ");"
++    private static Dataset compileOutput(final Closure syntax, final Closure clearSyntax,
++        final ClassFields fields, String configSource) {
++        return compile(
++            syntax.add(MethodLevelSyntaxElement.RETURN_NULL), clearSyntax, fields, DatasetFlavor.OUTPUT, configSource
+         );
+     }
+ 
+-    private static String callRubyCallsite(final int callsiteOffset, final String argument,
+-        final int offset, final String method) {
+-        return join(
+-            field(offset + callsiteOffset), ".call(RubyUtil.RUBY.getCurrentContext(), ",
+-            field(offset + PLUGIN_FIELD_OFFSET),
+-            ", RubyUtil.LOGSTASH_MODULE,", join("\"", method, "\""), ", ", argument,
+-            ", Block.NULL_BLOCK)"
+-        );
++    private static MethodLevelSyntaxElement buffer(final ValueSyntaxElement resultBuffer,
++        final ValueSyntaxElement argument) {
++        return resultBuffer.call("addAll", argument);
+     }
+ 
+-    private static Dataset compileFilterDataset(final int offset, final String syntax,
+-        final Object[] allArgs) {
+-        allArgs[offset + RESULT_BUFFER_OFFSET] = new ArrayList<>();
+-        return compile(
+-            join(syntax, "return ", field(offset + RESULT_BUFFER_OFFSET), ";"),
+-            join(clearSyntax(offset), clear(offset + RESULT_BUFFER_OFFSET)), allArgs
++    private static ValueSyntaxElement callRubyCallsite(final ValueSyntaxElement callsite,
++        final ValueSyntaxElement argument, final ValueSyntaxElement plugin, final String method) {
++        return callsite.call(
++            "call",
++            ValueSyntaxElement.GET_RUBY_THREAD_CONTEXT,
++            plugin,
++            SyntaxFactory.constant(RubyUtil.class, "LOGSTASH_MODULE"),
++            SyntaxFactory.value(SyntaxFactory.join("\"", method, "\"")),
++            argument,
++            SyntaxFactory.constant(Block.class, "NULL_BLOCK")
+         );
+     }
+ 
+-    private static String clearSyntax(final int count) {
+-        final StringBuilder syntax = new StringBuilder();
+-        for (int i = 0; i < count; ++i) {
+-            syntax.append(clear(i));
+-        }
+-        return syntax.toString();
++    private static Closure clearSyntax(final Collection<ValueSyntaxElement> toClear) {
++        return Closure.wrap(
++            toClear.stream().map(DatasetCompiler::clear).toArray(MethodLevelSyntaxElement[]::new)
++        );
+     }
+ 
+     private static DynamicMethod rubyCallsite(final IRubyObject rubyObject, final String name) {
+         return rubyObject.getMetaClass().searchMethod(name);
+     }
+ 
+-    private static String evalParents(final int count) {
+-        final StringBuilder syntax = new StringBuilder();
+-        for (int i = 0; i < count; ++i) {
+-            syntax.append(
+-                join(field(count + INPUT_BUFFER_OFFSET), ".addAll(", computeDataset(i), ");")
+-            );
+-        }
+-        return syntax.toString();
+-    }
+-
+-    private static String filterBody(final int offset) {
+-        return join(evalParents(offset), callFilter(offset), clear(offset + INPUT_BUFFER_OFFSET));
+-    }
+-
+     /**
+-     * Generates a code-snippet typecast to the strictest possible type for the given object.
+-     * Example: Given a obj = "foo" the method generates {@code (java.lang.String) obj}
+-     * @param obj Object to generate type cast snippet for
+-     * @return Java Source Code
++     * Complementary {@link Dataset} to a {@link SplitDataset} representing the
++     * negative branch of the {@code if} statement.
+      */
+-    private static String castToOwnType(final Object obj) {
+-        return String.format("(%s)", typeName(obj));
+-    }
++    public static final class Complement implements Dataset {
+ 
+-    /**
+-     * Returns the strictest possible syntax conform type for the given object. Note that for
+-     * any {@link Dataset} instance, this will be {@code org.logstash.config.ir.compiler.Dataset}
+-     * instead of a concrete class, since Dataset implementations are using runtime compiled
+-     * classes.
+-     * @param obj Object to lookup type name for
+-     * @return Syntax conform type name
+-     */
+-    private static String typeName(final Object obj) {
+-        final Class<?> clazz;
+-        if (obj instanceof Dataset) {
+-            clazz = Dataset.class;
+-        } else {
+-            clazz = obj.getClass();
++        /**
++         * Positive branch of underlying {@code if} statement.
++         */
++        private final Dataset parent;
++
++        /**
++         * This collection is shared with {@link DatasetCompiler.Complement#parent} and
++         * mutated when calling its {@code compute} method. This class does not directly compute
++         * it.
++         */
++        private final Collection<JrubyEventExtLibrary.RubyEvent> data;
++
++        private boolean done;
++
++        public static Dataset from(final Dataset parent,
++            final Collection<JrubyEventExtLibrary.RubyEvent> complement) {
++            return new DatasetCompiler.Complement(parent, complement);
+         }
+-        final String classname = clazz.getTypeName();
+-        // JavaFilterDelegator classes are runtime generated by Ruby and are not available
+-        // to the Janino compiler's classloader. There is no value in casting to the concrete class
+-        // here anyways since JavaFilterDelegator instances are only passed as IRubyObject type
+-        // method parameters in the generated code.
+-        return classname.contains("JavaFilterDelegator")
+-            ? IRubyObject.class.getTypeName() : classname;
+-    }
+ 
+-    private static String join(final String... parts) {
+-        return String.join("", parts);
++        /**
++         * Ctor.
++         * @param left Positive Branch {@link SplitDataset}
++         * @param complement Collection of {@link JrubyEventExtLibrary.RubyEvent}s that did
++         * not match {@code left}
++         */
++        private Complement(
++            final Dataset left, final Collection<JrubyEventExtLibrary.RubyEvent> complement) {
++            this.parent = left;
++            data = complement;
++        }
++
++        @Override
++        public Collection<JrubyEventExtLibrary.RubyEvent> compute(final RubyArray batch,
++            final boolean flush, final boolean shutdown) {
++            if (done) {
++                return data;
++            }
++            parent.compute(batch, flush, shutdown);
++            done = true;
++            return data;
++        }
++
++        @Override
++        public void clear() {
++            parent.clear();
++            done = false;
++        }
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/DynamicClassLoader.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/DynamicClassLoader.java
+new file mode 100644
+index 00000000000..b88425aac48
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/DynamicClassLoader.java
+@@ -0,0 +1,31 @@
++package org.logstash.config.ir.compiler;
++
++import java.util.HashMap;
++import java.util.Map;
++
++/**
++ * Classloader capable of loading runtime compiled classes that were registered with it.
++ */
++final class DynamicClassLoader extends ClassLoader {
++
++    /**
++     * Map of classname to class for runtime compiled classes.
++     */
++    private final Map<String, Class<?>> cache = new HashMap<>();
++
++    /**
++     * Register a runtime compiled class with this classloader.
++     * @param clazz Class to register
++     */
++    public void addClass(final Class<?> clazz) {
++        cache.put(clazz.getName(), clazz);
++    }
++
++    @Override
++    protected Class<?> findClass(String name) throws ClassNotFoundException {
++        if (cache.containsKey(name)) {
++            return cache.get(name);
++        }
++        return Thread.currentThread().getContextClassLoader().loadClass(name);
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/EventCondition.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/EventCondition.java
+index e385dc43755..76773932462 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/EventCondition.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/EventCondition.java
+@@ -381,7 +381,7 @@ private static EventCondition gt(final EventValueExpression left,
+                 return new EventCondition.Compiler.FieldGreaterThanString(field, (String) value);
+             } else if (value instanceof Long || value instanceof Integer ||
+                 value instanceof Short) {
+-                return new FieldGreaterThanNumber(
++                return new EventCondition.Compiler.FieldGreaterThanNumber(
+                     field, RubyUtil.RUBY.newFixnum(((Number) value).longValue())
+                 );
+             }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/FieldDeclarationGroup.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/FieldDeclarationGroup.java
+new file mode 100644
+index 00000000000..2d52b0d7152
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/FieldDeclarationGroup.java
+@@ -0,0 +1,27 @@
++package org.logstash.config.ir.compiler;
++
++import java.util.Collection;
++import java.util.stream.Collectors;
++
++/**
++ * A group of field declarations.
++ */
++final class FieldDeclarationGroup implements SyntaxElement {
++
++    private final Collection<FieldDefinition> fields;
++
++    FieldDeclarationGroup(final Collection<FieldDefinition> defs) {
++        this.fields = defs;
++    }
++
++    public Collection<FieldDefinition> getFields() {
++        return fields;
++    }
++
++    @Override
++    public String generateCode() {
++        return fields.isEmpty() ? "" : SyntaxFactory.join(fields.stream().map(
++            SyntaxElement::generateCode).collect(Collectors.joining(";")), ";"
++        );
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/FieldDefinition.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/FieldDefinition.java
+new file mode 100644
+index 00000000000..6e32f36976c
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/FieldDefinition.java
+@@ -0,0 +1,102 @@
++package org.logstash.config.ir.compiler;
++
++/**
++ * Definition of an instance field, named via its numeric index according to the schema
++ * {@code field$[index]}.
++ */
++final class FieldDefinition implements SyntaxElement {
++
++    private final VariableDefinition def;
++
++    private final boolean mutable;
++
++    private final SyntaxElement initializer;
++
++    private final Object ctorArgument;
++
++    /**
++     * Create an immutable field with given value and at given index.
++     * @param index Index for naming
++     * @param value Object value of the field
++     * @return Field definition
++     */
++    public static FieldDefinition fromValue(final int index, final Object value) {
++        return new FieldDefinition(
++            new VariableDefinition(value.getClass(), field(index)), false,
++            null, value
++        );
++    }
++
++    /**
++     * Creates a mutable field with given type and without an assigned value.
++     * @param index Index for naming
++     * @param type Type of the field
++     * @return Field definition
++     */
++    public static FieldDefinition mutableUnassigned(final int index, final Class<?> type) {
++        return new FieldDefinition(
++            new VariableDefinition(type, field(index)), true, null, null
++        );
++    }
++
++    /**
++     * Creates an immutable field that is assigned its value inline in the class body by the given
++     * syntax element.
++     * @param index Index for naming
++     * @param type Type of the field
++     * @param initializer Initializer syntax
++     * @return Field definition
++     */
++    public static FieldDefinition withInitializer(final int index, final Class<?> type,
++        final SyntaxElement initializer) {
++        return new FieldDefinition(
++            new VariableDefinition(type, field(index)), false, initializer, null
++        );
++    }
++
++    private FieldDefinition(final VariableDefinition typeDef, final boolean mutable,
++        final SyntaxElement initializer, final Object ctorArgument) {
++        this.def = typeDef;
++        this.mutable = mutable;
++        this.initializer = initializer;
++        this.ctorArgument = ctorArgument;
++    }
++
++    /**
++     * Gets the {@link VariableDefinition} of the field.
++     * @return Variable Definition
++     */
++    public VariableDefinition asVariable() {
++        return def;
++    }
++
++    /**
++     * Gets the value that is assigned to the field in the constructor if one is set
++     * or {@code null} if none is set.
++     * @return Constructor argument to be assigned to the field
++     */
++    public Object getCtorArgument() {
++        return ctorArgument;
++    }
++
++    public String getName() {
++        return def.name;
++    }
++
++    @Override
++    public String generateCode() {
++        return SyntaxFactory.join(
++            "private ", mutable ? "" : "final ", def.generateCode(),
++            initializer != null ? SyntaxFactory.join("=", initializer.generateCode()) : ""
++        );
++    }
++
++    /**
++     * Field Naming Schema.
++     * @param id Index for naming
++     * @return Field name
++     */
++    private static String field(final int id) {
++        return String.format("field%d", id);
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/MethodLevelSyntaxElement.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/MethodLevelSyntaxElement.java
+new file mode 100644
+index 00000000000..8fb62a60e37
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/MethodLevelSyntaxElement.java
+@@ -0,0 +1,28 @@
++package org.logstash.config.ir.compiler;
++
++/**
++ * A {@link SyntaxElement} that is part of a method body.
++ */
++interface MethodLevelSyntaxElement extends SyntaxElement {
++
++    /**
++     * Syntax element that generates {@code return null}.
++     */
++    MethodLevelSyntaxElement RETURN_NULL = SyntaxFactory.ret(SyntaxFactory.value("null"));
++
++    /**
++     * Replace any occurrences of {@code search} by {@code replacement} in this element.
++     * @param search Syntax element to replace
++     * @param replacement Replacement
++     * @return A copy of this element with the replacement applied
++     */
++    MethodLevelSyntaxElement replace(MethodLevelSyntaxElement search,
++        MethodLevelSyntaxElement replacement);
++
++    /**
++     * Count the number of occurrences of {@code search} in this element.
++     * @param search Element to count
++     * @return Number of occurrences
++     */
++    int count(MethodLevelSyntaxElement search);
++}
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/MethodSyntaxElement.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/MethodSyntaxElement.java
+new file mode 100644
+index 00000000000..71af048cd53
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/MethodSyntaxElement.java
+@@ -0,0 +1,101 @@
++package org.logstash.config.ir.compiler;
++
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.stream.Collectors;
++import java.util.stream.StreamSupport;
++import org.jruby.RubyArray;
++
++/**
++ * An instance method.
++ */
++interface MethodSyntaxElement extends SyntaxElement {
++
++    /**
++     * Builds a constructor from the given method body and arguments.
++     * @param classname Name of the Class
++     * @param body Constructor Method Body
++     * @param arguments Method Argument Definitions
++     * @return Method Syntax
++     */
++    static MethodSyntaxElement constructor(final String classname, final Closure body,
++        final Iterable<VariableDefinition> arguments) {
++        return new MethodSyntaxElement.MethodSyntaxElementImpl(classname, "", body, arguments);
++    }
++
++    /**
++     * Builds an implementation of {@link Dataset#clear()} from the given method body.
++     * @param body Method Body
++     * @return Method Syntax
++     */
++    static MethodSyntaxElement clear(final Closure body) {
++        return new MethodSyntaxElement.MethodSyntaxElementImpl(void.class, "clear", body);
++    }
++
++    /**
++     * Builds an implementation of {@link Dataset#compute(RubyArray, boolean, boolean)} ()}
++     * from the given method body.
++     * @param body Method Body
++     * @return Method Syntax
++     */
++    static MethodSyntaxElement compute(final Closure body) {
++        return new MethodSyntaxElement.MethodSyntaxElementImpl(
++            Collection.class, "compute", body,
++            new VariableDefinition(RubyArray.class, DatasetCompiler.BATCH_ARG),
++            new VariableDefinition(boolean.class, DatasetCompiler.FLUSH_ARG),
++            new VariableDefinition(boolean.class, DatasetCompiler.SHUTDOWN_ARG)
++        );
++    }
++
++    /**
++     * Builds an implementation of {@link SplitDataset#right()} given reference to the else branch's
++     * event collection.
++     * @param elseData Else Branch's Event Collection Syntax Element
++     * @return Method Syntax
++     */
++    static MethodSyntaxElement right(final ValueSyntaxElement elseData) {
++        return new MethodSyntaxElement.MethodSyntaxElementImpl(Dataset.class, "right",
++            Closure.wrap(
++                SyntaxFactory.ret(
++                    SyntaxFactory.constant(
++                        DatasetCompiler.class, DatasetCompiler.Complement.class.getSimpleName()
++                    ).call("from", SyntaxFactory.THIS, elseData)
++                )
++            )
++        );
++    }
++
++    final class MethodSyntaxElementImpl implements MethodSyntaxElement {
++
++        private final String name;
++
++        private final String returnType;
++
++        private final Closure body;
++
++        private final Iterable<VariableDefinition> arguments;
++
++        private MethodSyntaxElementImpl(final Class<?> returnType, final String name,
++            final Closure body, final VariableDefinition... arguments) {
++            this(returnType.getName(), name, body, Arrays.asList(arguments));
++        }
++
++        private MethodSyntaxElementImpl(final String returnType, final String name,
++            final Closure body, final Iterable<VariableDefinition> arguments) {
++            this.name = name;
++            this.returnType = returnType;
++            this.arguments = arguments;
++            this.body = body;
++        }
++
++        @Override
++        public String generateCode() {
++            return SyntaxFactory.join(
++                "public ", returnType, " ", name, "(",
++                StreamSupport.stream(arguments.spliterator(), false)
++                    .map(VariableDefinition::generateCode).collect(Collectors.joining(",")),
++                ") {", body.generateCode(), "}"
++            );
++        }
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/SplitDataset.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/SplitDataset.java
+new file mode 100644
+index 00000000000..8a83cd75bf2
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/SplitDataset.java
+@@ -0,0 +1,13 @@
++package org.logstash.config.ir.compiler;
++
++/**
++ * {@link Dataset} representing an conditional.
++ */
++public interface SplitDataset extends Dataset {
++
++    /**
++     * {@link Dataset} representing the else branch of the conditional.
++     * @return Else Branch Dataset
++     */
++    Dataset right();
++}
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/SyntaxElement.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/SyntaxElement.java
+new file mode 100644
+index 00000000000..167472164a4
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/SyntaxElement.java
+@@ -0,0 +1,12 @@
++package org.logstash.config.ir.compiler;
++
++/**
++ * Syntax element that can be rendered to Java sourcecode.
++ */
++interface SyntaxElement {
++
++    /**
++     * @return Java code that can be compiled by Janino
++     */
++    String generateCode();
++}
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/SyntaxFactory.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/SyntaxFactory.java
+new file mode 100644
+index 00000000000..faa385ce534
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/SyntaxFactory.java
+@@ -0,0 +1,450 @@
++package org.logstash.config.ir.compiler;
++
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.stream.Collectors;
++
++/**
++ * Utility class for setting up various {@link SyntaxElement}.
++ */
++final class SyntaxFactory {
++
++    public static final SyntaxFactory.IdentifierStatement THIS = identifier("this");
++
++    public static final SyntaxFactory.IdentifierStatement TRUE = identifier("true");
++
++    public static final SyntaxFactory.IdentifierStatement FALSE = identifier("false");
++
++    /**
++     * Joins given {@link String}s without delimiter.
++     * @param parts Strings to join
++     * @return Strings join without delimiter
++     */
++    public static String join(final String... parts) {
++        return String.join("", parts);
++    }
++
++    public static MethodLevelSyntaxElement ret(final MethodLevelSyntaxElement value) {
++        return new SyntaxFactory.ReturnStatement(value);
++    }
++
++    public static ValueSyntaxElement value(final String value) {
++        return new SyntaxFactory.ValueStatement(value);
++    }
++
++    public static SyntaxFactory.IdentifierStatement identifier(final String name) {
++        return new SyntaxFactory.IdentifierStatement(name);
++    }
++
++    public static ValueSyntaxElement constant(final Class<?> clazz,
++        final String name) {
++        return new SyntaxFactory.ValueStatement(
++            join(clazz.getName(), ".", name));
++    }
++
++    public static ValueSyntaxElement arrayField(final MethodLevelSyntaxElement array,
++        final int index) {
++        return new ValueSyntaxElement() {
++            @Override
++            public MethodLevelSyntaxElement replace(final MethodLevelSyntaxElement search,
++                final MethodLevelSyntaxElement replacement) {
++                return arrayField(array.replace(search, replacement), index);
++            }
++
++            @Override
++            public int count(final MethodLevelSyntaxElement search) {
++                return array.count(search);
++            }
++
++            @Override
++            public String generateCode() {
++                return join(array.generateCode(), String.format("[%d]", index));
++            }
++        };
++    }
++
++    public static MethodLevelSyntaxElement assignment(final SyntaxElement target,
++        final MethodLevelSyntaxElement value) {
++        return new SyntaxFactory.Assignment(target, value);
++    }
++
++    public static MethodLevelSyntaxElement definition(final VariableDefinition declaration,
++        final MethodLevelSyntaxElement value) {
++        return new SyntaxFactory.Assignment(declaration, value);
++    }
++
++    public static ValueSyntaxElement cast(final Class<?> clazz, final ValueSyntaxElement argument) {
++        return new SyntaxFactory.TypeCastStatement(clazz, argument);
++    }
++
++    public static MethodLevelSyntaxElement and(final ValueSyntaxElement left,
++        final ValueSyntaxElement right) {
++        return new MethodLevelSyntaxElement() {
++
++            @Override
++            public String generateCode() {
++                return join("(", left.generateCode(), "&&", right.generateCode(), ")");
++            }
++
++            @Override
++            public MethodLevelSyntaxElement replace(final MethodLevelSyntaxElement search,
++                final MethodLevelSyntaxElement replacement) {
++                return and(
++                    (ValueSyntaxElement) left.replace(search, replacement),
++                    (ValueSyntaxElement) right.replace(search, replacement)
++                );
++            }
++
++            @Override
++            public int count(final MethodLevelSyntaxElement search) {
++                return left.count(search) + right.count(search);
++            }
++        };
++    }
++
++    public static ValueSyntaxElement ternary(final ValueSyntaxElement condition,
++        final ValueSyntaxElement left, final ValueSyntaxElement right) {
++        return new SyntaxFactory.TernaryStatement(condition, left, right);
++    }
++
++    public static MethodLevelSyntaxElement not(final ValueSyntaxElement var) {
++        return new MethodLevelSyntaxElement() {
++            @Override
++            public MethodLevelSyntaxElement replace(final MethodLevelSyntaxElement search,
++                final MethodLevelSyntaxElement replacement) {
++                return not((ValueSyntaxElement) var.replace(search, replacement));
++            }
++
++            @Override
++            public int count(final MethodLevelSyntaxElement search) {
++                return var.count(search);
++            }
++
++            @Override
++            public String generateCode() {
++                return join("!(", var.generateCode(), ")");
++            }
++        };
++    }
++
++    public static MethodLevelSyntaxElement forLoop(final VariableDefinition element,
++        final MethodLevelSyntaxElement iterable, final Closure body) {
++        return new MethodLevelSyntaxElement() {
++            @Override
++            public MethodLevelSyntaxElement replace(final MethodLevelSyntaxElement search,
++                final MethodLevelSyntaxElement replacement) {
++                return forLoop(
++                    element, iterable.replace(search, replacement),
++                    (Closure) body.replace(search, replacement)
++                );
++            }
++
++            @Override
++            public int count(final MethodLevelSyntaxElement search) {
++                return iterable.count(search) + iterable.count(search);
++            }
++
++            @Override
++            public String generateCode() {
++                return join(
++                    "for (", element.generateCode(), " : ",
++                    iterable.generateCode(), ") {", body.generateCode(), "}"
++                );
++            }
++        };
++    }
++
++    public static MethodLevelSyntaxElement ifCondition(final MethodLevelSyntaxElement condition,
++        final Closure body) {
++        return ifCondition(condition, body, Closure.EMPTY);
++    }
++
++    public static MethodLevelSyntaxElement ifCondition(final MethodLevelSyntaxElement condition,
++        final Closure left, final Closure right) {
++        return new MethodLevelSyntaxElement() {
++            @Override
++            public String generateCode() {
++                return join(
++                    "if(", condition.generateCode(), ") {", left.generateCode(),
++                    "} else {", right.generateCode(), "}"
++                );
++            }
++
++            @Override
++            public MethodLevelSyntaxElement replace(final MethodLevelSyntaxElement search,
++                final MethodLevelSyntaxElement replacement) {
++                return ifCondition(
++                    condition.replace(search, replacement),
++                    (Closure) left.replace(search, replacement),
++                    (Closure) right.replace(search, replacement)
++                );
++            }
++
++            @Override
++            public int count(final MethodLevelSyntaxElement search) {
++                return condition.count(search) + left.count(search) + right.count(search);
++            }
++        };
++    }
++
++    /**
++     * Syntax Element that cannot be replaced via
++     * {@link MethodLevelSyntaxElement#replace(MethodLevelSyntaxElement, MethodLevelSyntaxElement)}.
++     */
++    public static final class IdentifierStatement implements ValueSyntaxElement {
++
++        private final String value;
++
++        private IdentifierStatement(final String value) {
++            this.value = value;
++        }
++
++        @Override
++        public String generateCode() {
++            return value;
++        }
++
++        @Override
++        public MethodLevelSyntaxElement replace(final MethodLevelSyntaxElement search,
++            final MethodLevelSyntaxElement replacement) {
++            return this;
++        }
++
++        @Override
++        public int count(final MethodLevelSyntaxElement search) {
++            return this == search ? 1 : 0;
++        }
++    }
++
++    /**
++     * An assignment, renders {@code target = value}.
++     */
++    private static final class Assignment implements MethodLevelSyntaxElement {
++
++        private final SyntaxElement field;
++
++        private final MethodLevelSyntaxElement value;
++
++        private Assignment(final SyntaxElement field, final MethodLevelSyntaxElement value) {
++            this.field = field;
++            this.value = value;
++        }
++
++        @Override
++        public String generateCode() {
++            return join(field.generateCode(), "=", value.generateCode());
++        }
++
++        @Override
++        public MethodLevelSyntaxElement replace(final MethodLevelSyntaxElement search,
++            final MethodLevelSyntaxElement replacement) {
++            return new SyntaxFactory.Assignment(field, value.replace(search, replacement));
++        }
++
++        @Override
++        public int count(final MethodLevelSyntaxElement search) {
++            return value.count(search);
++        }
++    }
++
++    /**
++     * A object value that can be assigned to and call methods on.
++     */
++    private static final class ValueStatement implements ValueSyntaxElement {
++
++        private final String value;
++
++        private ValueStatement(final String value) {
++            this.value = value;
++        }
++
++        @Override
++        public String generateCode() {
++            return value;
++        }
++
++        @Override
++        public MethodLevelSyntaxElement replace(final MethodLevelSyntaxElement search,
++            final MethodLevelSyntaxElement replacement) {
++            return this.equals(search) ? replacement : this;
++        }
++
++        @Override
++        public int count(final MethodLevelSyntaxElement search) {
++            return this.equals(search) ? 1 : 0;
++        }
++
++        @Override
++        public boolean equals(final Object other) {
++            if (this == other) {
++                return true;
++            }
++            if (!(other instanceof SyntaxFactory.ValueStatement)) {
++                return false;
++            }
++            return this.value.equals(((SyntaxFactory.ValueStatement) other).value);
++        }
++    }
++
++    /**
++     * The result of an instance method call.
++     */
++    static final class MethodCallReturnValue implements ValueSyntaxElement {
++
++        /**
++         * Instance to call method on.
++         */
++        private final MethodLevelSyntaxElement instance;
++
++        /**
++         * Name of method.
++         */
++        private final String method;
++
++        /**
++         * Arguments to pass to method.
++         */
++        private final Collection<MethodLevelSyntaxElement> args;
++
++        MethodCallReturnValue(final MethodLevelSyntaxElement instance, final String method,
++            final MethodLevelSyntaxElement... args) {
++            this.instance = instance;
++            this.args = Arrays.asList(args);
++            this.method = method;
++        }
++
++        @Override
++        public MethodLevelSyntaxElement replace(final MethodLevelSyntaxElement search,
++            final MethodLevelSyntaxElement replacement) {
++            return this.equals(search) ? replacement : new SyntaxFactory.MethodCallReturnValue(
++                instance.replace(search, replacement), method,
++                args.stream().map(var -> var.replace(search, replacement))
++                    .toArray(ValueSyntaxElement[]::new)
++            );
++        }
++
++        @Override
++        public int count(final MethodLevelSyntaxElement search) {
++            return this.equals(search) ? 1 :
++                instance.count(search) + args.stream().mapToInt(v -> v.count(search)).sum();
++        }
++
++        @Override
++        public String generateCode() {
++            return join(
++                instance.generateCode(), ".", method, "(", String.join(
++                    ",",
++                    args.stream().map(SyntaxElement::generateCode).collect(Collectors.toList())
++                ), ")"
++            );
++        }
++
++        @Override
++        public boolean equals(final Object other) {
++            if (this == other) {
++                return true;
++            }
++            if (!(other instanceof SyntaxFactory.MethodCallReturnValue)) {
++                return false;
++            }
++            final SyntaxFactory.MethodCallReturnValue that =
++                (SyntaxFactory.MethodCallReturnValue) other;
++            return this.instance.equals(that.instance) && this.method.equals(that.method)
++                && this.args.size() == that.args.size() && this.args.containsAll(that.args);
++        }
++    }
++
++    private static final class TypeCastStatement implements ValueSyntaxElement {
++
++        private final Class<?> clazz;
++
++        private final ValueSyntaxElement argument;
++
++        private TypeCastStatement(final Class<?> clazz, final ValueSyntaxElement argument) {
++            this.clazz = clazz;
++            this.argument = argument;
++        }
++
++        @Override
++        public MethodLevelSyntaxElement replace(final MethodLevelSyntaxElement search,
++            final MethodLevelSyntaxElement replacement) {
++            return new SyntaxFactory.TypeCastStatement(
++                clazz, (ValueSyntaxElement) argument.replace(search, replacement)
++            );
++        }
++
++        @Override
++        public int count(final MethodLevelSyntaxElement search) {
++            return argument.count(search);
++        }
++
++        @Override
++        public String generateCode() {
++            return join("((", clazz.getName(), ")", argument.generateCode(), ")");
++        }
++    }
++
++    private static final class ReturnStatement implements MethodLevelSyntaxElement {
++
++        private final MethodLevelSyntaxElement value;
++
++        private ReturnStatement(final MethodLevelSyntaxElement value) {
++            this.value = value;
++        }
++
++        @Override
++        public String generateCode() {
++            return join("return ", value.generateCode());
++        }
++
++        @Override
++        public MethodLevelSyntaxElement replace(final MethodLevelSyntaxElement search,
++            final MethodLevelSyntaxElement replacement) {
++            return new SyntaxFactory.ReturnStatement(value.replace(search, replacement));
++        }
++
++        @Override
++        public int count(final MethodLevelSyntaxElement search) {
++            return value.count(search);
++        }
++    }
++
++    private static final class TernaryStatement implements ValueSyntaxElement {
++
++        private final ValueSyntaxElement left;
++
++        private final ValueSyntaxElement right;
++
++        private final ValueSyntaxElement condition;
++
++        private TernaryStatement(final ValueSyntaxElement condition,
++            final ValueSyntaxElement left, final ValueSyntaxElement right) {
++            this.condition = condition;
++            this.left = left;
++            this.right = right;
++        }
++
++        @Override
++        public String generateCode() {
++            return join(
++                "(", condition.generateCode(), " ? ", left.generateCode(), " : ",
++                right.generateCode(), ")"
++            );
++        }
++
++        @Override
++        public MethodLevelSyntaxElement replace(final MethodLevelSyntaxElement search,
++            final MethodLevelSyntaxElement replacement) {
++            return new SyntaxFactory.TernaryStatement(
++                (ValueSyntaxElement) condition.replace(search, replacement),
++                (ValueSyntaxElement) left.replace(search, replacement),
++                (ValueSyntaxElement) right.replace(search, replacement)
++            );
++        }
++
++        @Override
++        public int count(final MethodLevelSyntaxElement search) {
++            return left.count(search) + right.count(search);
++        }
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/ValueSyntaxElement.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/ValueSyntaxElement.java
+new file mode 100644
+index 00000000000..b0b281181e9
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/ValueSyntaxElement.java
+@@ -0,0 +1,27 @@
++package org.logstash.config.ir.compiler;
++
++import org.jruby.Ruby;
++import org.logstash.RubyUtil;
++
++/**
++ * An instance that can methods can be invoked on.
++ */
++interface ValueSyntaxElement extends MethodLevelSyntaxElement {
++
++    /**
++     * Return of the method call to {@link Ruby#getCurrentContext()} that has the current Ruby
++     * thread-context as its return value.
++     */
++    ValueSyntaxElement GET_RUBY_THREAD_CONTEXT =
++        SyntaxFactory.constant(RubyUtil.class, "RUBY").call("getCurrentContext");
++
++    /**
++     * Call method on instance.
++     * @param method Method Name
++     * @param args Arguments to pass to Method
++     * @return Method Return
++     */
++    default ValueSyntaxElement call(final String method, final MethodLevelSyntaxElement... args) {
++        return new SyntaxFactory.MethodCallReturnValue(this, method, args);
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/VariableDefinition.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/VariableDefinition.java
+new file mode 100644
+index 00000000000..18755553895
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/VariableDefinition.java
+@@ -0,0 +1,61 @@
++package org.logstash.config.ir.compiler;
++
++import org.jruby.runtime.builtin.IRubyObject;
++
++/**
++ * Definition of a variable.
++ */
++final class VariableDefinition implements SyntaxElement {
++    public final Class<?> type;
++    public final String name;
++
++    VariableDefinition(final Class<?> type, final SyntaxFactory.IdentifierStatement name) {
++        this(type, name.generateCode());
++    }
++
++    VariableDefinition(final Class<?> type, final String name) {
++        this.type = safeType(type);
++        this.name = name;
++    }
++
++    /**
++     * Get a {@link ValueSyntaxElement} for accessing the variable.
++     * @return Syntax element allowing access to the variable
++     */
++    public ValueSyntaxElement access() {
++        return SyntaxFactory.value(name);
++    }
++
++    /**
++     * Create a copy of this instance with a new name but the same type.
++     * @param newName New Name
++     * @return Variable Definition with Adjusted Name
++     */
++    public VariableDefinition rename(final String newName) {
++        return new VariableDefinition(type, newName);
++    }
++
++    @Override
++    public String generateCode() {
++        return SyntaxFactory.join(type.getTypeName(), " ", name);
++    }
++
++    /**
++     * Determines a type that can be used in runtime compilable syntax. Types that are dynamically
++     * compiled by Logstash or JRuby are filtered as their static parent types.
++     * @param clazz Class to find safe type for
++     * @return Safe type that can be used in syntax
++     */
++    private static Class<?> safeType(final Class<?> clazz) {
++        final Class<?> safe;
++        if (clazz.getSimpleName().contains("JavaFilterDelegator")) {
++            safe = IRubyObject.class;
++        } else if (EventCondition.class.isAssignableFrom(clazz)) {
++            safe = EventCondition.class;
++        } else {
++            safe = clazz;
++        }
++        return safe;
++    }
++
++}
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java b/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java
+index f620791b956..f5cb6cb3af3 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java
+@@ -1,39 +1,109 @@
+ package org.logstash.config.ir.compiler;
+ 
+-import org.hamcrest.CoreMatchers;
+-import org.hamcrest.MatcherAssert;
++import java.util.Collection;
+ import org.jruby.RubyArray;
++import org.jruby.runtime.ThreadContext;
+ import org.junit.Test;
+ import org.logstash.Event;
++import org.logstash.FieldReference;
+ import org.logstash.RubyUtil;
+ import org.logstash.ext.JrubyEventExtLibrary;
+ 
++import static org.hamcrest.CoreMatchers.is;
++import static org.hamcrest.CoreMatchers.nullValue;
++import static org.hamcrest.MatcherAssert.assertThat;
++
+ public final class DatasetCompilerTest {
+ 
+     @Test
+     public void compilesEmptyMethod() {
+-        final Dataset func = DatasetCompiler.compile("return batch.to_a();", "");
+-        final RubyArray batch = RubyUtil.RUBY.newArray();
+-        MatcherAssert.assertThat(
+-            func.compute(batch, false, false),
+-            CoreMatchers.is(batch)
++        final Dataset func = DatasetCompiler.compile(
++            Closure.wrap(SyntaxFactory.ret(DatasetCompiler.BATCH_ARG.call("to_a"))),
++            Closure.EMPTY, new ClassFields(), DatasetCompiler.DatasetFlavor.ROOT, "foo"
+         );
++        final RubyArray batch = RubyUtil.RUBY.newArray();
++        assertThat(func.compute(batch, false, false), is(batch));
+     }
+ 
+     @Test
+     public void compilesParametrizedMethod() {
+-        final JrubyEventExtLibrary.RubyEvent additional =
+-            JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event());
+         final RubyArray batch = RubyUtil.RUBY.newArray(
+             JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event())
+         );
++        final VariableDefinition eventsDef = new VariableDefinition(Collection.class, "events");
++        final ValueSyntaxElement events = eventsDef.access();
++        final ClassFields fields = new ClassFields();
+         final Dataset func = DatasetCompiler.compile(
+-            "final Collection events = batch.to_a();events.add(field0);return events;", "",
+-            additional
++            Closure.wrap(
++                SyntaxFactory.definition(eventsDef, DatasetCompiler.BATCH_ARG.call("to_a")),
++                events.call(
++                    "add",
++                    fields.add(
++                        JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event())
++                    )
++                ),
++                SyntaxFactory.ret(events)
++            ),
++            Closure.EMPTY, fields, DatasetCompiler.DatasetFlavor.ROOT, "foo"
++        );
++        assertThat(func.compute(batch, false, false).size(), is(2));
++    }
++
++    /**
++     * Smoke test ensuring that output {@link Dataset} is compiled correctly.
++     */
++    @Test
++    public void compilesOutputDataset() {
++        assertThat(
++            DatasetCompiler.outputDataset(
++                DatasetCompiler.ROOT_DATASETS,
++                RubyUtil.RUBY.evalScriptlet(
++                    "output = Object.new\noutput.define_singleton_method(:multi_receive) do |batch|\nend\noutput"
++                ),
++                "foo", true
++            ).compute(RubyUtil.RUBY.newArray(), false, false),
++            nullValue()
+         );
+-        MatcherAssert.assertThat(
+-            func.compute(batch, false, false).size(),
+-            CoreMatchers.is(2)
++    }
++
++    @Test
++    public void compilesSplitDataset() {
++        final FieldReference key = FieldReference.from("foo");
++        final EventCondition condition = event -> event.getEvent().includes(key);
++        final SplitDataset left =
++            DatasetCompiler.splitDataset(DatasetCompiler.ROOT_DATASETS, condition, "foo");
++        final Event trueEvent = new Event();
++        trueEvent.setField(key, "val");
++        final JrubyEventExtLibrary.RubyEvent falseEvent =
++            JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event());
++        final Dataset right = left.right();
++        final RubyArray batch = RubyUtil.RUBY.newArray(
++            JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, trueEvent), falseEvent
++        );
++        assertThat(left.compute(batch, false, false).size(), is(1));
++        assertThat(right.compute(batch, false, false).size(), is(1));
++    }
++
++    @Test
++    public void optimizesRedundantRubyThreadContext() {
++        assertThat(
++            Closure.wrap(
++                SyntaxFactory.definition(
++                    new VariableDefinition(ThreadContext.class, "context1"),
++                    ValueSyntaxElement.GET_RUBY_THREAD_CONTEXT
++                ),
++                SyntaxFactory.definition(
++                    new VariableDefinition(ThreadContext.class, "context2"),
++                    ValueSyntaxElement.GET_RUBY_THREAD_CONTEXT
++                )
++            ).generateCode(),
++            is(
++                String.join("",
++                    "org.jruby.runtime.ThreadContext context=org.logstash.RubyUtil.RUBY.getCurrentContext();",
++                    "org.jruby.runtime.ThreadContext context1=context;",
++                    "org.jruby.runtime.ThreadContext context2=context;"
++                )
++            )
+         );
+     }
+ }

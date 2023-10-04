@@ -1,0 +1,260 @@
+diff --git a/.buildkite/serverless_integration_pipeline.yml b/.buildkite/serverless_integration_pipeline.yml
+index fc0ad48a67a..37c06db247f 100644
+--- a/.buildkite/serverless_integration_pipeline.yml
++++ b/.buildkite/serverless_integration_pipeline.yml
+@@ -16,8 +16,10 @@ steps:
+     command: ./.buildkite/scripts/setup_java.sh && ./ci/serverless/elastic_integration_filter_tests.sh
+   - label: "central pipeline management test"
+     command: ./.buildkite/scripts/setup_java.sh && ./ci/serverless/cpm_tests.sh
++  # Legacy monitoring is disabled. Serverless does not support /_monitoring/bulk, hence the test always fails to ingest metrics.
+   - label: "Logstash legacy monitoring test"
+     command: ./.buildkite/scripts/setup_java.sh && ./ci/serverless/monitoring_tests.sh
++    skip: true
+   - label: "Kibana API test"
+     command: ./.buildkite/scripts/setup_java.sh && ./ci/serverless/kibana_api_tests.sh
+   - label: "metricbeat stack monitoring test"
+diff --git a/ci/serverless/README.md b/ci/serverless/README.md
+new file mode 100644
+index 00000000000..5f3383403ce
+--- /dev/null
++++ b/ci/serverless/README.md
+@@ -0,0 +1,47 @@
++The test cases against serverless Elasticsearch covers the following scenarios
++
++- es-output
++- es-input
++- es-filter
++- elastic-integration-filter (Logstash run ingest pipeline)
++- DLQ
++- central pipeline management
++- Kibana API for pipeline management (CPM)
++- Metricbeat monitoring 
++- ~~Logstash legacy monitoring~~
++
++### Credentials
++
++The username, password, API key and hosts are stored in Vault `secret/ci/elastic-logstash/serverless-test`.
++
++| Vault field             |                                       |
++|-------------------------|---------------------------------------|
++| es_user                 | username of superuser                 |
++| es_user_pw              | password of superuser                 |
++| ls_role_api_key_encoded | base64 api_key for integration-filter |
++| ls_plugin_api_key       | id:api_key for Logstash plugins       |
++| es_host                 | Elasticsearch endpoint                |
++| kb_host                 | Kibana endpoint                       |
++
++
++
++Generate API key for Logstash with limited privileges instead of using superuser `elastic`.
++
++```
++POST /_security/api_key
++{
++  "name": "logstash_serverless_apikey",
++  "expiration": "365d",   
++  "role_descriptors": { 
++    "logstash_serverless_role": {
++      "cluster": ["monitor", "manage_index_templates", "manage_logstash_pipelines", "cluster:admin/ingest/pipeline/get", "read_pipeline"], 
++      "indices": [
++        {
++          "names": [ "logstash", "logstash-*", "ecs-logstash", "ecs-logstash-*", "serverless*", "logs-*", "metrics-*", "synthetics-*", "traces-*" ], 
++          "privileges": ["manage", "write", "create_index", "read", "view_index_metadata"]  
++        }
++      ]
++    }
++  }
++}
++```
+\ No newline at end of file
+diff --git a/ci/serverless/common.sh b/ci/serverless/common.sh
+index 7646bf2b6c1..82eae5ff033 100755
+--- a/ci/serverless/common.sh
++++ b/ci/serverless/common.sh
+@@ -14,6 +14,8 @@ setup_vault() {
+   export ES_ENDPOINT=$(vault read -field=es_host "${vault_path}")
+   export ES_USER=$(vault read -field=es_user "${vault_path}")
+   export ES_PW=$(vault read -field=es_user_pw "${vault_path}")
++  export LS_ROLE_API_KEY_ENCODED=$(vault read -field=ls_role_api_key_encoded "${vault_path}")
++  export LS_PLUGIN_API_KEY=$(vault read -field=ls_plugin_api_key "${vault_path}")
+   export KB_ENDPOINT=$(vault read -field=kb_host "${vault_path}")
+   set -x
+ }
+diff --git a/ci/serverless/config/logstash.yml b/ci/serverless/config/logstash.yml
+index 2e9f298d94f..a1d6a6bc9c5 100644
+--- a/ci/serverless/config/logstash.yml
++++ b/ci/serverless/config/logstash.yml
+@@ -1,10 +1,9 @@
+ xpack.management.enabled: true
+ xpack.management.pipeline.id: ["gen_es"]
+-xpack.management.elasticsearch.username: ${ES_USER}
+-xpack.management.elasticsearch.password: ${ES_PW}
++xpack.management.elasticsearch.api_key: ${LS_PLUGIN_API_KEY}
+ xpack.management.elasticsearch.hosts: ["${ES_ENDPOINT}"]
+ 
+-xpack.monitoring.enabled: true
+-xpack.monitoring.elasticsearch.username: ${ES_USER}
+-xpack.monitoring.elasticsearch.password: ${ES_PW}
+-xpack.monitoring.elasticsearch.hosts: ["${ES_ENDPOINT}"]
+\ No newline at end of file
++# Legacy monitoring is disabled.
++#xpack.monitoring.enabled: true
++#xpack.monitoring.elasticsearch.api_key: ${LS_PLUGIN_API_KEY}
++#xpack.monitoring.elasticsearch.hosts: ["${ES_ENDPOINT}"]
+\ No newline at end of file
+diff --git a/ci/serverless/cpm_tests.sh b/ci/serverless/cpm_tests.sh
+index 32b6c9643fe..37fc301b454 100755
+--- a/ci/serverless/cpm_tests.sh
++++ b/ci/serverless/cpm_tests.sh
+@@ -17,7 +17,7 @@ index_pipeline() {
+ # index pipeline to serverless ES
+ index_cpm_pipelines() {
+   index_pipeline "$PIPELINE_NAME" '{
+-    "pipeline": "input { generator { count => 100 } } output { elasticsearch { hosts => \"${ES_ENDPOINT}\" user => \"${ES_USER}\" password => \"${ES_PW}\" index=> \"${INDEX_NAME}\" } }",
++    "pipeline": "input { generator { count => 100 } } output { elasticsearch { hosts => \"${ES_ENDPOINT}\" api_key => \"${LS_PLUGIN_API_KEY}\" index=> \"${INDEX_NAME}\" } }",
+     "last_modified": "2023-07-04T22:22:22.222Z",
+     "pipeline_metadata": { "version": "1"},
+     "username": "log.stash",
+diff --git a/ci/serverless/kibana_api_tests.sh b/ci/serverless/kibana_api_tests.sh
+index 180a2c90b16..2c793483029 100755
+--- a/ci/serverless/kibana_api_tests.sh
++++ b/ci/serverless/kibana_api_tests.sh
+@@ -7,7 +7,7 @@ export PIPELINE_NAME="stdin_stdout"
+ export EXIT_CODE="0"
+ 
+ create_pipeline() {
+-    RESP_CODE=$(curl -s -w "%{http_code}" -o /dev/null -X PUT -u "$ES_USER:$ES_PW" "$KB_ENDPOINT/api/logstash/pipeline/$PIPELINE_NAME" \
++    RESP_CODE=$(curl -s -w "%{http_code}" -o /dev/null -X PUT -H "Authorization: ApiKey $LS_ROLE_API_KEY_ENCODED" "$KB_ENDPOINT/api/logstash/pipeline/$PIPELINE_NAME" \
+       -H 'Content-Type: application/json' -H 'kbn-xsrf: logstash' \
+       --data-binary @"$CURRENT_DIR/test_data/$PIPELINE_NAME.json")
+ 
+@@ -18,14 +18,20 @@ create_pipeline() {
+ }
+ 
+ get_pipeline() {
+-    RESP_BODY=$(curl -s -X GET -u "$ES_USER:$ES_PW" "$KB_ENDPOINT/api/logstash/pipeline/$PIPELINE_NAME")
+-
++    RESP_BODY=$(curl -s -X GET -H "Authorization: ApiKey $LS_ROLE_API_KEY_ENCODED" "$KB_ENDPOINT/api/logstash/pipeline/$PIPELINE_NAME")
+     SOURCE_BODY=$(cat "$CURRENT_DIR/test_data/$PIPELINE_NAME.json")
+ 
+-    if [[ $(echo "$RESP_BODY" | jq -r '.id') -ne "$PIPELINE_NAME" ]] ||\
+-      [[ $(echo "$RESP_BODY" | jq -r '.pipeline') -ne $(echo "$SOURCE_BODY" | jq -r '.pipeline') ]] ||\
+-      [[ $(echo "$RESP_BODY" | jq -r '.settings') -ne $(echo "$SOURCE_BODY" | jq -r '.settings') ]]; then
++    RESP_PIPELINE_NAME=$(echo "$RESP_BODY" | jq -r '.id')
++
++    RESP_PIPELINE=$(echo "$RESP_BODY" | jq -r '.pipeline')
++    SOURCE_PIPELINE=$(echo "$SOURCE_BODY" | jq -r '.pipeline')
++
++    RESP_SETTING=$(echo "$RESP_BODY" | jq -r '.settings')
++    SOURCE_SETTING=$(echo "$SOURCE_BODY" | jq -r '.settings')
++
+ 
++    # compare strings contain curly brackets
++    if [[ ("$RESP_PIPELINE_NAME" -ne "$PIPELINE_NAME") || ("$RESP_PIPELINE" != "$SOURCE_PIPELINE") || ("$RESP_SETTING" != "$SOURCE_SETTING") ]]; then
+       EXIT_CODE=$(( EXIT_CODE + 1 ))
+       echo "Fail to get pipeline."
+     fi
+@@ -33,7 +39,7 @@ get_pipeline() {
+ }
+ 
+ list_pipeline() {
+-    RESP_BODY=$(curl -s -X GET -u "$ES_USER:$ES_PW" "$KB_ENDPOINT/api/logstash/pipelines" | jq --arg name "$PIPELINE_NAME" '.pipelines[] | select(.id==$name)' )
++    RESP_BODY=$(curl -s -X GET -H "Authorization: ApiKey $LS_ROLE_API_KEY_ENCODED" "$KB_ENDPOINT/api/logstash/pipelines" | jq --arg name "$PIPELINE_NAME" '.pipelines[] | select(.id==$name)' )
+     if [[ -z "$RESP_BODY" ]]; then
+       EXIT_CODE=$(( EXIT_CODE + 1 ))
+       echo "Fail to list pipeline."
+@@ -41,7 +47,7 @@ list_pipeline() {
+ }
+ 
+ delete_pipeline() {
+-    RESP_CODE=$(curl -s -w "%{http_code}" -o /dev/null -X DELETE -u "$ES_USER:$ES_PW" "$KB_ENDPOINT/api/logstash/pipeline/$PIPELINE_NAME" \
++    RESP_CODE=$(curl -s -w "%{http_code}" -o /dev/null -X DELETE -H "Authorization: ApiKey $LS_ROLE_API_KEY_ENCODED" "$KB_ENDPOINT/api/logstash/pipeline/$PIPELINE_NAME" \
+       -H 'Content-Type: application/json' -H 'kbn-xsrf: logstash' \
+       --data-binary @"$CURRENT_DIR/test_data/$PIPELINE_NAME.json")
+ 
+diff --git a/ci/serverless/monitoring_tests.sh b/ci/serverless/monitoring_tests.sh
+index 1d2fa7cf71c..fee6e757a8e 100755
+--- a/ci/serverless/monitoring_tests.sh
++++ b/ci/serverless/monitoring_tests.sh
+@@ -1,4 +1,6 @@
+ #!/usr/bin/env bash
++
++# Legacy monitoring is disabled. Serverless does not support /_monitoring/bulk, hence this test always fails to ingest metrics.
+ set -ex
+ 
+ source ./$(dirname "$0")/common.sh
+diff --git a/ci/serverless/pipeline/001_es-output.conf b/ci/serverless/pipeline/001_es-output.conf
+index 33ba0967b59..454c20899fc 100644
+--- a/ci/serverless/pipeline/001_es-output.conf
++++ b/ci/serverless/pipeline/001_es-output.conf
+@@ -13,15 +13,13 @@ output {
+     elasticsearch {
+         id => "named_index"
+         hosts => ["${ES_ENDPOINT}"]
+-        user => "${ES_USER}"
+-        password => "${ES_PW}"
++        api_key => "${LS_PLUGIN_API_KEY}"
+         index => "${INDEX_NAME}"
+     }
+ 
+     elasticsearch {
+         id => "data_stream"
+         hosts => ["${ES_ENDPOINT}"]
+-        user => "${ES_USER}"
+-        password => "${ES_PW}"
++        api_key => "${LS_PLUGIN_API_KEY}"
+     }
+ }
+\ No newline at end of file
+diff --git a/ci/serverless/pipeline/002_es-filter.conf b/ci/serverless/pipeline/002_es-filter.conf
+index b7657088029..c524ec5fe17 100644
+--- a/ci/serverless/pipeline/002_es-filter.conf
++++ b/ci/serverless/pipeline/002_es-filter.conf
+@@ -7,8 +7,7 @@ input {
+ filter {
+     elasticsearch {
+         hosts => ["${ES_ENDPOINT}"]
+-        user => "${ES_USER}"
+-        password => "${ES_PW}"
++        api_key => "${LS_PLUGIN_API_KEY}"
+         index => "${INDEX_NAME}"
+         query => "*"
+         add_field => {"check" => "good"}
+diff --git a/ci/serverless/pipeline/003_es-input.conf b/ci/serverless/pipeline/003_es-input.conf
+index 8bf3645cbe5..4b09ec5fcbd 100644
+--- a/ci/serverless/pipeline/003_es-input.conf
++++ b/ci/serverless/pipeline/003_es-input.conf
+@@ -1,8 +1,7 @@
+ input {
+   elasticsearch {
+     hosts => ["${ES_ENDPOINT}"]
+-    user => "${ES_USER}"
+-    password => "${ES_PW}"
++    api_key => "${LS_PLUGIN_API_KEY}"
+     index => "${INDEX_NAME}"
+     size => 100
+     schedule => "*/10 * * * * *"
+diff --git a/ci/serverless/pipeline/004_integration-filter.conf b/ci/serverless/pipeline/004_integration-filter.conf
+index b561b1350bb..14073e8347e 100644
+--- a/ci/serverless/pipeline/004_integration-filter.conf
++++ b/ci/serverless/pipeline/004_integration-filter.conf
+@@ -11,8 +11,7 @@ input {
+ filter {
+     elastic_integration {
+         hosts => "${ES_ENDPOINT}"
+-        username => "${ES_USER}"
+-        password => "${ES_PW}"
++        api_key => "${LS_ROLE_API_KEY_ENCODED}"
+         remove_field => ["_version"]
+         add_field => {"ingested" => "ok"}
+     }
+@@ -29,7 +28,6 @@ output {
+     elasticsearch {
+         id => "data_stream"
+         hosts => ["${ES_ENDPOINT}"]
+-        user => "${ES_USER}"
+-        password => "${ES_PW}"
++        api_key => "${LS_PLUGIN_API_KEY}"
+     }
+ }
+\ No newline at end of file

@@ -1,0 +1,456 @@
+diff --git a/config/jvm.options b/config/jvm.options
+index ac27467d0bf..4433b1efe45 100644
+--- a/config/jvm.options
++++ b/config/jvm.options
+@@ -76,3 +76,6 @@
+ 
+ # Entropy source for randomness
+ -Djava.security.egd=file:/dev/urandom
++
++# Copy the logging context from parent threads to children
++-Dlog4j2.isThreadContextMapInheritable=true
+\ No newline at end of file
+diff --git a/config/log4j2.properties b/config/log4j2.properties
+index a9eed0a3e83..6a2e503fb2d 100644
+--- a/config/log4j2.properties
++++ b/config/log4j2.properties
+@@ -4,7 +4,7 @@ name = LogstashPropertiesConfig
+ appender.console.type = Console
+ appender.console.name = plain_console
+ appender.console.layout.type = PatternLayout
+-appender.console.layout.pattern = [%d{ISO8601}][%-5p][%-25c] %m%n
++appender.console.layout.pattern = [%d{ISO8601}][%-5p][%-15c{1.}]%notEmpty{[%X{pipeline.id}]}%notEmpty{[%X{plugin.id}]} %m%n
+ 
+ appender.json_console.type = Console
+ appender.json_console.name = json_console
+@@ -21,7 +21,7 @@ appender.rolling.policies.time.type = TimeBasedTriggeringPolicy
+ appender.rolling.policies.time.interval = 1
+ appender.rolling.policies.time.modulate = true
+ appender.rolling.layout.type = PatternLayout
+-appender.rolling.layout.pattern = [%d{ISO8601}][%-5p][%-25c] %-.10000m%n
++appender.rolling.layout.pattern = [%d{ISO8601}][%-5p][%-25c]%notEmpty{[%X{pipeline.id}]}%notEmpty{[%X{plugin.id}]} %-.10000m%n
+ appender.rolling.policies.size.type = SizeBasedTriggeringPolicy
+ appender.rolling.policies.size.size = 100MB
+ appender.rolling.strategy.type = DefaultRolloverStrategy
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index 94f3cabfb09..098fc417dbe 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -89,6 +89,7 @@ def initialize(settings = LogStash::SETTINGS, source_loader = nil)
+ 
+   def execute
+     @thread = Thread.current # this var is implicitly used by Stud.stop?
++    LogStash::Util.set_thread_name("Agent thread")
+     logger.debug("Starting agent")
+ 
+     transition_to_running
+@@ -307,7 +308,7 @@ def converge_state(pipeline_actions)
+ 
+     pipeline_actions.map do |action|
+       Thread.new(action, converge_result) do |action, converge_result|
+-        java.lang.Thread.currentThread().setName("Converge #{action}");
++        LogStash::Util.set_thread_name("Converge #{action}")
+         # We execute every task we need to converge the current state of pipelines
+         # for every task we will record the action result, that will help us
+         # the results of all the task will determine if the converge was successful or not
+diff --git a/logstash-core/lib/logstash/java_pipeline.rb b/logstash-core/lib/logstash/java_pipeline.rb
+index 1360dd5e04d..065282c2ce2 100644
+--- a/logstash-core/lib/logstash/java_pipeline.rb
++++ b/logstash-core/lib/logstash/java_pipeline.rb
+@@ -8,6 +8,8 @@
+ require "logstash/compiler"
+ require "logstash/config/lir_serializer"
+ 
++java_import org.apache.logging.log4j.ThreadContext
++
+ module LogStash; class JavaPipeline < JavaBasePipeline
+   include LogStash::Util::Loggable
+   attr_reader \
+@@ -102,6 +104,7 @@ def start
+     @thread = Thread.new do
+       begin
+         LogStash::Util.set_thread_name("pipeline.#{pipeline_id}")
++        ThreadContext.put("pipeline.id", pipeline_id)
+         run
+         @finished_run.make_true
+       rescue => e
+@@ -236,6 +239,7 @@ def start_workers
+       pipeline_workers.times do |t|
+         thread = Thread.new do
+           Util.set_thread_name("[#{pipeline_id}]>worker#{t}")
++          ThreadContext.put("pipeline.id", pipeline_id)
+           org.logstash.execution.WorkerLoop.new(
+               lir_execution, filter_queue_client, @events_filtered, @events_consumed,
+               @flushRequested, @flushing, @shutdownRequested, @drain_queue).run
+@@ -305,6 +309,8 @@ def start_input(plugin)
+ 
+   def inputworker(plugin)
+     Util::set_thread_name("[#{pipeline_id}]<#{plugin.class.config_name}")
++    ThreadContext.put("pipeline.id", pipeline_id)
++    ThreadContext.put("plugin.id", plugin.config_name)
+     begin
+       plugin.run(wrapped_write_client(plugin.id.to_sym))
+     rescue => e
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index 82add71206e..a06a4e37bb7 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -12,6 +12,8 @@
+ require "logstash/filter_delegator"
+ require "logstash/compiler"
+ 
++java_import org.apache.logging.log4j.ThreadContext
++
+ module LogStash; class BasePipeline < AbstractPipeline
+   include LogStash::Util::Loggable
+ 
+@@ -171,8 +173,9 @@ def start
+     @finished_run.make_false
+ 
+     @thread = Thread.new do
++      LogStash::Util.set_thread_name("[#{pipeline_id}]-manager")
++      ThreadContext.put("pipeline.id", pipeline_id)
+       begin
+-        LogStash::Util.set_thread_name("pipeline.#{pipeline_id}")
+         run
+         @finished_run.make_true
+       rescue => e
+@@ -212,7 +215,6 @@ def wait_until_started
+   def run
+     @started_at = Time.now
+     @thread = Thread.current
+-    Util.set_thread_name("[#{pipeline_id}]-pipeline-manager")
+ 
+     start_workers
+ 
+@@ -300,7 +302,8 @@ def start_workers
+ 
+       pipeline_workers.times do |t|
+         thread = Thread.new(batch_size, batch_delay, self) do |_b_size, _b_delay, _pipeline|
+-          Util.set_thread_name("[#{pipeline_id}]>worker#{t}")
++          LogStash::Util::set_thread_name("[#{pipeline_id}]>worker#{t}")
++          ThreadContext.put("pipeline.id", pipeline_id)
+           _pipeline.worker_loop(_b_size, _b_delay)
+         end
+         @worker_threads << thread
+@@ -430,6 +433,8 @@ def start_input(plugin)
+ 
+   def inputworker(plugin)
+     Util::set_thread_name("[#{pipeline_id}]<#{plugin.class.config_name}")
++    ThreadContext.put("pipeline.id", pipeline_id)
++    ThreadContext.put("plugin.id", plugin.class.config_name)
+     begin
+       plugin.run(wrapped_write_client(plugin.id.to_sym))
+     rescue => e
+@@ -535,6 +540,8 @@ def start_flusher
+     raise "Attempted to start flusher on a stopped pipeline!" if stopped?
+ 
+     @flusher_thread = Thread.new do
++      LogStash::Util.set_thread_name("[#{pipeline_id}]-flusher-thread")
++      ThreadContext.put("pipeline.id", pipeline_id)
+       while Stud.stoppable_sleep(5, 0.1) { stopped? }
+         flush
+         break if stopped?
+diff --git a/logstash-core/spec/logstash/pipeline_spec.rb b/logstash-core/spec/logstash/pipeline_spec.rb
+index 12dd306e7e5..bba5c3f9825 100644
+--- a/logstash-core/spec/logstash/pipeline_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_spec.rb
+@@ -15,6 +15,7 @@ def register
+   end
+ 
+   def run(queue)
++    @logger.debug("check log4j fish tagging: [" + ThreadContext.get("plugin.id") + "]")
+   end
+ 
+   def close
+@@ -52,10 +53,12 @@ class DummyCodec < LogStash::Codecs::Base
+   config :format, :validate => :string
+ 
+   def decode(data)
++    @logger.debug("Codec - decode")
+     data
+   end
+ 
+   def encode(event)
++    @logger.debug("Codec - encode")
+     event
+   end
+ 
+@@ -73,7 +76,9 @@ class DummyFilter < LogStash::Filters::Base
+ 
+   def register() end
+ 
+-  def filter(event) end
++  def filter(event)
++    @logger.debug("Filter")
++  end
+ 
+   def threadsafe?() false; end
+ 
+@@ -243,6 +248,7 @@ def flush(options)
+         before do
+           expect(::LogStash::Pipeline).to receive(:logger).and_return(logger)
+           allow(logger).to receive(:debug?).and_return(true)
++          allow_any_instance_of(DummyFilter).to receive(:logger).and_return(logger)
+         end
+ 
+         it "should not receive a debug message with the compiled code" do
+@@ -263,6 +269,17 @@ def flush(options)
+           pipeline_settings_obj.set("config.debug", true)
+           pipeline = mock_pipeline_from_string(test_config_with_filters, pipeline_settings_obj)
+           expect(logger).to receive(:debug).with(/filter received/, anything)
++
++          pipeline.filter_func([LogStash::Event.new])
++          pipeline.close
++        end
++
++        it "should log fish tagging of plugins" do
++          pipeline_settings_obj.set("config.debug", true)
++          pipeline = mock_pipeline_from_string(test_config_with_filters, pipeline_settings_obj)
++          expect(logger).to receive(:debug).with(/filter received/, anything)
++          expect(logger).to receive(:debug).with(/[dummyfilter]/)
++
+           pipeline.filter_func([LogStash::Event.new])
+           pipeline.close
+         end
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
+index 28717e9832c..4a96938a46d 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
+@@ -9,6 +9,7 @@
+ import org.jruby.RubyHash;
+ import org.jruby.internal.runtime.methods.DynamicMethod;
+ import org.jruby.runtime.Block;
++import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.logstash.RubyUtil;
+ import org.logstash.ext.JrubyEventExtLibrary;
+@@ -180,7 +181,10 @@ public static ComputeStepSyntaxElement<Dataset> outputDataset(final Collection<D
+             }
+             final ValueSyntaxElement inputBuffer = fields.add(buffer);
+             computeSyntax = withInputBuffering(
+-                Closure.wrap(invokeOutput(fields.add(output), inputBuffer), inlineClear),
++                Closure.wrap(
++                        setPluginIdForLog4j(output),
++                        invokeOutput(fields.add(output), inputBuffer), inlineClear,
++                        unsetPluginIdForLog4j()),
+                 parentFields, inputBuffer
+             );
+         }
+@@ -196,12 +200,13 @@ private static Closure filterBody(final ValueSyntaxElement outputBuffer,
+         final ValueSyntaxElement inputBuffer, final ClassFields fields,
+         final AbstractFilterDelegatorExt plugin) {
+         final ValueSyntaxElement filterField = fields.add(plugin);
+-        final Closure body = Closure.wrap(
++        final Closure body = Closure.wrap(setPluginIdForLog4j(plugin),
+             buffer(outputBuffer, filterField.call("multiFilter", inputBuffer))
+         );
+         if (plugin.hasFlush()) {
+             body.add(callFilterFlush(fields, outputBuffer, filterField, !plugin.periodicFlush()));
+         }
++        body.add(unsetPluginIdForLog4j());
+         return body;
+     }
+ 
+@@ -298,6 +303,26 @@ private static MethodLevelSyntaxElement callFilterFlush(final ClassFields fields
+         );
+     }
+ 
++    private static MethodLevelSyntaxElement unsetPluginIdForLog4j() {
++        return () -> "org.apache.logging.log4j.ThreadContext.remove(\"plugin.id\")";
++    }
++
++    private static MethodLevelSyntaxElement setPluginIdForLog4j(final AbstractFilterDelegatorExt filterPlugin) {
++        final ThreadContext context = RubyUtil.RUBY.getCurrentContext();
++        final IRubyObject configName = filterPlugin.configName(context);
++        return generateLog4jContextAssignment(configName);
++    }
++
++    private static MethodLevelSyntaxElement setPluginIdForLog4j(final AbstractOutputDelegatorExt outputPlugin) {
++        final ThreadContext context = RubyUtil.RUBY.getCurrentContext();
++        final IRubyObject configName = outputPlugin.configName(context);
++        return generateLog4jContextAssignment(configName);
++    }
++
++    private static MethodLevelSyntaxElement generateLog4jContextAssignment(IRubyObject configName) {
++        return () -> "org.apache.logging.log4j.ThreadContext.put(\"plugin.id\", \"" + configName + "\")";
++    }
++
+     private static MethodLevelSyntaxElement clear(final ValueSyntaxElement field) {
+         return field.call("clear");
+     }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java
+index 6a39c9e062c..96d1505dc3d 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java
+@@ -6,6 +6,7 @@
+ import org.jruby.RubyClass;
+ import org.jruby.RubyHash;
+ import org.jruby.RubyString;
++import org.jruby.RubyObject;
+ import org.jruby.anno.JRubyClass;
+ import org.jruby.anno.JRubyMethod;
+ import org.jruby.internal.runtime.methods.DynamicMethod;
+@@ -44,13 +45,14 @@ public IRubyObject initialize(final ThreadContext context, final IRubyObject fil
+     }
+ 
+     @VisibleForTesting
+-    public FilterDelegatorExt initForTesting(final IRubyObject filter) {
++    public FilterDelegatorExt initForTesting(final IRubyObject filter, RubyObject configNameDouble) {
+         eventMetricOut = LongCounter.DUMMY_COUNTER;
+         eventMetricIn = LongCounter.DUMMY_COUNTER;
+         eventMetricTime = LongCounter.DUMMY_COUNTER;
+         this.filter = filter;
+         filterMethod = filter.getMetaClass().searchMethod(FILTER_METHOD_NAME);
+         flushes = filter.respondsTo("flush");
++        filterClass = configNameDouble.getType();
+         return this;
+     }
+ 
+@@ -96,8 +98,15 @@ protected IRubyObject getConfigName(final ThreadContext context) {
+     @Override
+     @SuppressWarnings({"rawtypes"})
+     protected RubyArray doMultiFilter(final RubyArray batch) {
+-        return (RubyArray) filterMethod.call(
+-                WorkerLoop.THREAD_CONTEXT.get(), filter, filterClass, FILTER_METHOD_NAME, batch);
++        final ThreadContext context = RubyUtil.RUBY.getCurrentContext();
++        final IRubyObject configName = this.getConfigName(context);
++        org.apache.logging.log4j.ThreadContext.put("plugin.id", configName.toString());
++        try {
++            return (RubyArray) filterMethod.call(
++                    WorkerLoop.THREAD_CONTEXT.get(), filter, filterClass, FILTER_METHOD_NAME, batch);
++        } finally {
++            org.apache.logging.log4j.ThreadContext.remove("plugin.id");
++        }
+     }
+ 
+     @Override
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/JavaInputDelegatorExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/JavaInputDelegatorExt.java
+index 4ceb3f5643a..17b70785841 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/JavaInputDelegatorExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/JavaInputDelegatorExt.java
+@@ -60,7 +60,11 @@ public IRubyObject start(final ThreadContext context) {
+         } else {
+             queueWriter = qw;
+         }
+-        Thread t = new Thread(() -> input.start(queueWriter::push));
++        Thread t = new Thread(() -> {
++            org.apache.logging.log4j.ThreadContext.put("pipeline.id", pipeline.pipelineId().toString());
++            org.apache.logging.log4j.ThreadContext.put("plugin.id", this.configName(context).toString());
++            input.start(queueWriter::push);
++        });
+         t.setName(pipeline.pipelineId().asJavaString() + "_" + input.getName() + "_" + input.getId());
+         t.start();
+         return JavaObject.wrap(context.getRuntime(), t);
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputDelegatorExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputDelegatorExt.java
+index 2e6c5516c11..db7f2ff9d6a 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputDelegatorExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputDelegatorExt.java
+@@ -11,6 +11,7 @@
+ import org.jruby.runtime.Block;
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
++import org.logstash.RubyUtil;
+ import org.logstash.execution.ExecutionContextExt;
+ import org.logstash.execution.WorkerLoop;
+ import org.logstash.ext.JrubyEventExtLibrary;
+@@ -75,9 +76,14 @@ protected IRubyObject getConcurrency(final ThreadContext context) {
+     @Override
+     protected void doOutput(final Collection<JrubyEventExtLibrary.RubyEvent> batch) {
+         try {
++            final ThreadContext context = RubyUtil.RUBY.getCurrentContext();
++            final IRubyObject configName = this.getConfigName(context);
++            org.apache.logging.log4j.ThreadContext.put("plugin.id", configName.toString());
+             strategy.multiReceive(WorkerLoop.THREAD_CONTEXT.get(), (IRubyObject) batch);
+         } catch (final InterruptedException ex) {
+             throw new IllegalStateException(ex);
++        } finally {
++            org.apache.logging.log4j.ThreadContext.remove("plugin.id");
+         }
+     }
+ 
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java b/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java
+index 70642c10621..6e8c1bf7364 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java
+@@ -16,6 +16,7 @@
+ import org.hamcrest.MatcherAssert;
+ import org.jruby.RubyInteger;
+ import org.jruby.RubyString;
++import org.jruby.RubyObject;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.junit.After;
+ import org.junit.Before;
+@@ -491,9 +492,10 @@ public AbstractOutputDelegatorExt buildOutput(final RubyString name, final RubyI
+         public AbstractFilterDelegatorExt buildFilter(final RubyString name, final RubyInteger line,
+                                                       final RubyInteger column, final IRubyObject args,
+                                                       Map<String, Object> pluginArgs) {
++            final RubyObject configNameDouble = PluginConfigNameMethodDouble.create(name);
+             return new FilterDelegatorExt(
+                 RubyUtil.RUBY, RubyUtil.FILTER_DELEGATOR_CLASS)
+-                .initForTesting(setupPlugin(name, filters));
++                .initForTesting(setupPlugin(name, filters), configNameDouble);
+         }
+ 
+         @Override
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/PluginConfigNameMethodDouble.java b/logstash-core/src/test/java/org/logstash/config/ir/PluginConfigNameMethodDouble.java
+new file mode 100644
+index 00000000000..85e32ee273d
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/config/ir/PluginConfigNameMethodDouble.java
+@@ -0,0 +1,55 @@
++package org.logstash.config.ir;
++
++import org.jruby.Ruby;
++import org.jruby.RubyClass;
++import org.jruby.RubyObject;
++import org.jruby.RubyString;
++import org.jruby.anno.JRubyClass;
++import org.jruby.anno.JRubyMethod;
++import org.jruby.runtime.ThreadContext;
++import org.jruby.runtime.builtin.IRubyObject;
++
++import static org.logstash.RubyUtil.RUBY;
++
++/**
++ * Fake class to double the Ruby's method config_name()
++ * */
++@JRubyClass(name = "PluginConfigNameMethodDouble")
++public class PluginConfigNameMethodDouble extends RubyObject {
++
++    private static final long serialVersionUID = 1L;
++
++    static final RubyClass RUBY_META_CLASS;
++    private RubyString filterName;
++
++    static {
++        RUBY_META_CLASS = RUBY.defineClass("PluginConfigNameMethodDouble", RUBY.getObject(),
++                                          PluginConfigNameMethodDouble::new);
++        RUBY_META_CLASS.defineAnnotatedMethods(org.logstash.config.ir.compiler.FakeOutClass.class);
++    }
++
++    PluginConfigNameMethodDouble(final Ruby runtime, final RubyClass metaClass) {
++        super(runtime, metaClass);
++    }
++
++    static PluginConfigNameMethodDouble create(RubyString filterName) {
++        final PluginConfigNameMethodDouble instance = new PluginConfigNameMethodDouble(RUBY, RUBY_META_CLASS);
++        instance.filterName = filterName;
++        return instance;
++    }
++
++    @JRubyMethod
++    public IRubyObject name(final ThreadContext context) {
++        return RUBY.newString("example");
++    }
++
++    @JRubyMethod(name = "config_name")
++    public IRubyObject configName(final ThreadContext context, final IRubyObject recv) {
++        return filterName;
++    }
++
++    @JRubyMethod
++    public IRubyObject initialize(final ThreadContext context, final IRubyObject args) {
++        return this;
++    }
++}

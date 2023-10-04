@@ -1,0 +1,191 @@
+diff --git a/deploy.sh b/deploy.sh
+new file mode 100755
+index 00000000000..0f39572a787
+--- /dev/null
++++ b/deploy.sh
+@@ -0,0 +1,29 @@
++VERSION=`git describe --tags|cut -f1-2 -d '-'`
++echo Building logstash $VERSION ...
++# make jar
++ROOT=`dirname $0`
++ROOT=`cd $ROOT; pwd`
++REPO_DIR=$ROOT/repo/$VERSION
++mkdir -p $REPO_DIR
++REPO=file://$REPO_DIR
++rm -rf $REPO_DIR
++
++mvn deploy:deploy-file -Durl=$REPO \
++                       -DrepositoryId=localRepo \
++                       -Dfile=build/logstash-1.1.6.dev-monolithic.jar \
++                       -DgroupId=net.logstash \
++                       -DartifactId=logstash \
++                       -Dversion=$VERSION \
++                       -Dpackaging=jar \
++                       -DgeneratePom=true \
++                       -DgeneratePom.description="Logstash Jar" \
++                       -DrepositoryLayout=default \
++                       -DuniqueVersion=false
++
++# Zipping up the repo
++if [ -d $REPO_DIR ]
++then
++  cd $REPO_DIR
++  zip -r logstash-$VERSION.zip *
++fi
++
+diff --git a/lib/logstash/agent.rb b/lib/logstash/agent.rb
+index bf96476ef43..1843c286f92 100644
+--- a/lib/logstash/agent.rb
++++ b/lib/logstash/agent.rb
+@@ -690,8 +690,9 @@ def register_signal_handlers
+     end
+ 
+     Signal.trap("HUP") do
+-      @logger.warn("SIGHUP received, reloading.")
+-      reload
++      # [rfeng]: Ignore the SIGHUP as it is not working well for elastic search output
++      # @logger.warn("SIGHUP received, reloading.")
++      # reload
+     end
+ 
+     Signal.trap("TERM") do
+diff --git a/lib/logstash/config/grammar.rb b/lib/logstash/config/grammar.rb
+index 3e7181d5a11..49f06f6a084 100644
+--- a/lib/logstash/config/grammar.rb
++++ b/lib/logstash/config/grammar.rb
+@@ -317,9 +317,9 @@ def parse(string)
+ 	        break if _upper < _lower
+ 	        _mid = _lower + ( (_upper - _lower) >> 1 )
+ 
+-	        if data[p] < _logstash_config_trans_keys[_mid]
++	        if data[p].ord < _logstash_config_trans_keys[_mid]
+ 	           _upper = _mid - 1
+-	        elsif data[p] > _logstash_config_trans_keys[_mid]
++	        elsif data[p].ord > _logstash_config_trans_keys[_mid]
+ 	           _lower = _mid + 1
+ 	        else
+ 	           _trans += (_mid - _keys)
+@@ -338,9 +338,9 @@ def parse(string)
+ 	     loop do
+ 	        break if _upper < _lower
+ 	        _mid = _lower + (((_upper-_lower) >> 1) & ~1)
+-	        if data[p] < _logstash_config_trans_keys[_mid]
++	        if data[p].ord < _logstash_config_trans_keys[_mid]
+ 	          _upper = _mid - 2
+-	        elsif data[p] > _logstash_config_trans_keys[_mid+1]
++	        elsif data[p].ord > _logstash_config_trans_keys[_mid+1]
+ 	          _lower = _mid + 2
+ 	        else
+ 	          _trans += ((_mid - _keys) >> 1)
+diff --git a/lib/logstash/filters/grok.rb b/lib/logstash/filters/grok.rb
+index 638219ba30a..4fb9dc81bc9 100644
+--- a/lib/logstash/filters/grok.rb
++++ b/lib/logstash/filters/grok.rb
+@@ -217,8 +217,14 @@ class LogStash::Filters::Grok < LogStash::Filters::Base
+   @@patterns_path ||= Set.new
+   if __FILE__ =~ /file:\/.*\.jar!.*/
+     @@patterns_path += ["#{File.dirname(__FILE__)}/../../patterns/*"]
+-  else
+-    @@patterns_path += ["#{File.dirname(__FILE__)}/../../../patterns/*"]
++  else 
++    if __FILE__.include?('lib/logstash/filters/')
++      # Run directly from the github checkout
++      @@patterns_path += ["#{File.dirname(__FILE__)}/../../../patterns/*"]
++    else 
++      # Exploded jar
++      @@patterns_path += ["#{File.dirname(__FILE__)}/../../patterns/*"]
++    end
+   end
+ 
+   # This flag becomes `--grok-patterns-path`
+diff --git a/lib/logstash/outputs/elasticsearch.rb b/lib/logstash/outputs/elasticsearch.rb
+index 34ac6945b5b..daefd266605 100644
+--- a/lib/logstash/outputs/elasticsearch.rb
++++ b/lib/logstash/outputs/elasticsearch.rb
+@@ -161,7 +161,12 @@ def receive(event)
+                      :inflight_requests => @inflight_requests,
+                      :max_inflight_requests => @max_inflight_requests);
+         @inflight_cv.wait(@inflight_mutex)
++        @logger.info("ES requests are now resumed.", 
++                      :inflight_requests => @inflight_requests,
++                      :max_inflight_requests => @max_inflight_requests);
+       end
++      # Increase the counter within @inflight_mutex 
++      @inflight_requests += 1
+     end
+ 
+     if @document_id.nil?
+@@ -171,7 +176,6 @@ def receive(event)
+       req = @client.index(index, type, id, event.to_hash)
+     end
+ 
+-    increment_inflight_request_count
+     #timer = @logger.time("elasticsearch write")
+     req.on(:success) do |response|
+       @logger.debug("Successfully indexed", :event => event.to_hash)
+@@ -185,8 +189,11 @@ def receive(event)
+ 
+       # Failed to index, try again after a short sleep (incase our hammering is
+       # the problem).
+-      sleep(0.200)
+-      receive(event)
++      # [rfeng] We need to run the callback in a different thread to avoid holding the ES thread from the pool
++      Thread.new do
++        sleep(0.200)
++        receive(event)
++      end
+     end
+ 
+     # Execute this request asynchronously.
+@@ -195,19 +202,14 @@ def receive(event)
+ 
+   # Ruby doesn't appear to have a semaphore implementation, so this is a
+   # hack until I write one.
+-  private
+-  def increment_inflight_request_count
+-    @inflight_mutex.synchronize do
+-      @inflight_requests += 1
+-      @logger.debug("ElasticSearch in-flight requests", :count => @inflight_requests)
+-    end
+-  end # def increment_inflight_request_count
+ 
+   private
+   def decrement_inflight_request_count
+     @inflight_mutex.synchronize do
+       @inflight_requests -= 1
+       @inflight_cv.signal
++      @logger.debug("ElasticSearch request is now finished", 
++                   :count => @inflight_requests)
+     end
+   end # def decrement_inflight_request_count
+ end # class LogStash::Outputs::Elasticsearch
+diff --git a/logstash.gemspec b/logstash.gemspec
+index d22e074d3d6..2e9e631c822 100644
+--- a/logstash.gemspec
++++ b/logstash.gemspec
+@@ -35,7 +35,7 @@ Gem::Specification.new do |gem|
+   #TODO Can these be optional?
+   gem.add_runtime_dependency "aws-sdk"
+   gem.add_runtime_dependency "heroku"
+-  gem.add_runtime_dependency "addressable", ["~> 2.2.6"]
++  gem.add_runtime_dependency "addressable", ["~> 2.3.2"]
+   gem.add_runtime_dependency "bunny"
+   gem.add_runtime_dependency "ffi"
+   gem.add_runtime_dependency "ffi-rzmq", ["0.9.3"]
+diff --git a/patterns/grok-patterns b/patterns/grok-patterns
+index a90be794bc6..6bc66da07b0 100755
+--- a/patterns/grok-patterns
++++ b/patterns/grok-patterns
+@@ -91,7 +91,11 @@ QS %{QUOTEDSTRING}
+ 
+ # Log formats
+ SYSLOGBASE %{SYSLOGTIMESTAMP:timestamp} (?:%{SYSLOGFACILITY} )?%{SYSLOGHOST:logsource} %{SYSLOGPROG}:
+-COMBINEDAPACHELOG %{IPORHOST:clientip} %{USER:ident} %{USER:auth} \[%{HTTPDATE:timestamp}\] "(?:%{WORD:verb} %{NOTSPACE:request}(?: HTTP/%{NUMBER:httpversion})?|-)" %{NUMBER:response} (?:%{NUMBER:bytes}|-) %{QS:referrer} %{QS:agent}
++COMBINEDAPACHELOG %{IPORHOST:clientip} %{USER:ident} %{USER:auth} \[%{HTTPDATE:timestamp}\] "(?:%{WORD:verb} %{NOTSPACE:request}%{SPACE}(?: HTTP/%{NUMBER:httpversion})?|-)" %{NUMBER:response} (?:%{NUMBER:bytes}|-) %{QS:referrer} %{QS:agent}
++
++TOMCATACCESSLOG %{IPORHOST:clientip} %{USER:ident} %{USER:auth} \[%{HTTPDATE:timestamp}\] "(?:%{WORD:verb} %{URIPATHPARAM:request}%{SPACE}(?: HTTP/%{NUMBER:httpversion})?|-)" %{NUMBER:response} (?:%{NUMBER:bytes}|-) %{QS:referrer} %{QS:agent} %{NUMBER:timetaken} %{QS:forwaredfor} (?:%{NOTSPACE:usersessionid}|-) (?:%{NOTSPACE:errormessage}|-) (?:%{NOTSPACE:lbcookie}|-)
++
++# "%h %l %u %t &quot;%r&quot; %s %b &quot;%{Referer}i&quot; &quot;%{User-agent}i&quot; %D &quot;%{X-Forwarded-For}i&quot; %S %{AL_ERROR_MESSAGE}r %{lb}c"
+ 
+ # Log Levels
+ LOGLEVEL ([T|t]race|TRACE|[D|d]ebug|DEBUG|[N|n]otice|NOTICE|[I|i]nfo|INFO|[W|w]arn?(?:ing)?|WARN?(?:ING)?|[E|e]rr?(?:or)?|ERR?(?:OR)?|[C|c]rit?(?:ical)?|CRIT?(?:ICAL)?|[F|f]atal|FATAL|[S|s]evere|SEVERE)

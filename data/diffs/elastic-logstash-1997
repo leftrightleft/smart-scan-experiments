@@ -1,0 +1,186 @@
+diff --git a/lib/logstash/errors.rb b/lib/logstash/errors.rb
+index f91d4774209..38c628b61e7 100644
+--- a/lib/logstash/errors.rb
++++ b/lib/logstash/errors.rb
+@@ -5,6 +5,7 @@ class EnvironmentError < Error; end
+   class ConfigurationError < Error; end
+   class PluginLoadingError < Error; end
+   class ShutdownSignal < StandardError; end
++  class BulkSendError < Error; end
+ 
+   class Bug < Error; end
+   class ThisMethodWasRemoved < Bug; end
+diff --git a/lib/logstash/outputs/elasticsearch.rb b/lib/logstash/outputs/elasticsearch.rb
+index a9b30dabf60..249f60f8e50 100644
+--- a/lib/logstash/outputs/elasticsearch.rb
++++ b/lib/logstash/outputs/elasticsearch.rb
+@@ -342,7 +342,18 @@ def receive(event)
+   def flush(actions, teardown=false)
+     begin
+       @logger.debug? and @logger.debug "Sending bulk of actions to client[#{@client_idx}]: #{@host[@client_idx]}"
+-      @current_client.bulk(actions)
++
++      Stud::try(3.times) do
++        bulk_response = @current_client.bulk(actions)
++        if bulk_response["errors"]
++          failed_actions = bulk_response['statuses'].map.with_index {|x, i| actions[i] unless [200, 201].include?(x)}.compact
++          if failed_actions
++            @logger.debug? and @logger.debug "#{failed_actions.size}/#{actions.size} events were unsuccessful in sending, retrying."
++            actions = failed_actions
++            raise LogStash::BulkSendError, "Unsuccessful bulk request, some messages did not make it to Elasticsearch"
++          end
++        end
++      end
+     rescue => e
+       @logger.error "Got error to send bulk of actions to elasticsearch server at #{@host[@client_idx]} : #{e.message}"
+       raise e
+@@ -352,10 +363,8 @@ def flush(actions, teardown=false)
+           shift_client
+       end
+     end
+-    # TODO(sissel): Handle errors. Since bulk requests could mostly succeed
+-    # (aka partially fail), we need to figure out what documents need to be
+-    # retried.
+-    #
++    # TODO(talevy): We need to figure out how to prevent replaying successful events when
++    # Stud::try does not succeed.
+     # In the worst case, a failing flush (exception) will incur a retry from Stud::Buffer.
+   end # def flush
+ 
+diff --git a/lib/logstash/outputs/elasticsearch/protocol.rb b/lib/logstash/outputs/elasticsearch/protocol.rb
+index d0747980dcb..3858f0fbf66 100644
+--- a/lib/logstash/outputs/elasticsearch/protocol.rb
++++ b/lib/logstash/outputs/elasticsearch/protocol.rb
+@@ -1,5 +1,6 @@
+ require "logstash/outputs/elasticsearch"
+ require "cabin"
++require "set"
+ 
+ module LogStash::Outputs::Elasticsearch
+   module Protocols
+@@ -73,7 +74,7 @@ def build_client(options)
+ 
+       if ENV["BULK"] == "esruby"
+         def bulk(actions)
+-          bulk_esruby(actions)
++          return bulk_esruby(actions)
+         end
+       else
+         def bulk(actions)
+@@ -82,13 +83,19 @@ def bulk(actions)
+       end
+ 
+       def bulk_esruby(actions)
+-        @client.bulk(:body => actions.collect do |action, args, source|
++        bulk_response = @client.bulk(:body => actions.collect do |action, args, source|
+           if source
+             next [ { action => args }, source ]
+           else
+             next { action => args }
+           end
+         end.flatten)
++
++        if bulk_response["errors"]
++          return {"errors" => true, "statuses" => bulk_response["items"].map { |i| i["status"] }}
++        else
++          return {"errors" => false}
++        end
+       end # def bulk_esruby
+ 
+       # Avoid creating a new string for newline every time
+@@ -228,9 +235,17 @@ def bulk(actions)
+         actions.each do |action, args, source|
+           prep.add(build_request(action, args, source))
+         end
++
+         response = prep.execute.actionGet()
++        
++        if response.has_failures()
++          return {"errors" => true,
++                  "statuses" => response.map { |i| (i.is_failed && i.get_failure.get_status.get_status) || 200 }}
++        else
++          return {"errors" => false}
++        end
+ 
+-        # TODO(sissel): What format should the response be in?
++        # returns 200 for all successful actions, represents 201 & 200
+       end # def bulk
+ 
+       def build_request(action, args, source)
+diff --git a/spec/outputs/elasticsearch_spec.rb b/spec/outputs/elasticsearch_spec.rb
+index 450e7a262fb..53afe07a52d 100644
+--- a/spec/outputs/elasticsearch_spec.rb
++++ b/spec/outputs/elasticsearch_spec.rb
+@@ -347,7 +347,71 @@
+     end
+   end
+ 
+-  describe "elasticsearch protocol", :elasticsearch => true do
++  describe "failures in bulk class expected behavior", :elasticsearch => true do
++
++    def mock_actions_with_response(*resp)
++      LogStash::Outputs::Elasticsearch::Protocols::HTTPClient
++        .any_instance.stub(:bulk).and_return(*resp)
++      LogStash::Outputs::Elasticsearch::Protocols::NodeClient
++        .any_instance.stub(:bulk).and_return(*resp)
++      LogStash::Outputs::Elasticsearch::Protocols::TransportClient
++        .any_instance.stub(:bulk).and_return(*resp)
++    end
++
++    def send_actions(subject)
++      subject.register
++      subject.receive(LogStash::Event.new("somevalue" => 100))
++      subject.receive(LogStash::Event.new("geoip" => { "location" => [ 0.0, 0.0] }))
++      subject.buffer_flush(:final => true)
++    end
++
++    ["node", "transport", "http"].each do |protocol|
++      context "with protocol => #{protocol}" do
++        subject do
++          require "logstash/outputs/elasticsearch"
++          settings = {
++            "manage_template" => true,
++            "template_overwrite" => true,
++            "protocol" => protocol,
++            "host" => "localhost"
++          }
++          next LogStash::Outputs::ElasticSearch.new(settings)
++        end
++
++        before :each do
++          # Delete all templates first.
++          require "elasticsearch"
++
++          # Clean ES of data before we start.
++          @es = Elasticsearch::Client.new
++          @es.indices.delete_template(:name => "*")
++          @es.indices.delete(:index => "*")
++          @es.indices.refresh
++        end
++
++        it "should return no errors if all bulk actions are successful" do
++          mock_actions_with_response({"errors" => false})
++          send_actions(subject)
++        end
++
++        it "should retry actions 3 times with response status of 503" do
++          mock_actions_with_response({"errors" => true, "statuses" => [200, 503]},
++                                     {"errors" => true, "statuses" => [503]},
++                                     {"errors" => false})
++          send_actions(subject)
++        end
++        
++        it "should retry actions 3 times with response status of 429" do
++          mock_actions_with_response({"errors" => true, "statuses" => [200, 429]},
++                                     {"errors" => true, "statuses" => [429]},
++                                     {"errors" => false})
++          send_actions(subject)
++        end
++      end
++    end
++  end
++
++  describe "elasticsearch protocol", :todo => true do
+     # ElasticSearch related jars
+     LogStash::Environment.load_elasticsearch_jars!
+     # Load elasticsearch protocol

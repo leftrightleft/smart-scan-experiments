@@ -1,0 +1,2098 @@
+diff --git a/.ruby-version b/.ruby-version
+index 87d3afa187d..5347b6dea48 100644
+--- a/.ruby-version
++++ b/.ruby-version
+@@ -1 +1 @@
+-jruby-9.1.12.0
++jruby-9.2.4.1
+diff --git a/Dockerfile b/Dockerfile
+index 1391eef73d7..56dc10b8fc6 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,6 +1,24 @@
+-FROM container-registry-test.elastic.co/logstash-test/logstash-base:latest
++FROM ubuntu:xenial
+ 
+-RUN ln -s /tmp/vendor /opt/logstash/vendor
++RUN apt-get update && \
++    apt-get install -y zlib1g-dev build-essential vim rake git curl libssl-dev libreadline-dev libyaml-dev  \
++      libxml2-dev libxslt-dev openjdk-8-jdk-headless curl iputils-ping netcat && \
++    apt-get clean
++
++WORKDIR /root
++
++RUN adduser --disabled-password --gecos "" --home /home/logstash logstash && \
++    mkdir -p /usr/local/share/ruby-build && \
++    mkdir -p /opt/logstash && \
++    mkdir -p /opt/logstash/data && \
++    mkdir -p /mnt/host && \
++    chown logstash:logstash /opt/logstash
++
++USER logstash
++WORKDIR /home/logstash
++
++# used by the purge policy
++LABEL retention="keep"
+ 
+ ADD gradlew /opt/logstash/gradlew
+ ADD gradle/wrapper /opt/logstash/gradle/wrapper
+diff --git a/Dockerfile.base b/Dockerfile.base
+index 159f2b3cbab..a33c1bfd2df 100644
+--- a/Dockerfile.base
++++ b/Dockerfile.base
+@@ -16,30 +16,7 @@ RUN adduser --disabled-password --gecos "" --home /home/logstash logstash && \
+ 
+ USER logstash
+ WORKDIR /home/logstash
+-
+-RUN git clone https://github.com/sstephenson/rbenv.git .rbenv && \
+-    git clone https://github.com/sstephenson/ruby-build.git .rbenv/plugins/ruby-build && \
+-    echo 'export PATH=/home/logstash/.rbenv/bin:$PATH' >> /home/logstash/.bashrc
+-
+-ENV PATH "/home/logstash/.rbenv/bin:$PATH"
+-
+-#Only used to help bootstrap the build (not to run Logstash itself)
+-RUN echo 'eval "$(rbenv init -)"' >> .bashrc && \
+-    rbenv install jruby-9.1.12.0 && \
+-    rbenv global jruby-9.1.12.0 && \
+-    bash -i -c 'gem install bundler' && \
+-    rbenv local jruby-9.1.12.0 && \
+-    mkdir -p /opt/logstash/data
+-
+-
+-# Create a cache for the dependencies based on the current master, any dependencies not cached will be downloaded at runtime
+-RUN git clone https://github.com/elastic/logstash.git /tmp/logstash && \
+-    cd /tmp/logstash && \
+-    ./gradlew bootstrap compileJava compileTestJava && \
+-    cd qa/integration && \
+-    /home/logstash/.rbenv/shims/bundle install && \
+-    mv /tmp/logstash/vendor /tmp/vendor && \
+-    rm -rf /tmp/logstash
++RUN mkdir -p /opt/logstash/data
+ 
+ # used by the purge policy
+-LABEL retention="keep"
+\ No newline at end of file
++LABEL retention="keep"
+diff --git a/Gemfile.template b/Gemfile.template
+index e8ab0c64643..45b6a92d5c1 100644
+--- a/Gemfile.template
++++ b/Gemfile.template
+@@ -21,11 +21,12 @@ gem "rack-test", :require => "rack/test", :group => :development
+ gem "flores", "~> 0.0.6", :group => :development
+ gem "term-ansicolor", "~> 1.3.2", :group => :development
+ gem "json-schema", "~> 2.6", :group => :development
++gem "webmock", "~> 3.5.1", :group => :development
+ gem "belzebuth", :group => :development
+ gem "pleaserun", "~>0.0.28"
+ gem 'webrick', '~> 1.3.1'
+ gem "atomic", "<= 1.1.99"
+-gem "rake", "~> 12.2.1", :group => :build
++gem "rake", "~> 12.2.1"
+ gem "logstash-codec-cef"
+ gem "logstash-codec-collectd"
+ gem "logstash-codec-dots"
+@@ -115,7 +116,6 @@ gem "logstash-output-kafka"
+ gem "logstash-output-lumberjack"
+ gem "logstash-output-nagios"
+ gem "logstash-output-null"
+-gem "logstash-output-pagerduty"
+ gem "logstash-output-pipe"
+ gem "logstash-output-rabbitmq"
+ gem "logstash-output-redis"
+diff --git a/bin/logstash.lib.sh b/bin/logstash.lib.sh
+index 10746af0347..dccc06894e9 100755
+--- a/bin/logstash.lib.sh
++++ b/bin/logstash.lib.sh
+@@ -137,7 +137,7 @@ setup_vendored_jruby() {
+   fi
+ 
+   if [ -z "$LS_GEM_HOME" ] ; then
+-    export GEM_HOME="${LOGSTASH_HOME}/vendor/bundle/jruby/2.3.0"
++    export GEM_HOME="${LOGSTASH_HOME}/vendor/bundle/jruby/2.5.0"
+   else
+     export GEM_HOME=${LS_GEM_HOME}
+   fi
+diff --git a/build.gradle b/build.gradle
+index 340c755b54a..6a0ab60c559 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -57,6 +57,7 @@ allprojects {
+       exceptionFormat "full"
+       showCauses true
+       showStackTraces true
++      enableAssertions false
+ 
+       // set options for log level DEBUG and INFO
+       debug {
+@@ -171,7 +172,7 @@ verifyFile.onlyIf { customJRubyDir == "" }
+ 
+ task buildCustomJRuby(type: Exec) {
+   description "Build tar.gz and .jar artifacts from JRuby source directory"
+-  workingDir customJRubyDir
++  workingDir (customJRubyDir == "" ? "./" : customJRubyDir)
+   commandLine './mvnw', 'clean', 'install', '-Pdist', '-Pcomplete'
+   standardOutput = new ByteArrayOutputStream()
+   errorOutput = new ByteArrayOutputStream()
+@@ -208,6 +209,9 @@ task downloadAndInstallJRuby(dependsOn: [verifyFile, installCustomJRuby], type:
+     exclude "**/stdlib/rdoc/**"
+     includeEmptyDirs = false
+     into "${projectDir}/vendor/jruby"
++    doLast {
++      rubyGradleUtils.gem("rake", "12.3.1", "${projectDir}/vendor/bundle/jruby/2.5.0")
++    }
+ }
+ 
+ downloadAndInstallJRuby.onlyIf { customJRubyDir == "" }
+@@ -219,8 +223,9 @@ task installDefaultGems(dependsOn: downloadAndInstallJRuby) {
+   outputs.file("${projectDir}/Gemfile")
+   outputs.file("${projectDir}/Gemfile.lock")
+   outputs.dir("${projectDir}/logstash-core/lib/jars")
+-  outputs.dir("${projectDir}/vendor/bundle/jruby/2.3.0")
++  outputs.dir("${projectDir}/vendor/bundle/jruby/2.5.0")
+   doLast {
++    rubyGradleUtils.gem("rake", "12.3.1", "${projectDir}/vendor/bundle/jruby/2.5.0")
+     rubyGradleUtils.rake('plugin:install-default')
+   }
+ }
+@@ -236,8 +241,9 @@ task installTestGems(dependsOn: assemblyDeps) {
+   outputs.file("${projectDir}/Gemfile")
+   outputs.file("${projectDir}/Gemfile.lock")
+   outputs.dir("${projectDir}/logstash-core/lib/jars")
+-  outputs.dir("${projectDir}/vendor/bundle/jruby/2.3.0")
++  outputs.dir("${projectDir}/vendor/bundle/jruby/2.5.0")
+   doLast {
++    rubyGradleUtils.gem("rake", "12.3.1", "${projectDir}/vendor/bundle/jruby/2.5.0")
+     rubyGradleUtils.rake('test:install-core')
+   }
+ }
+@@ -254,6 +260,7 @@ task assembleTarDistribution(dependsOn: assemblyDeps) {
+   inputs.files fileTree("${projectDir}/x-pack")
+   outputs.files file("${buildDir}/logstash-${project.version}-SNAPSHOT.tar.gz")
+   doLast {
++    rubyGradleUtils.gem("rake", "12.3.1", "${projectDir}/vendor/bundle/jruby/2.5.0")
+     rubyGradleUtils.rake('artifact:tar')
+   }
+ }
+@@ -314,13 +321,13 @@ task unpackTarDistribution(dependsOn: assembleTarDistribution, type: Copy) {
+ }
+ 
+ def qaVendorPath = "${buildDir}/qa/integration/vendor"
+-def qaBundledGemPath = "${qaVendorPath}/jruby/2.3.0"
++def qaBundledGemPath = "${qaVendorPath}/jruby/2.5.0"
+ def qaBundleBin = "${qaBundledGemPath}/bin/bundle"
+ 
+ task installIntegrationTestBundler(dependsOn: unpackTarDistribution) {
+-  outputs.files fileTree("${qaBundledGemPath}/gems/bundler-1.16.0")
++  outputs.files fileTree("${qaBundledGemPath}/gems/bundler-1.17.1")
+   doLast {
+-    rubyGradleUtils.gem("bundler", "1.16.0", qaBundledGemPath)
++    rubyGradleUtils.gem("bundler", "1.17.1", qaBundledGemPath)
+   }
+ }
+ 
+diff --git a/buildSrc/build.gradle b/buildSrc/build.gradle
+index 09e6d42ded9..29e903be3ae 100644
+--- a/buildSrc/build.gradle
++++ b/buildSrc/build.gradle
+@@ -8,5 +8,5 @@ repositories {
+ }
+ 
+ dependencies {
+-  compile group: 'org.jruby', name: 'jruby-complete', version: '9.1.13.0'
++  compile group: 'org.jruby', name: 'jruby-complete', version: '9.2.5.0'
+ }
+diff --git a/buildSrc/src/main/groovy/org/logstash/gradle/RubyGradleUtils.groovy b/buildSrc/src/main/groovy/org/logstash/gradle/RubyGradleUtils.groovy
+index 3d1e1acdb59..53d26e45b4b 100644
+--- a/buildSrc/src/main/groovy/org/logstash/gradle/RubyGradleUtils.groovy
++++ b/buildSrc/src/main/groovy/org/logstash/gradle/RubyGradleUtils.groovy
+@@ -88,7 +88,7 @@ final class RubyGradleUtils {
+   Object executeJruby(Closure<?> block) {
+     def jruby = new ScriptingContainer()
+     def env = jruby.environment
+-    def gemDir = "${projectDir}/vendor/bundle/jruby/2.3.0".toString()
++    def gemDir = "${projectDir}/vendor/bundle/jruby/2.5.0".toString()
+     env.put "USE_RUBY", "1"
+     env.put "GEM_HOME", gemDir
+     env.put "GEM_SPEC_CACHE", "${buildDir}/cache".toString()
+diff --git a/config/jvm.options b/config/jvm.options
+index daae9d96dcb..401f7154bb6 100644
+--- a/config/jvm.options
++++ b/config/jvm.options
+@@ -17,7 +17,6 @@
+ ################################################################
+ 
+ ## GC configuration
+--XX:+UseParNewGC
+ -XX:+UseConcMarkSweepGC
+ -XX:CMSInitiatingOccupancyFraction=75
+ -XX:+UseCMSInitiatingOccupancyOnly
+diff --git a/gradle/wrapper/gradle-wrapper.jar b/gradle/wrapper/gradle-wrapper.jar
+index ca78035ef05..28861d273a5 100644
+Binary files a/gradle/wrapper/gradle-wrapper.jar and b/gradle/wrapper/gradle-wrapper.jar differ
+diff --git a/gradle/wrapper/gradle-wrapper.properties b/gradle/wrapper/gradle-wrapper.properties
+index 590f0e81da2..115e6ac0aab 100644
+--- a/gradle/wrapper/gradle-wrapper.properties
++++ b/gradle/wrapper/gradle-wrapper.properties
+@@ -1,5 +1,5 @@
+ distributionBase=GRADLE_USER_HOME
+ distributionPath=wrapper/dists
++distributionUrl=https\://services.gradle.org/distributions/gradle-4.10-bin.zip
+ zipStoreBase=GRADLE_USER_HOME
+ zipStorePath=wrapper/dists
+-distributionUrl=https\://services.gradle.org/distributions/gradle-4.3-all.zip
+diff --git a/gradlew b/gradlew
+index 27309d92314..cccdd3d517f 100755
+--- a/gradlew
++++ b/gradlew
+@@ -1,4 +1,4 @@
+-#!/usr/bin/env bash
++#!/usr/bin/env sh
+ 
+ ##############################################################################
+ ##
+@@ -33,11 +33,11 @@ DEFAULT_JVM_OPTS=""
+ # Use the maximum available, or set MAX_FD != -1 to use that value.
+ MAX_FD="maximum"
+ 
+-warn ( ) {
++warn () {
+     echo "$*"
+ }
+ 
+-die ( ) {
++die () {
+     echo
+     echo "$*"
+     echo
+@@ -154,11 +154,19 @@ if $cygwin ; then
+     esac
+ fi
+ 
+-# Split up the JVM_OPTS And GRADLE_OPTS values into an array, following the shell quoting and substitution rules
+-function splitJvmOpts() {
+-    JVM_OPTS=("$@")
++# Escape application args
++save () {
++    for i do printf %s\\n "$i" | sed "s/'/'\\\\''/g;1s/^/'/;\$s/\$/' \\\\/" ; done
++    echo " "
+ }
+-eval splitJvmOpts $DEFAULT_JVM_OPTS $JAVA_OPTS $GRADLE_OPTS
+-JVM_OPTS[${#JVM_OPTS[*]}]="-Dorg.gradle.appname=$APP_BASE_NAME"
++APP_ARGS=$(save "$@")
+ 
+-exec "$JAVACMD" "${JVM_OPTS[@]}" -classpath "$CLASSPATH" org.gradle.wrapper.GradleWrapperMain "$@"
++# Collect all arguments for the java command, following the shell quoting and substitution rules
++eval set -- $DEFAULT_JVM_OPTS $JAVA_OPTS $GRADLE_OPTS "\"-Dorg.gradle.appname=$APP_BASE_NAME\"" -classpath "\"$CLASSPATH\"" org.gradle.wrapper.GradleWrapperMain "$APP_ARGS"
++
++# by default we should be in the correct project dir, but when run from Finder on Mac, the cwd is wrong
++if [ "$(uname)" = "Darwin" ] && [ "$HOME" = "$PWD" ]; then
++  cd "$(dirname "$0")"
++fi
++
++exec "$JAVACMD" "$@"
+diff --git a/gradlew.bat b/gradlew.bat
+index f6d5974e72f..e95643d6a2c 100644
+--- a/gradlew.bat
++++ b/gradlew.bat
+@@ -49,7 +49,6 @@ goto fail
+ @rem Get command-line arguments, handling Windows variants
+ 
+ if not "%OS%" == "Windows_NT" goto win9xME_args
+-if "%@eval[2+2]" == "4" goto 4NT_args
+ 
+ :win9xME_args
+ @rem Slurp the command line arguments.
+@@ -60,11 +59,6 @@ set _SKIP=2
+ if "x%~1" == "x" goto execute
+ 
+ set CMD_LINE_ARGS=%*
+-goto execute
+-
+-:4NT_args
+-@rem Get arguments from the 4NT Shell from JP Software
+-set CMD_LINE_ARGS=%$
+ 
+ :execute
+ @rem Setup the command line
+diff --git a/lib/bootstrap/bundler.rb b/lib/bootstrap/bundler.rb
+index e8ca3aa3fe5..305fbdc0f13 100644
+--- a/lib/bootstrap/bundler.rb
++++ b/lib/bootstrap/bundler.rb
+@@ -10,15 +10,20 @@ def patch!
+       # Patch to prevent Bundler to save a .bundle/config file in the root
+       # of the application
+       ::Bundler::Settings.module_exec do
+-        def set_key(key, value, hash, file)
+-          key = key_for(key)
+-
+-          unless hash[key] == value
+-            hash[key] = value
+-            hash.delete(key) if value.nil?
+-          end
++        def set_local(key, value)
++          set_key(key, value, @local_config, nil)
++        end
++      end
+ 
+-          value
++      # In recent versions (currently 1.17.1) Bundler calls reset_paths! early during
++      # Bundler::CLI.start (https://github.com/bundler/bundler/blob/v1.17.1/lib/bundler/cli.rb#L39)
++      # This breaks our setting up of gemfile and bundle paths, the without group setting etc
++      # We need to tone down this very aggressive resetter (https://github.com/bundler/bundler/blob/v1.17.1/lib/bundler.rb#L487-L500)
++      # So we reimplement it here to only nullify the definition object, so that it can be computed
++      # again if necessary with all the configuration in place.
++      ::Bundler.module_exec do
++        def self.reset_paths!
++          @definition = nil
+         end
+       end
+ 
+@@ -47,11 +52,11 @@ def setup!(options = {})
+       require "bundler"
+       LogStash::Bundler.patch!
+ 
+-      ::Bundler.settings[:path] = Environment::BUNDLE_DIR
+-      ::Bundler.settings[:without] = options[:without].join(":")
++      ::Bundler.settings.set_local(:path, Environment::BUNDLE_DIR)
++      ::Bundler.settings.set_local(:without, options[:without])
+       # in the context of Bundler.setup it looks like this is useless here because Gemfile path can only be specified using
+       # the ENV, see https://github.com/bundler/bundler/blob/v1.8.3/lib/bundler/shared_helpers.rb#L103
+-      ::Bundler.settings[:gemfile] = Environment::GEMFILE_PATH
++      ::Bundler.settings.set_local(:gemfile, Environment::GEMFILE_PATH)
+ 
+       ::Bundler.reset!
+       ::Bundler.setup
+@@ -93,7 +98,7 @@ def invoke!(options = {})
+         )
+       end
+       # create Gemfile.jruby-1.9.lock from template iff a template exists it itself does not exist
+-      lock_template = ::File.join(ENV["LOGSTASH_HOME"], "Gemfile.jruby-2.3.lock.release")
++      lock_template = ::File.join(ENV["LOGSTASH_HOME"], "Gemfile.jruby-2.5.lock.release")
+       if ::File.exists?(lock_template) && !::File.exists?(Environment::LOCKFILE)
+         FileUtils.copy(lock_template, Environment::LOCKFILE)
+       end
+@@ -103,10 +108,10 @@ def invoke!(options = {})
+       # force Rubygems sources to our Gemfile sources
+       ::Gem.sources = ::Gem::SourceList.from(options[:rubygems_source]) if options[:rubygems_source]
+ 
+-      ::Bundler.settings[:path] = LogStash::Environment::BUNDLE_DIR
+-      ::Bundler.settings[:gemfile] = LogStash::Environment::GEMFILE_PATH
+-      ::Bundler.settings[:without] = options[:without].join(":")
+-      ::Bundler.settings[:force] = options[:force]
++      ::Bundler.settings.set_local(:path, LogStash::Environment::BUNDLE_DIR)
++      ::Bundler.settings.set_local(:gemfile, LogStash::Environment::GEMFILE_PATH)
++      ::Bundler.settings.set_local(:without, options[:without])
++      ::Bundler.settings.set_local(:force, options[:force])
+ 
+       if !debug?
+         # Will deal with transient network errors
+diff --git a/lib/bootstrap/rspec.rb b/lib/bootstrap/rspec.rb
+index 31ea434d271..4bda1ac3886 100755
+--- a/lib/bootstrap/rspec.rb
++++ b/lib/bootstrap/rspec.rb
+@@ -10,6 +10,8 @@
+ require "rspec"
+ require 'ci/reporter/rake/rspec_loader'
+ 
++RSpec.world.reset # if multiple rspec runs occur in a single process, the RSpec "world" state needs to be reset.
++
+ status = RSpec::Core::Runner.run(ARGV.empty? ? ($JUNIT_ARGV || ["spec"]) : ARGV).to_i
+ if ENV["IS_JUNIT_RUN"]
+   return status
+diff --git a/lib/pluginmanager/bundler/logstash_injector.rb b/lib/pluginmanager/bundler/logstash_injector.rb
+index aa9070695b7..33286a74a8c 100644
+--- a/lib/pluginmanager/bundler/logstash_injector.rb
++++ b/lib/pluginmanager/bundler/logstash_injector.rb
+@@ -56,41 +56,36 @@ def self.dependency(plugin)
+     # And managing the gemfile is down by using our own Gemfile parser, this allow us to
+     # make it work with gems that are already defined in the gemfile.
+     def inject(gemfile_path, lockfile_path, dependencies)
+-      if Bundler.settings[:frozen]
+-        # ensure the lock and Gemfile are synced
+-        Bundler.definition.ensure_equivalent_gemfile_and_lockfile(true)
+-        # temporarily remove frozen while we inject
+-        frozen = Bundler.settings.delete(:frozen)
+-      end
+-
+-      builder = Dsl.new
+-      gemfile = LogStash::Gemfile.new(File.new(gemfile_path, "r+")).load
++      Bundler.definition.ensure_equivalent_gemfile_and_lockfile(true) if Bundler.settings[:frozen]
+ 
+-      begin
+-        @new_deps.each do |dependency|
+-          gemfile.update(dependency.name, dependency.requirement)
+-        end
++      Bundler.settings.temporary(:frozen => false) do
++        builder = Dsl.new
++        gemfile = LogStash::Gemfile.new(File.new(gemfile_path, "r+")).load
+ 
+-        # If the dependency is defined in the gemfile, lets try to update the version with the one we have
+-        # with the pack.
+-        dependencies.each do |dependency|
+-          if gemfile.defined_in_gemfile?(dependency.name)
++        begin
++          @deps.each do |dependency|
+             gemfile.update(dependency.name, dependency.requirement)
+           end
+-        end
+ 
+-        builder.eval_gemfile("bundler file", gemfile.generate())
+-        definition = builder.to_definition(lockfile_path, {})
+-        definition.lock(lockfile_path)
+-        gemfile.save
+-      rescue => e
+-        # the error should be handled elsewhere but we need to get the original file if we dont
+-        # do this logstash will be in an inconsistent state
+-        gemfile.restore!
+-        raise e
++          # If the dependency is defined in the gemfile, lets try to update the version with the one we have
++          # with the pack.
++          dependencies.each do |dependency|
++            if gemfile.defined_in_gemfile?(dependency.name)
++              gemfile.update(dependency.name, dependency.requirement)
++            end
++          end
++
++          builder.eval_gemfile("bundler file", gemfile.generate())
++          definition = builder.to_definition(lockfile_path, {})
++          definition.lock(lockfile_path)
++          gemfile.save
++        rescue => e
++          # the error should be handled elsewhere but we need to get the original file if we dont
++          # do this logstash will be in an inconsistent state
++          gemfile.restore!
++          raise e
++        end
+       end
+-    ensure
+-      Bundler.settings[:frozen] = "1" if frozen
+     end
+   end
+ end
+diff --git a/lib/pluginmanager/bundler/logstash_uninstall.rb b/lib/pluginmanager/bundler/logstash_uninstall.rb
+index bdaef0dbac6..d77bd95126e 100644
+--- a/lib/pluginmanager/bundler/logstash_uninstall.rb
++++ b/lib/pluginmanager/bundler/logstash_uninstall.rb
+@@ -71,13 +71,11 @@ def display_cant_remove_message(gem_name, dependencies_from)
+     end
+ 
+     def unfreeze_gemfile
+-      if Bundler.settings[:frozen]
+-        Bundler.definition.ensure_equivalent_gemfile_and_lockfile(true)
+-        frozen = Bundler.settings.delete(:frozen)
++      Bundler.definition.ensure_equivalent_gemfile_and_lockfile(true) if Bundler.settings[:frozen]
++
++      Bundler.settings.temporary(:frozen => false) do
++        yield
+       end
+-      yield
+-    ensure
+-      Bundler.settings[:frozen] = "1" if frozen
+     end
+ 
+     def self.uninstall!(gem_name, options = { :gemfile => LogStash::Environment::GEMFILE, :lockfile => LogStash::Environment::LOCKFILE })
+diff --git a/lib/pluginmanager/gem_installer.rb b/lib/pluginmanager/gem_installer.rb
+index 18b13b602df..5a770cd9db3 100644
+--- a/lib/pluginmanager/gem_installer.rb
++++ b/lib/pluginmanager/gem_installer.rb
+@@ -10,7 +10,7 @@ module LogStash module PluginManager
+   # - Generate the specifications
+   # - Copy the data in the right folders
+   class GemInstaller
+-    GEM_HOME = Pathname.new(::File.join(LogStash::Environment::BUNDLE_DIR, "jruby", "2.3.0"))
++    GEM_HOME = Pathname.new(::File.join(LogStash::Environment::BUNDLE_DIR, "jruby", "2.5.0"))
+     SPECIFICATIONS_DIR = "specifications"
+     GEMS_DIR = "gems"
+     CACHE_DIR = "cache"
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index 2d4203545c9..6ef5032d70a 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -186,7 +186,7 @@ def converge_state_and_update
+ 
+   # Calculate the Logstash uptime in milliseconds
+   #
+-  # @return [Fixnum] Uptime in milliseconds
++  # @return [Integer] Uptime in milliseconds
+   def uptime
+     ((Time.now.to_f - STARTED_AT.to_f) * 1000.0).to_i
+   end
+diff --git a/logstash-core/lib/logstash/compiler/lscl.rb b/logstash-core/lib/logstash/compiler/lscl.rb
+index 4bcad68e0f1..277c3ef27c6 100644
+--- a/logstash-core/lib/logstash/compiler/lscl.rb
++++ b/logstash-core/lib/logstash/compiler/lscl.rb
+@@ -317,10 +317,9 @@ def expr
+ 
+     def precedence(op)
+       #  Believe this is right for logstash?
+-      case op
+-      when AND_METHOD
++      if op == AND_METHOD
+         2
+-      when OR_METHOD
++      elsif op == OR_METHOD
+         1
+       else
+         raise ArgumentError, "Unexpected operator #{op}"
+diff --git a/logstash-core/lib/logstash/instrument/metric_store.rb b/logstash-core/lib/logstash/instrument/metric_store.rb
+index 09e803a46fa..864f2c01ab7 100644
+--- a/logstash-core/lib/logstash/instrument/metric_store.rb
++++ b/logstash-core/lib/logstash/instrument/metric_store.rb
+@@ -302,7 +302,7 @@ def fetch_or_store_namespaces(namespaces_path)
+     #
+     # @param [Concurrent::Map] Map to search for the key
+     # @param [Array] List of path to create
+-    # @param [Fixnum] Which part from the list to create
++    # @param [Integer] Which part from the list to create
+     #
+     def fetch_or_store_namespace_recursively(map, namespaces_path, idx = 0)
+       current = namespaces_path[idx]
+diff --git a/logstash-core/lib/logstash/patches/resolv.rb b/logstash-core/lib/logstash/patches/resolv.rb
+index 0d74900801b..bdc1d0813c0 100644
+--- a/logstash-core/lib/logstash/patches/resolv.rb
++++ b/logstash-core/lib/logstash/patches/resolv.rb
+@@ -10,7 +10,6 @@
+ 
+ # make sure we abort if a known correct JRuby version is installed 
+ # to avoid having an unnecessary legacy patch being applied in the future.
+-raise("Unnecessary patch on resolv.rb for JRuby version 9.1.16+") if Gem::Version.new(JRUBY_VERSION) >= Gem::Version.new("9.1.16.0")
+ 
+ # The code below is copied from JRuby 9.1.16.0 resolv.rb:
+ # https://github.com/jruby/jruby/blob/9.1.16.0/lib/ruby/stdlib/resolv.rb#L775-L784
+@@ -18,23 +17,3 @@
+ # JRuby is Copyright (c) 2007-2017 The JRuby project, and is released
+ # under a tri EPL/GPL/LGPL license.
+ # Full license available at https://github.com/jruby/jruby/blob/9.1.16.0/COPYING
+-
+-class Resolv
+-  class DNS
+-    class Requester
+-      class UnconnectedUDP
+-        def sender(msg, data, host, port=Port)
+-          sock = @socks_hash[host.index(':') ? "::" : "0.0.0.0"]
+-          return nil if !sock
+-          service = [IPAddr.new(host), port]
+-          id = DNS.allocate_request_id(service[0], service[1])
+-          request = msg.encode
+-          request[0,2] = [id].pack('n')
+-          return @senders[[service, id]] =
+-              Sender.new(request, data, sock, host, port)
+-        end
+-      end
+-    end
+-  end
+-end
+-
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index f70c8063cd7..212e2a98f7f 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -542,7 +542,7 @@ def flush
+ 
+   # Calculate the uptime in milliseconds
+   #
+-  # @return [Fixnum] Uptime in milliseconds, 0 if the pipeline is not started
++  # @return [Integer] Uptime in milliseconds, 0 if the pipeline is not started
+   def uptime
+     return 0 if started_at.nil?
+     ((Time.now.to_f - started_at.to_f) * 1000.0).to_i
+diff --git a/logstash-core/lib/logstash/settings.rb b/logstash-core/lib/logstash/settings.rb
+index cf32b171248..94994dcaa8b 100644
+--- a/logstash-core/lib/logstash/settings.rb
++++ b/logstash-core/lib/logstash/settings.rb
+@@ -368,7 +368,7 @@ def coerce(value)
+         case value
+         when ::Range
+           value
+-        when ::Fixnum
++        when ::Integer
+           value..value
+         when ::String
+           first, last = value.split(PORT_SEPARATOR)
+@@ -481,11 +481,11 @@ def value
+ 
+     class Bytes < Coercible
+       def initialize(name, default=nil, strict=true)
+-        super(name, ::Fixnum, default, strict=true) { |value| valid?(value) }
++        super(name, ::Integer, default, strict=true) { |value| valid?(value) }
+       end
+ 
+       def valid?(value)
+-        value.is_a?(Fixnum) && value >= 0
++        value.is_a?(::Integer) && value >= 0
+       end
+ 
+       def coerce(value)
+@@ -508,11 +508,11 @@ def validate(value)
+ 
+     class TimeValue < Coercible
+       def initialize(name, default, strict=true, &validator_proc)
+-        super(name, ::Fixnum, default, strict, &validator_proc)
++        super(name, ::Integer, default, strict, &validator_proc)
+       end
+ 
+       def coerce(value)
+-        return value if value.is_a?(::Fixnum)
++        return value if value.is_a?(::Integer)
+         Util::TimeValue.from_value(value).to_nanos
+       end
+     end
+diff --git a/logstash-core/lib/logstash/util.rb b/logstash-core/lib/logstash/util.rb
+index 9b6dbe0f426..b04192659bf 100644
+--- a/logstash-core/lib/logstash/util.rb
++++ b/logstash-core/lib/logstash/util.rb
+@@ -9,6 +9,8 @@ module LogStash::Util
+ 
+   PR_SET_NAME = 15
+   def self.set_thread_name(name)
++    previous_name = Java::java.lang.Thread.currentThread.getName() if block_given?
++
+     if RUBY_ENGINE == "jruby"
+       # Keep java and ruby thread names in sync.
+       Java::java.lang.Thread.currentThread.setName(name)
+@@ -21,6 +23,14 @@ def self.set_thread_name(name)
+       # since MRI 1.9, JRuby, and Rubinius use system threads for this.
+       LibC.prctl(PR_SET_NAME, name[0..16], 0, 0, 0)
+     end
++
++    if block_given?
++      begin
++        yield
++      ensure
++        set_thread_name(previous_name)
++      end
++    end
+   end # def set_thread_name
+ 
+   def self.set_thread_plugin(plugin)
+@@ -191,7 +201,7 @@ def self.deep_clone(o)
+       o.inject({}) {|h, (k,v)| h[k] = deep_clone(v); h }
+     when Array
+       o.map {|v| deep_clone(v) }
+-    when Fixnum, Symbol, IO, TrueClass, FalseClass, NilClass
++    when Integer, Symbol, IO, TrueClass, FalseClass, NilClass
+       o
+     when LogStash::Codecs::Base
+       o.clone
+diff --git a/logstash-core/lib/logstash/util/duration_formatter.rb b/logstash-core/lib/logstash/util/duration_formatter.rb
+index 42cf6ff66f1..b80c3353173 100644
+--- a/logstash-core/lib/logstash/util/duration_formatter.rb
++++ b/logstash-core/lib/logstash/util/duration_formatter.rb
+@@ -7,7 +7,7 @@ module LogStash::Util::DurationFormatter
+   # a format that a human can understand. This is currently used by
+   # the API.
+   #
+-  # @param [Fixnum] Duration in milliseconds
++  # @param [Integer] Duration in milliseconds
+   # @return [String] Duration in human format
+   def self.human_format(duration)
+     ChronicDuration.output(duration / 1000, CHRONIC_OPTIONS)
+diff --git a/logstash-core/spec/logstash/event_spec.rb b/logstash-core/spec/logstash/event_spec.rb
+index 2600e9c3ef7..ae615ad8898 100644
+--- a/logstash-core/spec/logstash/event_spec.rb
++++ b/logstash-core/spec/logstash/event_spec.rb
+@@ -141,10 +141,10 @@
+       expect(e.get("foo")).to eq(BigDecimal.new(1))
+     end
+ 
+-    it "should set RubyBignum" do
++    it "should set RubyInteger" do
+       e = LogStash::Event.new()
+       e.set("[foo]", -9223372036854776000)
+-      expect(e.get("foo")).to be_kind_of(Bignum)
++      expect(e.get("foo")).to be_kind_of(Integer)
+       expect(e.get("foo")).to eq(-9223372036854776000)
+     end
+ 
+diff --git a/logstash-core/spec/logstash/legacy_ruby_event_spec.rb b/logstash-core/spec/logstash/legacy_ruby_event_spec.rb
+index acc91259ea0..5c1a75e1ea8 100644
+--- a/logstash-core/spec/logstash/legacy_ruby_event_spec.rb
++++ b/logstash-core/spec/logstash/legacy_ruby_event_spec.rb
+@@ -82,7 +82,7 @@
+         expect(event.get("reference_test")).not_to eq(data)
+       end
+ 
+-      it "should not return a Fixnum reference" do
++      it "should not return an Integer reference" do
+         data = 1
+         event = LogStash::Event.new({ "reference" => data })
+         LogStash::Util::Decorators.add_fields({"reference_test" => "%{reference}"}, event, "dummy-plugin")
+diff --git a/logstash-core/spec/logstash/queue_factory_spec.rb b/logstash-core/spec/logstash/queue_factory_spec.rb
+index 05ed26b4904..5741c234d1b 100644
+--- a/logstash-core/spec/logstash/queue_factory_spec.rb
++++ b/logstash-core/spec/logstash/queue_factory_spec.rb
+@@ -47,7 +47,7 @@
+       let(:queue_path) { ::File.join(settings.get("path.queue"), pipeline_id) }
+ 
+       after :each do
+-        FileUtils.rmdir(queue_path)
++        FileUtils.rm_rf(queue_path)
+       end
+ 
+       it "creates a queue directory based on the pipeline id" do
+diff --git a/logstash-core/spec/logstash/runner_spec.rb b/logstash-core/spec/logstash/runner_spec.rb
+index 97e5eb2f9d5..7ed51614426 100644
+--- a/logstash-core/spec/logstash/runner_spec.rb
++++ b/logstash-core/spec/logstash/runner_spec.rb
+@@ -22,6 +22,8 @@
+   before :each do
+     clear_data_dir
+ 
++    WebMock.disable_net_connect!(allow_localhost: true)
++
+     allow(LogStash::Runner).to receive(:logger).and_return(logger)
+     allow(logger).to receive(:debug?).and_return(true)
+     allow(logger).to receive(:subscribe).with(any_args)
+diff --git a/logstash-core/spec/logstash/settings/array_coercible_spec.rb b/logstash-core/spec/logstash/settings/array_coercible_spec.rb
+index 8b52bb85009..780f18ccae2 100644
+--- a/logstash-core/spec/logstash/settings/array_coercible_spec.rb
++++ b/logstash-core/spec/logstash/settings/array_coercible_spec.rb
+@@ -27,7 +27,7 @@
+ 
+   describe "initialization" do
+     subject { described_class }
+-    let(:element_class) { Fixnum }
++    let(:element_class) { Integer }
+     context "when given values of incorrect element class" do
+       let(:value) { "test" }
+ 
+diff --git a/logstash-core/spec/logstash/settings/bytes_spec.rb b/logstash-core/spec/logstash/settings/bytes_spec.rb
+index b4fe0aab765..084a252aa98 100644
+--- a/logstash-core/spec/logstash/settings/bytes_spec.rb
++++ b/logstash-core/spec/logstash/settings/bytes_spec.rb
+@@ -35,8 +35,8 @@
+ 
+         before { subject.set(text) }
+ 
+-        it "should coerce it to a Fixnum" do
+-          expect(subject.value).to be_a(Fixnum)
++        it "should coerce it to an Integer" do
++          expect(subject.value).to be_a(::Integer)
+         end
+       end
+ 
+diff --git a/logstash-core/spec/logstash/settings/port_range_spec.rb b/logstash-core/spec/logstash/settings/port_range_spec.rb
+index 6085b026da1..8a5fb6e53a9 100644
+--- a/logstash-core/spec/logstash/settings/port_range_spec.rb
++++ b/logstash-core/spec/logstash/settings/port_range_spec.rb
+@@ -5,7 +5,7 @@
+ 
+ describe LogStash::Setting::PortRange do
+ 
+-  context "When the value is a Fixnum" do
++  context "When the value is an Integer" do
+     subject { LogStash::Setting::PortRange.new("mynewtest", 9000) }
+ 
+     it "coerces the value in a range" do
+diff --git a/logstash-core/spec/logstash/util/time_value_spec.rb b/logstash-core/spec/logstash/util/time_value_spec.rb
+index bbd8d3efdd7..c263a322af3 100644
+--- a/logstash-core/spec/logstash/util/time_value_spec.rb
++++ b/logstash-core/spec/logstash/util/time_value_spec.rb
+@@ -51,7 +51,7 @@ module LogStash module Util
+         a = TimeValue.from_value(32)
+         fail "should not parse"
+       rescue ArgumentError => e
+-        expect(e.message).to eq("value is not a string: 32 [Fixnum]")
++        expect(e.message).to eq("value is not a string: 32 [Integer]")
+       end
+     end
+ end
+diff --git a/logstash-core/src/main/java/org/logstash/ConvertedList.java b/logstash-core/src/main/java/org/logstash/ConvertedList.java
+index 3d3032d45e2..c67b87b2d1c 100644
+--- a/logstash-core/src/main/java/org/logstash/ConvertedList.java
++++ b/logstash-core/src/main/java/org/logstash/ConvertedList.java
+@@ -37,7 +37,7 @@ public static ConvertedList newFromRubyArray(final IRubyObject[] a) {
+         return result;
+     }
+ 
+-    public static ConvertedList newFromRubyArray(RubyArray a) {
++    public static ConvertedList newFromRubyArray(@SuppressWarnings("rawtypes") RubyArray a) {
+         final ConvertedList result = new ConvertedList(a.size());
+ 
+         for (IRubyObject o : a.toJavaArray()) {
+diff --git a/logstash-core/src/main/java/org/logstash/RubyUtil.java b/logstash-core/src/main/java/org/logstash/RubyUtil.java
+index 6d45f3ef0c1..24fc9262384 100644
+--- a/logstash-core/src/main/java/org/logstash/RubyUtil.java
++++ b/logstash-core/src/main/java/org/logstash/RubyUtil.java
+@@ -1,6 +1,5 @@
+ package org.logstash;
+ 
+-import org.jruby.NativeException;
+ import org.jruby.Ruby;
+ import org.jruby.RubyClass;
+ import org.jruby.RubyModule;
+@@ -562,9 +561,10 @@ private RubyUtil() {
+      * @param e the Java exception to wrap
+      * @return RaiseException the wrapped IOError
+      */
++    @SuppressWarnings("deprecation")
+     public static RaiseException newRubyIOError(Ruby runtime, Throwable e) {
+         // will preserve Java stacktrace & bubble up as a Ruby IOError
+-        return new RaiseException(e, new NativeException(runtime, runtime.getIOError(), e));
++        return new RaiseException(e, new org.jruby.NativeException(runtime, runtime.getIOError(), e));
+     }
+ 
+     /**
+diff --git a/logstash-core/src/main/java/org/logstash/Rubyfier.java b/logstash-core/src/main/java/org/logstash/Rubyfier.java
+index 369d7c1c9b3..d788c187552 100644
+--- a/logstash-core/src/main/java/org/logstash/Rubyfier.java
++++ b/logstash-core/src/main/java/org/logstash/Rubyfier.java
+@@ -55,6 +55,7 @@ public static IRubyObject deep(final Ruby runtime, final Object input) {
+         return fallbackConvert(runtime, input, cls);
+     }
+ 
++    @SuppressWarnings("rawtypes")
+     private static RubyArray deepList(final Ruby runtime, final Collection<?> list) {
+         final int length = list.size();
+         final RubyArray array = runtime.newArray(length);
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/AckedReadBatch.java b/logstash-core/src/main/java/org/logstash/ackedqueue/AckedReadBatch.java
+index 7195c168e3b..599c4022409 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/AckedReadBatch.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/AckedReadBatch.java
+@@ -52,7 +52,7 @@ public void merge(final IRubyObject event) {
+         }
+     }
+ 
+-    @SuppressWarnings("unchecked")
++    @SuppressWarnings({"unchecked", "rawtypes"})
+     @Override
+     public RubyArray to_a() {
+         ThreadContext context = RUBY.getCurrentContext();
+diff --git a/logstash-core/src/main/java/org/logstash/common/AbstractDeadLetterQueueWriterExt.java b/logstash-core/src/main/java/org/logstash/common/AbstractDeadLetterQueueWriterExt.java
+index 44d0840edf1..48d45142ac6 100644
+--- a/logstash-core/src/main/java/org/logstash/common/AbstractDeadLetterQueueWriterExt.java
++++ b/logstash-core/src/main/java/org/logstash/common/AbstractDeadLetterQueueWriterExt.java
+@@ -141,7 +141,7 @@ public AbstractDeadLetterQueueWriterExt.PluginDeadLetterQueueWriterExt initializ
+             final IRubyObject pluginType) {
+             writerWrapper = innerWriter;
+             if (writerWrapper.getJavaClass().equals(DeadLetterQueueWriter.class)) {
+-                this.innerWriter = (DeadLetterQueueWriter) writerWrapper.toJava(
++                this.innerWriter = writerWrapper.toJava(
+                     DeadLetterQueueWriter.class
+                 );
+             }
+diff --git a/logstash-core/src/main/java/org/logstash/common/BufferedTokenizerExt.java b/logstash-core/src/main/java/org/logstash/common/BufferedTokenizerExt.java
+index 7380c651f76..f3602f7ed5f 100644
+--- a/logstash-core/src/main/java/org/logstash/common/BufferedTokenizerExt.java
++++ b/logstash-core/src/main/java/org/logstash/common/BufferedTokenizerExt.java
+@@ -18,7 +18,7 @@ public class BufferedTokenizerExt extends RubyObject {
+ 
+     private static final IRubyObject MINUS_ONE = RubyUtil.RUBY.newFixnum(-1);
+ 
+-    private RubyArray input = RubyUtil.RUBY.newArray();
++    private @SuppressWarnings("rawtypes") RubyArray input = RubyUtil.RUBY.newArray();
+     private IRubyObject delimiter = RubyUtil.RUBY.newString("\n");
+     private int sizeLimit;
+     private boolean hasSizeLimit;
+@@ -53,6 +53,7 @@ public IRubyObject init(final ThreadContext context, IRubyObject[] args) {
+      * @return Extracted tokens
+      */
+     @JRubyMethod
++    @SuppressWarnings("rawtypes")
+     public RubyArray extract(final ThreadContext context, IRubyObject data) {
+         final RubyArray entities = ((RubyString) data).split(context, delimiter, MINUS_ONE);
+         if (hasSizeLimit) {
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java b/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
+index 6cdef9fd117..9cc2546ab28 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
+@@ -280,14 +280,18 @@ private Dataset compile() {
+          * @return Filter {@link Dataset}
+          */
+         private Dataset filterDataset(final Vertex vertex, final Collection<Dataset> datasets) {
+-            return plugins.computeIfAbsent(
+-                vertex.getId(), v -> {
+-                    final ComputeStepSyntaxElement<Dataset> prepared =
+-                        DatasetCompiler.filterDataset(flatten(datasets, vertex), filters.get(v));
+-                    LOGGER.debug("Compiled filter\n {} \n into \n {}", vertex, prepared);
+-                    return prepared.instantiate();
+-                }
+-            );
++            final String vertexId = vertex.getId();
++
++            if (!plugins.containsKey(vertexId)) {
++                final ComputeStepSyntaxElement<Dataset> prepared =
++                        DatasetCompiler.filterDataset(flatten(datasets, vertex),
++                                                      filters.get(vertexId));
++                LOGGER.debug("Compiled filter\n {} \n into \n {}", vertex, prepared);
++
++                plugins.put(vertexId, prepared.instantiate());
++            }
++
++            return plugins.get(vertexId);
+         }
+ 
+         /**
+@@ -298,16 +302,18 @@ private Dataset filterDataset(final Vertex vertex, final Collection<Dataset> dat
+          * @return Output {@link Dataset}
+          */
+         private Dataset outputDataset(final Vertex vertex, final Collection<Dataset> datasets) {
+-            return plugins.computeIfAbsent(
+-                vertex.getId(), v -> {
+-                    final ComputeStepSyntaxElement<Dataset> prepared =
+-                        DatasetCompiler.outputDataset(
+-                            flatten(datasets, vertex), outputs.get(v), outputs.size() == 1
+-                        );
+-                    LOGGER.debug("Compiled output\n {} \n into \n {}", vertex, prepared);
+-                    return prepared.instantiate();
+-                }
+-            );
++            final String vertexId = vertex.getId();
++
++            if (!plugins.containsKey(vertexId)) {
++                final ComputeStepSyntaxElement<Dataset> prepared =
++                        DatasetCompiler.outputDataset(flatten(datasets, vertex),
++                                                      outputs.get(vertexId),
++                                                     outputs.size() == 1);
++                LOGGER.debug("Compiled output\n {} \n into \n {}", vertex, prepared);
++                plugins.put(vertexId, prepared.instantiate());
++            }
++
++            return plugins.get(vertexId);
+         }
+ 
+         /**
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/ConfigCompiler.java b/logstash-core/src/main/java/org/logstash/config/ir/ConfigCompiler.java
+index 22186545dc5..668563fc6bb 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/ConfigCompiler.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/ConfigCompiler.java
+@@ -40,6 +40,6 @@ public static PipelineIR configToPipelineIR(final String config, final boolean s
+                     RubyUtil.RUBY.newBoolean(supportEscapes)
+                 }
+             );
+-        return (PipelineIR) code.toJava(PipelineIR.class);
++        return code.toJava(PipelineIR.class);
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractFilterDelegatorExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractFilterDelegatorExt.java
+index 3a8465d5ed9..46bc7b1c3ca 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractFilterDelegatorExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractFilterDelegatorExt.java
+@@ -107,7 +107,7 @@ public IRubyObject getId() {
+     }
+ 
+     @JRubyMethod(name = "multi_filter")
+-    @SuppressWarnings("unchecked")
++    @SuppressWarnings({"unchecked", "rawtypes"})
+     public RubyArray multiFilter(final IRubyObject input) {
+         RubyArray batch = (RubyArray) input;
+         eventMetricIn.increment((long) batch.size());
+@@ -124,9 +124,11 @@ public RubyArray multiFilter(final IRubyObject input) {
+         return result;
+     }
+ 
++    @SuppressWarnings({"rawtypes"})
+     protected abstract RubyArray doMultiFilter(final RubyArray batch);
+ 
+     @JRubyMethod(name = "flush")
++    @SuppressWarnings("rawtypes")
+     public RubyArray flush(final IRubyObject input) {
+         RubyHash options = (RubyHash) input;
+         final ThreadContext context = WorkerLoop.THREAD_CONTEXT.get();
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractOutputDelegatorExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractOutputDelegatorExt.java
+index b6fd76ac41f..2df5c678c13 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractOutputDelegatorExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/AbstractOutputDelegatorExt.java
+@@ -93,6 +93,7 @@ public IRubyObject metricEvents() {
+     @SuppressWarnings("unchecked")
+     @JRubyMethod(name = OUTPUT_METHOD_NAME)
+     public IRubyObject multiReceive(final IRubyObject events) {
++        @SuppressWarnings("rawtypes")
+         final RubyArray batch = (RubyArray) events;
+         final int count = batch.size();
+         eventMetricIn.increment((long) count);
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/CommonActions.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/CommonActions.java
+index b9fc4d3561b..3db6ef5dc37 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/CommonActions.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/CommonActions.java
+@@ -96,7 +96,7 @@ static void addField(Event evt, Map<String, Object> fieldsToAdd) {
+                         ((List) val).add(valueToSet);
+                         evt.setField(keyToSet, val);
+                     } else {
+-                        RubyArray list = RubyArray.newArray(RubyUtil.RUBY, 2);
++                        @SuppressWarnings("rawtypes") RubyArray list = RubyArray.newArray(RubyUtil.RUBY, 2);
+                         list.add(val);
+                         list.add(valueToSet);
+                         evt.setField(keyToSet, list);
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/Dataset.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/Dataset.java
+index dcc10bf526a..a3478ae56a6 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/Dataset.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/Dataset.java
+@@ -24,7 +24,8 @@ public interface Dataset {
+     Dataset IDENTITY = new Dataset() {
+         @SuppressWarnings("unchecked")
+         @Override
+-        public Collection<JrubyEventExtLibrary.RubyEvent> compute(final RubyArray batch, final boolean flush, final boolean shutdown) {
++        public Collection<JrubyEventExtLibrary.RubyEvent> compute(final @SuppressWarnings("rawtypes") RubyArray batch,
++                                                                  final boolean flush, final boolean shutdown) {
+             return batch;
+         }
+ 
+@@ -43,7 +44,7 @@ public void clear() {
+      * the pipeline it belongs to is shut down
+      * @return Computed {@link RubyArray} of {@link org.logstash.ext.JrubyEventExtLibrary.RubyEvent}
+      */
+-    Collection<JrubyEventExtLibrary.RubyEvent> compute(RubyArray batch,
++    Collection<JrubyEventExtLibrary.RubyEvent> compute(@SuppressWarnings({"rawtypes"}) RubyArray batch,
+         boolean flush, boolean shutdown);
+ 
+     /**
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
+index ac844e3478f..28717e9832c 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/DatasetCompiler.java
+@@ -95,6 +95,7 @@ public static ComputeStepSyntaxElement<Dataset> filterDataset(final Collection<D
+         } else {
+             final Collection<ValueSyntaxElement> parentFields =
+                 parents.stream().map(fields::add).collect(Collectors.toList());
++            @SuppressWarnings("rawtypes")
+             final RubyArray inputBuffer = RubyUtil.RUBY.newArray();
+             clear.add(clearSyntax(parentFields));
+             final ValueSyntaxElement inputBufferField = fields.add(inputBuffer);
+@@ -167,6 +168,7 @@ public static ComputeStepSyntaxElement<Dataset> outputDataset(final Collection<D
+         } else {
+             final Collection<ValueSyntaxElement> parentFields =
+                 parents.stream().map(fields::add).collect(Collectors.toList());
++            @SuppressWarnings("rawtypes")
+             final RubyArray buffer = RubyUtil.RUBY.newArray();
+             final Closure inlineClear;
+             if (terminal) {
+@@ -371,8 +373,8 @@ private Complement(
+         }
+ 
+         @Override
+-        public Collection<JrubyEventExtLibrary.RubyEvent> compute(final RubyArray batch,
+-            final boolean flush, final boolean shutdown) {
++        public Collection<JrubyEventExtLibrary.RubyEvent> compute(@SuppressWarnings("rawtypes") final RubyArray batch,
++                                                                  final boolean flush, final boolean shutdown) {
+             if (done) {
+                 return data;
+             }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java
+index 93b2e82268b..6a39c9e062c 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/FilterDelegatorExt.java
+@@ -94,6 +94,7 @@ protected IRubyObject getConfigName(final ThreadContext context) {
+     }
+ 
+     @Override
++    @SuppressWarnings({"rawtypes"})
+     protected RubyArray doMultiFilter(final RubyArray batch) {
+         return (RubyArray) filterMethod.call(
+                 WorkerLoop.THREAD_CONTEXT.get(), filter, filterClass, FILTER_METHOD_NAME, batch);
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/JavaFilterDelegatorExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/JavaFilterDelegatorExt.java
+index b035ceaede9..0e4638ec4cf 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/JavaFilterDelegatorExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/JavaFilterDelegatorExt.java
+@@ -54,7 +54,7 @@ public static JavaFilterDelegatorExt create(final String configName, final Strin
+         return instance;
+     }
+ 
+-    @SuppressWarnings("unchecked")
++    @SuppressWarnings({"unchecked","rawtypes"})
+     @Override
+     protected RubyArray doMultiFilter(final RubyArray batch) {
+         List<Event> inputEvents = (List<Event>) batch.stream()
+@@ -76,7 +76,7 @@ protected void doRegister(ThreadContext context) {
+     protected IRubyObject doFlush(final ThreadContext context, final RubyHash options) {
+         if (filter.requiresFlush()) {
+             Collection<Event> outputEvents = filter.flush(filterMatchListener);
+-            RubyArray newBatch = RubyArray.newArray(RubyUtil.RUBY, outputEvents.size());
++            @SuppressWarnings("rawtypes") RubyArray newBatch = RubyArray.newArray(RubyUtil.RUBY, outputEvents.size());
+             for (Event outputEvent : outputEvents) {
+                 newBatch.add(JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, (org.logstash.Event)outputEvent));
+             }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputStrategyExt.java b/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputStrategyExt.java
+index 291f3f75c03..4f90b86a823 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputStrategyExt.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/compiler/OutputStrategyExt.java
+@@ -148,7 +148,7 @@ public static final class LegacyOutputStrategyExt extends OutputStrategyExt.Abst
+ 
+         private IRubyObject workerCount;
+ 
+-        private RubyArray workers;
++        private @SuppressWarnings({"rawtypes"}) RubyArray workers;
+ 
+         public LegacyOutputStrategyExt(final Ruby runtime, final RubyClass metaClass) {
+             super(runtime, metaClass);
+diff --git a/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java b/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
+index 726790770af..e96f0396d26 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
++++ b/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
+@@ -45,10 +45,10 @@ public class AbstractPipelineExt extends RubyBasicObject {
+ 
+     private static final Logger LOGGER = LogManager.getLogger(AbstractPipelineExt.class);
+ 
+-    private static final RubyArray CAPACITY_NAMESPACE =
++    private static final @SuppressWarnings("rawtypes") RubyArray CAPACITY_NAMESPACE =
+         RubyArray.newArray(RubyUtil.RUBY, RubyUtil.RUBY.newSymbol("capacity"));
+ 
+-    private static final RubyArray DATA_NAMESPACE =
++    private static final @SuppressWarnings("rawtypes") RubyArray DATA_NAMESPACE =
+         RubyArray.newArray(RubyUtil.RUBY, RubyUtil.RUBY.newSymbol("data"));
+ 
+     private static final RubySymbol PAGE_CAPACITY_IN_BYTES =
+@@ -76,7 +76,7 @@ public class AbstractPipelineExt extends RubyBasicObject {
+ 
+     private static final RubySymbol DLQ_KEY = RubyUtil.RUBY.newSymbol("dlq");
+ 
+-    private static final RubyArray EVENTS_METRIC_NAMESPACE = RubyArray.newArray(
++    private static final @SuppressWarnings("rawtypes") RubyArray EVENTS_METRIC_NAMESPACE = RubyArray.newArray(
+         RubyUtil.RUBY, new IRubyObject[]{MetricKeys.STATS_KEY, MetricKeys.EVENTS_KEY}
+     );
+ 
+@@ -182,7 +182,7 @@ public final IRubyObject openQueue(final ThreadContext context) {
+                     context.runtime,
+                     new IRubyObject[]{
+                         MetricKeys.STATS_KEY, MetricKeys.PIPELINES_KEY,
+-                        pipelineId.convertToString().intern19(), MetricKeys.EVENTS_KEY
++                        pipelineId.convertToString().intern(), MetricKeys.EVENTS_KEY
+                     }
+                 )
+             )
+diff --git a/logstash-core/src/main/java/org/logstash/execution/JavaBasePipelineExt.java b/logstash-core/src/main/java/org/logstash/execution/JavaBasePipelineExt.java
+index 55d153f4805..f8ac46672ba 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/JavaBasePipelineExt.java
++++ b/logstash-core/src/main/java/org/logstash/execution/JavaBasePipelineExt.java
+@@ -31,11 +31,11 @@ public final class JavaBasePipelineExt extends AbstractPipelineExt {
+ 
+     private CompiledPipeline lirExecution;
+ 
+-    private RubyArray inputs;
++    private @SuppressWarnings("rawtypes") RubyArray inputs;
+ 
+-    private RubyArray filters;
++    private @SuppressWarnings("rawtypes") RubyArray filters;
+ 
+-    private RubyArray outputs;
++    private @SuppressWarnings("rawtypes") RubyArray outputs;
+ 
+     public JavaBasePipelineExt(final Ruby runtime, final RubyClass metaClass) {
+         super(runtime, metaClass);
+@@ -76,16 +76,19 @@ public IRubyObject lirExecution(final ThreadContext context) {
+     }
+ 
+     @JRubyMethod
++    @SuppressWarnings("rawtypes")
+     public RubyArray inputs() {
+         return inputs;
+     }
+ 
+     @JRubyMethod
++    @SuppressWarnings("rawtypes")
+     public RubyArray filters() {
+         return filters;
+     }
+ 
+     @JRubyMethod
++    @SuppressWarnings("rawtypes")
+     public RubyArray outputs() {
+         return outputs;
+     }
+@@ -101,7 +104,7 @@ public RubyBoolean reloadablePlugins(final ThreadContext context) {
+         return nonReloadablePlugins(context).isEmpty() ? context.tru : context.fals;
+     }
+ 
+-    @SuppressWarnings("unchecked")
++    @SuppressWarnings({"unchecked", "rawtypes"})
+     @JRubyMethod(name = "non_reloadable_plugins")
+     public RubyArray nonReloadablePlugins(final ThreadContext context) {
+         final RubyArray result = RubyArray.newArray(context.runtime);
+diff --git a/logstash-core/src/main/java/org/logstash/execution/MemoryReadBatch.java b/logstash-core/src/main/java/org/logstash/execution/MemoryReadBatch.java
+index 26ef1c6bec3..c6854044004 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/MemoryReadBatch.java
++++ b/logstash-core/src/main/java/org/logstash/execution/MemoryReadBatch.java
+@@ -30,6 +30,7 @@ public static MemoryReadBatch create() {
+     }
+ 
+     @Override
++    @SuppressWarnings({"rawtypes"})
+     public RubyArray to_a() {
+         ThreadContext context = RUBY.getCurrentContext();
+         final RubyArray result = context.runtime.newArray(events.size());
+diff --git a/logstash-core/src/main/java/org/logstash/execution/PipelineReporterExt.java b/logstash-core/src/main/java/org/logstash/execution/PipelineReporterExt.java
+index 5ffe633e76a..677b19bdac8 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/PipelineReporterExt.java
++++ b/logstash-core/src/main/java/org/logstash/execution/PipelineReporterExt.java
+@@ -104,6 +104,7 @@ public RubyHash toHash(final ThreadContext context) {
+         final RubyHash batchMap = (RubyHash) pipeline
+             .callMethod(context, "filter_queue_client")
+             .callMethod(context, "inflight_batches");
++        @SuppressWarnings("rawtypes")
+         final RubyArray workerStates = workerStates(context, batchMap);
+         result.op_aset(context, WORKER_STATES_KEY, workerStates);
+         result.op_aset(
+@@ -131,7 +132,7 @@ public RubyHash toHash(final ThreadContext context) {
+         return result;
+     }
+ 
+-    @SuppressWarnings("unchecked")
++    @SuppressWarnings({"unchecked","rawtypes"})
+     private RubyArray workerStates(final ThreadContext context, final RubyHash batchMap) {
+         final RubyArray result = context.runtime.newArray();
+         ((Iterable<IRubyObject>) pipeline.callMethod(context, "worker_threads"))
+@@ -155,7 +156,7 @@ private RubyArray workerStates(final ThreadContext context, final RubyHash batch
+         return result;
+     }
+ 
+-    @SuppressWarnings("unchecked")
++    @SuppressWarnings({"unchecked","rawtypes"})
+     private RubyArray outputInfo(final ThreadContext context) {
+         final RubyArray result = context.runtime.newArray();
+         final IRubyObject outputs = pipeline.callMethod(context, "outputs");
+diff --git a/logstash-core/src/main/java/org/logstash/execution/QueueBatch.java b/logstash-core/src/main/java/org/logstash/execution/QueueBatch.java
+index b83a5212e82..c2c68f57d86 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/QueueBatch.java
++++ b/logstash-core/src/main/java/org/logstash/execution/QueueBatch.java
+@@ -7,7 +7,7 @@
+ 
+ public interface QueueBatch {
+     int filteredSize();
+-    RubyArray to_a();
++    @SuppressWarnings({"rawtypes"}) RubyArray to_a();
+     void merge(IRubyObject event);
+     void close() throws IOException;
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JrubyAckedWriteClientExt.java b/logstash-core/src/main/java/org/logstash/ext/JrubyAckedWriteClientExt.java
+index ec595afd61f..0012d189c99 100644
+--- a/logstash-core/src/main/java/org/logstash/ext/JrubyAckedWriteClientExt.java
++++ b/logstash-core/src/main/java/org/logstash/ext/JrubyAckedWriteClientExt.java
+@@ -28,10 +28,10 @@ public static JrubyAckedWriteClientExt create(final ThreadContext context, final
+         final IRubyObject queue, final IRubyObject closed) {
+         return new JrubyAckedWriteClientExt(
+             context.runtime, RubyUtil.ACKED_WRITE_CLIENT_CLASS,
+-            (JRubyAckedQueueExt) queue.toJava(
++            queue.toJava(
+                 JRubyAckedQueueExt.class
+             ),
+-            (AtomicBoolean) closed.toJava(AtomicBoolean.class)
++            closed.toJava(AtomicBoolean.class)
+         );
+     }
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java b/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java
+index 863d8b0123c..a7a44c77b54 100644
+--- a/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java
++++ b/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java
+@@ -174,7 +174,7 @@ public IRubyObject ruby_sprintf(ThreadContext context, IRubyObject format) {
+             try {
+                 return RubyString.newString(context.runtime, event.sprintf(format.toString()));
+             } catch (IOException e) {
+-                throw new RaiseException(getRuntime(), RubyUtil.LOGSTASH_ERROR, "timestamp field is missing", true);
++                throw RaiseException.from(getRuntime(), RubyUtil.LOGSTASH_ERROR, "timestamp field is missing");
+             }
+         }
+ 
+@@ -212,7 +212,7 @@ public IRubyObject ruby_to_json(ThreadContext context, IRubyObject[] args)
+             try {
+                 return RubyString.newString(context.runtime, event.toJson());
+             } catch (Exception e) {
+-                throw new RaiseException(context.runtime, RubyUtil.GENERATOR_ERROR, e.getMessage(), true);
++                throw RaiseException.from(context.runtime, RubyUtil.GENERATOR_ERROR, e.getMessage());
+             }
+         }
+ 
+@@ -226,9 +226,10 @@ public static IRubyObject ruby_from_json(ThreadContext context, IRubyObject recv
+             try {
+                 events = Event.fromJson(value.asJavaString());
+             } catch (Exception e) {
+-                throw new RaiseException(context.runtime, RubyUtil.PARSER_ERROR, e.getMessage(), true);
++                throw RaiseException.from(context.runtime, RubyUtil.PARSER_ERROR, e.getMessage());
+             }
+ 
++            @SuppressWarnings("rawtypes")
+             RubyArray result = RubyArray.newArray(context.runtime, events.length);
+ 
+             if (events.length == 1) {
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JrubyTimestampExtLibrary.java b/logstash-core/src/main/java/org/logstash/ext/JrubyTimestampExtLibrary.java
+index 5211c5b80c1..0d357a0bb36 100644
+--- a/logstash-core/src/main/java/org/logstash/ext/JrubyTimestampExtLibrary.java
++++ b/logstash-core/src/main/java/org/logstash/ext/JrubyTimestampExtLibrary.java
+@@ -63,10 +63,9 @@ public JrubyTimestampExtLibrary.RubyTimestamp initialize(final ThreadContext con
+                 try {
+                     this.timestamp = new Timestamp(time.toString());
+                 } catch (IllegalArgumentException e) {
+-                    throw new RaiseException(
++                    throw RaiseException.from(
+                         getRuntime(), RubyUtil.TIMESTAMP_PARSER_ERROR,
+-                        "invalid timestamp string format " + time,
+-                        true
++                        "invalid timestamp string format " + time
+                     );
+ 
+                 }
+@@ -151,10 +150,9 @@ public static IRubyObject ruby_coerce(ThreadContext context, IRubyObject recv, I
+                     return context.runtime.getNil();
+                 }
+              } catch (IllegalArgumentException e) {
+-                throw new RaiseException(
++                throw RaiseException.from(
+                         context.runtime, RubyUtil.TIMESTAMP_PARSER_ERROR,
+-                        "invalid timestamp format " + e.getMessage(),
+-                        true
++                        "invalid timestamp format " + e.getMessage()
+                 );
+ 
+             }
+@@ -167,10 +165,9 @@ public static IRubyObject ruby_parse_iso8601(ThreadContext context, IRubyObject
+                 try {
+                     return fromRString(context.runtime, (RubyString) time);
+                 } catch (IllegalArgumentException e) {
+-                    throw new RaiseException(
++                    throw RaiseException.from(
+                             context.runtime, RubyUtil.TIMESTAMP_PARSER_ERROR,
+-                            "invalid timestamp format " + e.getMessage(),
+-                            true
++                            "invalid timestamp format " + e.getMessage()
+                     );
+ 
+                 }
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/AbstractNamespacedMetricExt.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/AbstractNamespacedMetricExt.java
+index 8e356f57efb..414b05b99e2 100644
+--- a/logstash-core/src/main/java/org/logstash/instrument/metrics/AbstractNamespacedMetricExt.java
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/AbstractNamespacedMetricExt.java
+@@ -51,6 +51,7 @@ public IRubyObject reportTime(final ThreadContext context, final IRubyObject key
+     }
+ 
+     @JRubyMethod(name = "namespace_name")
++    @SuppressWarnings("rawtypes")
+     public RubyArray namespaceName(final ThreadContext context) {
+         return getNamespaceName(context);
+     }
+@@ -58,6 +59,7 @@ public RubyArray namespaceName(final ThreadContext context) {
+     protected abstract IRubyObject getGauge(ThreadContext context, IRubyObject key,
+         IRubyObject value);
+ 
++    @SuppressWarnings("rawtypes")
+     protected abstract RubyArray getNamespaceName(ThreadContext context);
+ 
+     protected abstract IRubyObject getCounter(ThreadContext context, IRubyObject key);
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/NamespacedMetricExt.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/NamespacedMetricExt.java
+index 583e2ef5713..6e2a00b3605 100644
+--- a/logstash-core/src/main/java/org/logstash/instrument/metrics/NamespacedMetricExt.java
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/NamespacedMetricExt.java
+@@ -16,12 +16,12 @@ public final class NamespacedMetricExt extends AbstractNamespacedMetricExt {
+ 
+     private static final long serialVersionUID = 1L;
+ 
+-    private RubyArray namespaceName;
++    private @SuppressWarnings("rawtypes") RubyArray namespaceName;
+ 
+     private MetricExt metric;
+ 
+     public static NamespacedMetricExt create(final MetricExt metric,
+-        final RubyArray namespaceName) {
++        final @SuppressWarnings("rawtypes") RubyArray namespaceName) {
+         final NamespacedMetricExt res =
+             new NamespacedMetricExt(RubyUtil.RUBY, RubyUtil.NAMESPACED_METRIC_CLASS);
+         res.metric = metric;
+@@ -93,6 +93,7 @@ protected IRubyObject doReportTime(final ThreadContext context, final IRubyObjec
+     }
+ 
+     @Override
++    @SuppressWarnings("rawtypes")
+     protected RubyArray getNamespaceName(final ThreadContext context) {
+         return namespaceName;
+     }
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/NullNamespacedMetricExt.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/NullNamespacedMetricExt.java
+index 2fd014a08a2..0a02c26c33f 100644
+--- a/logstash-core/src/main/java/org/logstash/instrument/metrics/NullNamespacedMetricExt.java
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/NullNamespacedMetricExt.java
+@@ -19,12 +19,12 @@ public final class NullNamespacedMetricExt extends AbstractNamespacedMetricExt {
+ 
+     private static final RubySymbol NULL = RubyUtil.RUBY.newSymbol("null");
+ 
+-    private RubyArray namespaceName;
++    private @SuppressWarnings("rawtypes") RubyArray namespaceName;
+ 
+     private NullMetricExt metric;
+ 
+     public static AbstractNamespacedMetricExt create(final NullMetricExt metric,
+-        final RubyArray namespaceName) {
++        final @SuppressWarnings("rawtypes") RubyArray namespaceName) {
+         final NullNamespacedMetricExt res =
+             new NullNamespacedMetricExt(RubyUtil.RUBY, RubyUtil.NULL_NAMESPACED_METRIC_CLASS);
+         res.metric = metric;
+@@ -88,6 +88,7 @@ protected IRubyObject doReportTime(final ThreadContext context, final IRubyObjec
+     }
+ 
+     @Override
++    @SuppressWarnings("rawtypes")
+     protected RubyArray getNamespaceName(final ThreadContext context) {
+         return namespaceName;
+     }
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/SnapshotExt.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/SnapshotExt.java
+index f7b524e9335..187ae233903 100644
+--- a/logstash-core/src/main/java/org/logstash/instrument/metrics/SnapshotExt.java
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/SnapshotExt.java
+@@ -28,7 +28,7 @@ public SnapshotExt initialize(final ThreadContext context, final IRubyObject[] a
+         if (args.length == 2) {
+             createdAt = (RubyTime) args[1];
+         } else {
+-            createdAt = (RubyTime) RubyTime.newInstance(context, context.runtime.getTime());
++            createdAt = RubyTime.newInstance(context, context.runtime.getTime());
+         }
+         return this;
+     }
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/counter/LongCounter.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/counter/LongCounter.java
+index 1b08395b90f..76814b7686c 100644
+--- a/logstash-core/src/main/java/org/logstash/instrument/metrics/counter/LongCounter.java
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/counter/LongCounter.java
+@@ -37,7 +37,7 @@ public static LongCounter fromRubyBase(final AbstractNamespacedMetricExt metric,
+         counter.callMethod(context, "increment", context.runtime.newFixnum(0));
+         final LongCounter javaCounter;
+         if (LongCounter.class.isAssignableFrom(counter.getJavaClass())) {
+-            javaCounter = (LongCounter) counter.toJava(LongCounter.class);
++            javaCounter = counter.toJava(LongCounter.class);
+         } else {
+             javaCounter = DUMMY_COUNTER;
+         }
+diff --git a/logstash-core/src/main/java/org/logstash/log/LoggableExt.java b/logstash-core/src/main/java/org/logstash/log/LoggableExt.java
+index e541578cb45..f16386238a7 100644
+--- a/logstash-core/src/main/java/org/logstash/log/LoggableExt.java
++++ b/logstash-core/src/main/java/org/logstash/log/LoggableExt.java
+@@ -54,7 +54,7 @@ private static RubyString log4jName(final ThreadContext context, final RubyModul
+         return ((RubyString) ((RubyString) name).gsub(
+             context, RubyUtil.RUBY.newString("::"), RubyUtil.RUBY.newString("."),
+             Block.NULL_BLOCK
+-        )).downcase19(context);
++        )).downcase(context);
+     }
+ 
+     /**
+diff --git a/logstash-core/src/main/java/org/logstash/log/StructuredMessage.java b/logstash-core/src/main/java/org/logstash/log/StructuredMessage.java
+index 8c8d46455fb..ee6fa1bf37f 100644
+--- a/logstash-core/src/main/java/org/logstash/log/StructuredMessage.java
++++ b/logstash-core/src/main/java/org/logstash/log/StructuredMessage.java
+@@ -14,7 +14,7 @@ public class StructuredMessage implements Message {
+     private final String message;
+     private final Map<Object, Object> params;
+ 
+-    @SuppressWarnings("unchecked")
++    @SuppressWarnings({"unchecked","rawtypes"})
+     public StructuredMessage(String message) {
+         this(message, (Map) null);
+     }
+diff --git a/logstash-core/src/main/java/org/logstash/plugins/PluginFactoryExt.java b/logstash-core/src/main/java/org/logstash/plugins/PluginFactoryExt.java
+index d8879cba619..1176058fab2 100644
+--- a/logstash-core/src/main/java/org/logstash/plugins/PluginFactoryExt.java
++++ b/logstash-core/src/main/java/org/logstash/plugins/PluginFactoryExt.java
+@@ -79,7 +79,7 @@ public static IRubyObject filterDelegator(final ThreadContext context,
+             final RubyString id = (RubyString) arguments.op_aref(context, ID_KEY);
+             filterInstance.callMethod(
+                     context, "metric=",
+-                    ((AbstractMetricExt) args[3]).namespace(context, id.intern19())
++                    ((AbstractMetricExt) args[3]).namespace(context, id.intern())
+             );
+             filterInstance.callMethod(context, "execution_context=", args[4]);
+             return new FilterDelegatorExt(context.runtime, RubyUtil.FILTER_DELEGATOR_CLASS)
+@@ -94,7 +94,7 @@ public Plugins(final Ruby runtime, final RubyClass metaClass) {
+         public PluginFactoryExt.Plugins initialize(final ThreadContext context,
+                                                    final IRubyObject[] args) {
+             return init(
+-                    (PipelineIR) args[0].toJava(PipelineIR.class),
++                    args[0].toJava(PipelineIR.class),
+                     (PluginFactoryExt.Metrics) args[1], (PluginFactoryExt.ExecutionContext) args[2],
+                     (RubyClass) args[3]
+             );
+@@ -394,7 +394,7 @@ public Context toContext(PluginLookup.PluginType pluginType) {
+ 
+                     if (innerWriter != null) {
+                         if (innerWriter.getJavaClass().equals(DeadLetterQueueWriter.class)) {
+-                            dlq = (DeadLetterQueueWriter) innerWriter.toJava(DeadLetterQueueWriter.class);
++                            dlq = innerWriter.toJava(DeadLetterQueueWriter.class);
+                         }
+                     }
+                 }
+@@ -422,7 +422,7 @@ public Metrics(final Ruby runtime, final RubyClass metaClass) {
+         @JRubyMethod
+         public PluginFactoryExt.Metrics initialize(final ThreadContext context,
+             final IRubyObject pipelineId, final IRubyObject metrics) {
+-            this.pipelineId = pipelineId.convertToString().intern19();
++            this.pipelineId = pipelineId.convertToString().intern();
+             if (metrics.isNil()) {
+                 this.metric = new NullMetricExt(context.runtime, RubyUtil.NULL_METRIC_CLASS);
+             } else {
+diff --git a/logstash-core/src/main/java/org/logstash/plugins/discovery/ConfigurationBuilder.java b/logstash-core/src/main/java/org/logstash/plugins/discovery/ConfigurationBuilder.java
+index 675085e68a8..a23aa7eb43d 100644
+--- a/logstash-core/src/main/java/org/logstash/plugins/discovery/ConfigurationBuilder.java
++++ b/logstash-core/src/main/java/org/logstash/plugins/discovery/ConfigurationBuilder.java
+@@ -29,7 +29,7 @@ public ConfigurationBuilder() {
+         urls = Sets.newHashSet();
+     }
+ 
+-    @SuppressWarnings("unchecked")
++    @SuppressWarnings({"unchecked","rawtypes"})
+     public static ConfigurationBuilder build(final Object... params) {
+         ConfigurationBuilder builder = new ConfigurationBuilder();
+ 
+@@ -72,7 +72,7 @@ public static ConfigurationBuilder build(final Object... params) {
+             } else if (param instanceof Class) {
+                 if (Scanner.class.isAssignableFrom((Class) param)) {
+                     try {
+-                        builder.addScanners((Scanner) ((Class) param).newInstance());
++                        builder.addScanners((Scanner) ((Class) param).getConstructor().newInstance());
+                     } catch (Exception e) { /*fallback*/ }
+                 }
+                 builder.addUrls(ClasspathHelper.forClass((Class) param, classLoaders));
+diff --git a/logstash-core/src/main/java/org/logstash/secret/store/SecretStoreException.java b/logstash-core/src/main/java/org/logstash/secret/store/SecretStoreException.java
+index 50ed501b6fe..b7270e2ddd5 100644
+--- a/logstash-core/src/main/java/org/logstash/secret/store/SecretStoreException.java
++++ b/logstash-core/src/main/java/org/logstash/secret/store/SecretStoreException.java
+@@ -81,6 +81,13 @@ public ImplementationNotFoundException(String message, Throwable throwable) {
+         }
+     }
+ 
++    static public class ImplementationInvalidException extends SecretStoreException {
++        private static final long serialVersionUID = 1L;
++        public ImplementationInvalidException(String message, Throwable throwable) {
++            super(message, throwable);
++        }
++    }
++
+     static public class AccessException extends SecretStoreException {
+         private static final long serialVersionUID = 1L;
+         public AccessException(String message, Throwable throwable) {
+diff --git a/logstash-core/src/main/java/org/logstash/secret/store/SecretStoreFactory.java b/logstash-core/src/main/java/org/logstash/secret/store/SecretStoreFactory.java
+index 556dba8839f..097ad6decd8 100644
+--- a/logstash-core/src/main/java/org/logstash/secret/store/SecretStoreFactory.java
++++ b/logstash-core/src/main/java/org/logstash/secret/store/SecretStoreFactory.java
+@@ -4,6 +4,7 @@
+ import org.apache.logging.log4j.Logger;
+ import org.logstash.secret.SecretIdentifier;
+ 
++import java.lang.reflect.InvocationTargetException;
+ import java.util.Map;
+ 
+ /**
+@@ -105,14 +106,14 @@ private SecretStore doIt(MODE mode, SecureConfig secureConfig) {
+             addSecretStoreAccess(secureConfig);
+ 
+             if (MODE.LOAD.equals(mode)) {
+-                return implementation.newInstance().load(secureConfig);
++                return implementation.getConstructor().newInstance().load(secureConfig);
+             } else if (MODE.CREATE.equals(mode)) {
+-                return implementation.newInstance().create(secureConfig);
++                return implementation.getConstructor().newInstance().create(secureConfig);
+             } else if (MODE.DELETE.equals(mode)) {
+-                implementation.newInstance().delete(secureConfig);
++                implementation.getConstructor().newInstance().delete(secureConfig);
+                 return null;
+             } else if (MODE.EXISTS.equals(mode)) {
+-                return implementation.newInstance();
++                return implementation.getConstructor().newInstance();
+             } else {
+                 throw new IllegalStateException("missing mode. This is bug in Logstash.");
+             }
+@@ -120,6 +121,10 @@ private SecretStore doIt(MODE mode, SecureConfig secureConfig) {
+             throw new SecretStoreException.ImplementationNotFoundException(
+                     String.format("Could not %s class %s, please validate the `keystore.classname` is configured correctly and that the class can be loaded by Logstash ", mode
+                                     .name().toLowerCase(), className), e);
++        } catch (NoSuchMethodException | InvocationTargetException e) {
++            throw new SecretStoreException.ImplementationInvalidException(
++                    String.format("Could not %s class %s, please validate the `keystore.classname` is configured correctly and that the class can be loaded by Logstash ", mode
++                            .name().toLowerCase(), className), e);
+         }
+     }
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/secret/store/backend/JavaKeyStore.java b/logstash-core/src/main/java/org/logstash/secret/store/backend/JavaKeyStore.java
+index e25e058259a..90c64c165a6 100644
+--- a/logstash-core/src/main/java/org/logstash/secret/store/backend/JavaKeyStore.java
++++ b/logstash-core/src/main/java/org/logstash/secret/store/backend/JavaKeyStore.java
+@@ -138,6 +138,9 @@ public boolean exists(SecureConfig config) {
+         return new File(new String(path)).exists();
+     }
+ 
++    // Object#finalize() is deprecated, but `Cleaner` alternative did not ship until Java 9;
++    // since this project still supports Java 8, suppress the warning.
++    @SuppressWarnings("deprecation")
+     @Override
+     protected void finalize() throws Throwable {
+         SecretStoreUtil.clearChars(keyStorePass);
+diff --git a/logstash-core/src/test/java/org/logstash/RSpecTests.java b/logstash-core/src/test/java/org/logstash/RSpecTests.java
+index 34ef7481e74..835483651e6 100644
+--- a/logstash-core/src/test/java/org/logstash/RSpecTests.java
++++ b/logstash-core/src/test/java/org/logstash/RSpecTests.java
+@@ -4,16 +4,37 @@
+ import java.nio.file.Path;
+ import java.nio.file.Paths;
+ import java.util.Arrays;
++import java.util.Collection;
++
+ import org.assertj.core.util.Files;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.junit.Assert;
+ import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
++import org.junit.runners.Parameterized.Parameter;
++import org.junit.runners.Parameterized.Parameters;
+ 
+ /**
+  * Runs the Logstash RSpec suit.
+  */
++@RunWith(Parameterized.class)
+ public final class RSpecTests {
+ 
++    @Parameters(name="{0}")
++    public static Collection<Object[]> data() {
++        return Arrays.asList(new Object[][] {
++                { "compliance", "spec/compliance/**/*_spec.rb"},
++                { "core tests", "spec/unit/**/*_spec.rb,logstash-core/spec/**/*_spec.rb" }
++        });
++    }
++
++    @Parameter(0)
++    public String description;
++
++    @Parameter(1)
++    public String specGlob;
++
+     @Test
+     public void rspecTests() throws Exception {
+         final String root = Files.currentFolder().getParent();
+@@ -23,7 +44,7 @@ public void rspecTests() throws Exception {
+             "$JUNIT_ARGV",
+             Rubyfier.deep(
+                 RubyUtil.RUBY, Arrays.asList(
+-                    "-fd", "--pattern", "spec/unit/**/*_spec.rb,logstash-core/spec/**/*_spec.rb"
++                    "-fd", "--pattern", specGlob
+                 ))
+         );
+         final Path rspec = Paths.get(root, "lib/bootstrap/rspec.rb");
+@@ -32,7 +53,7 @@ public void rspecTests() throws Exception {
+             rspec.toFile().getAbsolutePath()
+         );
+         if (!result.toJava(Long.class).equals(0L)) {
+-            Assert.fail("RSpec test suit saw at least one failure.");
++            Assert.fail(String.format("RSpec test suite `%s` saw at least one failure.", description));
+         }
+     }
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/RubyfierTest.java b/logstash-core/src/test/java/org/logstash/RubyfierTest.java
+index 63da58b3729..589b17dd0bb 100644
+--- a/logstash-core/src/test/java/org/logstash/RubyfierTest.java
++++ b/logstash-core/src/test/java/org/logstash/RubyfierTest.java
+@@ -52,6 +52,7 @@ public void testDeepListWithString() throws Exception {
+         List<String> data = new ArrayList<>();
+         data.add("foo");
+ 
++        @SuppressWarnings("rawtypes")
+         RubyArray rubyArray = (RubyArray)Rubyfier.deep(RubyUtil.RUBY, data);
+ 
+         // toJavaArray does not newFromRubyArray inner elements to Java types \o/
+@@ -88,6 +89,7 @@ public void testDeepListWithInteger() throws Exception {
+         List<Integer> data = new ArrayList<>();
+         data.add(1);
+ 
++        @SuppressWarnings("rawtypes")
+         RubyArray rubyArray = (RubyArray)Rubyfier.deep(RubyUtil.RUBY, data);
+ 
+         // toJavaArray does not newFromRubyArray inner elements to Java types \o/
+@@ -124,6 +126,7 @@ public void testDeepListWithFloat() throws Exception {
+         List<Float> data = new ArrayList<>();
+         data.add(1.0F);
+ 
++        @SuppressWarnings("rawtypes")
+         RubyArray rubyArray = (RubyArray)Rubyfier.deep(RubyUtil.RUBY, data);
+ 
+         // toJavaArray does not newFromRubyArray inner elements to Java types \o/
+@@ -160,6 +163,7 @@ public void testDeepListWithDouble() throws Exception {
+         List<Double> data = new ArrayList<>();
+         data.add(1.0D);
+ 
++        @SuppressWarnings("rawtypes")
+         RubyArray rubyArray = (RubyArray)Rubyfier.deep(RubyUtil.RUBY, data);
+ 
+         // toJavaArray does not newFromRubyArray inner elements to Java types \o/
+@@ -197,6 +201,7 @@ public void testDeepListWithBigDecimal() throws Exception {
+         List<BigDecimal> data = new ArrayList<>();
+         data.add(new BigDecimal(1));
+ 
++        @SuppressWarnings("rawtypes")
+         RubyArray rubyArray = (RubyArray)Rubyfier.deep(RubyUtil.RUBY, data);
+ 
+         // toJavaArray does not newFromRubyArray inner elements to Java types \o/
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/RubyEnvTestCase.java b/logstash-core/src/test/java/org/logstash/config/ir/RubyEnvTestCase.java
+index 58606916d69..4470c8cd807 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/RubyEnvTestCase.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/RubyEnvTestCase.java
+@@ -26,7 +26,7 @@ private static void ensureLoadpath() {
+                 System.getProperty("logstash.core.root.dir", "")
+             ).toAbsolutePath();
+             final String gems = root.getParent().resolve("vendor").resolve("bundle")
+-                .resolve("jruby").resolve("2.3.0").toFile().getAbsolutePath();
++                .resolve("jruby").resolve("2.5.0").toFile().getAbsolutePath();
+             environment.put("GEM_HOME", gems);
+             environment.put("GEM_PATH", gems);
+             loader.addPaths(root.resolve("lib").toFile().getAbsolutePath());
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java b/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java
+index 4ede982de0c..23124545669 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/compiler/DatasetCompilerTest.java
+@@ -41,6 +41,7 @@ public void compilesSplitDataset() {
+         final JrubyEventExtLibrary.RubyEvent falseEvent =
+             JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event());
+         final Dataset right = left.right();
++        @SuppressWarnings("rawtypes")
+         final RubyArray batch = RubyUtil.RUBY.newArray(
+             JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, trueEvent), falseEvent
+         );
+diff --git a/qa/integration/fixtures/logstash-dummy-pack/logstash-dummy-pack.zip b/qa/integration/fixtures/logstash-dummy-pack/logstash-dummy-pack.zip
+index f2dbc63c8d6..4d66ebe8542 100644
+Binary files a/qa/integration/fixtures/logstash-dummy-pack/logstash-dummy-pack.zip and b/qa/integration/fixtures/logstash-dummy-pack/logstash-dummy-pack.zip differ
+diff --git a/qa/integration/patch/childprocess-modern-java.rb b/qa/integration/patch/childprocess-modern-java.rb
+new file mode 100644
+index 00000000000..7a2125d3769
+--- /dev/null
++++ b/qa/integration/patch/childprocess-modern-java.rb
+@@ -0,0 +1,23 @@
++# encoding: utf-8
++
++# Implementation of ChildProcess::JRuby::Process#pid depends heavily on
++# what Java SDK is being used; here, we look it up once at load, then
++# override that method with an implementation that works on modern Javas
++# if necessary.
++#
++# This patch can be removed when the upstream childprocess gem supports Java 9+
++# https://github.com/enkessler/childprocess/pull/141
++normalised_java_version_major = java.lang.System.get_property("java.version")
++                                    .slice(/^(1\.)?([0-9]+)/, 2)
++                                    .to_i
++
++if normalised_java_version_major >= 9
++  $stderr.puts("patching childprocess for Java9+ support...")
++  ChildProcess::JRuby::Process.class_exec do
++    def pid
++      @process.pid
++    rescue java.lang.UnsupportedOperationException => e
++      raise NotImplementedError, "pid is not supported on this platform: #{e.message}"
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/qa/integration/rspec.rb b/qa/integration/rspec.rb
+index bafa7c44c5f..e4f350c01bb 100644
+--- a/qa/integration/rspec.rb
++++ b/qa/integration/rspec.rb
+@@ -5,7 +5,7 @@
+ ::Gem.clear_paths
+ 
+ ENV['GEM_HOME'] = ENV['GEM_PATH'] = ::File.expand_path(
+-    ::File.join(__FILE__, "..", "..", "..", "build", "qa", "integration", "vendor", "jruby", "2.3.0")
++    ::File.join(__FILE__, "..", "..", "..", "build", "qa", "integration", "vendor", "jruby", "2.5.0")
+ )
+ 
+ require "bundler"
+diff --git a/qa/integration/services/elasticsearch_setup.sh b/qa/integration/services/elasticsearch_setup.sh
+index 97852da0c64..b0bbc163707 100755
+--- a/qa/integration/services/elasticsearch_setup.sh
++++ b/qa/integration/services/elasticsearch_setup.sh
+@@ -8,7 +8,7 @@ if [ -n "${ES_VERSION+1}" ]; then
+   echo "Elasticsearch version is $ES_VERSION"
+   version=$ES_VERSION
+ else
+-   version=5.0.1
++   version=6.5.4
+ fi
+ 
+ ES_HOME=$INSTALL_DIR/elasticsearch
+diff --git a/qa/integration/services/filebeat_setup.sh b/qa/integration/services/filebeat_setup.sh
+index e9ce2ae821a..3bd73b3a73f 100755
+--- a/qa/integration/services/filebeat_setup.sh
++++ b/qa/integration/services/filebeat_setup.sh
+@@ -8,7 +8,7 @@ if [ -n "${FILEBEAT_VERSION}" ]; then
+   echo "Filebeat version is $FILEBEAT_VERSION"
+   version=$FILEBEAT_VERSION
+ else
+-  version=5.0.1
++  version=6.5.4
+ fi
+ 
+ FB_HOME=$INSTALL_DIR/filebeat
+diff --git a/qa/integration/services/logstash_service.rb b/qa/integration/services/logstash_service.rb
+index ce571514eed..ab86c5b41c0 100644
+--- a/qa/integration/services/logstash_service.rb
++++ b/qa/integration/services/logstash_service.rb
+@@ -1,6 +1,7 @@
+ require_relative "monitoring_api"
+ 
+ require "childprocess"
++require_relative "../patch/childprocess-modern-java"
+ require "bundler"
+ require "socket"
+ require "tempfile"
+diff --git a/qa/integration/specs/beats_input_spec.rb b/qa/integration/specs/beats_input_spec.rb
+index 926f2cbb678..1ecfaed6c09 100644
+--- a/qa/integration/specs/beats_input_spec.rb
++++ b/qa/integration/specs/beats_input_spec.rb
+@@ -72,9 +72,9 @@
+           "scan_frequency" => "1s"
+         },
+         "output" => {
+-          "logstash" => { "hosts" => ["localhost:5044"] },
+-          "logging" => { "level" => "debug" }
+-        }
++          "logstash" => { "hosts" => ["localhost:5044"] }
++        },
++        "logging" => { "level" => "debug" }
+       }
+     end
+ 
+@@ -105,9 +105,9 @@
+               "ssl" => {
+                 "certificate_authorities" => certificate_authorities
+               }
+-            },
+-            "logging" => { "level" => "debug" }
+-          }
++            }
++          },
++          "logging" => { "level" => "debug" }
+         }
+       end
+ 
+@@ -136,9 +136,9 @@
+                 "certificate" => certificate,
+                 "key" => ssl_key
+               }
+-            },
+-            "logging" => { "level" => "debug" }
+-          }
++            }
++          },
++          "logging" => { "level" => "debug" }
+         }
+       end
+ 
+diff --git a/qa/integration/specs/cli/prepare_offline_pack_spec.rb b/qa/integration/specs/cli/prepare_offline_pack_spec.rb
+index 3f36b6f48c2..babdb039371 100644
+--- a/qa/integration/specs/cli/prepare_offline_pack_spec.rb
++++ b/qa/integration/specs/cli/prepare_offline_pack_spec.rb
+@@ -47,7 +47,11 @@
+ 
+       unpacked = unpack(temporary_zip_file)
+ 
+-      filters = @logstash_plugin.list(plugins_to_pack.first).stderr_and_stdout.split("\n").delete_if { |f| f =~ /cext/ || f =~ /JAVA_OPT/  || f =~ /fatal/}
++      filters = @logstash_plugin.list(plugins_to_pack.first)
++                                .stderr_and_stdout.split("\n")
++                                .delete_if do |line|
++                                  line =~ /cext|JAVA_OPT|fatal|^WARNING|Option \w+ was deprecated/
++                                end
+ 
+       expect(unpacked.plugins.collect(&:name)).to include(*filters)
+       expect(unpacked.plugins.size).to eq(filters.size)
+diff --git a/qa/integration/specs/cli/remove_spec.rb b/qa/integration/specs/cli/remove_spec.rb
+index 95981265d5a..2bce464ce48 100644
+--- a/qa/integration/specs/cli/remove_spec.rb
++++ b/qa/integration/specs/cli/remove_spec.rb
+@@ -45,7 +45,7 @@
+ 
+             expect(execute.exit_code).to eq(1)
+             expect(execute.stderr_and_stdout).to match(/Failed to remove "logstash-codec-json"/)
+-            expect(execute.stderr_and_stdout).to match(/logstash-input-beats/) # one of the dependency
++            expect(execute.stderr_and_stdout).to match(/logstash-input-kafka/) # one of the dependency
+             expect(execute.stderr_and_stdout).to match(/logstash-output-udp/) # one of the dependency
+ 
+             presence_check = @logstash_plugin.list("logstash-codec-json")
+@@ -78,7 +78,7 @@
+ 
+           expect(execute.exit_code).to eq(1)
+           expect(execute.stderr_and_stdout).to match(/Failed to remove "logstash-codec-json"/)
+-          expect(execute.stderr_and_stdout).to match(/logstash-input-beats/) # one of the dependency
++          expect(execute.stderr_and_stdout).to match(/logstash-input-kafka/) # one of the dependency
+           expect(execute.stderr_and_stdout).to match(/logstash-output-udp/) # one of the dependency
+ 
+           presence_check = @logstash_plugin.list("logstash-codec-json")
+diff --git a/rakelib/artifacts.rake b/rakelib/artifacts.rake
+index 7dc147315ab..cdfe425337d 100644
+--- a/rakelib/artifacts.rake
++++ b/rakelib/artifacts.rake
+@@ -24,6 +24,7 @@ namespace "artifact" do
+       "logstash-core/*.gemspec",
+ 
+       "logstash-core-plugin-api/lib/**/*",
++      "logstash-core-plugin-api/versions-gem-copy.yml",
+       "logstash-core-plugin-api/*.gemspec",
+ 
+       "patterns/**/*",
+diff --git a/rakelib/dependency.rake b/rakelib/dependency.rake
+index 22219304de4..b2de8661966 100644
+--- a/rakelib/dependency.rake
++++ b/rakelib/dependency.rake
+@@ -1,7 +1,7 @@
+ 
+ namespace "dependency" do
+   task "bundler" do
+-    Rake::Task["gem:require"].invoke("bundler", "~> 1.9.4")
++    Rake::Task["gem:require"].invoke("bundler", "~> 1.17.1")
+   end
+ 
+   task "clamp" do
+diff --git a/rakelib/test.rake b/rakelib/test.rake
+index 58cff40ad1f..9b37a06ec72 100644
+--- a/rakelib/test.rake
++++ b/rakelib/test.rake
+@@ -12,10 +12,15 @@ namespace "test" do
+   end
+ 
+   desc "run the ruby unit tests"
+-  task "core-ruby" do
++  task "core-ruby" => "compliance" do
+     exit 1 unless system(*default_spec_command)
+   end
+ 
++  desc 'run the ruby compliance tests'
++  task 'compliance' do
++    exit 1 unless system('bin/rspec', '-fd', '--patern', 'spec/compliance/**/*_spec.rb')
++  end
++
+   desc "run all core specs"
+   task "core" => ["core-slow"]
+   
+diff --git a/rakelib/vendor.rake b/rakelib/vendor.rake
+index 5c60e4d9b7d..842640b7034 100644
+--- a/rakelib/vendor.rake
++++ b/rakelib/vendor.rake
+@@ -7,8 +7,6 @@ namespace "vendor" do
+     system('./gradlew downloadAndInstallJRuby') unless File.exists?(File.join("vendor", "jruby"))
+   end # jruby
+ 
+-  task "all" => "jruby"
+-
+   namespace "force" do
+     task "gems" => ["vendor:gems"]
+   end
+diff --git a/spec/unit/license_spec.rb b/spec/compliance/license_spec.rb
+similarity index 90%
+rename from spec/unit/license_spec.rb
+rename to spec/compliance/license_spec.rb
+index b82cd014a8b..d42b1cd44b1 100644
+--- a/spec/unit/license_spec.rb
++++ b/spec/compliance/license_spec.rb
+@@ -33,7 +33,8 @@
+       # Skipped because version 2.6.2 which we use has multiple licenses: MIT, ARTISTIC 2.0, GPL-2
+       # See https://rubygems.org/gems/mime-types/versions/2.6.2
+       # version 3.0 of mime-types (which is only compatible with Ruby 2.0) is MIT licensed
+-      "mime-types"
++      "mime-types",
++      "logstash-core-plugin-api"
+     ]
+   end
+ 
+@@ -52,9 +53,10 @@
+     end
+ 
+     it "has runtime dependencies with expected licenses" do
+-      spec.runtime_dependencies.map { |dep| dep.to_spec }.each do |runtime_spec|
+-        next unless runtime_spec
+-        next if skipped_dependencies.include?(runtime_spec.name)
++      spec.runtime_dependencies.map do |dep|
++        next if skipped_dependencies.include?(dep.name)
++        dep.to_spec
++      end.compact.each do |runtime_spec|
+         runtime_spec.licenses.each do |license|
+           expect(license.downcase).to match(expected_licenses),
+             lambda { "Runtime license check failed for gem #{runtime_spec.name} with version #{runtime_spec.version}" }
+diff --git a/spec/spec_helper.rb b/spec/spec_helper.rb
+index f8853d477b2..674f7823bd6 100644
+--- a/spec/spec_helper.rb
++++ b/spec/spec_helper.rb
+@@ -47,7 +47,9 @@ def puts(payload)
+       LogStash::SETTINGS.set("queue.type", "memory")
+       LogStash::SETTINGS.set("path.data", temp_directory)
+ 
+-      example.run
++      LogStash::Util.set_thread_name("RSPEC Example #{example.full_description} (from: `#{example.location}`)") do
++        example.run
++      end
+     end
+   end
+ end
+diff --git a/spec/unit/bootstrap/bundler_spec.rb b/spec/unit/bootstrap/bundler_spec.rb
+index df6b4d169a5..1216ddbe704 100644
+--- a/spec/unit/bootstrap/bundler_spec.rb
++++ b/spec/unit/bootstrap/bundler_spec.rb
+@@ -44,7 +44,7 @@
+     after do
+       expect(::Bundler.settings[:path]).to eq(LogStash::Environment::BUNDLE_DIR)
+       expect(::Bundler.settings[:gemfile]).to eq(LogStash::Environment::GEMFILE_PATH)
+-      expect(::Bundler.settings[:without]).to eq(options.fetch(:without, []).join(':'))
++      expect(::Bundler.settings[:without]).to eq(options.fetch(:without, []))
+ 
+       expect(ENV['GEM_PATH']).to eq(LogStash::Environment.logstash_gem_home)
+ 
+diff --git a/tools/release/bump_plugin_versions.rb b/tools/release/bump_plugin_versions.rb
+index 32107de304f..71cdfd7c7b1 100755
+--- a/tools/release/bump_plugin_versions.rb
++++ b/tools/release/bump_plugin_versions.rb
+@@ -31,7 +31,7 @@ def compute_dependecy(version, allow_for)
+ puts "Computing #{allow_bump_for} plugin dependency bump from #{base_logstash_version}.."
+ 
+ puts "Fetching lock file for #{base_logstash_version}.."
+-uri = URI.parse("https://raw.githubusercontent.com/elastic/logstash/v#{base_logstash_version}/Gemfile.jruby-2.3.lock.release")
++uri = URI.parse("https://raw.githubusercontent.com/elastic/logstash/v#{base_logstash_version}/Gemfile.jruby-2.5.lock.release")
+ result = Net::HTTP.get(uri)
+ if result.match(/404/)
+   puts "Lock file or git tag for #{base_logstash_version} not found. Aborting"
+@@ -60,7 +60,7 @@ def compute_dependecy(version, allow_for)
+ 
+ puts "Cleaning up before running 'rake artifact:tar'"
+ FileUtils.rm_f("Gemfile")
+-FileUtils.rm_f("Gemfile.jruby-2.3.lock.release")
++FileUtils.rm_f("Gemfile.jruby-2.5.lock.release")
+ FileUtils.rm_rf("vendor")
+ 
+ # compute new lock file
+@@ -78,17 +78,17 @@ def compute_dependecy(version, allow_for)
+ 
+ # rename file
+ puts "Finishing up.."
+-FileUtils.mv("Gemfile.lock", "Gemfile.jruby-2.3.lock.release")
++FileUtils.mv("Gemfile.lock", "Gemfile.jruby-2.5.lock.release")
+ 
+ `git checkout -- Gemfile.template`
+ 
+-puts `git diff Gemfile.jruby-2.3.lock.release`
++puts `git diff Gemfile.jruby-2.5.lock.release`
+ 
+ puts "Creating commit.."
+ 
+ branch_name = "update_lock_#{Time.now.to_i}"
+ `git checkout -b #{branch_name}`
+-`git commit Gemfile.jruby-2.3.lock.release -m "Update #{allow_bump_for} plugin versions in gemfile lock"`
++`git commit Gemfile.jruby-2.5.lock.release -m "Update #{allow_bump_for} plugin versions in gemfile lock"`
+ 
+ puts "Pushing commit.."
+ `git remote add upstream git@github.com:elastic/logstash.git`
+diff --git a/versions.yml b/versions.yml
+index 597777ecd8f..4fb88e9c5cb 100644
+--- a/versions.yml
++++ b/versions.yml
+@@ -6,19 +6,19 @@ logstash-core-plugin-api: 2.1.16
+ # jruby must reference a *released* version of jruby which can be downloaded from the official download url
+ # *and* for which jars artifacts are published for compile-time
+ jruby:
+-  version: 9.1.13.0
+-  sha1: 815bac27d5daa1459a4477d6d80584f007ce6a68
++  version: 9.2.5.0
++  sha1: c78526ce98b1b4273d11989246cb9bf224ce9712
+ 
+ # jruby-runtime-override, if specified, will override the jruby version installed in vendor/jruby for logstash runtime only,
+ # not for the compile-time jars
+ #
+ #jruby-runtime-override:
+-#  url: http://ci.jruby.org/snapshots/previous/jruby-bin-9.1.13.0-SNAPSHOT.tar.gz
+-#  version: 9.1.13.0-SNAPSHOT
++#  url: http://ci.jruby.org/snapshots/previous/jruby-bin-9.2.0.0-SNAPSHOT.tar.gz
++#  version: 9.2.0.0-SNAPSHOT
+ #  sha1: IGNORE
+ 
+ # Note: this file is copied to the root of logstash-core because its gemspec needs it when
+ #       bundler evaluates the gemspec via bin/logstash
+ # Ensure Jackson version here is kept in sync with version used by jrjackson gem
+-jrjackson: 0.4.6
+-jackson: 2.9.5
++jrjackson: 0.4.7
++jackson: 2.9.8

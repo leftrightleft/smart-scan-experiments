@@ -1,0 +1,382 @@
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 8df3237f4c9..90d8d234536 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -79,7 +79,7 @@ module Environment
+            Setting::Boolean.new("api.ssl.enabled", false),
+   Setting::ExistingFilePath.new("api.ssl.keystore.path", nil, false).nullable,
+           Setting::Password.new("api.ssl.keystore.password", nil, false).nullable,
+-            Setting::String.new("queue.type", "memory", true, ["persisted", "memory"]),
++            Setting::String.new("queue.type", "memory", true, ["persisted", "memory", "recent_memory"]),
+             Setting::Boolean.new("queue.drain", false),
+             Setting::Bytes.new("queue.page_capacity", "64mb"),
+             Setting::Bytes.new("queue.max_bytes", "1024mb"),
+diff --git a/logstash-core/src/main/java/org/logstash/RubyUtil.java b/logstash-core/src/main/java/org/logstash/RubyUtil.java
+index abf86480298..0f8971664fa 100644
+--- a/logstash-core/src/main/java/org/logstash/RubyUtil.java
++++ b/logstash-core/src/main/java/org/logstash/RubyUtil.java
+@@ -59,8 +59,11 @@
+ import org.logstash.ext.JrubyEventExtLibrary;
+ import org.logstash.ext.JrubyMemoryReadClientExt;
+ import org.logstash.ext.JrubyMemoryWriteClientExt;
++import org.logstash.ext.JrubyRecentMemoryReadClientExt;
++import org.logstash.ext.JrubyRecentMemoryWriteClientExt;
+ import org.logstash.ext.JrubyTimestampExtLibrary;
+ import org.logstash.ext.JrubyWrappedSynchronousQueueExt;
++import org.logstash.ext.JrubyWrappedSynchronousRingBufferExt;
+ import org.logstash.instrument.metrics.AbstractMetricExt;
+ import org.logstash.instrument.metrics.AbstractNamespacedMetricExt;
+ import org.logstash.instrument.metrics.AbstractSimpleMetricExt;
+@@ -117,12 +120,16 @@ public final class RubyUtil {
+ 
+     public static final RubyClass MEMORY_WRITE_CLIENT_CLASS;
+ 
++    public static final RubyClass RECENT_MEMORY_WRITE_CLIENT_CLASS;
++
+     public static final RubyClass ACKED_WRITE_CLIENT_CLASS;
+ 
+     public static final RubyClass ABSTRACT_WRAPPED_QUEUE_CLASS;
+ 
+     public static final RubyClass WRAPPED_SYNCHRONOUS_QUEUE_CLASS;
+ 
++    public static final RubyClass WRAPPED_SYNCHRONOUS_RING_BUFFER_CLASS;
++
+     public static final RubyClass WRAPPED_ACKED_QUEUE_CLASS;
+ 
+     public static final RubyClass ACKED_QUEUE_CLASS;
+@@ -431,6 +438,10 @@ public final class RubyUtil {
+             ABSTRACT_WRITE_CLIENT_CLASS, JrubyMemoryWriteClientExt::new,
+             JrubyMemoryWriteClientExt.class
+         );
++        RECENT_MEMORY_WRITE_CLIENT_CLASS = setupLogstashClass(
++            ABSTRACT_WRITE_CLIENT_CLASS, JrubyRecentMemoryWriteClientExt::new,
++            JrubyRecentMemoryWriteClientExt.class
++        );
+         ACKED_WRITE_CLIENT_CLASS = setupLogstashClass(
+             ABSTRACT_WRITE_CLIENT_CLASS, JrubyAckedWriteClientExt::new,
+             JrubyAckedWriteClientExt.class
+@@ -439,6 +450,10 @@ public final class RubyUtil {
+             ABSTRACT_WRAPPED_QUEUE_CLASS, JrubyWrappedSynchronousQueueExt::new,
+             JrubyWrappedSynchronousQueueExt.class
+         );
++        WRAPPED_SYNCHRONOUS_RING_BUFFER_CLASS = setupLogstashClass(
++            ABSTRACT_WRAPPED_QUEUE_CLASS, JrubyWrappedSynchronousRingBufferExt::new,
++            JrubyWrappedSynchronousRingBufferExt.class
++        );
+         WRAPPED_ACKED_QUEUE_CLASS = setupLogstashClass(
+             ABSTRACT_WRAPPED_QUEUE_CLASS, JRubyWrappedAckedQueueExt::new,
+             JRubyWrappedAckedQueueExt.class
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/QueueFactoryExt.java b/logstash-core/src/main/java/org/logstash/ackedqueue/QueueFactoryExt.java
+index 15b572d7da2..f76fb95991d 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/QueueFactoryExt.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/QueueFactoryExt.java
+@@ -35,6 +35,7 @@
+ import org.logstash.ackedqueue.ext.JRubyWrappedAckedQueueExt;
+ import org.logstash.execution.AbstractWrappedQueueExt;
+ import org.logstash.ext.JrubyWrappedSynchronousQueueExt;
++import org.logstash.ext.JrubyWrappedSynchronousRingBufferExt;
+ 
+ /**
+  * Persistent queue factory JRuby extension.
+@@ -82,11 +83,18 @@ public static AbstractWrappedQueueExt create(final ThreadContext context, final
+                         .convertToInteger().getIntValue()
+                 )
+             );
++        } else if ("recent_memory".equals(type)) {
++            return new JrubyWrappedSynchronousRingBufferExt(
++                context.runtime, RubyUtil.WRAPPED_SYNCHRONOUS_RING_BUFFER_CLASS
++            ).initialize(
++                context,
++                getSetting(context, settings, "queue.max_events")
++            );
+         } else {
+             throw context.runtime.newRaiseException(
+                 RubyUtil.CONFIGURATION_ERROR_CLASS,
+                 String.format(
+-                    "Invalid setting `%s` for `queue.type`, supported types are: 'memory' or 'persisted'",
++                    "Invalid setting `%s` for `queue.type`, supported types are: 'memory', 'recent_memory', and 'persisted'",
+                     type
+                 )
+             );
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JrubyRecentMemoryReadClientExt.java b/logstash-core/src/main/java/org/logstash/ext/JrubyRecentMemoryReadClientExt.java
+new file mode 100644
+index 00000000000..cdcbc82cc2a
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/ext/JrubyRecentMemoryReadClientExt.java
+@@ -0,0 +1,90 @@
++/*
++ * Licensed to Elasticsearch B.V. under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch B.V. licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *	http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++
++package org.logstash.ext;
++
++import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.TimeUnit;
++import org.jruby.Ruby;
++import org.jruby.RubyClass;
++import org.jruby.anno.JRubyClass;
++import org.logstash.RubyUtil;
++import org.logstash.common.LsQueueUtils;
++import org.logstash.execution.MemoryReadBatch;
++import org.logstash.execution.QueueBatch;
++import org.logstash.execution.QueueReadClientBase;
++
++/**
++ * JRuby extension to provide an implementation of the queue client for an
++ * in-memory ring buffer queue.
++ * */
++@JRubyClass(name = "RecentMemoryReadClient", parent = "QueueReadClientBase")
++public final class JrubyRecentMemoryReadClientExt extends QueueReadClientBase {
++
++    private static final long serialVersionUID = 1L;
++
++    @SuppressWarnings("rawtypes") private BlockingQueue queue;
++
++    public JrubyRecentMemoryReadClientExt(final Ruby runtime, final RubyClass metaClass) {
++        super(runtime, metaClass);
++    }
++
++    @SuppressWarnings("rawtypes")
++    private JrubyRecentMemoryReadClientExt(final Ruby runtime, final RubyClass metaClass,
++                                     BlockingQueue queue, int batchSize, int waitForMillis) {
++        super(runtime, metaClass);
++        this.queue = queue;
++        this.batchSize = batchSize;
++        this.waitForNanos = TimeUnit.NANOSECONDS.convert(waitForMillis, TimeUnit.MILLISECONDS);
++        this.waitForMillis = waitForMillis;
++    }
++
++    @SuppressWarnings("rawtypes")
++    public static JrubyRecentMemoryReadClientExt create(BlockingQueue queue, int batchSize,
++                                                  int waitForMillis) {
++        return new JrubyRecentMemoryReadClientExt(RubyUtil.RUBY,
++                RubyUtil.MEMORY_READ_CLIENT_CLASS, queue, batchSize, waitForMillis);
++    }
++
++    @Override
++    public void close() {
++        // no-op
++    }
++
++    @Override
++    public boolean isEmpty() {
++        return queue.isEmpty();
++    }
++
++    @Override
++    public QueueBatch newBatch() {
++        return MemoryReadBatch.create();
++    }
++
++    @Override
++    @SuppressWarnings("unchecked")
++    public QueueBatch readBatch() throws InterruptedException {
++        final MemoryReadBatch batch = MemoryReadBatch.create(LsQueueUtils.drain(queue, batchSize, waitForNanos));
++        startMetrics(batch);
++        return batch;
++    }
++
++
++}
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JrubyRecentMemoryWriteClientExt.java b/logstash-core/src/main/java/org/logstash/ext/JrubyRecentMemoryWriteClientExt.java
+new file mode 100644
+index 00000000000..7ee5da3c98d
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/ext/JrubyRecentMemoryWriteClientExt.java
+@@ -0,0 +1,98 @@
++/*
++ * Licensed to Elasticsearch B.V. under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch B.V. licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *	http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++
++package org.logstash.ext;
++
++import java.util.Collection;
++import java.util.Map;
++import java.util.concurrent.BlockingDeque;
++import org.jruby.Ruby;
++import org.jruby.RubyClass;
++import org.jruby.anno.JRubyClass;
++import org.jruby.runtime.ThreadContext;
++import org.logstash.Event;
++import org.logstash.RubyUtil;
++import org.logstash.common.LsQueueUtils;
++
++@JRubyClass(name = "RecentMemoryWriteClient")
++public final class JrubyRecentMemoryWriteClientExt extends JRubyAbstractQueueWriteClientExt {
++
++    private static final long serialVersionUID = 1L;
++
++    private BlockingDeque<JrubyEventExtLibrary.RubyEvent> queue;
++
++    public JrubyRecentMemoryWriteClientExt(final Ruby runtime, final RubyClass metaClass) {
++        super(runtime, metaClass);
++    }
++
++    private JrubyRecentMemoryWriteClientExt(final Ruby runtime, final RubyClass metaClass,
++        final BlockingDeque<JrubyEventExtLibrary.RubyEvent> queue) {
++        super(runtime, metaClass);
++        this.queue = queue;
++    }
++
++    public static JrubyRecentMemoryWriteClientExt create(
++        final BlockingDeque<JrubyEventExtLibrary.RubyEvent> queue) {
++        return new JrubyRecentMemoryWriteClientExt(RubyUtil.RUBY,
++            RubyUtil.RECENT_MEMORY_WRITE_CLIENT_CLASS, queue);
++    }
++
++    @Override
++    protected JRubyAbstractQueueWriteClientExt doPush(final ThreadContext context,
++        final JrubyEventExtLibrary.RubyEvent event)
++        throws InterruptedException {
++            while(queue.remainingCapacity() < 1) {
++            try {
++                queue.removeFirst();
++            }
++            catch (java.util.NoSuchElementException e) {
++                break;
++            }
++        }
++
++        queue.put(event);
++        return this;
++    }
++
++    @Override
++    public JRubyAbstractQueueWriteClientExt doPushBatch(final ThreadContext context,
++        final Collection<JrubyEventExtLibrary.RubyEvent> batch) throws InterruptedException {
++        while(queue.remainingCapacity() < batch.size()) {
++            try {
++                queue.removeFirst();
++            }
++            catch (java.util.NoSuchElementException e) {
++                break;
++            }
++        }
++
++        LsQueueUtils.addAll(queue, batch);
++        return this;
++    }
++
++    @Override
++    public void push(Map<String, Object> event) {
++        try {
++            queue.put(JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event(event)));
++        } catch (InterruptedException e) {
++            throw new IllegalStateException(e);
++        }
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JrubyWrappedSynchronousRingBufferExt.java b/logstash-core/src/main/java/org/logstash/ext/JrubyWrappedSynchronousRingBufferExt.java
+new file mode 100644
+index 00000000000..a651a1bbd1a
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/ext/JrubyWrappedSynchronousRingBufferExt.java
+@@ -0,0 +1,76 @@
++/*
++ * Licensed to Elasticsearch B.V. under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch B.V. licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *	http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++
++package org.logstash.ext;
++
++import java.util.concurrent.LinkedBlockingDeque;
++import java.util.concurrent.BlockingDeque;
++import org.jruby.Ruby;
++import org.jruby.RubyClass;
++import org.jruby.RubyNumeric;
++import org.jruby.anno.JRubyClass;
++import org.jruby.anno.JRubyMethod;
++import org.jruby.runtime.ThreadContext;
++import org.jruby.runtime.builtin.IRubyObject;
++import org.logstash.execution.AbstractWrappedQueueExt;
++import org.logstash.execution.QueueReadClientBase;
++
++/**
++ * JRuby extension to wrap in memory ring buffer queue
++ * */
++@JRubyClass(name = "WrappedSynchronousRingBuffer")
++public final class JrubyWrappedSynchronousRingBufferExt extends AbstractWrappedQueueExt {
++
++    private static final long serialVersionUID = 1L;
++
++    private BlockingDeque<JrubyEventExtLibrary.RubyEvent> queue;
++
++    public JrubyWrappedSynchronousRingBufferExt(final Ruby runtime, final RubyClass metaClass) {
++        super(runtime, metaClass);
++    }
++
++    @JRubyMethod
++    @SuppressWarnings("unchecked")
++    public JrubyWrappedSynchronousRingBufferExt initialize(final ThreadContext context,
++        IRubyObject size) {
++        int typedSize = ((RubyNumeric)size).getIntValue();
++        this.queue = new LinkedBlockingDeque<>(typedSize);
++        return this;
++    }
++
++    @Override
++    protected JRubyAbstractQueueWriteClientExt getWriteClient(final ThreadContext context) {
++        return JrubyRecentMemoryWriteClientExt.create(queue);
++    }
++
++    @Override
++    protected QueueReadClientBase getReadClient() {
++        // batch size and timeout are currently hard-coded to 125 and 50ms as values observed
++        // to be reasonable tradeoffs between latency and throughput per PR #8707
++        return JrubyRecentMemoryReadClientExt.create(queue, 125, 50);
++    }
++
++    @Override
++    public IRubyObject doClose(final ThreadContext context) {
++        // no op
++        return this;
++    }
++
++}

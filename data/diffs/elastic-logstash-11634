@@ -1,0 +1,176 @@
+diff --git a/logstash-core/lib/logstash/api/rack_app.rb b/logstash-core/lib/logstash/api/rack_app.rb
+index 8b2d1905559..6b8a7eb6b5f 100644
+--- a/logstash-core/lib/logstash/api/rack_app.rb
++++ b/logstash-core/lib/logstash/api/rack_app.rb
+@@ -1,5 +1,5 @@
+-require "sinatra"
+ require "rack"
++require "sinatra/base"
+ require "logstash/api/modules/base"
+ require "logstash/api/modules/node"
+ require "logstash/api/modules/node_stats"
+@@ -74,6 +74,11 @@ def call(env)
+       end
+ 
+       def self.app(logger, agent, environment)
++        # LS should avoid loading sinatra/main.rb as it does not need the full Sinatra functionality
++        # such as configuration based on ARGV (actually dangerous if there's a --name collision),
++        # pretty much the only piece needed is the DSL but even that only for the rackup part :
++        Rack::Builder.send(:include, Sinatra::Delegator) unless Rack::Builder < Sinatra::Delegator
++
+         namespaces = rack_namespaces(agent)
+ 
+         Rack::Builder.new do
+diff --git a/qa/integration/fixtures/command_line_spec.yml b/qa/integration/fixtures/command_line_spec.yml
+new file mode 100644
+index 00000000000..cbfc784af81
+--- /dev/null
++++ b/qa/integration/fixtures/command_line_spec.yml
+@@ -0,0 +1,3 @@
++---
++services:
++  - logstash
+diff --git a/qa/integration/services/logstash_service.rb b/qa/integration/services/logstash_service.rb
+index ca1729787c1..a35c46b762c 100644
+--- a/qa/integration/services/logstash_service.rb
++++ b/qa/integration/services/logstash_service.rb
+@@ -20,6 +20,10 @@ class LogstashService < Service
+   STDIN_CONFIG = "input {stdin {}} output { }"
+   RETRY_ATTEMPTS = 60
+ 
++  TIMEOUT_MAXIMUM = 60 * 10 # 10mins.
++
++  class ProcessStatus < Struct.new(:exit_code, :stderr_and_stdout); end
++
+   @process = nil
+ 
+   attr_reader :logstash_home
+@@ -202,24 +206,52 @@ def application_settings_file
+   end
+ 
+   def plugin_cli
+-    PluginCli.new(@logstash_home)
++    PluginCli.new(self)
+   end
+ 
+   def lock_file
+     File.join(@logstash_home, "Gemfile.lock")
+   end
+ 
++  def run_cmd(cmd_args, change_dir = true, environment = {})
++    out = Tempfile.new("content")
++    out.sync = true
++
++    cmd, *args = cmd_args
++    process = ChildProcess.build(cmd, *args)
++    environment.each do |k, v|
++      process.environment[k] = v
++    end
++    process.io.stdout = process.io.stderr = out
++
++    Bundler.with_clean_env do
++      if change_dir
++        Dir.chdir(@logstash_home) do
++          process.start
++        end
++      else
++        process.start
++      end
++    end
++
++    process.poll_for_exit(TIMEOUT_MAXIMUM)
++    out.rewind
++    ProcessStatus.new(process.exit_code, out.read)
++  end
++
++  def run(*args)
++    run_cmd [ @logstash_bin, *args ]
++  end
++
+   class PluginCli
+-    class ProcessStatus < Struct.new(:exit_code, :stderr_and_stdout); end
+ 
+-    TIMEOUT_MAXIMUM = 60 * 10 # 10mins.
+     LOGSTASH_PLUGIN = File.join("bin", "logstash-plugin")
+ 
+     attr_reader :logstash_plugin
+ 
+-    def initialize(logstash_home)
+-      @logstash_plugin = File.join(logstash_home, LOGSTASH_PLUGIN)
+-      @logstash_home = logstash_home
++    def initialize(logstash_service)
++      @logstash = logstash_service
++      @logstash_plugin = File.join(@logstash.logstash_home, LOGSTASH_PLUGIN)
+     end
+ 
+     def remove(plugin_name)
+@@ -244,36 +276,12 @@ def install(plugin_name)
+       run("install #{plugin_name}")
+     end
+ 
+-    def run_raw(cmd_parameters, change_dir = true, environment = {})
+-      out = Tempfile.new("content")
+-      out.sync = true
+-
+-      parts = cmd_parameters.split(" ")
+-      cmd = parts.shift
+-
+-      process = ChildProcess.build(cmd, *parts)
+-      environment.each do |k, v|
+-        process.environment[k] = v
+-      end
+-      process.io.stdout = process.io.stderr = out
+-
+-      Bundler.with_clean_env do
+-        if change_dir
+-          Dir.chdir(@logstash_home) do
+-            process.start
+-          end
+-        else
+-          process.start
+-        end
+-      end
+-
+-      process.poll_for_exit(TIMEOUT_MAXIMUM)
+-      out.rewind
+-      ProcessStatus.new(process.exit_code, out.read)
+-    end
+-
+     def run(command)
+       run_raw("#{logstash_plugin} #{command}")
+     end
++
++    def run_raw(cmd, change_dir = true, environment = {})
++      @logstash.run_cmd(cmd.split(' '), change_dir, environment)
++    end
+   end
+ end
+diff --git a/qa/integration/specs/command_line_spec.rb b/qa/integration/specs/command_line_spec.rb
+new file mode 100644
+index 00000000000..ae07e30240a
+--- /dev/null
++++ b/qa/integration/specs/command_line_spec.rb
+@@ -0,0 +1,23 @@
++# encoding: utf-8
++require_relative "../framework/fixture"
++require_relative "../framework/settings"
++require_relative "../framework/helpers"
++
++describe "CLI >" do
++
++  before(:all) do
++    @fixture = Fixture.new(__FILE__)
++    @logstash = @fixture.get_service("logstash")
++  end
++
++  after(:each) { @logstash.teardown }
++
++  it "shows --help" do
++    execute = @logstash.run('--help')
++
++    expect(execute.exit_code).to eq(0)
++    expect(execute.stderr_and_stdout).to include('bin/logstash [OPTIONS]')
++    expect(execute.stderr_and_stdout).to include('--pipeline.id ID')
++  end
++
++end

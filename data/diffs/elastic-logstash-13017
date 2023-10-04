@@ -1,0 +1,693 @@
+diff --git a/logstash-core/lib/logstash/plugin.rb b/logstash-core/lib/logstash/plugin.rb
+index a21e183929c..9c4d445dc59 100644
+--- a/logstash-core/lib/logstash/plugin.rb
++++ b/logstash-core/lib/logstash/plugin.rb
+@@ -18,6 +18,7 @@
+ require "logstash/config/mixin"
+ require "logstash/plugins/ecs_compatibility_support"
+ require "concurrent"
++require "logstash/plugins/event_factory_support"
+ require "securerandom"
+ 
+ require_relative 'plugin_metadata'
+@@ -31,6 +32,7 @@ class LogStash::Plugin
+ 
+   include LogStash::Config::Mixin
+   include LogStash::Plugins::ECSCompatibilitySupport
++  include LogStash::Plugins::EventFactorySupport
+ 
+   # Disable or enable metric logging for this specific plugin instance
+   # by default we record all the metrics we can, but you can disable metrics collection
+diff --git a/logstash-core/lib/logstash/plugins/event_factory_support.rb b/logstash-core/lib/logstash/plugins/event_factory_support.rb
+new file mode 100644
+index 00000000000..007218858ab
+--- /dev/null
++++ b/logstash-core/lib/logstash/plugins/event_factory_support.rb
+@@ -0,0 +1,68 @@
++require 'logstash/util/thread_safe_attributes'
++
++module LogStash
++  module Plugins
++    module EventFactorySupport
++
++      extend LogStash::Util::ThreadSafeAttributes
++
++      # The event_factory method is effectively final and should not be re-defined by plugins.
++      #
++      # @return an event factory object with a `new_event(Hash)` API
++      # @since LS 7.14
++      lazy_init_attr(:event_factory, variable: :@_event_factory) { create_event_factory }
++
++      # The `targeted_event_factory` method is effectively final and should not be re-defined.
++      # If the plugin defines a `target => ...` option than this method will return a factory
++      # that respects the set target, otherwise (no target) returns {#event_factory}.
++      #
++      # @return an event factory object with a `new_event(Hash)` API
++      # @since LS 7.14
++      lazy_init_attr :targeted_event_factory, variable: :@_targeted_event_factory do
++        raise ArgumentError.new('config(:target) not present') unless respond_to?(:target)
++        target.nil? ? event_factory : TargetedEventFactory.new(event_factory, target)
++      end
++
++      private
++
++      # @api private
++      # @since LS 7.14
++      def create_event_factory
++        BasicEventFactory::INSTANCE
++      end
++
++      class BasicEventFactory
++        INSTANCE = new
++
++        # @param payload [Hash]
++        # @return [LogStash::Event]
++        def new_event(payload = {})
++          LogStash::Event.new(payload)
++        end
++
++      end
++      private_constant :BasicEventFactory
++
++      class TargetedEventFactory
++
++        def initialize(inner, target)
++          fail(ArgumentError, "invalid EventFactory `#{inner}`") unless inner.respond_to?(:new_event)
++          fail(ArgumentError, "invalid target field reference `#{target}`") unless org.logstash.FieldReference.isValid(target)
++          @delegate = inner
++          @target = target
++        end
++
++        # @param payload [Hash]
++        # @return [LogStash::Event]
++        def new_event(payload = {})
++          event = @delegate.new_event
++          event.set(@target, payload)
++          event
++        end
++
++      end
++      private_constant :TargetedEventFactory
++
++    end
++  end
++end
+diff --git a/logstash-core/lib/logstash/util/thread_safe_attributes.rb b/logstash-core/lib/logstash/util/thread_safe_attributes.rb
+new file mode 100644
+index 00000000000..cbd0963ed12
+--- /dev/null
++++ b/logstash-core/lib/logstash/util/thread_safe_attributes.rb
+@@ -0,0 +1,44 @@
++# Licensed to Elasticsearch B.V. under one or more contributor
++# license agreements. See the NOTICE file distributed with
++# this work for additional information regarding copyright
++# ownership. Elasticsearch B.V. licenses this file to you under
++# the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#  http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++
++module LogStash
++  module Util
++    # @api internal
++    module ThreadSafeAttributes
++
++      # Thread-safe lazy initialized attribute with a given (variable) name.
++      def lazy_init_attr(attribute, variable: "@#{attribute}".to_sym, &block)
++        raise ArgumentError.new("invalid attribute name: #{attribute}") unless attribute.match? /^[_A-Za-z]\w*$/
++        raise ArgumentError.new('no block given') unless block_given?
++        send(:define_method, attribute.to_sym) do
++          if instance_variable_defined?(variable)
++            instance_variable_get(variable)
++          else
++            LogStash::Util.synchronize(self) do
++              if instance_variable_defined?(variable)
++                instance_variable_get(variable)
++              else
++                instance_variable_set(variable, instance_eval(&block))
++              end
++            end
++          end
++        end
++      end
++
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/logstash-core/spec/logstash/event_spec.rb b/logstash-core/spec/logstash/event_spec.rb
+index b84b8c89ad0..b130a1c22a6 100644
+--- a/logstash-core/spec/logstash/event_spec.rb
++++ b/logstash-core/spec/logstash/event_spec.rb
+@@ -314,15 +314,9 @@
+       end
+     end
+ 
+-    it "should raise TypeError on nil string" do
+-      expect{LogStash::Event.from_json(nil)}.to raise_error TypeError
+-    end
+-
+     it "should consistently handle nil" do
+-      blank_strings.each do |s|
+-        expect{LogStash::Event.from_json(nil)}.to raise_error
+-        expect{LogStash::Event.new(LogStash::Json.load(nil))}.to raise_error
+-      end
++      expect{LogStash::Event.from_json(nil)}.to raise_error(TypeError)
++      expect{LogStash::Event.new(LogStash::Json.load(nil))}.to raise_error # java.lang.ClassCastException
+     end
+ 
+     it "should consistently handle bare string" do
+@@ -331,6 +325,12 @@
+         expect{LogStash::Event.new(LogStash::Json.load(s))}.to raise_error LogStash::Json::ParserError
+        end
+     end
++
++    it "should allow to pass a block that acts as an event factory" do
++      events = LogStash::Event.from_json(source_json) { |data| LogStash::Event.new(data).tap { |e| e.set('answer', 42) } }
++      expect( events.size ).to eql 1
++      expect( events.first.get('answer') ).to eql 42
++    end
+   end
+ 
+   context "initialize" do
+diff --git a/logstash-core/spec/logstash/plugins/event_factory_support_spec.rb b/logstash-core/spec/logstash/plugins/event_factory_support_spec.rb
+new file mode 100644
+index 00000000000..07005c576dc
+--- /dev/null
++++ b/logstash-core/spec/logstash/plugins/event_factory_support_spec.rb
+@@ -0,0 +1,136 @@
++require "spec_helper"
++
++require "logstash/plugin"
++
++require 'logstash/inputs/base'
++require 'logstash/filters/base'
++require 'logstash/codecs/base'
++require 'logstash/outputs/base'
++
++describe LogStash::Plugins::EventFactorySupport do
++
++  let(:event_factory_support) { described_class }
++
++  [
++      LogStash::Inputs::Base,
++      LogStash::Filters::Base,
++      LogStash::Codecs::Base,
++      LogStash::Outputs::Base
++  ].each do |base_class|
++
++    context "that inherits from `#{base_class}`" do
++
++      let(:plugin_base_class) { base_class }
++
++      subject(:plugin_class) do
++        Class.new(plugin_base_class) do
++          config_name 'sample'
++        end
++      end
++
++      it 'defines an `event_factory` method' do
++        expect(plugin_class.method_defined?(:event_factory)).to be true
++      end
++
++      it 'defines an `targeted_event_factory` method' do
++        expect(plugin_class.method_defined?(:targeted_event_factory)).to be true
++      end
++
++      let(:options) { Hash.new }
++      let(:plugin) { plugin_class.new(options) }
++
++      shared_examples 'an event factory' do
++
++        it 'returns an event' do
++          expect( event_factory.new_event ).to be_a LogStash::Event
++          expect( event = event_factory.new_event('foo' => 'bar') ).to be_a LogStash::Event
++          expect( event.get('foo') ).to eql 'bar'
++        end
++
++      end
++
++      describe 'event_factory' do
++
++        subject(:event_factory) { plugin.send(:event_factory) }
++
++        it_behaves_like 'an event factory'
++
++        it 'memoizes the factory instance' do
++          expect( event_factory ).to be plugin.send(:event_factory)
++        end
++
++      end
++
++      describe 'targeted_event_factory (no config :target option)' do
++
++        it 'raises an error' do
++          expect { plugin.send(:targeted_event_factory) }.to raise_error(ArgumentError, /target/)
++        end
++
++      end
++
++      describe 'targeted_event_factory' do
++
++        subject(:plugin_class) do
++          Class.new(plugin_base_class) do
++            config_name 'sample'
++
++            config :target, :validate => :string
++          end
++        end
++
++        subject(:targeted_event_factory) { plugin.send(:targeted_event_factory) }
++
++        it_behaves_like 'an event factory' do
++          subject(:event_factory) { targeted_event_factory }
++        end
++
++        it 'memoizes the factory instance' do
++          expect( targeted_event_factory ).to be plugin.send(:targeted_event_factory)
++        end
++
++        it 'uses the basic event factory (no target specified)' do
++          expect( targeted_event_factory ).to be plugin.send(:event_factory)
++        end
++
++        context 'with target' do
++
++          let(:options) { super().merge('target' => '[the][baz]') }
++
++          it 'returns an event' do
++            expect( targeted_event_factory.new_event ).to be_a LogStash::Event
++            expect( event = targeted_event_factory.new_event('foo' => 'bar') ).to be_a LogStash::Event
++            expect( event.include?('foo') ).to be false
++            expect( event.get('[the][baz][foo]') ).to eql 'bar'
++          end
++
++          it 'memoizes the factory instance' do
++            expect( targeted_event_factory ).to be plugin.send(:targeted_event_factory)
++          end
++
++          it 'uses a different factory from the basic one' do
++            expect( targeted_event_factory ).not_to be plugin.send(:event_factory)
++          end
++
++        end
++
++        context 'from_json (integration)' do
++
++          let(:json) { '[ {"foo": "bar"}, { "baz": { "a": 1 } } ]' }
++
++          let(:options) { super().merge('target' => 'internal') }
++
++          it 'works' do
++            events = LogStash::Event.from_json(json) { |data| targeted_event_factory.new_event(data) }
++            expect( events.size ).to eql 2
++            expect( events[0].get('[internal]') ).to eql 'foo' => 'bar'
++            expect( events[1].get('[internal]') ).to eql 'baz' => { 'a' => 1 }
++          end
++
++        end
++      end
++
++    end
++  end
++
++end
+diff --git a/logstash-core/src/main/java/co/elastic/logstash/api/EventFactory.java b/logstash-core/src/main/java/co/elastic/logstash/api/EventFactory.java
+index 8e111a96a45..03ed275b902 100644
+--- a/logstash-core/src/main/java/co/elastic/logstash/api/EventFactory.java
++++ b/logstash-core/src/main/java/co/elastic/logstash/api/EventFactory.java
+@@ -21,14 +21,21 @@
+ package co.elastic.logstash.api;
+ 
+ import java.io.Serializable;
++import java.util.Collections;
+ import java.util.Map;
+ 
++/**
++ * A factory for events.
++ */
++@FunctionalInterface
+ public interface EventFactory {
+ 
+     /**
+      * @return New and empty event.
+      */
+-    Event newEvent();
++    default Event newEvent() {
++        return newEvent(Collections.emptyMap());
++    }
+ 
+     /**
+      * @param data Map from which the new event should copy its data.
+diff --git a/logstash-core/src/main/java/org/logstash/Event.java b/logstash-core/src/main/java/org/logstash/Event.java
+index dc02e30b0c4..a991563db99 100644
+--- a/logstash-core/src/main/java/org/logstash/Event.java
++++ b/logstash-core/src/main/java/org/logstash/Event.java
+@@ -20,6 +20,7 @@
+ 
+ package org.logstash;
+ 
++import co.elastic.logstash.api.EventFactory;
+ import com.fasterxml.jackson.core.JsonProcessingException;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+@@ -29,12 +30,12 @@
+ import org.jruby.RubySymbol;
+ import org.logstash.ackedqueue.Queueable;
+ import org.logstash.ext.JrubyTimestampExtLibrary;
++import org.logstash.plugins.BasicEventFactory;
+ 
+ import java.io.IOException;
+ import java.io.Serializable;
+ import java.time.Instant;
+ import java.util.ArrayList;
+-import java.util.Collection;
+ import java.util.Date;
+ import java.util.HashMap;
+ import java.util.List;
+@@ -253,30 +254,53 @@ public String toJson() throws JsonProcessingException {
+     private static final Event[] NULL_ARRAY = new Event[0];
+ 
+     @SuppressWarnings("unchecked")
+-    public static Event[] fromJson(String json)
+-            throws IOException
+-    {
++    private static Object parseJson(final String json) throws IOException {
++        return JSON_MAPPER.readValue(json, Object.class);
++    }
++
++    /**
++     * Map a JSON string into events.
++     * @param json input string
++     * @return events
++     * @throws IOException when (JSON) parsing fails
++     */
++    public static Event[] fromJson(final String json) throws IOException {
++        return fromJson(json, BasicEventFactory.INSTANCE);
++    }
++
++    /**
++     * Map a JSON string into events.
++     * @param json input string
++     * @param factory event factory
++     * @return events
++     * @throws IOException when (JSON) parsing fails
++     */
++    @SuppressWarnings("unchecked")
++    public static Event[] fromJson(final String json, final EventFactory factory) throws IOException {
+         // empty/blank json string does not generate an event
+-        if (json == null || json.trim().isEmpty()) {
++        if (json == null || isBlank(json)) {
+             return NULL_ARRAY;
+         }
+ 
+-        Event[] result;
+-        Object o = JSON_MAPPER.readValue(json, Object.class);
++        Object o = parseJson(json);
+         // we currently only support Map or Array json objects
+         if (o instanceof Map) {
+-            result = new Event[]{ new Event((Map<String, Object>)o) };
+-        } else if (o instanceof List) {
+-            final Collection<Map<String, Object>> list = (Collection<Map<String, Object>>) o; 
+-            result = new Event[list.size()];
+-            int i = 0;
+-            for (final Map<String, Object> e : list) {
+-                result[i++] = new Event(e);
+-            }
+-        } else {
+-            throw new IOException("incompatible json object type=" + o.getClass().getName() + " , only hash map or arrays are supported");
++            // NOTE: we need to assume the factory returns org.logstash.Event impl
++            return new Event[] { (Event) factory.newEvent((Map<? extends Serializable, Object>) o) };
++        }
++        if (o instanceof List) { // Jackson returns an ArrayList
++            return fromList((List<Map<String, Object>>) o, factory);
+         }
+ 
++        throw new IOException("incompatible json object type=" + o.getClass().getName() + " , only hash map or arrays are supported");
++    }
++
++    private static Event[] fromList(final List<Map<String, Object>> list, final EventFactory factory) {
++        final int len = list.size();
++        Event[] result = new Event[len];
++        for (int i = 0; i < len; i++) {
++            result[i] = (Event) factory.newEvent(list.get(i));
++        }
+         return result;
+     }
+ 
+@@ -359,6 +383,17 @@ public String toString() {
+                 : hostMessageString;
+     }
+ 
++    private static boolean isBlank(final String str) {
++        final int len = str.length();
++        if (len == 0) return true;
++        for (int i = 0; i < len; i++) {
++            if (!Character.isWhitespace(str.charAt(i))) {
++                return false;
++            }
++        }
++        return true;
++    }
++
+     private static Timestamp initTimestamp(Object o) {
+         if (o == null || o instanceof RubyNil) {
+             // most frequent
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java b/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java
+index d69c7e64b9d..560f6dfeb3a 100644
+--- a/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java
++++ b/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java
+@@ -23,8 +23,10 @@
+ import java.io.IOException;
+ import java.util.Map;
+ import java.util.concurrent.atomic.AtomicLong;
++
++import co.elastic.logstash.api.EventFactory;
++
+ import org.jruby.Ruby;
+-import org.jruby.RubyArray;
+ import org.jruby.RubyBoolean;
+ import org.jruby.RubyClass;
+ import org.jruby.RubyHash;
+@@ -35,14 +37,17 @@
+ import org.jruby.exceptions.RaiseException;
+ import org.jruby.java.proxies.MapJavaProxy;
+ import org.jruby.javasupport.JavaUtil;
++import org.jruby.runtime.Block;
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
++
+ import org.logstash.ConvertedMap;
+ import org.logstash.Event;
+ import org.logstash.FieldReference;
+ import org.logstash.RubyUtil;
+ import org.logstash.Rubyfier;
+ import org.logstash.Valuefier;
++import org.logstash.plugins.BasicEventFactory;
+ 
+ public final class JrubyEventExtLibrary {
+ 
+@@ -196,7 +201,7 @@ public IRubyObject ruby_sprintf(ThreadContext context, IRubyObject format) {
+             try {
+                 return RubyString.newString(context.runtime, event.sprintf(format.toString()));
+             } catch (IOException e) {
+-                throw RaiseException.from(getRuntime(), RubyUtil.LOGSTASH_ERROR, "timestamp field is missing");
++                throw toRubyError(context, RubyUtil.LOGSTASH_ERROR, "timestamp field is missing", e);
+             }
+         }
+ 
+@@ -223,8 +228,7 @@ public IRubyObject ruby_to_hash_with_metadata(ThreadContext context) {
+         }
+ 
+         @JRubyMethod(name = "to_java")
+-        public IRubyObject ruby_to_java(ThreadContext context)
+-        {
++        public IRubyObject ruby_to_java(ThreadContext context) {
+             return JavaUtil.convertJavaToUsableRubyObject(context.runtime, this.event);
+         }
+ 
+@@ -234,7 +238,7 @@ public IRubyObject ruby_to_json(ThreadContext context, IRubyObject[] args)
+             try {
+                 return RubyString.newString(context.runtime, event.toJson());
+             } catch (Exception e) {
+-                throw RaiseException.from(context.runtime, RubyUtil.GENERATOR_ERROR, e.getMessage());
++                throw toRubyError(context, RubyUtil.GENERATOR_ERROR, e);
+             }
+         }
+ 
+@@ -242,13 +246,21 @@ public IRubyObject ruby_to_json(ThreadContext context, IRubyObject[] args)
+         // and a json array will newFromRubyArray each element into individual Event
+         // @return Array<Event> array of events
+         @JRubyMethod(name = "from_json", required = 1, meta = true)
+-        public static IRubyObject ruby_from_json(ThreadContext context, IRubyObject recv, RubyString value)
+-        {
++        public static IRubyObject ruby_from_json(ThreadContext context, IRubyObject recv, RubyString value, final Block block) {
++            if (!block.isGiven()) return fromJson(context, value, BasicEventFactory.INSTANCE);
++            return fromJson(context, value, (data) -> {
++                // LogStash::Event works fine with a Map arg (instead of a native Hash)
++                IRubyObject event = block.yield(context, RubyUtil.toRubyObject(data));
++                return ((RubyEvent) event).getEvent(); // we unwrap just to re-wrap later
++            });
++        }
++
++        private static IRubyObject fromJson(ThreadContext context, RubyString json, EventFactory eventFactory) {
+             Event[] events;
+             try {
+-                events = Event.fromJson(value.asJavaString());
++                events = Event.fromJson(json.asJavaString(), eventFactory);
+             } catch (Exception e) {
+-                throw RaiseException.from(context.runtime, RubyUtil.PARSER_ERROR, e.getMessage());
++                throw toRubyError(context, RubyUtil.PARSER_ERROR, e);
+             }
+ 
+             if (events.length == 1) {
+@@ -371,5 +383,16 @@ private static int nextHash() {
+             final long sequence = SEQUENCE_GENERATOR.incrementAndGet();
+             return (int) (sequence ^ sequence >>> 32) + 31;
+         }
++
++        private static RaiseException toRubyError(ThreadContext context, RubyClass type, Exception e) {
++            return toRubyError(context, type, e.getMessage(), e);
++        }
++
++        private static RaiseException toRubyError(ThreadContext context, RubyClass type, String message, Exception e) {
++            RaiseException ex = RaiseException.from(context.runtime, type, message);
++            ex.initCause(e);
++            return ex;
++        }
++
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/plugins/BasicEventFactory.java b/logstash-core/src/main/java/org/logstash/plugins/BasicEventFactory.java
+new file mode 100644
+index 00000000000..77f49fa1484
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/plugins/BasicEventFactory.java
+@@ -0,0 +1,57 @@
++/*
++ * Licensed to Elasticsearch B.V. under one or more contributor
++ * license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright
++ * ownership. Elasticsearch B.V. licenses this file to you under
++ * the Apache License, Version 2.0 (the "License"); you may
++ * not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *	http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.logstash.plugins;
++
++import co.elastic.logstash.api.Event;
++import co.elastic.logstash.api.EventFactory;
++import org.logstash.ConvertedMap;
++
++import java.io.Serializable;
++import java.util.Map;
++
++/**
++ * A basic {@link EventFactory} implementation for plugins.
++ *
++ * @see #INSTANCE
++ * @since Logstash 7.14
++ */
++public class BasicEventFactory implements EventFactory {
++
++    /**
++     * An event factory instance.
++     */
++    public static final EventFactory INSTANCE = new BasicEventFactory();
++
++    protected BasicEventFactory() { /* avoid direct instantiation */ }
++
++    @Override
++    public Event newEvent() {
++        return new org.logstash.Event();
++    }
++
++    @Override
++    public Event newEvent(Map<? extends Serializable, Object> data) {
++        if (data instanceof ConvertedMap) {
++            return new org.logstash.Event((ConvertedMap) data);
++        }
++        return new org.logstash.Event(data);
++    }
++
++}
+diff --git a/logstash-core/src/main/java/org/logstash/plugins/ContextImpl.java b/logstash-core/src/main/java/org/logstash/plugins/ContextImpl.java
+index 5ee3e48cf20..655242f2f8c 100644
+--- a/logstash-core/src/main/java/org/logstash/plugins/ContextImpl.java
++++ b/logstash-core/src/main/java/org/logstash/plugins/ContextImpl.java
+@@ -23,12 +23,8 @@
+ import co.elastic.logstash.api.*;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+-import org.logstash.ConvertedMap;
+ import org.logstash.log.DefaultDeprecationLogger;
+ 
+-import java.io.Serializable;
+-import java.util.Map;
+-
+ /**
+  * Default implementation of Logstash Plugin's {@link Context}
+  * */
+@@ -68,19 +64,6 @@ public DeprecationLogger getDeprecationLogger(Plugin plugin) {
+ 
+     @Override
+     public EventFactory getEventFactory() {
+-        return new EventFactory() {
+-            @Override
+-            public Event newEvent() {
+-                return new org.logstash.Event();
+-            }
+-
+-            @Override
+-            public Event newEvent(Map<? extends Serializable, Object> data) {
+-                if (data instanceof ConvertedMap) {
+-                    return new org.logstash.Event((ConvertedMap)data);
+-                }
+-                return new org.logstash.Event(data);
+-            }
+-        };
++        return BasicEventFactory.INSTANCE;
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/util/UtilExt.java b/logstash-core/src/main/java/org/logstash/util/UtilExt.java
+index bafdaa1dbc1..d46c287e7d5 100644
+--- a/logstash-core/src/main/java/org/logstash/util/UtilExt.java
++++ b/logstash-core/src/main/java/org/logstash/util/UtilExt.java
+@@ -23,6 +23,7 @@
+ import org.jruby.RubyThread;
+ import org.jruby.anno.JRubyMethod;
+ import org.jruby.anno.JRubyModule;
++import org.jruby.runtime.Block;
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
+ 
+@@ -43,4 +44,11 @@ public static IRubyObject get_thread_id(final ThreadContext context, IRubyObject
+         return javaThread == null ? context.nil : context.runtime.newFixnum(javaThread.getId());
+     }
+ 
++    @JRubyMethod(module = true) // JRuby.reference(target).synchronized { ... }
++    public static IRubyObject synchronize(final ThreadContext context, IRubyObject self, IRubyObject target, Block block) {
++        synchronized (target) {
++            return block.yieldSpecific(context);
++        }
++    }
++
+ }

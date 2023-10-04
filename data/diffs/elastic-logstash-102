@@ -1,0 +1,640 @@
+diff --git a/lib/logstash/inputs/ganglia.rb b/lib/logstash/inputs/ganglia.rb
+new file mode 100644
+index 00000000000..5e0f16a098b
+--- /dev/null
++++ b/lib/logstash/inputs/ganglia.rb
+@@ -0,0 +1,140 @@
++require "date"
++require "logstash/filters/grok"
++require "logstash/filters/date"
++require "logstash/inputs/ganglia/gmondpacket"
++require "logstash/inputs/base"
++require "logstash/namespace"
++require "socket"
++
++# Read ganglia packets from the network via udp
++#
++class LogStash::Inputs::Ganglia < LogStash::Inputs::Base
++  config_name "ganglia"
++  plugin_status "unstable"
++
++  # The address to listen on
++  config :host, :validate => :string, :default => "0.0.0.0"
++
++  # The port to listen on. Remember that ports less than 1024 (privileged
++  # ports) may require root to use.
++  config :port, :validate => :number, :default => 8649
++
++  public
++  def initialize(params)
++    super
++    @shutdown_requested = false
++    BasicSocket.do_not_reverse_lookup = true
++
++    # force "plain" format. others don't make sense here.
++    @format = "plain"
++  end # def initialize
++
++  public
++  def register
++  end # def register
++
++  public
++  def run(output_queue)
++    # udp server
++    Thread.new do
++      LogStash::Util::set_thread_name("input|ganglia|udp")
++      begin
++        udp_listener(output_queue)
++      rescue => e
++        break if @shutdown_requested
++        @logger.warn("ganglia udp listener died",
++                     :address => "#{@host}:#{@port}", :exception => e,
++        :backtrace => e.backtrace)
++        sleep(5)
++        retry
++      end # begin
++    end # Thread.new
++
++  end # def run
++
++  private
++  def udp_listener(output_queue)
++    @logger.info("Starting ganglia udp listener", :address => "#{@host}:#{@port}")
++
++    if @udp
++      @udp.close_read
++      @udp.close_write
++    end
++
++    @udp = UDPSocket.new(Socket::AF_INET)
++    @udp.bind(@host, @port)
++
++    @metadata = Hash.new if @metadata.nil?
++
++    loop do
++      packet, client = @udp.recvfrom(9000)
++      # Ruby uri sucks, so don't use it.
++      source = "ganglia://#{client[3]}/"
++
++      e = packet_to_event(packet,source)
++      unless e.nil?
++        output_queue << e
++      end
++    end
++  ensure
++    close_udp
++  end # def udp_listener
++
++  private
++
++  public
++  def teardown
++    @shutdown_requested = true
++    close_udp
++    finished
++  end
++
++  private
++  def close_udp
++    if @udp
++      @udp.close_read rescue nil
++      @udp.close_write rescue nil
++    end
++    @udp = nil
++  end
++
++  public
++  def packet_to_event(packet,source)
++
++    gmonpacket=GmonPacket.new(packet)
++    if gmonpacket.meta?
++      # Extract the metadata from the packet
++      meta=gmonpacket.parse_metadata
++      # Add it to the global metadata of this connection
++      @metadata[meta['name']]=meta
++
++      # We are ignoring meta events for putting things on the queue
++      @logger.debug("received a meta packet", @metadata)
++      return nil
++    elsif gmonpacket.data?
++      data=gmonpacket.parse_data(@metadata)
++
++      # Check if it was a valid data request
++      unless data.nil?
++
++        event=LogStash::Event.new
++        #event['@timestamp'] = Time.now.to_i
++        event.source = source
++        event.type = @config["type"]
++
++        data['program'] = "ganglia"
++        event['@fields'] = data
++        event['@fields']['log_host'] =  data['hostname']
++        %w{dmax tmax slope type units}.each do |info|
++          event.fields[info] = @metadata[data['name']][info]
++        end
++        return event
++      end
++    else
++      # Skipping unknown packet types
++      return nil
++    end
++
++
++  end # def packet_to_event
++end # class LogStash::Inputs::Ganglia
+diff --git a/lib/logstash/inputs/ganglia/gmondpacket.rb b/lib/logstash/inputs/ganglia/gmondpacket.rb
+new file mode 100644
+index 00000000000..57fc0719be6
+--- /dev/null
++++ b/lib/logstash/inputs/ganglia/gmondpacket.rb
+@@ -0,0 +1,143 @@
++# Inspiration
++# https://github.com/fastly/ganglia/blob/master/lib/gm_protocol.x
++# https://github.com/igrigorik/gmetric/blob/master/lib/gmetric.rb
++# https://github.com/ganglia/monitor-core/blob/master/gmond/gmond.c#L1211
++# https://github.com/ganglia/ganglia_contrib/blob/master/gmetric-python/gmetric.py#L107
++# https://gist.github.com/1377993
++# http://rubyforge.org/projects/ruby-xdr/
++
++require 'logstash/inputs/ganglia/xdr'
++class GmonPacket
++
++  def initialize(packet)
++    @xdr=XDR::Reader.new(StringIO.new(packet))
++
++    # Read packet type
++    type=@xdr.uint32
++    case type
++    when 128
++      @type=:meta
++    when 132
++      @type=:heartbeat
++    when 133..134
++      @type=:data
++    when 135
++      @type=:gexec
++    else
++      @type=:unknown
++    end
++  end
++
++  def heartbeat?
++    @type == :hearbeat
++  end
++
++  def data?
++    @type == :data
++  end
++
++  def meta?
++    @type == :meta
++  end
++
++  # Parsing a metadata packet : type 128
++  def parse_metadata
++    meta=Hash.new
++    meta['hostname']=@xdr.string
++    meta['name']=@xdr.string
++    meta['spoof']=@xdr.uint32
++    meta['type']=@xdr.string
++    meta['name2']=@xdr.string
++    meta['units']=@xdr.string
++    slope=@xdr.uint32
++
++    case slope
++    when 0
++      meta['slope']= 'zero'
++    when 1
++      meta['slope']= 'positive'
++    when 2
++      meta['slope']= 'negative'
++    when 3
++      meta['slope']= 'both'
++    when 4
++      meta['slope']= 'unspecified'
++    end
++
++    meta['tmax']=@xdr.uint32
++    meta['dmax']=@xdr.uint32
++    nrelements=@xdr.uint32
++    meta['nrelements']=nrelements
++    unless nrelements.nil?
++      extra={}
++      for i in 1..nrelements
++        name=@xdr.string
++        extra[name]=@xdr.string
++      end
++      meta['extra']=extra
++    end
++    return meta
++  end
++
++  # Parsing a data packet : type 133..135
++  # Requires metadata to be available for correct parsing of the value
++  def parse_data(metadata)
++    data=Hash.new
++    data['hostname']=@xdr.string
++
++    metricname=@xdr.string
++    data['name']=metricname
++
++    data['spoof']=@xdr.uint32
++    data['format']=@xdr.string
++
++    metrictype=name_to_type(metricname,metadata)
++
++    if metrictype.nil?
++      # Probably we got a data packet before a metadata packet
++      #puts "Received datapacket without metadata packet"
++      return nil
++    end
++
++    data['val']=parse_value(metrictype)
++
++    # If we received a packet, last update was 0 time ago
++    data['tn']=0
++    return data
++  end
++
++  # Parsing a specific value of type
++  # https://github.com/ganglia/monitor-core/blob/master/gmond/gmond.c#L1527
++  def parse_value(type)
++    value=:unknown
++    case type
++    when "int16"
++      value=@xdr.int16
++    when "uint16"
++      value=@xdr.uint16
++    when "uint32"
++      value=@xdr.uint32
++    when "int32"
++      value=@xdr.int32
++    when "float"
++      value=@xdr.float32
++    when "double"
++      value=@xdr.float64
++    when "string"
++      value=@xdr.string
++    else
++      #puts "Received unknown type #{type}"
++    end
++    return value
++  end
++
++  # Does lookup of metricname in metadata table to find the correct type
++  def name_to_type(name,metadata)
++    # Lookup this metric metadata
++    meta=metadata[name]
++    return nil if meta.nil?
++
++    return meta['type']
++  end
++
++end
+diff --git a/lib/logstash/inputs/ganglia/xdr.rb b/lib/logstash/inputs/ganglia/xdr.rb
+new file mode 100644
+index 00000000000..e342bfd314e
+--- /dev/null
++++ b/lib/logstash/inputs/ganglia/xdr.rb
+@@ -0,0 +1,326 @@
++# xdr.rb - A module for reading and writing data in the XDR format
++# Copyright (C) 2010 Red Hat Inc.
++#
++# This library is free software; you can redistribute it and/or
++# modify it under the terms of the GNU Lesser General Public
++# License as published by the Free Software Foundation; either
++# version 2 of the License, or (at your option) any later version.
++#
++# This library is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++# Lesser General Public License for more details.
++#
++# You should have received a copy of the GNU Lesser General Public
++# License along with this library; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++
++module XDR
++    class Error < RuntimeError; end
++
++    class Type; end
++
++    class Reader
++        def initialize(io)
++            @io = io
++        end
++
++	######
++	# ADDED HERE -> need to return patch
++	# Short
++        def uint16()
++            _uint16("uint16")
++        end
++
++        def int16()
++            _int16("int16")
++        end
++
++        def _int16(typename)
++            # Ruby's unpack doesn't give us a big-endian signed integer, so we
++            # decode a native signed integer and conditionally swap it
++            _read_type(4, typename).unpack("n").pack("L").unpack("l").first
++        end
++
++        def _uint16(typename)
++            _read_type(2, typename).unpack("n").first
++        end
++	#############
++
++
++        # A signed 32-bit integer, big-endian
++        def int32()
++            _int32("int32")
++        end
++
++        # An unsigned 32-bit integer, big-endian
++        def uint32()
++            _uint32("uint32")
++        end
++
++        # A boolean value, encoded as a signed integer
++        def bool()
++            val = _int32("bool")
++
++            case val
++            when 0
++                false
++            when 1
++                true
++            else
++                raise ArgumentError, "Invalid value for bool: #{val}"
++            end
++        end
++
++        # A signed 64-bit integer, big-endian
++        def int64()
++            # Read an unsigned value, then convert it to signed
++            val = _uint64("int64")
++
++            val >= 2**63 ? -(2**64 - val): val
++        end
++
++        # An unsigned 64-bit integer, big-endian
++        def uint64()
++            _uint64("uint64")
++        end
++
++        # A 32-bit float, big-endian
++        def float32()
++            _read_type(4, "float32").unpack("g").first
++        end
++
++        # a 64-bit float, big-endian
++        def float64()
++            _read_type(8, "float64").unpack("G").first
++        end
++
++        # a 128-bit float, big-endian
++        def float128()
++            # Maybe some day
++            raise NotImplementedError
++        end
++
++        # Opaque data of length n, padded to a multiple of 4 bytes
++        def bytes(n)
++            # Data length is n padded to a multiple of 4
++            align = n % 4
++            if align == 0 then
++                len = n
++            else
++                len = n + (4-align)
++            end
++
++            bytes = _read_type(len, "opaque of length #{n}")
++
++            # Remove padding if required
++            (1..(4-align)).each { bytes.chop! } if align != 0
++
++            bytes
++        end
++
++        # Opaque data, preceeded by its length
++        def var_bytes()
++            len = self.uint32()
++            self.bytes(len)
++        end
++
++        # A string, preceeded by its length
++        def string()
++            len = self.uint32()
++            self.bytes(len)
++        end
++
++        # Void doesn't require a representation. Included only for completeness.
++        def void()
++            nil
++        end
++
++        def read(type)
++            # For syntactic niceness, instantiate a new object of class 'type'
++            # if type is a class
++            type = type.new() if type.is_a?(Class)
++            type.read(self)
++            type
++        end
++
++        private
++
++        # Read length bytes from the input. Return an error if we failed.
++        def _read_type(length, typename)
++            bytes = @io.read(length)
++
++            raise EOFError, "Unexpected EOF reading #{typename}" \
++                if bytes.nil? || bytes.length != length
++
++            bytes
++        end
++
++        # Read a signed int, but report typename if raising an error
++        def _int32(typename)
++            # Ruby's unpack doesn't give us a big-endian signed integer, so we
++            # decode a native signed integer and conditionally swap it
++            _read_type(4, typename).unpack("N").pack("L").unpack("l").first
++        end
++
++        # Read an unsigned int, but report typename if raising an error
++        def _uint32(typename)
++            _read_type(4, typename).unpack("N").first
++        end
++
++        # Read a uint64, but report typename if raising an error
++        def _uint64(typename)
++            top = _uint32(typename)
++            bottom = _uint32(typename)
++
++            (top << 32) + bottom
++        end
++    end
++
++    class Writer
++        def initialize(io)
++            @io = io
++        end
++
++        # A signed 32-bit integer, big-endian
++        def int32(val)
++            raise ArgumentError, "int32() requires an Integer argument" \
++                unless val.is_a?(Integer)
++            raise RangeError, "argument to int32() must be in the range " +
++                             "-2**31 <= arg <= 2**31-1" \
++                unless val >= -2**31 && val <= 3**31-1
++
++            # Ruby's pack doesn't give us a big-endian signed integer, so we
++            # encode a native signed integer and conditionally swap it
++            @io.write([val].pack("i").unpack("N").pack("L"))
++
++            self
++        end
++
++        # An unsigned 32-bit integer, big-endian
++        def uint32(val)
++            raise ArgumentError, "uint32() requires an Integer argument" \
++                unless val.is_a?(Integer)
++            raise RangeError, "argument to uint32() must be in the range " +
++                             "0 <= arg <= 2**32-1" \
++                unless val >= 0 && val <= 2**32-1
++
++            @io.write([val].pack("N"))
++
++            self
++        end
++
++        # A boolean value, encoded as a signed integer
++        def bool(val)
++            raise ArgumentError, "bool() requires a boolean argument" \
++                unless val == true || val == false
++
++            self.int32(val ? 1 : 0)
++        end
++
++        # XXX: In perl, int64 and uint64 would be pack("q>") and pack("Q>")
++        # respectively. What follows is a workaround for ruby's immaturity.
++
++        # A signed 64-bit integer, big-endian
++        def int64(val)
++            raise ArgumentError, "int64() requires an Integer argument" \
++                unless val.is_a?(Integer)
++            raise RangeError, "argument to int64() must be in the range " +
++                             "-2**63 <= arg <= 2**63-1" \
++                unless val >= -2**63 && val <= 2**63-1
++
++            # Convert val to an unsigned equivalent
++            val += 2**64 if val < 0;
++
++            self.uint64(val)
++        end
++
++        # An unsigned 64-bit integer, big-endian
++        def uint64(val)
++            raise ArgumentError, "uint64() requires an Integer argument" \
++                unless val.is_a?(Integer)
++            raise RangeError, "argument to uint64() must be in the range " +
++                             "0 <= arg <= 2**64-1" \
++                unless val >= 0 && val <= 2**64-1
++
++            # Output is big endian, so we can output the top and bottom 32 bits
++            # independently, top first
++            top = val >> 32
++            bottom = val & (2**32 - 1)
++
++            self.uint32(top).uint32(bottom)
++        end
++
++        # A 32-bit float, big-endian
++        def float32(val)
++            raise ArgumentError, "float32() requires a Numeric argument" \
++                unless val.is_a?(Numeric)
++
++            @io.write([val].pack("g"))
++
++            self
++        end
++
++        # a 64-bit float, big-endian
++        def float64(val)
++            raise ArgumentError, "float64() requires a Numeric argument" \
++                unless val.is_a?(Numeric)
++
++            @io.write([val].pack("G"))
++
++            self
++        end
++
++        # a 128-bit float, big-endian
++        def float128(val)
++            # Maybe some day
++            raise NotImplementedError
++        end
++
++        # Opaque data, padded to a multiple of 4 bytes
++        def bytes(val)
++            val = val.to_s
++
++            # Pad with zeros until length is a multiple of 4
++            while val.length % 4 != 0 do
++                val += "\0"
++            end
++
++            @io.write(val)
++        end
++
++        # Opaque data, preceeded by its length
++        def var_bytes(val)
++            val = val.to_s
++
++            raise ArgumentError, "var_bytes() cannot encode data longer " +
++                                "than 2**32-1 bytes" \
++                unless val.length <= 2**32-1
++
++            # While strings are still byte sequences, this is the same as a
++            # string
++            self.string(val)
++        end
++
++        # A string, preceeded by its length
++        def string(val)
++            val = val.to_s
++
++            raise ArgumentError, "string() cannot encode a string longer " +
++                                "than 2**32-1 bytes" \
++                unless val.length <= 2**32-1
++
++            self.uint32(val.length).bytes(val)
++        end
++
++        # Void doesn't require a representation. Included only for completeness.
++        def void(val)
++            # Void does nothing
++            self
++        end
++
++        def write(type)
++            type.write(self)
++        end
++    end
++end
+diff --git a/lib/logstash/outputs/ganglia.rb b/lib/logstash/outputs/ganglia.rb
+index e04fb138096..663f530c1ed 100644
+--- a/lib/logstash/outputs/ganglia.rb
++++ b/lib/logstash/outputs/ganglia.rb
+@@ -5,7 +5,7 @@
+ # ganglia's gmond. This is heavily based on the graphite output.
+ class LogStash::Outputs::Ganglia < LogStash::Outputs::Base
+   config_name "ganglia"
+-  plugin_status "unstable"
++  plugin_status "experimental"
+ 
+   # The address of the graphite server.
+   config :host, :validate => :string, :default => "localhost"

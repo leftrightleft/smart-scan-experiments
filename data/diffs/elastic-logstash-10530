@@ -1,0 +1,769 @@
+diff --git a/bin/logstash.bat b/bin/logstash.bat
+index a04a5de9f01..edbca797be8 100644
+--- a/bin/logstash.bat
++++ b/bin/logstash.bat
+@@ -38,20 +38,25 @@ if "%LS_JVM_OPTIONS_CONFIG%" == "" (
+   set LS_JVM_OPTIONS_CONFIG="%LS_HOME%\config\jvm.options"
+ )
+ 
+-rem extract the options from the JVM options file %LS_JVM_OPTIONS_CONFIG%
+-rem such options are the lines beginning with '-', thus "findstr /b"
+-if exist %LS_JVM_OPTIONS_CONFIG% (
+-  for /F "usebackq delims=" %%a in (`findstr /b \- %LS_JVM_OPTIONS_CONFIG%`) do set options=!options! %%a
+-  set "LS_JAVA_OPTS=!options! %LS_JAVA_OPTS%"
+-) else (
+-  echo "warning: no jvm.options file found"
++rem Use wildcard for jars, instead of concatenating each jar to classpath to avoid reaching max size
++set CLASSPATH=%LS_HOME%\logstash-core\lib\jars\*
++
++if not exist %LS_JVM_OPTIONS_CONFIG% (
++echo No jvm.options found at %LS_JVM_OPTIONS_CONFIG%
++exit /b 1
+ )
+-set JAVA_OPTS=%LS_JAVA_OPTS%
+ 
+-for %%i in ("%LS_HOME%\logstash-core\lib\jars\*.jar") do (
+-	call :concat "%%i"
++@setlocal
++for /F "usebackq delims=" %%a in (`"%JAVA% -cp "!CLASSPATH!" "org.logstash.util.JvmOptionsConfigParser" "!LS_JVM_OPTIONS_CONFIG!" || echo jvm_options_parser_failed"`) do set JVM_OPTIONS=%%a
++@endlocal & set "MAYBE_JVM_OPTIONS_PARSER_FAILED=%JVM_OPTIONS%" & set "LS_JAVA_OPTS=%JVM_OPTIONS% %LS_JAVA_OPTS%"
++
++if "!MAYBE_JVM_OPTIONS_PARSER_FAILED!" == "jvm_options_parser_failed" (
++echo Logstash jvm options parser failed
++exit /b 1
+ )
+ 
++set JAVA_OPTS=%LS_JAVA_OPTS%
++
+ %JAVA% %JAVA_OPTS% -cp "%CLASSPATH%" org.logstash.Logstash %*
+ 
+ goto :end
+diff --git a/bin/logstash.lib.sh b/bin/logstash.lib.sh
+index 33c05fbc480..4f4458a3cc0 100755
+--- a/bin/logstash.lib.sh
++++ b/bin/logstash.lib.sh
+@@ -95,6 +95,16 @@ setup_java() {
+     unset JAVA_TOOL_OPTIONS
+   fi
+ 
++  # Set a default GC log file for use by jvm.options _before_ it's called.
++  if [ -z "$LS_GC_LOG_FILE" ] ; then
++    LS_GC_LOG_FILE="./logstash-gc.log"
++  fi
++
++  # jruby launcher uses JAVACMD as its java executable and JAVA_OPTS as the JVM options
++  export JAVACMD
++}
++
++setup_java_opts() {
+   # JAVA_OPTS is not a built-in JVM mechanism but some people think it is so we
+   # warn them that we are not observing the value of $JAVA_OPTS
+   if [ ! -z "$JAVA_OPTS" ]; then
+@@ -102,10 +112,6 @@ setup_java() {
+     echo "pass JVM parameters via LS_JAVA_OPTS"
+   fi
+ 
+-  # Set a default GC log file for use by jvm.options _before_ it's called.
+-  if [ -z "$LS_GC_LOG_FILE" ] ; then
+-    LS_GC_LOG_FILE="./logstash-gc.log"
+-  fi
+ 
+   # Set the initial JVM options from the jvm.options file.  Look in
+   # /etc/logstash first, and break if that file is found readable there.
+@@ -114,17 +120,21 @@ setup_java() {
+                         "$LOGSTASH_HOME"/config/jvm.options;
+                          do
+           if [ -r "$jvm_options" ]; then
+-              LS_JVM_OPTS=$jvm_options
+-              break
++            for J in $(cd "${LOGSTASH_JARS}"; ls *.jar); do
++                LS_OPTIONS_CP=${LS_OPTIONS_CP}${LS_OPTIONS_CP:+:}${LOGSTASH_JARS}/${J}
++            done
++            # Call out to the JvmOptionsConfigParser to parse out the jvm options. This allows versioning of settings
++            # the same way that Elasticsearch does
++            LS_JVM_OPTS=`"$JAVACMD" -cp "$LS_OPTIONS_CP" org.logstash.util.JvmOptionsConfigParser "$jvm_options"`
++            unset LS_OPTIONS_CP
++            break
+           fi
+       done
+   fi
++
+   # then override with anything provided
+-  LS_JAVA_OPTS="$(parse_jvm_options "$LS_JVM_OPTS") $LS_JAVA_OPTS"
++  LS_JAVA_OPTS="$LS_JVM_OPTS $LS_JAVA_OPTS"
+   JAVA_OPTS=$LS_JAVA_OPTS
+-
+-  # jruby launcher uses JAVACMD as its java executable and JAVA_OPTS as the JVM options
+-  export JAVACMD
+   export JAVA_OPTS
+ }
+ 
+@@ -159,6 +169,7 @@ setup_vendored_jruby() {
+ 
+ setup() {
+   setup_java
++  setup_java_opts
+   setup_vendored_jruby
+ }
+ 
+diff --git a/config/jvm.options b/config/jvm.options
+index 401f7154bb6..adda56dc2af 100644
+--- a/config/jvm.options
++++ b/config/jvm.options
+@@ -17,7 +17,7 @@
+ ################################################################
+ 
+ ## GC configuration
+--XX:+UseConcMarkSweepGC
++8:-XX:+UseConcMarkSweepGC
+ -XX:CMSInitiatingOccupancyFraction=75
+ -XX:+UseCMSInitiatingOccupancyOnly
+ 
+@@ -74,3 +74,17 @@
+ 
+ # Entropy source for randomness
+ -Djava.security.egd=file:/dev/urandom
++
++# Java 9 and above:
++9-:--add-opens=java.base/java.lang=ALL-UNNAMED
++9-:--add-opens=java.base/java.security=ALL-UNNAMED
++9-:--add-opens=java.base/java.util=ALL-UNNAMED
++9-:--add-opens=java.base/java.security.cert=ALL-UNNAMED
++9-:--add-opens=java.base/java.util.zip=ALL-UNNAMED
++9-:--add-opens=java.base/java.lang.reflect=ALL-UNNAMED
++9-:--add-opens=java.base/java.util.regex=ALL-UNNAMED
++9-:--add-opens=java.base/java.net=ALL-UNNAMED
++9-:--add-opens=java.base/java.io=ALL-UNNAMED
++9-:--add-opens=java.base/java.lang=ALL-UNNAMED
++9-:--add-opens=java.base/javax.crypto=ALL-UNNAMED
++9-:--add-opens=java.management/sun.management=ALL-UNNAMED
+diff --git a/docs/static/jvm-options.asciidoc b/docs/static/jvm-options.asciidoc
+new file mode 100644
+index 00000000000..807b8fb5ca4
+--- /dev/null
++++ b/docs/static/jvm-options.asciidoc
+@@ -0,0 +1,76 @@
++[[jvm-options-file]]
++=== Setting JVM options
++
++You should rarely need to change Java Virtual Machine (JVM) options. If you do,
++the most likely change is setting the heap-size. The remainder of
++this document explains in detail how to set JVM options.
++
++The preferred method of setting JVM options (including system properties and JVM
++flags) is via the `jvm.options` configuration file. The default location of this
++file is `config/jvm.options` (when installing from the tar or zip distributions)
++and `/etc/logstash/jvm.options` (when installing from the Debian or RPM
++packages).
++
++This file contains a line-delimited list of JVM arguments following
++a special syntax:
++
++* lines consisting of whitespace only are ignored
++* lines beginning with `#` are treated as comments and are ignored
+++
++[source,text]
++-------------------------------------
++# this is a comment
++-------------------------------------
++
++* lines beginning with a `-` are treated as a JVM option that applies
++  independent of the version of the JVM
+++
++[source,text]
++-------------------------------------
++-Xmx2g
++-------------------------------------
++
++* lines beginning with a number followed by a `:` followed by a `-` are treated
++  as a JVM option that applies only if the version of the JVM matches the number
+++
++[source,text]
++-------------------------------------
++8:-Xmx2g
++-------------------------------------
++
++* lines beginning with a number followed by a `-` followed by a `:` are treated
++  as a JVM option that applies only if the version of the JVM is greater than or
++  equal to the number
+++
++[source,text]
++-------------------------------------
++8-:-Xmx2g
++-------------------------------------
++
++* lines beginning with a number followed by a `-` followed by a number followed
++  by a `:` are treated as a JVM option that applies only if the version of the
++  JVM falls in the range of the two numbers
+++
++[source,text]
++-------------------------------------
++8-9:-Xmx2g
++-------------------------------------
++
++* all other lines are rejected
++
++You can add custom JVM flags to this file and check this configuration into your
++version control system.
++
++An alternative mechanism for setting Java Virtual Machine options is via the
++`LS_JAVA_OPTS` environment variable. For instance:
++
++[source,sh]
++---------------------------------
++export LS_JAVA_OPTS="$LS_JAVA_OPTS -Djava.io.tmpdir=/path/to/temp/dir"
++---------------------------------
++
++Additionally, some other Java programs support the `JAVA_OPTS` environment
++variable. This is *not* a mechanism built into the JVM but instead a convention
++in the ecosystem. However, we do not support this environment variable, instead
++supporting setting JVM options via the `jvm.options` file or the environment
++variable `LS_JAVA_OPTS` as above.
+\ No newline at end of file
+diff --git a/docs/static/setting-up-logstash.asciidoc b/docs/static/setting-up-logstash.asciidoc
+index b50b7649db1..372f8f75fbe 100644
+--- a/docs/static/setting-up-logstash.asciidoc
++++ b/docs/static/setting-up-logstash.asciidoc
+@@ -188,7 +188,7 @@ The settings files are already defined in the Logstash installation. Logstash in
+   Contains JVM configuration flags. Use this file to set initial and maximum values for
+   total heap space. You can also use this file to set the locale for Logstash.
+   Specify each flag on a separate line. All other settings in this file are
+-  considered expert settings.
++  considered expert settings. See <<jvm-options-file>> for details.
+ *`log4j2.properties`*:: Contains default settings for `log4j 2` library. See <<log4j2>> for more info.
+ *`startup.options` (Linux)*::
+   Contains options used by the `system-install` script in `/usr/share/logstash/bin` to build the appropriate startup
+diff --git a/logstash-core/src/main/java/org/logstash/util/JavaVersion.java b/logstash-core/src/main/java/org/logstash/util/JavaVersion.java
+new file mode 100644
+index 00000000000..b8039a73a31
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/util/JavaVersion.java
+@@ -0,0 +1,51 @@
++package org.logstash.util;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Objects;
++
++public class JavaVersion {
++
++    public static final List<Integer> CURRENT = parse(System.getProperty("java.specification.version"));
++    public static final List<Integer> JAVA_8 = parse("1.8");
++
++    static List<Integer> parse(final String value) {
++        if (!value.matches("^0*[0-9]+(\\.[0-9]+)*$")) {
++            throw new IllegalArgumentException(value);
++        }
++
++        final List<Integer> version = new ArrayList<Integer>();
++        final String[] components = value.split("\\.");
++        for (final String component : components) {
++            version.add(Integer.valueOf(component));
++        }
++        return version;
++    }
++
++    public static int majorVersion(final List<Integer> javaVersion) {
++        Objects.requireNonNull(javaVersion);
++        if (javaVersion.get(0) > 1) {
++            return javaVersion.get(0);
++        } else {
++            return javaVersion.get(1);
++        }
++    }
++
++    static int compare(final List<Integer> left, final List<Integer> right) {
++        // lexicographically compare two lists, treating missing entries as zeros
++        final int len = Math.max(left.size(), right.size());
++        for (int i = 0; i < len; i++) {
++            final int l = (i < left.size()) ? left.get(i) : 0;
++            final int r = (i < right.size()) ? right.get(i) : 0;
++            if (l < r) {
++                return -1;
++            }
++            if (r < l) {
++                return 1;
++            }
++        }
++        return 0;
++    }
++
++
++}
+diff --git a/logstash-core/src/main/java/org/logstash/util/JvmOptionsConfigParser.java b/logstash-core/src/main/java/org/logstash/util/JvmOptionsConfigParser.java
+new file mode 100644
+index 00000000000..751c615ee76
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/util/JvmOptionsConfigParser.java
+@@ -0,0 +1,241 @@
++package org.logstash.util;
++
++import java.io.BufferedReader;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.InputStreamReader;
++import java.io.Reader;
++import java.nio.charset.Charset;
++import java.nio.file.Files;
++import java.nio.file.Paths;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.SortedMap;
++import java.util.TreeMap;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/**
++ * Parses JVM options from a file and prints a single line with all JVM options to standard output.
++ */
++final class JvmOptionsConfigParser {
++
++    /**
++     * The main entry point. The exit code is 0 if the JVM options were successfully parsed, otherwise the exit code is 1. If an improperly
++     * formatted line is discovered, the line is output to standard error.
++     *
++     * @param args the args to the program which should consist of a single option, the path to the JVM options
++     */
++    public static void main(final String[] args) throws IOException {
++        if (args.length != 1) {
++            throw new IllegalArgumentException("expected one argument specifying path to jvm.options but was " + Arrays.toString(args));
++        }
++        final List<String> jvmOptions = new ArrayList<>();
++        final SortedMap<Integer, String> invalidLines = new TreeMap<>();
++        try (InputStream is = Files.newInputStream(Paths.get(args[0]));
++             Reader reader = new InputStreamReader(is, Charset.forName("UTF-8"));
++             BufferedReader br = new BufferedReader(reader)) {
++            parse(
++                    JavaVersion.majorVersion(JavaVersion.CURRENT),
++                    br,
++                    jvmOptions::add,
++                    invalidLines::put);
++        }
++
++        if (invalidLines.isEmpty()) {
++            final String spaceDelimitedJvmOptions = spaceDelimitJvmOptions(jvmOptions);
++            System.out.println(spaceDelimitedJvmOptions);
++            System.exit(0);
++        } else {
++            final String errorMessage = String.format(
++                    Locale.ROOT,
++                    "encountered [%d] error%s parsing [%s]",
++                    invalidLines.size(),
++                    invalidLines.size() == 1 ? "" : "s",
++                    args[0]);
++            System.err.println(errorMessage);
++            int count = 0;
++            for (final Map.Entry<Integer, String> entry : invalidLines.entrySet()) {
++                count++;
++                final String message = String.format(
++                        Locale.ROOT,
++                        "[%d]: encountered improperly formatted JVM option line [%s] on line number [%d]",
++                        count,
++                        entry.getValue(),
++                        entry.getKey());
++                System.err.println(message);
++            }
++            System.exit(1);
++        }
++    }
++
++    /**
++     * Callback for valid JVM options.
++     */
++    interface JvmOptionConsumer {
++        /**
++         * Invoked when a line in the JVM options file matches the specified syntax and the specified major version.
++         * @param jvmOption the matching JVM option
++         */
++        void accept(String jvmOption);
++    }
++
++    /**
++     * Callback for invalid lines in the JVM options.
++     */
++    interface InvalidLineConsumer {
++        /**
++         * Invoked when a line in the JVM options does not match the specified syntax.
++         */
++        void accept(int lineNumber, String line);
++    }
++
++    private static final Pattern PATTERN = Pattern.compile("((?<start>\\d+)(?<range>-)?(?<end>\\d+)?:)?(?<option>-.*)$");
++
++    /**
++     * Parse the line-delimited JVM options from the specified buffered reader for the specified Java major version.
++     * Valid JVM options are:
++     * <ul>
++     *     <li>
++     *         a line starting with a dash is treated as a JVM option that applies to all versions
++     *     </li>
++     *     <li>
++     *         a line starting with a number followed by a colon is treated as a JVM option that applies to the matching Java major version
++     *         only
++     *     </li>
++     *     <li>
++     *         a line starting with a number followed by a dash followed by a colon is treated as a JVM option that applies to the matching
++     *         Java specified major version and all larger Java major versions
++     *     </li>
++     *     <li>
++     *         a line starting with a number followed by a dash followed by a number followed by a colon is treated as a JVM option that
++     *         applies to the specified range of matching Java major versions
++     *     </li>
++     * </ul>
++     *
++     * For example, if the specified Java major version is 8, the following JVM options will be accepted:
++     * <ul>
++     *     <li>
++     *         {@code -XX:+PrintGCDateStamps}
++     *     </li>
++     *     <li>
++     *         {@code 8:-XX:+PrintGCDateStamps}
++     *     </li>
++     *     <li>
++     *         {@code 8-:-XX:+PrintGCDateStamps}
++     *     </li>
++     *     <li>
++     *         {@code 7-8:-XX:+PrintGCDateStamps}
++     *     </li>
++     * </ul>
++     * and the following JVM options will not be accepted:
++     * <ul>
++     *     <li>
++     *         {@code 9:-Xlog:age*=trace,gc*,safepoint:file=logs/gc.log:utctime,pid,tags:filecount=32,filesize=64m}
++     *     </li>
++     *     <li>
++     *         {@code 9-:-Xlog:age*=trace,gc*,safepoint:file=logs/gc.log:utctime,pid,tags:filecount=32,filesize=64m}
++     *     </li>
++     *     <li>
++     *         {@code 9-10:-Xlog:age*=trace,gc*,safepoint:file=logs/gc.log:utctime,pid,tags:filecount=32,filesize=64m}
++     *     </li>
++     * </ul>
++     *
++     * If the version syntax specified on a line matches the specified JVM options, the JVM option callback will be invoked with the JVM
++     * option. If the line does not match the specified syntax for the JVM options, the invalid line callback will be invoked with the
++     * contents of the entire line.
++     *
++     * @param javaMajorVersion the Java major version to match JVM options against
++     * @param br the buffered reader to read line-delimited JVM options from
++     * @param jvmOptionConsumer the callback that accepts matching JVM options
++     * @param invalidLineConsumer a callback that accepts invalid JVM options
++     * @throws IOException if an I/O exception occurs reading from the buffered reader
++     */
++    static void parse(
++            final int javaMajorVersion,
++            final BufferedReader br,
++            final JvmOptionConsumer jvmOptionConsumer,
++            final InvalidLineConsumer invalidLineConsumer) throws IOException {
++        int lineNumber = 0;
++        while (true) {
++            final String line = br.readLine();
++            lineNumber++;
++            if (line == null) {
++                break;
++            }
++            if (line.startsWith("#")) {
++                // lines beginning with "#" are treated as comments
++                continue;
++            }
++            if (line.matches("\\s*")) {
++                // skip blank lines
++                continue;
++            }
++            final Matcher matcher = PATTERN.matcher(line);
++            if (matcher.matches()) {
++                final String start = matcher.group("start");
++                final String end = matcher.group("end");
++                if (start == null) {
++                    // no range present, unconditionally apply the JVM option
++                    jvmOptionConsumer.accept(line);
++                } else {
++                    final int lower;
++                    try {
++                        lower = Integer.parseInt(start);
++                    } catch (final NumberFormatException e) {
++                        invalidLineConsumer.accept(lineNumber, line);
++                        continue;
++                    }
++                    final int upper;
++                    if (matcher.group("range") == null) {
++                        // no range is present, apply the JVM option to the specified major version only
++                        upper = lower;
++                    } else if (end == null) {
++                        // a range of the form \\d+- is present, apply the JVM option to all major versions larger than the specified one
++                        upper = Integer.MAX_VALUE;
++                    } else {
++                        // a range of the form \\d+-\\d+ is present, apply the JVM option to the specified range of major versions
++                        try {
++                            upper = Integer.parseInt(end);
++                        } catch (final NumberFormatException e) {
++                            invalidLineConsumer.accept(lineNumber, line);
++                            continue;
++                        }
++                        if (upper < lower) {
++                            invalidLineConsumer.accept(lineNumber, line);
++                            continue;
++                        }
++                    }
++                    if (lower <= javaMajorVersion && javaMajorVersion <= upper) {
++                        jvmOptionConsumer.accept(matcher.group("option"));
++                    }
++                }
++            } else {
++                invalidLineConsumer.accept(lineNumber, line);
++            }
++        }
++    }
++
++    /**
++     * Delimits the specified JVM options by spaces.
++     *
++     * @param jvmOptions the JVM options
++     * @return a single-line string containing the specified JVM options in the order they appear delimited by spaces
++     */
++    static String spaceDelimitJvmOptions(final List<String> jvmOptions) {
++        final StringBuilder spaceDelimitedJvmOptionsBuilder = new StringBuilder();
++        final Iterator<String> it = jvmOptions.iterator();
++        while (it.hasNext()) {
++            spaceDelimitedJvmOptionsBuilder.append(it.next());
++            if (it.hasNext()) {
++                spaceDelimitedJvmOptionsBuilder.append(" ");
++            }
++        }
++        return spaceDelimitedJvmOptionsBuilder.toString();
++    }
++
++}
+\ No newline at end of file
+diff --git a/logstash-core/src/test/java/org/logstash/util/JvmOptionsConfigParserTests.java b/logstash-core/src/test/java/org/logstash/util/JvmOptionsConfigParserTests.java
+new file mode 100644
+index 00000000000..016f18e657b
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/util/JvmOptionsConfigParserTests.java
+@@ -0,0 +1,222 @@
++package org.logstash.util;
++
++import org.junit.Test;
++
++import java.io.BufferedReader;
++import java.io.IOException;
++import java.io.StringReader;
++import java.security.SecureRandom;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Random;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++import static org.hamcrest.CoreMatchers.equalTo;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertThat;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++
++public class JvmOptionsConfigParserTests {
++
++    @Test
++    public void testUnversionedOptions() throws IOException {
++        try (StringReader sr = new StringReader("-Xms1g\n-Xmx1g");
++             BufferedReader br = new BufferedReader(sr)) {
++            assertExpectedJvmOptions(randomIntBetween(8, Integer.MAX_VALUE), br, Arrays.asList("-Xms1g", "-Xmx1g"));
++        }
++
++    }
++
++    @Test
++    public void testSingleVersionOption() throws IOException {
++        final int javaMajorVersion = randomIntBetween(8, Integer.MAX_VALUE - 1);
++        final int smallerJavaMajorVersion = randomIntBetween(7, javaMajorVersion);
++        final int largerJavaMajorVersion = randomIntBetween(javaMajorVersion + 1, Integer.MAX_VALUE);
++        try (StringReader sr = new StringReader(
++                String.format(
++                        Locale.ROOT,
++                        "-Xms1g\n%d:-Xmx1g\n%d:-XX:+UseG1GC\n%d:-Xlog:gc",
++                        javaMajorVersion,
++                        smallerJavaMajorVersion,
++                        largerJavaMajorVersion));
++             BufferedReader br = new BufferedReader(sr)) {
++            assertExpectedJvmOptions(javaMajorVersion, br, Arrays.asList("-Xms1g", "-Xmx1g"));
++        }
++    }
++
++    @Test
++    public void testUnboundedVersionOption() throws IOException {
++        final int javaMajorVersion = randomIntBetween(8, Integer.MAX_VALUE - 1);
++        final int smallerJavaMajorVersion = randomIntBetween(7, javaMajorVersion);
++        final int largerJavaMajorVersion = randomIntBetween(javaMajorVersion + 1, Integer.MAX_VALUE);
++        try (StringReader sr = new StringReader(
++                String.format(
++                        Locale.ROOT,
++                        "-Xms1g\n%d-:-Xmx1g\n%d-:-XX:+UseG1GC\n%d-:-Xlog:gc",
++                        javaMajorVersion,
++                        smallerJavaMajorVersion,
++                        largerJavaMajorVersion));
++             BufferedReader br = new BufferedReader(sr)) {
++            assertExpectedJvmOptions(javaMajorVersion, br, Arrays.asList("-Xms1g", "-Xmx1g", "-XX:+UseG1GC"));
++        }
++    }
++
++    @Test
++    public void testBoundedVersionOption() throws IOException {
++        final int javaMajorVersion = randomIntBetween(8, Integer.MAX_VALUE - 1);
++        final int javaMajorVersionUpperBound = randomIntBetween(javaMajorVersion, Integer.MAX_VALUE - 1);
++        final int smallerJavaMajorVersionLowerBound = randomIntBetween(7, javaMajorVersion);
++        final int smallerJavaMajorVersionUpperBound = randomIntBetween(smallerJavaMajorVersionLowerBound, javaMajorVersion);
++        final int largerJavaMajorVersionLowerBound = randomIntBetween(javaMajorVersion + 1, Integer.MAX_VALUE);
++        final int largerJavaMajorVersionUpperBound = randomIntBetween(largerJavaMajorVersionLowerBound, Integer.MAX_VALUE);
++        try (StringReader sr = new StringReader(
++                String.format(
++                        Locale.ROOT,
++                        "-Xms1g\n%d-%d:-Xmx1g\n%d-%d:-XX:+UseG1GC\n%d-%d:-Xlog:gc",
++                        javaMajorVersion,
++                        javaMajorVersionUpperBound,
++                        smallerJavaMajorVersionLowerBound,
++                        smallerJavaMajorVersionUpperBound,
++                        largerJavaMajorVersionLowerBound,
++                        largerJavaMajorVersionUpperBound));
++             BufferedReader br = new BufferedReader(sr)) {
++            assertExpectedJvmOptions(javaMajorVersion, br, Arrays.asList("-Xms1g", "-Xmx1g"));
++        }
++    }
++
++    @Test
++    public void testComplexOptions() throws IOException {
++        final int javaMajorVersion = randomIntBetween(8, Integer.MAX_VALUE - 1);
++        final int javaMajorVersionUpperBound = randomIntBetween(javaMajorVersion, Integer.MAX_VALUE - 1);
++        final int smallerJavaMajorVersionLowerBound = randomIntBetween(7, javaMajorVersion);
++        final int smallerJavaMajorVersionUpperBound = randomIntBetween(smallerJavaMajorVersionLowerBound, javaMajorVersion);
++        final int largerJavaMajorVersionLowerBound = randomIntBetween(javaMajorVersion + 1, Integer.MAX_VALUE);
++        final int largerJavaMajorVersionUpperBound = randomIntBetween(largerJavaMajorVersionLowerBound, Integer.MAX_VALUE);
++        try (StringReader sr = new StringReader(
++                String.format(
++                        Locale.ROOT,
++                        "-Xms1g\n%d:-Xmx1g\n%d-:-XX:+UseG1GC\n%d-%d:-Xlog:gc\n%d-%d:-XX:+PrintFlagsFinal\n%d-%d:-XX+AggressiveOpts",
++                        javaMajorVersion,
++                        javaMajorVersion,
++                        javaMajorVersion,
++                        javaMajorVersionUpperBound,
++                        smallerJavaMajorVersionLowerBound,
++                        smallerJavaMajorVersionUpperBound,
++                        largerJavaMajorVersionLowerBound,
++                        largerJavaMajorVersionUpperBound));
++             BufferedReader br = new BufferedReader(sr)) {
++            assertExpectedJvmOptions(javaMajorVersion, br, Arrays.asList("-Xms1g", "-Xmx1g", "-XX:+UseG1GC", "-Xlog:gc"));
++        }
++    }
++
++    @Test
++    public void testInvalidLines() throws IOException {
++        try (StringReader sr = new StringReader("XX:+UseG1GC");
++             BufferedReader br = new BufferedReader(sr)) {
++            JvmOptionsConfigParser.parse(
++                    randomIntBetween(8, Integer.MAX_VALUE),
++                    br,
++                    jvmOption -> fail("unexpected valid JVM option [" + jvmOption + "]"), (lineNumber, line) -> {
++                        assertThat(lineNumber, equalTo(1));
++                        assertThat(line, equalTo("XX:+UseG1GC"));
++                    });
++        }
++
++        final int javaMajorVersion = randomIntBetween(8, Integer.MAX_VALUE);
++        final int smallerJavaMajorVersion = randomIntBetween(7, javaMajorVersion - 1);
++        final String invalidRangeLine = String.format(Locale.ROOT, "%d:%d-XX:+UseG1GC", javaMajorVersion, smallerJavaMajorVersion);
++        try (StringReader sr = new StringReader(invalidRangeLine);
++             BufferedReader br = new BufferedReader(sr)) {
++            assertInvalidLines(br, Collections.singletonMap(1, invalidRangeLine));
++        }
++
++        final long invalidLowerJavaMajorVersion = (long) randomIntBetween(1, 16) + Integer.MAX_VALUE;
++        final long invalidUpperJavaMajorVersion = (long) randomIntBetween(1, 16) + Integer.MAX_VALUE;
++        final String numberFormatExceptionsLine = String.format(
++                Locale.ROOT,
++                "%d:-XX:+UseG1GC\n8-%d:-XX:+AggressiveOpts",
++                invalidLowerJavaMajorVersion,
++                invalidUpperJavaMajorVersion);
++        try (StringReader sr = new StringReader(numberFormatExceptionsLine);
++             BufferedReader br = new BufferedReader(sr)) {
++            final Map<Integer, String> invalidLines = new HashMap<>(2);
++            invalidLines.put(1, String.format(Locale.ROOT, "%d:-XX:+UseG1GC", invalidLowerJavaMajorVersion));
++            invalidLines.put(2, String.format(Locale.ROOT, "8-%d:-XX:+AggressiveOpts", invalidUpperJavaMajorVersion));
++            assertInvalidLines(br, invalidLines);
++        }
++
++        final String multipleInvalidLines = "XX:+UseG1GC\nXX:+AggressiveOpts";
++        try (StringReader sr = new StringReader(multipleInvalidLines);
++             BufferedReader br = new BufferedReader(sr)) {
++            final Map<Integer, String> invalidLines = new HashMap<>(2);
++            invalidLines.put(1, "XX:+UseG1GC");
++            invalidLines.put(2, "XX:+AggressiveOpts");
++            assertInvalidLines(br, invalidLines);
++        }
++
++        final int lowerBound = randomIntBetween(9, 16);
++        final int upperBound = randomIntBetween(8, lowerBound - 1);
++        final String upperBoundGreaterThanLowerBound = String.format(Locale.ROOT, "%d-%d-XX:+UseG1GC", lowerBound, upperBound);
++        try (StringReader sr = new StringReader(upperBoundGreaterThanLowerBound);
++             BufferedReader br = new BufferedReader(sr)) {
++            assertInvalidLines(br, Collections.singletonMap(1, upperBoundGreaterThanLowerBound));
++        }
++    }
++
++    @Test
++    public void testSpaceDelimitedJvmOptions() {
++        assertThat(JvmOptionsConfigParser.spaceDelimitJvmOptions(Collections.singletonList("-Xms1g")), equalTo("-Xms1g"));
++        assertThat(JvmOptionsConfigParser.spaceDelimitJvmOptions(Arrays.asList("-Xms1g", "-Xmx1g")), equalTo("-Xms1g -Xmx1g"));
++        assertThat(
++                JvmOptionsConfigParser.spaceDelimitJvmOptions(Arrays.asList("-Xms1g", "-Xmx1g", "-XX:+UseG1GC")),
++                equalTo("-Xms1g -Xmx1g -XX:+UseG1GC"));
++    }
++
++    private void assertExpectedJvmOptions(
++            final int javaMajorVersion, final BufferedReader br, final List<String> expectedJvmOptions) throws IOException {
++        final Map<String, AtomicBoolean> seenJvmOptions = new HashMap<>();
++        for (final String expectedJvmOption : expectedJvmOptions) {
++            assertNull(seenJvmOptions.put(expectedJvmOption, new AtomicBoolean()));
++        }
++        JvmOptionsConfigParser.parse(
++                javaMajorVersion,
++                br,
++                jvmOption -> {
++                    final AtomicBoolean seen = seenJvmOptions.get(jvmOption);
++                    if (seen == null) {
++                        fail("unexpected JVM option [" + jvmOption + "]");
++                    }
++                    assertFalse("saw JVM option [" + jvmOption + "] more than once", seen.get());
++                    seen.set(true);
++                },
++                (lineNumber, line) -> fail("unexpected invalid line [" + line + "] on line number [" + lineNumber + "]"));
++        for (final Map.Entry<String, AtomicBoolean> seenJvmOption : seenJvmOptions.entrySet()) {
++            assertTrue("expected JVM option [" + seenJvmOption.getKey() + "]", seenJvmOption.getValue().get());
++        }
++    }
++
++    private void assertInvalidLines(final BufferedReader br, final Map<Integer, String> invalidLines) throws IOException {
++        final Map<Integer, String> seenInvalidLines = new HashMap<>(invalidLines.size());
++        JvmOptionsConfigParser.parse(
++                randomIntBetween(8, Integer.MAX_VALUE),
++                br,
++                jvmOption -> fail("unexpected valid JVM options [" + jvmOption + "]"),
++                seenInvalidLines::put);
++        assertThat(seenInvalidLines, equalTo(invalidLines));
++    }
++
++
++    private int randomIntBetween(int from, int to) {
++        long range = (long) to - (long) from;
++        return from + r.nextInt(1 + (int)range);
++    }
++
++    private static Random r = new SecureRandom();
++}
+\ No newline at end of file

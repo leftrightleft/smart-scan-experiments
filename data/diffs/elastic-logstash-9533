@@ -1,0 +1,173 @@
+diff --git a/bin/pqcheck b/bin/pqcheck
+index ab15005a192..3c7c31f2b92 100755
+--- a/bin/pqcheck
++++ b/bin/pqcheck
+@@ -1,31 +1,41 @@
+-#!/usr/bin/env bin/ruby
++#!/usr/bin/env bash
+ 
+-DEFAULT_PQ_DIR = "data/queue/main"
+-
+-argv0 = ARGV[0].to_s.strip
+-if argv0 == "-h" || argv0 == "--help"
+-  puts("usage: pqcheck [PQ dir path]\n  default [PQ dir path] is #{DEFAULT_PQ_DIR}")
+-  exit(0)
+-end
+-
+-dir = argv0.empty? ? DEFAULT_PQ_DIR : argv0
+-if (!Dir.exist?(dir))
+-  puts("error: invalid PQ dir path: #{dir}")
+-  exit(1)
+-end
++unset CDPATH
++# This unwieldy bit of scripting is to try to catch instances where Logstash
++# was launched from a symlink, rather than a full path to the Logstash binary
++if [ -L "$0" ]; then
++  # Launched from a symlink
++  # --Test for the readlink binary
++  RL="$(command -v readlink)"
++  if [ $? -eq 0 ]; then
++    # readlink exists
++    SOURCEPATH="$(${RL} $0)"
++  else
++    # readlink not found, attempt to parse the output of stat
++    SOURCEPATH="$(stat -c %N $0 | awk '{print $3}' | sed -e 's/\‘//' -e 's/\’//')"
++    if [ $? -ne 0 ]; then
++      # Failed to execute or parse stat
++      echo "Failed to find source library at path $(cd `dirname $0`/..; pwd)/bin/logstash.lib.sh"
++      echo "You may need to launch Logstash with a full path instead of a symlink."
++      exit 1
++    fi
++  fi
++else
++  # Not a symlink
++  SOURCEPATH="$0"
++fi
+ 
+-puts("checking queue dir: #{dir}")
++. "$(cd `dirname ${SOURCEPATH}`/..; pwd)/bin/logstash.lib.sh"
++setup
+ 
+-Dir.glob("#{dir}/checkpoint.*").sort_by { |x| x[/[0-9]+$/].to_i }.each do |checkpoint|
+-  data = File.read(checkpoint)
+ 
+-  if data.size == 33
+-    version, page, firstUnackedPage, firstUnackedSeq, minSeq, elementCount, crc32 = data.unpack("nNNQ>Q>NN")
+-    fa = firstUnackedSeq >= (minSeq + elementCount)
+-    ps = File.exist?("#{dir}/page.#{page}") ? File.size("#{dir}/page.#{page}") : nil
+-    print("#{File.basename(checkpoint)}, fully-acked: #{fa ? "YES" : "NO"}, page.#{page} size: #{ps ? ps : "NOT FOUND"}, ")
+-    p(version: version, page: page, firstUnackedPage: firstUnackedPage, firstUnackedSeq: firstUnackedSeq, minSeq: minSeq, elementCount: elementCount, crc32: crc32)
+-  else
+-    puts("#{File.basename(checkpoint)}, invalid size: #{data.size} ")
+-  end
+-end
++function classpath() {
++    echo -n "$1"
++    shift
++    while [ $# -gt 0 ] ; do
++      echo -n ":${1}"
++      shift
++    done
++}
++CLASSPATH="$(classpath ${LOGSTASH_HOME}/logstash-core/lib/jars/*.jar)"
++exec "${JAVACMD}" ${JAVA_OPTS} -cp "${CLASSPATH}" org.logstash.ackedqueue.PqCheck "$@"
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/PqCheck.java b/logstash-core/src/main/java/org/logstash/ackedqueue/PqCheck.java
+new file mode 100644
+index 00000000000..6e27c152df5
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/PqCheck.java
+@@ -0,0 +1,81 @@
++package org.logstash.ackedqueue;
++
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.nio.file.DirectoryStream;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Comparator;
++import java.util.stream.StreamSupport;
++import org.logstash.ackedqueue.io.FileCheckpointIO;
++
++public final class PqCheck {
++
++    private static final String DEFAULT_PQ_DIR = "data/queue/main";
++
++    public static void main(final String... args) throws IOException {
++        if (args.length > 0) {
++            final String argv0 = args[0].trim();
++            if ("-h".equals(argv0) || "--help".equals(argv0)) {
++                System.out.println(
++                    String.format(
++                        "usage: pqcheck [PQ dir path]\n  default [PQ dir path] is %s",
++                        DEFAULT_PQ_DIR
++                    )
++                );
++            } else {
++                checkPQ(Paths.get(argv0));
++            }
++        } else {
++            checkPQ(Paths.get(DEFAULT_PQ_DIR));
++        }
++    }
++
++    private static void checkPQ(final Path path) throws IOException {
++        if (!path.toFile().isDirectory()) {
++            throw new IllegalStateException(String.format("error: invalid PQ dir path: %s", path));
++        }
++        System.out.println(String.format("Checking queue dir: %s", path));
++        try (
++            DirectoryStream<Path> checkpoints = Files.newDirectoryStream(path, "checkpoint.*")
++        ) {
++            StreamSupport.stream(
++                checkpoints.spliterator(), true
++            ).sorted(Comparator.comparingLong(PqCheck::cpNum)).map(Path::toFile).forEach(cp -> {
++                final long fileSize = cp.length();
++                if (fileSize == 34L) {
++                    try {
++                        final Path cpPath = cp.toPath();
++                        final Checkpoint checkpoint =
++                            FileCheckpointIO.read(ByteBuffer.wrap(Files.readAllBytes(cpPath)));
++                        final boolean fa = checkpoint.isFullyAcked();
++                        final int pageNum = checkpoint.getPageNum();
++                        final long pageSize = cpPath.getParent().resolve(
++                            String.format("page.%d", pageNum)
++                        ).toFile().length();
++                        System.out.println(
++                            String.format(
++                                "%s, fully-acked: %s, page.%d size: %s", cpPath.getFileName(),
++                                fa ? "YES" : "NO", pageNum,
++                                pageSize > 0L ? String.valueOf(pageSize) : "NOT FOUND"
++                            )
++                        );
++                        System.out.println(checkpoint.toString());
++                    } catch (final IOException ex) {
++                        throw new IllegalStateException(ex);
++                    }
++                } else {
++                    throw new IllegalStateException(
++                        String.format("%s, invalid size: %d", cp, fileSize)
++                    );
++                }
++            });
++        }
++    }
++
++    private static long cpNum(final Path cpFile) {
++        final String numString = cpFile.getFileName().toString().substring("checkpoint.".length());
++        return "head".equals(numString) ? Long.MAX_VALUE : Long.parseLong(numString);
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/io/FileCheckpointIO.java b/logstash-core/src/main/java/org/logstash/ackedqueue/io/FileCheckpointIO.java
+index 5889f94ac9e..c4660ee9658 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/io/FileCheckpointIO.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/io/FileCheckpointIO.java
+@@ -88,7 +88,7 @@ public String tailFileName(int pageNum) {
+         return TAIL_CHECKPOINT + pageNum;
+     }
+ 
+-    private static Checkpoint read(ByteBuffer data) throws IOException {
++    public static Checkpoint read(ByteBuffer data) throws IOException {
+         int version = (int) data.getShort();
+         // TODO - build reader for this version
+         int pageNum = data.getInt();

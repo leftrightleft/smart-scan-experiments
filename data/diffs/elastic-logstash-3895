@@ -1,0 +1,517 @@
+diff --git a/docs/asciidoc/static/include/pluginbody.asciidoc b/docs/asciidoc/static/include/pluginbody.asciidoc
+index 77cf2cb558d..89def49dd3f 100644
+--- a/docs/asciidoc/static/include/pluginbody.asciidoc
++++ b/docs/asciidoc/static/include/pluginbody.asciidoc
+@@ -725,24 +725,24 @@ endif::receive_method[]
+ 
+ // Teardown is now in the base class... can be pruned?
+ // /////////////////////////////////////////////////////////////////////////////
+-// If teardown_method is defined (should only be for input or output plugin page)
++// If close_method is defined (should only be for input or output plugin page)
+ // /////////////////////////////////////////////////////////////////////////////
+-// ifdef::teardown_method[]
++// ifdef::close_method[]
+ // [float]
+-// ==== `teardown` Method
++// ==== `close` Method
+ // [source,ruby]
+ // [subs="attributes"]
+ // ----------------------------------
+ // public
+-// def teardown
++// def close
+ //   @udp.close if @udp && !@udp.closed?
+ // end
+ // ----------------------------------
+-// The `teardown` method is not present in all input or output plugins.  It is
++// The `close` method is not present in all input or output plugins.  It is
+ // called when a shutdown happens to ensure that sockets, files, connections and
+ // threads are all closed down properly.  If your plugin uses these connections,
+-// you should include a teardown method.
+-// endif::teardown_method[]
++// you should include a close method.
++// endif::close_method[]
+ 
+ ==== Building the Plugin
+ 
+diff --git a/lib/logstash/codecs/base.rb b/lib/logstash/codecs/base.rb
+index 662f054dfde..25fad9da702 100644
+--- a/lib/logstash/codecs/base.rb
++++ b/lib/logstash/codecs/base.rb
+@@ -28,7 +28,7 @@ def encode(event)
+   end # def encode
+ 
+   public 
+-  def teardown; end;
++  def close; end;
+ 
+   # @param block [Proc(event, data)] the callback proc passing the original event and the encoded event
+   public
+diff --git a/lib/logstash/filters/base.rb b/lib/logstash/filters/base.rb
+index 61bf7887554..9b08f0b974f 100644
+--- a/lib/logstash/filters/base.rb
++++ b/lib/logstash/filters/base.rb
+@@ -235,7 +235,7 @@ def filter?(event)
+   end
+ 
+   public
+-  def teardown
++  def close
+     # Nothing to do by default.
+   end
+ end # class LogStash::Filters::Base
+diff --git a/lib/logstash/inputs/base.rb b/lib/logstash/inputs/base.rb
+index f28d04e0e98..b72490bae45 100644
+--- a/lib/logstash/inputs/base.rb
++++ b/lib/logstash/inputs/base.rb
+@@ -67,6 +67,7 @@ class LogStash::Inputs::Base < LogStash::Plugin
+   def initialize(params={})
+     super
+     @threadable = false
++    @stop_called = Concurrent::AtomicBoolean.new(false)
+     config_init(params)
+     @tags ||= []
+ 
+@@ -100,6 +101,28 @@ def tag(newtag)
+     @tags << newtag
+   end # def tag
+ 
++  public
++  # override stop if you need to do more than do_stop to
++  # enforce the input plugin to return from `run`.
++  # e.g. a tcp plugin might need to close the tcp socket
++  # so blocking read operation aborts
++  def stop
++    # override if necessary
++  end
++
++  public
++  def do_stop
++    @logger.debug("stopping", :plugin => self)
++    @stop_called.make_true
++    stop
++  end
++
++  # stop? should never be overriden
++  public
++  def stop?
++    @stop_called.value
++  end
++
+   protected
+   def to_event(raw, source)
+     raise LogStash::ThisMethodWasRemoved("LogStash::Inputs::Base#to_event - you should use codecs now instead of to_event. Not sure what this means? Get help on https://discuss.elastic.co/c/logstash")
+diff --git a/lib/logstash/pipeline.rb b/lib/logstash/pipeline.rb
+index 0089e3f1688..44eeb2fcf46 100644
+--- a/lib/logstash/pipeline.rb
++++ b/lib/logstash/pipeline.rb
+@@ -1,6 +1,7 @@
+ # encoding: utf-8
+-require "thread" #
++require "thread"
+ require "stud/interval"
++require "concurrent"
+ require "logstash/namespace"
+ require "logstash/errors"
+ require "logstash/event"
+@@ -34,29 +35,19 @@ def initialize(configstr)
+     end
+ 
+     @input_to_filter = SizedQueue.new(20)
+-
+-    # If no filters, pipe inputs directly to outputs
+-    if !filters?
+-      @filter_to_output = @input_to_filter
+-    else
+-      @filter_to_output = SizedQueue.new(20)
+-    end
++    # if no filters, pipe inputs directly to outputs
++    @filter_to_output = filters? ? SizedQueue.new(20) : @input_to_filter
+     @settings = {
+       "filter-workers" => 1,
+     }
+ 
+-    @run_mutex = Mutex.new
+-    @ready = false
+-    @started = false
++    # @ready requires thread safety since it is typically polled from outside the pipeline thread
++    @ready = Concurrent::AtomicBoolean.new(false)
+     @input_threads = []
+   end # def initialize
+ 
+   def ready?
+-    @run_mutex.synchronize{@ready}
+-  end
+-
+-  def started?
+-    @run_mutex.synchronize{@started}
++    @ready.value
+   end
+ 
+   def configure(setting, value)
+@@ -75,14 +66,15 @@ def filters?
+   end
+ 
+   def run
+-    @run_mutex.synchronize{@started = true}
+-
+-    # synchronize @input_threads between run and shutdown
+-    @run_mutex.synchronize{start_inputs}
+-    start_filters if filters?
+-    start_outputs
+-
+-    @run_mutex.synchronize{@ready = true}
++    begin
++      start_inputs
++      start_filters if filters?
++      start_outputs
++    ensure
++      # it is important to garantee @ready to be true after the startup sequence has been completed
++      # to potentially unblock the shutdown method which may be waiting on @ready to proceed
++      @ready.make_true
++    end
+ 
+     @logger.info("Pipeline started")
+     @logger.terminal("Logstash startup completed")
+@@ -107,12 +99,6 @@ def run
+ 
+   def wait_inputs
+     @input_threads.each(&:join)
+-  rescue Interrupt
+-    # rbx does weird things during do SIGINT that I haven't debugged
+-    # so we catch Interrupt here and signal a shutdown. For some reason the
+-    # signal handler isn't invoked it seems? I dunno, haven't looked much into
+-    # it.
+-    shutdown
+   end
+ 
+   def shutdown_filters
+@@ -175,9 +161,16 @@ def inputworker(plugin)
+     LogStash::Util::set_thread_name("<#{plugin.class.config_name}")
+     begin
+       plugin.run(@input_to_filter)
+-    rescue LogStash::ShutdownSignal
+-      # ignore and quit
+     rescue => e
++      # if plugin is stopping, ignore uncatched exceptions and exit worker
++      if plugin.stop?
++        @logger.debug("Input plugin raised exception during shutdown, ignoring it.",
++                      :plugin => plugin.class.config_name, :exception => e,
++                      :backtrace => e.backtrace)
++        return
++      end
++
++      # otherwise, report error and restart
+       if @logger.debug?
+         @logger.error(I18n.t("logstash.pipeline.worker-error-debug",
+                              :plugin => plugin.inspect, :error => e.to_s,
+@@ -187,23 +180,13 @@ def inputworker(plugin)
+         @logger.error(I18n.t("logstash.pipeline.worker-error",
+                              :plugin => plugin.inspect, :error => e))
+       end
+-      puts e.backtrace if @logger.debug?
+-      # input teardown must be synchronized since is can be called concurrently by
+-      # the input worker thread and from the pipeline thread shutdown method.
+-      # this means that input teardown methods must support multiple calls.
+-      @run_mutex.synchronize{plugin.teardown}
+-      sleep 1
+-      retry
+-    end
+-  ensure
+-    begin
+-      # input teardown must be synchronized since is can be called concurrently by
+-      # the input worker thread and from the pipeline thread shutdown method.
+-      # this means that input teardown methods must support multiple calls.
+-      @run_mutex.synchronize{plugin.teardown}
+-    rescue LogStash::ShutdownSignal
+-      # teardown could receive the ShutdownSignal, retry it
++
++      # Assuming the failure that caused this exception is transient,
++      # let's sleep for a bit and execute #run again
++      sleep(1)
+       retry
++    ensure
++      plugin.do_close
+     end
+   end # def inputworker
+ 
+@@ -231,7 +214,7 @@ def filterworker
+       @logger.error("Exception in filterworker", "exception" => e, "backtrace" => e.backtrace)
+     end
+ 
+-    @filters.each(&:teardown)
++    @filters.each(&:do_close)
+   end # def filterworker
+ 
+   def outputworker
+@@ -242,50 +225,27 @@ def outputworker
+       event = @filter_to_output.pop
+       break if event == LogStash::SHUTDOWN
+       output_func(event)
+-    end # while true
+-
++    end
++  ensure
+     @outputs.each do |output|
+-      output.worker_plugins.each(&:teardown)
++      output.worker_plugins.each(&:do_close)
+     end
+   end # def outputworker
+ 
+-  # Shutdown this pipeline.
+-  #
+-  # This method is intended to be called from another thread
++  # initiate the pipeline shutdown sequence
++  # this method is intended to be called from outside the pipeline thread
+   def shutdown
++    # shutdown can only start once the pipeline has completed its startup.
++    # avoid potential race conditoon between the startup sequence and this
++    # shutdown method which can be called from another thread at any time
++    sleep(0.1) while !ready?
++
++    # TODO: should we also check against calling shutdown multiple times concurently?
++
+     InflightEventsReporter.logger = @logger
+     InflightEventsReporter.start(@input_to_filter, @filter_to_output, @outputs)
+-    @input_threads.each do |thread|
+-      # Interrupt all inputs
+-      @logger.info("Sending shutdown signal to input thread", :thread => thread)
+-
+-      # synchronize both ShutdownSignal and teardown below. by synchronizing both
+-      # we will avoid potentially sending a shutdown signal when the inputworker is
+-      # executing the teardown method.
+-      @run_mutex.synchronize do
+-        thread.raise(LogStash::ShutdownSignal)
+-        begin
+-          thread.wakeup # in case it's in blocked IO or sleeping
+-        rescue ThreadError
+-        end
+-      end
+-    end
+-
+-    # sometimes an input is stuck in a blocking I/O so we need to tell it to teardown directly
+-    @inputs.each do |input|
+-      begin
+-        # input teardown must be synchronized since is can be called concurrently by
+-        # the input worker thread and from the pipeline thread shutdown method.
+-        # this means that input teardown methods must support multiple calls.
+-        @run_mutex.synchronize{input.teardown}
+-      rescue LogStash::ShutdownSignal
+-        # teardown could receive the ShutdownSignal, retry it
+-        retry
+-      end
+-    end
+ 
+-    # No need to send the ShutdownEvent to the filters/outputs nor to wait for
+-    # the inputs to finish, because in the #run method we wait for that anyway.
++    @inputs.each(&:do_stop)
+   end # def shutdown
+ 
+   def plugin(plugin_type, name, *args)
+diff --git a/lib/logstash/plugin.rb b/lib/logstash/plugin.rb
+index 3d263174471..e4ed6171ecc 100644
+--- a/lib/logstash/plugin.rb
++++ b/lib/logstash/plugin.rb
+@@ -3,6 +3,7 @@
+ require "logstash/logging"
+ require "logstash/config/mixin"
+ require "cabin"
++require "concurrent"
+ 
+ class LogStash::Plugin
+   attr_accessor :params
+@@ -27,72 +28,21 @@ def initialize(params=nil)
+     @logger = Cabin::Channel.get(LogStash)
+   end
+ 
+-  # This method is called when someone or something wants this plugin to shut
+-  # down. When you successfully shutdown, you must call 'finished'
+-  # You must also call 'super' in any subclasses.
++  # close is called during shutdown, after the plugin worker
++  # main task terminates
+   public
+-  def shutdown(queue)
+-    # By default, shutdown is assumed a no-op for all plugins.
+-    # If you need to take special efforts to shutdown (like waiting for
+-    # an operation to complete, etc)
+-    teardown
+-    @logger.info("Received shutdown signal", :plugin => self)
+-
+-    @shutdown_queue = queue
+-    if @plugin_state == :finished
+-      finished
+-    else
+-      @plugin_state = :terminating
+-    end
+-  end # def shutdown
+-
+-  # You should call this method when you (the plugin) are done with work
+-  # forever.
+-  public
+-  def finished
+-    # TODO(sissel): I'm not sure what I had planned for this shutdown_queue
+-    # thing
+-    if @shutdown_queue
+-      @logger.info("Sending shutdown event to agent queue", :plugin => self)
+-      @shutdown_queue << self
+-    end
+-
+-    if @plugin_state != :finished
+-      @logger.info("Plugin is finished", :plugin => self)
+-      @plugin_state = :finished
+-    end
+-  end # def finished
+-
+-  # Subclasses should implement this teardown method if you need to perform any
+-  # special tasks during shutdown (like flushing, etc.)
+-  public
+-  def teardown
+-    # nothing by default
+-    finished
++  def do_close
++    @logger.debug("closing", :plugin => self)
++    close
+   end
+ 
+-  # This method is called when a SIGHUP triggers a reload operation
++  # Subclasses should implement this close method if you need to perform any
++  # special tasks during shutdown (like flushing, etc.)
+   public
+-  def reload
+-    # Do nothing by default
++  def close
++    # ..
+   end
+ 
+-  public
+-  def finished?
+-    return @plugin_state == :finished
+-  end # def finished?
+-
+-  public
+-  def running?
+-    return @plugin_state != :finished
+-  end # def finished?
+-
+-  public
+-  def terminating?
+-    return @plugin_state == :terminating
+-  end # def terminating?
+-
+-  public
+   def to_s
+     return "#{self.class.name}: #{@params}"
+   end
+diff --git a/logstash-core.gemspec b/logstash-core.gemspec
+index e383d835ed4..709218163d6 100644
+--- a/logstash-core.gemspec
++++ b/logstash-core.gemspec
+@@ -23,7 +23,7 @@ Gem::Specification.new do |gem|
+   gem.add_runtime_dependency "clamp", "~> 0.6.5" #(MIT license) for command line args/flags
+   gem.add_runtime_dependency "filesize", "0.0.4" #(MIT license) for :bytes config validator
+   gem.add_runtime_dependency "gems", "~> 0.8.3"  #(MIT license)
+-  gem.add_runtime_dependency "concurrent-ruby", "0.9.1"
++  gem.add_runtime_dependency "concurrent-ruby", "~> 0.9.1"
+ 
+   # TODO(sissel): Treetop 1.5.x doesn't seem to work well, but I haven't
+   # investigated what the cause might be. -Jordan
+diff --git a/spec/core/pipeline_spec.rb b/spec/core/pipeline_spec.rb
+index 89ad07ef4bd..d0021d4a396 100644
+--- a/spec/core/pipeline_spec.rb
++++ b/spec/core/pipeline_spec.rb
+@@ -11,7 +11,7 @@ def register
+   def run(queue)
+   end
+ 
+-  def teardown
++  def close
+   end
+ end
+ 
+@@ -27,7 +27,7 @@ def encode(event)
+     event
+   end
+ 
+-  def teardown
++  def close
+   end
+ end
+ 
+@@ -35,11 +35,11 @@ class DummyOutput < LogStash::Outputs::Base
+   config_name "dummyoutput"
+   milestone 2
+ 
+-  attr_reader :num_teardowns
++  attr_reader :num_closes
+ 
+   def initialize(params={})
+     super
+-    @num_teardowns = 0
++    @num_closes = 0
+   end
+ 
+   def register
+@@ -48,8 +48,8 @@ def register
+   def receive(event)
+   end
+ 
+-  def teardown
+-    @num_teardowns += 1
++  def close
++    @num_closes += 1
+   end
+ end
+ 
+@@ -59,7 +59,7 @@ class TestPipeline < LogStash::Pipeline
+ 
+ describe LogStash::Pipeline do
+ 
+-context "teardown" do
++context "close" do
+ 
+   before(:each) do
+     allow(LogStash::Plugin).to receive(:lookup).with("input", "dummyinput").and_return(DummyInput)
+@@ -93,24 +93,24 @@ class TestPipeline < LogStash::Pipeline
+       eos
+     }
+ 
+-    context "output teardown" do
+-      it "should call teardown of output without output-workers" do
++    context "output close" do
++      it "should call close of output without output-workers" do
+         pipeline = TestPipeline.new(test_config_without_output_workers)
+         pipeline.run
+ 
+         expect(pipeline.outputs.size ).to eq(1)
+         expect(pipeline.outputs.first.worker_plugins.size ).to eq(1)
+-        expect(pipeline.outputs.first.worker_plugins.first.num_teardowns ).to eq(1)
++        expect(pipeline.outputs.first.worker_plugins.first.num_closes ).to eq(1)
+       end
+ 
+-      it "should call output teardown correctly with output workers" do
++      it "should call output close correctly with output workers" do
+         pipeline = TestPipeline.new(test_config_with_output_workers)
+         pipeline.run
+ 
+         expect(pipeline.outputs.size ).to eq(1)
+-        expect(pipeline.outputs.first.num_teardowns).to eq(0)
++        expect(pipeline.outputs.first.num_closes).to eq(0)
+         pipeline.outputs.first.worker_plugins.each do |plugin|
+-          expect(plugin.num_teardowns ).to eq(1)
++          expect(plugin.num_closes ).to eq(1)
+         end
+       end
+     end
+diff --git a/spec/filters/base_spec.rb b/spec/filters/base_spec.rb
+index 321b72965d1..0dfa31480b8 100644
+--- a/spec/filters/base_spec.rb
++++ b/spec/filters/base_spec.rb
+@@ -24,7 +24,7 @@ def filter(event)
+   end
+ 
+   it "should provide class public API" do
+-    [:register, :filter, :multi_filter, :execute, :threadsafe?, :filter_matched, :filter?, :teardown].each do |method|
++    [:register, :filter, :multi_filter, :execute, :threadsafe?, :filter_matched, :filter?, :close].each do |method|
+       expect(subject).to respond_to(method)
+     end
+   end

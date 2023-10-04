@@ -1,0 +1,180 @@
+diff --git a/build.gradle b/build.gradle
+index d5a18377675..251c9ec0d35 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -20,11 +20,13 @@ apply plugin: 'de.undercouch.download'
+ 
+ import de.undercouch.gradle.tasks.download.Download
+ import de.undercouch.gradle.tasks.download.Verify
+-import java.nio.file.Files
+-import java.nio.file.Paths
++import groovy.json.JsonSlurper
+ import org.logstash.gradle.RubyGradleUtils
+ import org.yaml.snakeyaml.Yaml
+ 
++import java.nio.file.Files
++import java.nio.file.Paths
++
+ allprojects {
+   group = 'org.logstash'
+ 
+@@ -99,6 +101,10 @@ subprojects {
+ // fetch version from Logstash's master versions.yml file
+ def versionMap = (Map) (new Yaml()).load(new File("${projectDir}/versions.yml").text)
+ version = versionMap['logstash-core']
++def versionQualifier = System.getenv('VERSION_QUALIFIER')
++if (versionQualifier) {
++    version = "$version-$versionQualifier"
++}
+ 
+ String jRubyURL
+ String jRubyVersion
+@@ -366,11 +372,9 @@ task generateLicenseReport(type: JavaExec) {
+ 
+     classpath = project.files([jarFile])
+     main = "org.logstash.dependencies.Main"
+-    args \
+-      licenseReportInputCSV, \
+-      project.getBuildDir().toString() + "/licenseReportFolders.txt", \
+-      licenseReportOutputCSV, \
+-      noticePath
++    args licenseReportInputCSV,
++      project.getBuildDir().toString() + "/licenseReportFolders.txt",
++      licenseReportOutputCSV, noticePath
+ }
+ 
+ task generateLicenseReportInputs() {
+@@ -409,12 +413,25 @@ bootstrap.dependsOn installTestGems
+ runIntegrationTests.shouldRunAfter tasks.getByPath(":logstash-core:test")
+ check.dependsOn runIntegrationTests
+ 
+-
+-String elasticsearchSnapshotURL = System.getenv("ELASTICSEARCH_SNAPSHOT_URL") ?: "https://snapshots.elastic.co/downloads/elasticsearch/elasticsearch-${version}-SNAPSHOT.tar.gz"
+-String elasticsearchDownloadLocation = "${projectDir}/build/elasticsearch-${version}-SNAPSHOT.tar.gz"
++String artifactsVersionApi = "https://artifacts-api.elastic.co/v1/versions/"
++String apiResponse = artifactsVersionApi.toURL().text
++def dlVersions = new JsonSlurper().parseText(apiResponse)
++// the version string can be either '7.0.0' or '7.0.0-alpha1', i.e. with the qualifier.
++// in the normal PR type builds it is plain '7.0.0'
++// in the build invoked by the release manager it is '7.0.0-alpha1' etc.
++// the artifacts-api will return JSON like this: `{"versions":["5.6.13-SNAPSHOT","6.4.3-SNAPSHOT","6.5.0-SNAPSHOT","6.6.0-SNAPSHOT","7.0.0-alpha1-SNAPSHOT"]}`
++String qualifiedVersion = dlVersions['versions'].grep(~/^${version}.*/)[0]
++String downloadedElasticsearchName = "elasticsearch-${qualifiedVersion}"
++String elasticsearchSnapshotURL = System.getenv("ELASTICSEARCH_SNAPSHOT_URL") ?: "https://snapshots.elastic.co/downloads/elasticsearch/${downloadedElasticsearchName}.tar.gz"
++String elasticsearchDownloadLocation = "${projectDir}/build/${downloadedElasticsearchName}.tar.gz"
+ 
+ task downloadEs(type: Download) {
+     description "Download ES Snapshot for current branch version: ${version}"
++    doFirst {
++        if (qualifiedVersion == "null") {
++            throw new GradleException("could not find the current artifact from the artifact-api for version: ${version}, api response was: ${apiResponse}")
++        }
++    }
+     src elasticsearchSnapshotURL
+     onlyIfNewer true
+     inputs.file("${projectDir}/versions.yml")
+@@ -433,7 +450,7 @@ task copyEs(type: Copy, dependsOn: [downloadEs, deleteLocalEs]) {
+     from tarTree(resources.gzip(elasticsearchDownloadLocation))
+     into "./build/"
+     doLast {
+-        file("./build/elasticsearch-${version}-SNAPSHOT").renameTo('./build/elasticsearch')
++        file("./build/${downloadedElasticsearchName}").renameTo('./build/elasticsearch')
+     }
+ }
+ 
+diff --git a/logstash-core-plugin-api/lib/logstash-core-plugin-api/version.rb b/logstash-core-plugin-api/lib/logstash-core-plugin-api/version.rb
+index b3a37bb451f..f240d0075bb 100644
+--- a/logstash-core-plugin-api/lib/logstash-core-plugin-api/version.rb
++++ b/logstash-core-plugin-api/lib/logstash-core-plugin-api/version.rb
+@@ -13,6 +13,6 @@
+ end
+ 
+ unless defined?(LOGSTASH_CORE_VERSION)
+-  LOGSTASH_CORE_VERSION = ALL_VERSIONS.fetch("logstash-core")
++  # PACKAGE_SUFFIX is declared in the artifact namespace from artifacts.rake
++  LOGSTASH_CORE_VERSION = defined?(PACKAGE_SUFFIX) ? "#{ALL_VERSIONS.fetch("logstash-core")}#{PACKAGE_SUFFIX}" : ALL_VERSIONS.fetch("logstash-core")
+ end
+-
+diff --git a/logstash-core-plugin-api/logstash-core-plugin-api.gemspec b/logstash-core-plugin-api/logstash-core-plugin-api.gemspec
+index 641339f7a21..59ce4471434 100644
+--- a/logstash-core-plugin-api/logstash-core-plugin-api.gemspec
++++ b/logstash-core-plugin-api/logstash-core-plugin-api.gemspec
+@@ -28,7 +28,7 @@ Gem::Specification.new do |gem|
+   gem.description   = %q{Logstash plugin API}
+   gem.summary       = %q{Define the plugin API that the plugin need to follow.}
+   gem.homepage      = "http://www.elastic.co/guide/en/logstash/current/index.html"
+-  gem.license       = "Apache License (2.0)"
++  gem.license       = "Apache-2.0"
+ 
+   gem.files         = Dir.glob(["logstash-core-plugin-api.gemspec", "lib/**/*.rb", "spec/**/*.rb"])
+   gem.test_files    = gem.files.grep(%r{^(test|spec|features)/})
+diff --git a/logstash-core/lib/logstash-core/version.rb b/logstash-core/lib/logstash-core/version.rb
+index 2231306827b..8907e466de1 100644
+--- a/logstash-core/lib/logstash-core/version.rb
++++ b/logstash-core/lib/logstash-core/version.rb
+@@ -7,6 +7,8 @@
+   require 'yaml'
+   ALL_VERSIONS = YAML.load_file(File.expand_path("../../versions-gem-copy.yml", File.dirname(__FILE__)))
+ end
++
+ if !defined?(LOGSTASH_CORE_VERSION)
+-  LOGSTASH_CORE_VERSION = ALL_VERSIONS.fetch("logstash-core")
++  # PACKAGE_SUFFIX is declared in the artifact namespace from artifacts.rake
++  LOGSTASH_CORE_VERSION = defined?(PACKAGE_SUFFIX) ? "#{ALL_VERSIONS.fetch("logstash-core")}#{PACKAGE_SUFFIX}" : ALL_VERSIONS.fetch("logstash-core")
+ end
+diff --git a/logstash-core/logstash-core.gemspec b/logstash-core/logstash-core.gemspec
+index 4f877cb2050..fe98ee26aef 100644
+--- a/logstash-core/logstash-core.gemspec
++++ b/logstash-core/logstash-core.gemspec
+@@ -1,4 +1,10 @@
+ # -*- encoding: utf-8 -*-
++
++# NOTE: please use `rake artifact:gems` or `rake artifact:build-logstash-core` to build LS gems
++# You can add a version qualifier (e.g. alpha1) via the VERSION_QUALIFIER env var, e.g.
++# VERSION_QUALIFIER=beta2 RELEASE=1 rake artifact:build-logstash-core
++# `require 'logstash-core/version'` is aware of this env var
++
+ lib = File.expand_path('../lib', __FILE__)
+ $LOAD_PATH.unshift(lib) unless $LOAD_PATH.include?(lib)
+ 
+@@ -28,7 +34,7 @@ Gem::Specification.new do |gem|
+   gem.description   = %q{The core components of logstash, the scalable log and event management tool}
+   gem.summary       = %q{logstash-core - The core components of logstash}
+   gem.homepage      = "http://www.elastic.co/guide/en/logstash/current/index.html"
+-  gem.license       = "Apache License (2.0)"
++  gem.license       = "Apache-2.0"
+ 
+   gem.files         = Dir.glob(
+     %w(versions-gem-copy.yml logstash-core.gemspec gemspec_jars.rb lib/**/*.rb spec/**/*.rb locales/*
+diff --git a/rakelib/artifacts.rake b/rakelib/artifacts.rake
+index 7dc147315ab..2d09f99b5dd 100644
+--- a/rakelib/artifacts.rake
++++ b/rakelib/artifacts.rake
+@@ -1,7 +1,12 @@
+ namespace "artifact" do
+ 
+   SNAPSHOT_BUILD = ENV["RELEASE"] != "1"
+-  PACKAGE_SUFFIX = SNAPSHOT_BUILD ? "-SNAPSHOT" : ""
++  VERSION_QUALIFIER = ENV["VERSION_QUALIFIER"]
++  if VERSION_QUALIFIER
++    PACKAGE_SUFFIX = SNAPSHOT_BUILD ? "-#{VERSION_QUALIFIER}-SNAPSHOT" : "-#{VERSION_QUALIFIER}"
++  else
++    PACKAGE_SUFFIX = SNAPSHOT_BUILD ? "-SNAPSHOT" : ""
++  end
+ 
+   def package_files
+     [
+diff --git a/versions.yml b/versions.yml
+index db14521fde7..63025352110 100644
+--- a/versions.yml
++++ b/versions.yml
+@@ -1,6 +1,7 @@
+ ---
+-logstash: 7.0.0-alpha1
+-logstash-core: 7.0.0-alpha1
++# alpha and beta qualifiers are now added via VERSION_QUALIFIER environment var
++logstash: 7.0.0
++logstash-core: 7.0.0
+ logstash-core-plugin-api: 2.1.16
+ 
+ # jruby must reference a *released* version of jruby which can be downloaded from the official download url

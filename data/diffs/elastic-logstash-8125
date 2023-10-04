@@ -1,0 +1,268 @@
+diff --git a/lib/pluginmanager/utils/downloader.rb b/lib/pluginmanager/utils/downloader.rb
+index 0d520febfaa..d2092f22188 100644
+--- a/lib/pluginmanager/utils/downloader.rb
++++ b/lib/pluginmanager/utils/downloader.rb
+@@ -68,7 +68,7 @@ def fetch(redirect_count = 0)
+           downloaded_file.path
+         end
+       rescue => e
+-        downloaded_file.close rescue nil
++        downloaded_file.close unless downloaded_file.closed?
+         FileUtils.rm_rf(download_to)
+         raise e
+       end
+diff --git a/logstash-core/spec/logstash/api/modules/node_stats_spec.rb b/logstash-core/spec/logstash/api/modules/node_stats_spec.rb
+index 2250e885e1a..922190383b9 100644
+--- a/logstash-core/spec/logstash/api/modules/node_stats_spec.rb
++++ b/logstash-core/spec/logstash/api/modules/node_stats_spec.rb
+@@ -70,7 +70,7 @@
+       "cpu"=>{
+         "total_in_millis"=>Numeric,
+         "percent"=>Numeric,
+-        "load_average" => { "1m" => Numeric }
++        # load_average is not supported on Windows, set it below
+       }
+     },
+    "pipeline" => {
+@@ -88,5 +88,9 @@
+    }
+   }
+ 
++  unless LogStash::Environment.windows?
++    root_structure["process"]["cpu"]["load_average"] = { "1m" => Numeric }
++  end
++
+   test_api_and_resources(root_structure)
+ end
+diff --git a/logstash-core/spec/logstash/pipeline_dlq_commit_spec.rb b/logstash-core/spec/logstash/pipeline_dlq_commit_spec.rb
+index 530f27f74bb..093517090c5 100644
+--- a/logstash-core/spec/logstash/pipeline_dlq_commit_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_dlq_commit_spec.rb
+@@ -67,7 +67,7 @@ def close() end
+   end
+ 
+   after(:each) do
+-    FileUtils.remove_entry pipeline_settings["path.dead_letter_queue"]
++    FileUtils.rm_rf(pipeline_settings["path.dead_letter_queue"])
+   end
+ 
+   context "dlq is enabled" do
+@@ -85,6 +85,7 @@ def close() end
+       entry = dlq_reader.pollEntry(40)
+       expect(entry).to_not be_nil
+       expect(entry.reason).to eq("my reason")
++      subject.shutdown
+     end
+   end
+ 
+@@ -101,6 +102,7 @@ def close() end
+       subject.run
+       dlq_path = java.nio.file.Paths.get(pipeline_settings_obj.get("path.dead_letter_queue"), pipeline_id)
+       expect(java.nio.file.Files.exists(dlq_path)).to eq(false)
++      subject.shutdown
+     end
+   end
+ 
+diff --git a/logstash-core/spec/logstash/settings/writable_directory_spec.rb b/logstash-core/spec/logstash/settings/writable_directory_spec.rb
+index 4463ca82db1..be00ce9f04f 100644
+--- a/logstash-core/spec/logstash/settings/writable_directory_spec.rb
++++ b/logstash-core/spec/logstash/settings/writable_directory_spec.rb
+@@ -3,17 +3,17 @@
+ require "logstash/settings"
+ require "tmpdir"
+ require "socket" # for UNIXSocket
++require "fileutils"
+ 
+ describe LogStash::Setting::WritableDirectory do
+-  let(:mode_rx) { 0555 }
+   # linux is 108, Macos is 104, so use a safe value
+   # Stud::Temporary.pathname, will exceed that size without adding anything
+   let(:parent) { File.join(Dir.tmpdir, Time.now.to_f.to_s) }
+   let(:path) { File.join(parent, "fancy") }
+ 
+   before { Dir.mkdir(parent) }
+-  after { Dir.exist?(path) && Dir.unlink(path) rescue nil }
+-  after { Dir.unlink(parent) }
++  after { Dir.exist?(path) && FileUtils.rm_rf(path)}
++  after { FileUtils.rm_rf(parent) }
+ 
+   shared_examples "failure" do
+     before { subject.set(path) }
+@@ -44,8 +44,9 @@
+       end
+ 
+       context "and the directory cannot be created" do
+-        before { File.chmod(mode_rx, parent) }
+         it "should fail" do
++          # using chmod does not work on Windows better mock and_raise("message")
++          expect(FileUtils).to receive(:mkdir_p).and_raise("foobar")
+           expect { subject.value }.to raise_error
+         end
+       end
+@@ -66,7 +67,8 @@
+       end
+ 
+       context "but is not writable" do
+-        before { File.chmod(0, path) }
++        # chmod does not work on Windows, mock writable? instead
++        before { expect(File).to receive(:writable?).and_return(false) }
+         it_behaves_like "failure"
+       end
+     end
+@@ -84,12 +86,13 @@
+         before { socket } # realize `socket` value
+         after { socket.close }
+         it_behaves_like "failure"
+-      end
++      end unless LogStash::Environment.windows?
+ 
++      
+       context "but is a symlink" do
+-        before { File::symlink("whatever", path) }
++        before { FileUtils.symlink("whatever", path) }
+         it_behaves_like "failure"
+-      end
++      end unless LogStash::Environment.windows?
+     end
+ 
+     context "when the directory is missing" do
+@@ -114,8 +117,8 @@
+ 
+       context "and cannot be created" do
+         before do
+-          # Remove write permission on the parent
+-          File.chmod(mode_rx, parent)
++          # chmod does not work on Windows, mock writable? instead
++          expect(File).to receive(:writable?).and_return(false)
+         end
+ 
+         it_behaves_like "failure"
+diff --git a/spec/unit/plugin_manager/pack_fetch_strategy/uri_spec.rb b/spec/unit/plugin_manager/pack_fetch_strategy/uri_spec.rb
+index 09effdb909c..210b32d5b9c 100644
+--- a/spec/unit/plugin_manager/pack_fetch_strategy/uri_spec.rb
++++ b/spec/unit/plugin_manager/pack_fetch_strategy/uri_spec.rb
+@@ -32,10 +32,12 @@
+     let(:temporary_file) do
+       f = Stud::Temporary.file
+       f.write("hola")
++      f.close
+       f.path
+     end
+ 
+-    let(:plugin_path) { "file://#{temporary_file}" }
++    # Windows safe way to produce a file: URI.
++    let(:plugin_path) { URI.join("file:///" + File.absolute_path(temporary_file)).to_s }
+ 
+     it "returns a `LocalInstaller`" do
+       expect(subject.get_installer_for(plugin_path)).to be_kind_of(LogStash::PluginManager::PackInstaller::Local)
+diff --git a/spec/unit/plugin_manager/prepare_offline_pack_spec.rb b/spec/unit/plugin_manager/prepare_offline_pack_spec.rb
+index aa9376c91cf..9c55457d0dd 100644
+--- a/spec/unit/plugin_manager/prepare_offline_pack_spec.rb
++++ b/spec/unit/plugin_manager/prepare_offline_pack_spec.rb
+@@ -79,6 +79,10 @@
+         expect(LogStash::PluginManager::OfflinePluginPackager).not_to receive(:package).with(anything)
+       end
+ 
++      after do
++        FileUtils.rm_rf(tmp_zip_file)
++      end
++
+       it "fails to do any action" do
+         expect { subject.run(cmd_args) }.to raise_error Clamp::ExecutionError, /you must specify a filename/
+       end
+@@ -101,13 +105,18 @@
+         FileUtils.touch(tmp_zip_file)
+       end
+ 
++      after do
++        FileUtils.rm_f(tmp_zip_file)
++      end
++
+       context "without `--overwrite`" do
+         before do
+           expect(LogStash::PluginManager::OfflinePluginPackager).not_to receive(:package).with(anything)
+         end
+ 
+         it "should fails" do
+-          expect { subject.run(cmd_args) }.to raise_error Clamp::ExecutionError, /output file destination #{tmp_zip_file} already exist/
++          # ignore the first path part of tmp_zip_file because on Windows the long path is shrinked in the exception message 
++          expect { subject.run(cmd_args) }.to raise_error Clamp::ExecutionError, /output file destination .+#{::File.basename(tmp_zip_file)} already exist/
+         end
+       end
+ 
+diff --git a/spec/unit/plugin_manager/utils/downloader_spec.rb b/spec/unit/plugin_manager/utils/downloader_spec.rb
+index e08e731af01..2f7a105eb95 100644
+--- a/spec/unit/plugin_manager/utils/downloader_spec.rb
++++ b/spec/unit/plugin_manager/utils/downloader_spec.rb
+@@ -56,7 +56,7 @@
+       let(:temporary_path) { Stud::Temporary.pathname }
+ 
+       before do
+-        expect_any_instance_of(::File).to receive(:close).at_least(:twice).and_raise("Didn't work")
++        expect(Net::HTTP::Get).to receive(:new).once.and_raise("Didn't work")
+         expect(Stud::Temporary).to receive(:pathname).and_return(temporary_path)
+       end
+ 
+diff --git a/tools/benchmark-cli/src/test/java/org/logstash/benchmark/cli/LsMetricsMonitorTest.java b/tools/benchmark-cli/src/test/java/org/logstash/benchmark/cli/LsMetricsMonitorTest.java
+index 693c8899d0a..4af3ce4dd7b 100644
+--- a/tools/benchmark-cli/src/test/java/org/logstash/benchmark/cli/LsMetricsMonitorTest.java
++++ b/tools/benchmark-cli/src/test/java/org/logstash/benchmark/cli/LsMetricsMonitorTest.java
+@@ -2,14 +2,16 @@
+ 
+ import com.github.tomakehurst.wiremock.client.WireMock;
+ import com.github.tomakehurst.wiremock.junit.WireMockRule;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
+ import java.nio.charset.StandardCharsets;
+-import java.nio.file.Files;
+-import java.nio.file.Paths;
+ import java.util.EnumMap;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
++import org.apache.commons.io.IOUtils;
+ import org.hamcrest.CoreMatchers;
+ import org.hamcrest.MatcherAssert;
+ import org.junit.Rule;
+@@ -30,11 +32,7 @@ public final class LsMetricsMonitorTest {
+     public void parsesFilteredCount() throws Exception {
+         final String path = "/_node/stats/?pretty";
+         http.stubFor(WireMock.get(WireMock.urlEqualTo(path)).willReturn(WireMock.okJson(
+-            new String(
+-                Files.readAllBytes(
+-                    Paths.get(LsMetricsMonitorTest.class.getResource("metrics.json").getPath()
+-                    ))
+-                , StandardCharsets.UTF_8)
++            metricsFixture()
+         )));
+         final ExecutorService executor = Executors.newSingleThreadExecutor();
+         try {
+@@ -54,11 +52,7 @@ public void parsesFilteredCount() throws Exception {
+     public void parsesCpuUsage() throws Exception {
+         final String path = "/_node/stats/?pretty";
+         http.stubFor(WireMock.get(WireMock.urlEqualTo(path)).willReturn(WireMock.okJson(
+-            new String(
+-                Files.readAllBytes(
+-                    Paths.get(LsMetricsMonitorTest.class.getResource("metrics.json").getPath()
+-                    ))
+-                , StandardCharsets.UTF_8)
++            metricsFixture()
+         )));
+         final ExecutorService executor = Executors.newSingleThreadExecutor();
+         try {
+@@ -73,4 +67,13 @@ public void parsesCpuUsage() throws Exception {
+             executor.shutdownNow();
+         }
+     }
++
++    private static String metricsFixture() throws IOException {
++        final ByteArrayOutputStream baos = new ByteArrayOutputStream();
++        try (final InputStream input = LsMetricsMonitorTest.class
++            .getResourceAsStream("metrics.json")) {
++            IOUtils.copy(input, baos);
++        }
++        return baos.toString(StandardCharsets.UTF_8.name());
++    }
+ }

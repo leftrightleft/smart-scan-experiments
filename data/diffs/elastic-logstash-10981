@@ -1,0 +1,908 @@
+diff --git a/config/logstash.yml b/config/logstash.yml
+index e625ef230fe..3d9c571cbbd 100644
+--- a/config/logstash.yml
++++ b/config/logstash.yml
+@@ -112,9 +112,25 @@
+ # config.debug: false
+ #
+ # When enabled, process escaped characters such as \n and \" in strings in the
+-# pipeline configuration files.
+-#
+-# config.support_escapes: false
++# pipeline configuration files. There are multiple modes:
++#
++# disabled:
++#     no unescaping is performed
++# minimal:
++#     \\ : literal backslash
++#     \" : literal double-quote
++#     \' : literal single-quote
++#     \n : newline
++#     \r : return
++#     \t : tab
++#     \0 : null byte
++# extended:
++#     everything from `minimal`, plus:
++#     `\xHH`: codepoint represented by given hexadecimal value
++#     `\uHHHH`: unicode character represented by given hexadecimal value
++#     `\uHHHHHHHH`: unicode character represented by given hexadecimal value
++#
++# config.support_escapes: disabled
+ #
+ # ------------ API Settings -------------
+ # Define settings related to the HTTP API here.
+diff --git a/docs/static/configuration.asciidoc b/docs/static/configuration.asciidoc
+index 966e13e7bb7..21275c08468 100644
+--- a/docs/static/configuration.asciidoc
++++ b/docs/static/configuration.asciidoc
+@@ -255,19 +255,33 @@ enclosed in quotes, either double or single.
+ 
+ ===== Escape sequences
+ 
+-By default, escape sequences are not enabled. If you wish to use escape
+-sequences in quoted strings, you will need to set
+-`config.support_escapes: true` in your `logstash.yml`. When `true`, quoted
+-strings (double and single) will have this transformation:
++By default, escape sequences are not enabled.
++If you wish to use escape sequences in quoted strings, you will need to set `config.support_escapes` to `minimal` or `extended` in your `logstash.yml`.
+ 
++When `minimal`, quoted strings (double and single) will have this transformation:
++
++[cols=">m,a"]
++|===========================
++| Text | Result
++
++| `\r` | carriage return (ASCII 13)
++| `\n` | new line (ASCII 10)
++| `\t` | tab (ASCII 9)
++| `\\` | backslash (ASCII 92)
++| `\"` | double quote (ASCII 34)
++| `\'` | single quote (ASCII 39)
++|===========================
++
++When `config.support_escapes` is set to `extended`, the following will apply _in addition to_ the `minimal` rules:
++
++[cols=">m,a"]
+ |===========================
+ | Text | Result
+-| \r   | carriage return (ASCII 13)
+-| \n   | new line (ASCII 10)
+-| \t   | tab (ASCII 9)
+-| \\   | backslash (ASCII 92)
+-| \"   | double quote (ASCII 34)
+-| \'   | single quote (ASCII 39)
++
++| `\0`   | null character (ASCII 0)
++| `\xHH`   | hexadecimal codepoints `00`-`FF`
++| `\uHHHH`   | unicode codepoints `0000`-`FFFF`
++| `\uHHHHHHHH`   | unicode codepoints up to `FFFFFFFF`
+ |===========================
+ 
+ Example:
+diff --git a/docs/static/settings-file.asciidoc b/docs/static/settings-file.asciidoc
+index 682cb0821b1..8d5cc3ce443 100644
+--- a/docs/static/settings-file.asciidoc
++++ b/docs/static/settings-file.asciidoc
+@@ -179,8 +179,23 @@ Values other than `disabled` are currently considered BETA, and may produce unin
+ | `false`
+ 
+ | `config.support_escapes`
+-| When set to `true`, quoted strings will process the following escape sequences: `\n` becomes a literal newline (ASCII 10). `\r` becomes a literal carriage return (ASCII 13). `\t` becomes a literal tab (ASCII 9). `\\` becomes a literal backslash `\`. `\"` becomes a literal double quotation mark. `\'` becomes a literal quotation mark.
+-| `false`
++a| The escape sequences in strings are not processed by default (`disabled`/`false`).
++
++When set to `minimal` (or `true`), quoted strings will process the following escape sequences:
++
++  * `\n` becomes a literal newline (ASCII 10),
++  * `\r` becomes a literal carriage return (ASCII 13),
++  * `\t` becomes a literal tab (ASCII 9),
++  * `\\` becomes a literal backslash `\`,
++  * `\"` becomes a literal double quotation mark,
++  * `\'` becomes a literal quotation mark, and
++  * `\0` becomes a literal NULL (ASCII 0).
++
++When set to `extended`, quoted strings will process everything in `minimal`, plus:
++
++  * `\xHH` becomes the corresponding hexadecimal codepoint (`\0x24` -> `$` ), and
++  * `\uHHHH` or `\uHHHHHHHH` become the corresponding unicode codepoint (`\u267B` -> &#x267B; ; `\u0001F49E` -> &#128158;).
++| `disabled`
+ 
+ | `modules`
+ | When configured, `modules` must be in the nested YAML structure described above this table.
+diff --git a/logstash-core/lib/logstash/compiler.rb b/logstash-core/lib/logstash/compiler.rb
+index 113b6827801..1f2848f7e96 100644
+--- a/logstash-core/lib/logstash/compiler.rb
++++ b/logstash-core/lib/logstash/compiler.rb
+@@ -20,7 +20,7 @@
+ module LogStash; class Compiler
+   include ::LogStash::Util::Loggable
+ 
+-  def self.compile_imperative(source_with_metadata, support_escapes)
++  def self.compile_imperative(source_with_metadata, string_escape_helper)
+     if !source_with_metadata.is_a?(org.logstash.common.SourceWithMetadata)
+       raise ArgumentError, "Expected 'org.logstash.common.SourceWithMetadata', got #{source_with_metadata.class}"
+     end
+@@ -32,7 +32,7 @@ def self.compile_imperative(source_with_metadata, support_escapes)
+       raise ConfigurationError, grammar.failure_reason
+     end
+ 
+-    config.process_escape_sequences = support_escapes
++    config.string_escape_helper = string_escape_helper
+     config.compile(source_with_metadata)
+   end
+ end; end
+diff --git a/logstash-core/lib/logstash/compiler/lscl.rb b/logstash-core/lib/logstash/compiler/lscl.rb
+index 7c792a9a885..698760f9c64 100644
+--- a/logstash-core/lib/logstash/compiler/lscl.rb
++++ b/logstash-core/lib/logstash/compiler/lscl.rb
+@@ -25,7 +25,7 @@
+ java_import org.logstash.common.SourceWithMetadata
+ 
+ module LogStashCompilerLSCLGrammar; module LogStash; module Compiler; module LSCL; module AST
+-  PROCESS_ESCAPE_SEQUENCES = :process_escape_sequences
++  STRING_ESCAPE_HELPER = :string_escape_helper
+ 
+     class Node < Treetop::Runtime::SyntaxNode
+     include Helpers
+@@ -43,8 +43,8 @@ def section_type
+   class Config < Node
+     include Helpers
+ 
+-    def process_escape_sequences=(val)
+-      set_meta(PROCESS_ESCAPE_SEQUENCES, val)
++    def string_escape_helper=(val)
++      set_meta(STRING_ESCAPE_HELPER, val)
+     end
+ 
+     def compile(base_source_with_metadata=nil)
+@@ -162,11 +162,8 @@ def expr
+ 
+   class String < Value
+     def expr
+-      value = if get_meta(PROCESS_ESCAPE_SEQUENCES)
+-        ::LogStash::Config::StringEscape.process_escapes(text_value[1...-1])
+-      else
+-        text_value[1...-1]
+-      end
++      esp = get_meta(STRING_ESCAPE_HELPER) || org.logstash.common.StringEscapeHelper::DISABLED
++      value = esp.unescape(text_value[1...-1])
+       jdsl.eValue(source_meta, value)
+     end
+   end
+diff --git a/logstash-core/lib/logstash/config/config_ast.rb b/logstash-core/lib/logstash/config/config_ast.rb
+index c7c5f9cfee0..b8ac66a8d58 100644
+--- a/logstash-core/lib/logstash/config/config_ast.rb
++++ b/logstash-core/lib/logstash/config/config_ast.rb
+@@ -21,7 +21,7 @@
+ require "logstash/compiler/treetop_monkeypatches"
+ 
+ module LogStash; module Config; module AST
+-  PROCESS_ESCAPE_SEQUENCES = :process_escape_sequences
++  STRING_ESCAPE_HELPER = :string_escape_helper
+ 
+   class << self
+     # @api private
+@@ -88,11 +88,10 @@ def text_value_for_comments
+   end
+ 
+   class Config < Node
+-    def process_escape_sequences=(val)
+-      set_meta(PROCESS_ESCAPE_SEQUENCES, val)
++    def string_escape_helper=(val)
++      set_meta(STRING_ESCAPE_HELPER, val)
+     end
+ 
+-
+     def compile
+       LogStash::Config::AST.exclusive { do_compile }
+     end
+@@ -345,11 +344,9 @@ def compile
+   end
+   class String < Value
+     def compile
+-      if get_meta(PROCESS_ESCAPE_SEQUENCES)
+-        Unicode.wrap(LogStash::Config::StringEscape.process_escapes(text_value[1...-1]))
+-      else
+-        Unicode.wrap(text_value[1...-1])
+-      end
++      esp = get_meta(STRING_ESCAPE_HELPER) || org.logstash.common.StringEscapeHelper::DISABLED
++      value = esp.unescape(text_value[1...-1])
++      Unicode.wrap(value)
+     end
+   end
+   class RegExp < Value
+diff --git a/logstash-core/lib/logstash/config/string_escape.rb b/logstash-core/lib/logstash/config/string_escape.rb
+index ab320a19890..30e4bfb1b88 100644
+--- a/logstash-core/lib/logstash/config/string_escape.rb
++++ b/logstash-core/lib/logstash/config/string_escape.rb
+@@ -15,30 +15,42 @@
+ # specific language governing permissions and limitations
+ # under the License.
+ 
+-module LogStash; module Config; module StringEscape
++require 'concurrent/set'
++
++require_relative '../util/loggable'
++
++module LogStash; module Config; class StringEscape
++
++  include Util::Loggable
++
++  def initialize(string_escape_helper)
++    @string_escape_helper = string_escape_helper
++  end
++
++  DISABLED = new(org.logstash.common.StringEscapeHelper::DISABLED)
++  MINIMAL  = new(org.logstash.common.StringEscapeHelper::MINIMAL)
++  EXTENDED = new(org.logstash.common.StringEscapeHelper::EXTENDED)
++
++  def process_escapes(input)
++    @string_escape_helper.unescape(input)
++  end
++
+   class << self
++
+     def process_escapes(input)
+-      input.gsub(/\\./) do |value|
+-        process(value)
+-      end
++      log_deprecation(caller.first)
++      MINIMAL.process_escapes(input)
+     end
+ 
+     private
+-    def process(value)
+-      case value[1]
+-      when '"', "'", "\\"
+-        value[1]
+-      when "n"
+-        "\n"
+-      when "r"
+-        "\r"
+-      when "t"
+-        "\t"
+-      when "0"
+-        "\x00"
+-      else
+-        value
+-      end
++
++    DEPRECATION_CALLSITES = Concurrent::Set.new
++    private_constant :DEPRECATION_CALLSITES
++
++    def log_deprecation(callsite)
++      return unless DEPRECATION_CALLSITES.size < 128 && DEPRECATION_CALLSITES.add?(callsite)
++
++      deprecation_logger.deprecated("#{StringEscape}#process_escapes is deprecated and will be removed in a future major release of Logstash (at `#{callsite}`)")
+     end
+   end
+ end end end
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 8df3237f4c9..5366c2417d2 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -47,8 +47,8 @@ module Environment
+            Setting::Boolean.new("modules_setup", false),
+            Setting::Boolean.new("config.test_and_exit", false),
+            Setting::Boolean.new("config.reload.automatic", false),
+-           Setting::TimeValue.new("config.reload.interval", "3s"), # in seconds
+-           Setting::Boolean.new("config.support_escapes", false),
++         Setting::TimeValue.new("config.reload.interval", "3s"), # in seconds
++   Setting::CoercibleString.new("config.support_escapes", "disabled", true, %w(disabled minimal extended), {"true" => "minimal", "false" => "disabled"}),
+            Setting::Boolean.new("metric.collect", true),
+             Setting::String.new("pipeline.id", "main"),
+            Setting::Boolean.new("pipeline.system", false),
+diff --git a/logstash-core/lib/logstash/settings.rb b/logstash-core/lib/logstash/settings.rb
+index aaa1c51e4ef..e20705c5a91 100644
+--- a/logstash-core/lib/logstash/settings.rb
++++ b/logstash-core/lib/logstash/settings.rb
+@@ -547,13 +547,20 @@ def validate(value)
+     # then these options in the config file or command line will be all valid: "foo", true, false, "true", "false"
+     #
+     class CoercibleString < Coercible
+-      def initialize(name, default=nil, strict=true, possible_strings=[], &validator_proc)
++      def initialize(name, default=nil, strict=true, possible_strings=[], deprecated_aliases={}, &validator_proc)
++        _init_validate_alias_mapping!(possible_strings, deprecated_aliases)
+         @possible_strings = possible_strings
++        @deprecated_aliases = deprecated_aliases
+         super(name, Object, default, strict, &validator_proc)
+       end
+ 
+       def coerce(value)
+-        value.to_s
++        value = value.to_s
++        if @deprecated_aliases.include?(value)
++          deprecated_value, value = value, @deprecated_aliases.fetch(value)
++          deprecation_logger.deprecated("The value `#{deprecated_value}` for setting `#{name}` is deprecated and may not be supported in a future major release of Logstash; please use `#{value}` instead.")
++        end
++        value
+       end
+ 
+       def validate(value)
+@@ -562,6 +569,18 @@ def validate(value)
+           raise ArgumentError.new("Invalid value \"#{value}\". Options are: #{@possible_strings.inspect}")
+         end
+       end
++
++      private
++
++      def _init_validate_alias_mapping!(possible, alias_mapping)
++        return if possible.empty? || alias_mapping.empty?
++
++        missing_targets = alias_mapping.values - possible
++        fail(ArgumentError, "Missing alias targets: #{missing_targets}") unless missing_targets.empty?
++
++        redefined_inputs = alias_mapping.keys & possible
++        fail(ArgumentError, "Invalid alias names redefine valid values: #{redefined_inputs}") unless redefined_inputs.empty?
++      end
+     end
+ 
+     class ExistingFilePath < Setting
+diff --git a/logstash-core/spec/logstash/compiler/compiler_spec.rb b/logstash-core/spec/logstash/compiler/compiler_spec.rb
+index a25fe2e4525..24382d0b23e 100644
+--- a/logstash-core/spec/logstash/compiler/compiler_spec.rb
++++ b/logstash-core/spec/logstash/compiler/compiler_spec.rb
+@@ -52,7 +52,9 @@ def rand_meta
+   describe "compiling imperative" do
+     let(:source_id) { "fake_sourcefile" }
+     let(:source_with_metadata) { org.logstash.common.SourceWithMetadata.new(source_protocol, source_id, 0, 0, source) }
+-    subject(:compiled) { described_class.compile_imperative(source_with_metadata, settings.get_value("config.support_escapes")) }
++    let(:string_escape_helper) { org.logstash.common.StringEscapeHelper.for_mode(escape_mode) }
++    let(:escape_mode) { settings.get_value("config.support_escapes") }
++    subject(:compiled) { described_class.compile_imperative(source_with_metadata, string_escape_helper) }
+ 
+     context "when config.support_escapes" do
+       let(:parser) { LogStashCompilerLSCLGrammarParser.new }
+@@ -77,6 +79,10 @@ def rand_meta
+         settings.set_value("config.support_escapes", process_escape_sequences)
+       end
+ 
++      after do
++        settings.get_setting("config.support_escapes").reset
++      end
++
+       context "is enabled" do
+         let(:process_escape_sequences) { true }
+ 
+diff --git a/logstash-core/spec/logstash/config/config_ast_spec.rb b/logstash-core/spec/logstash/config/config_ast_spec.rb
+index 8a9ed6deabc..35f4a6635af 100644
+--- a/logstash-core/spec/logstash/config/config_ast_spec.rb
++++ b/logstash-core/spec/logstash/config/config_ast_spec.rb
+@@ -193,9 +193,11 @@
+       let(:compiled_string) { eval(config.recursive_select(LogStash::Config::AST::String).first.compile) }
+ 
+       before do
+-        config.process_escape_sequences = escapes
++        config.string_escape_helper = org.logstash.common.StringEscapeHelper.forMode(escape_mode)
+       end
+ 
++      let(:escape_mode) { escapes ? 'minimal' : 'disabled' }
++
+       context "is enabled" do
+         let(:escapes) { true }
+ 
+diff --git a/logstash-core/spec/logstash/config/string_escape_spec.rb b/logstash-core/spec/logstash/config/string_escape_spec.rb
+index d7e6db4ace6..ff97eff2736 100644
+--- a/logstash-core/spec/logstash/config/string_escape_spec.rb
++++ b/logstash-core/spec/logstash/config/string_escape_spec.rb
+@@ -18,7 +18,9 @@
+ require "logstash/config/string_escape"
+ 
+ describe LogStash::Config::StringEscape do
+-  let(:result) { described_class.process_escapes(text) }
++
++  let(:string_escape) { fail NotImplementedError } # specify which
++  let(:result) { string_escape.process_escapes(text) }
+ 
+   table = {
+     '\\"' => '"',
+@@ -26,15 +28,79 @@
+     "\\n" => "\n",
+     "\\r" => "\r",
+     "\\t" => "\t",
+-    "\\\\" => "\\",
+-    "\\0" => "\x00",
++    "\\\\"=> "\\",
++    "\\0" => "\x00", # null-byte (since 8.0)
++    "🙂"   => "🙂",  # multibyte characters pass through
++    "\\"  => "\\", # legacy: emit trailing unescaped backslash
++    "\\g" => "g",  # legacy: absorb meaningless backslashes
++    "\\🙂" => "🙂", # legacy: absorb meaningless backslashes
+   }
+ 
+-  table.each do |input, expected|
+-    context "when processing #{input.inspect}" do
+-      let(:text) { input }
+-      it "should produce #{expected.inspect}" do
+-        expect(result).to be == expected
++  context 'in disabled mode' do
++    subject(:string_escape) { described_class::DISABLED }
++
++    table.keys.each do |input|
++      context "when processing escaped sequence #{input.inspect}" do
++        let(:text) { input }
++        it "should produce #{input.inspect} unmodified" do
++          expect(result).to be == input
++        end
++      end
++    end
++  end
++
++  shared_examples_for 'minimal_mode' do
++    table.each do |input, expected|
++      context "when processing escaped sequence #{input.inspect}" do
++        let(:text) { input }
++        it "should produce #{expected.inspect}" do
++          expect(result).to be == expected
++        end
++      end
++    end
++  end
++
++  context 'in minimal mode' do
++    subject(:string_escape) { described_class::MINIMAL }
++    include_examples 'minimal_mode'
++  end
++
++  context 'using deprecated `StringEscape::process_escapes` class method' do
++    let(:string_escape) { described_class }
++    let(:deprecation_logger_stub) { double('DeprecationLogger').as_null_object }
++    before(:each) do
++      allow(described_class).to receive(:deprecation_logger).and_return(deprecation_logger_stub)
++    end
++
++    it 'emits a deprecation log for each callsite' do
++      10.times do
++        string_escape::process_escapes("\\0\nmmhmm")
++        string_escape::process_escapes("\t\rokay")
++      end
++      expect(deprecation_logger_stub).to have_received(:deprecated).with(/process_escapes/).twice
++    end
++
++    it_behaves_like 'minimal_mode'
++  end
++
++  context 'in extended mode' do
++    subject(:string_escape) { described_class::EXTENDED }
++
++    extended_table = table.merge({
++                                   "\\0"         => "\0",
++                                   "\\x00"       => "\0",
++                                   "\\x20"       => " ",
++                                   '\\u0001F642' => '🙂',
++                                   '\\u13A3'     => 'Ꭳ',
++                                   '\\u000013A3' => 'Ꭳ',
++    })
++
++    extended_table.each do |input, expected|
++      context "when processing escaped sequence #{input.inspect}" do
++        let(:text) { input }
++        it "should produce #{expected.inspect}" do
++          expect(result).to be == expected
++        end
+       end
+     end
+   end
+diff --git a/logstash-core/spec/logstash/settings/coercible_string_spec.rb b/logstash-core/spec/logstash/settings/coercible_string_spec.rb
+new file mode 100644
+index 00000000000..faf62997ffc
+--- /dev/null
++++ b/logstash-core/spec/logstash/settings/coercible_string_spec.rb
+@@ -0,0 +1,77 @@
++# Licensed to Elasticsearch B.V. under one or more contributor
++# license agreements. See the NOTICE file distributed with
++# this work for additional information regarding copyright
++# ownership. Elasticsearch B.V. licenses this file to you under
++# the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#  http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++
++require "spec_helper"
++require "logstash/settings"
++
++describe LogStash::Setting::CoercibleString do
++  let(:setting_name) { "example" }
++  let(:supported_values) { %w(a b c) }
++  let(:default_value) { supported_values.first }
++  let(:deprecated_alias_mapping) { Hash.new.freeze }
++
++  subject(:coercible_setting) { described_class.new(setting_name, default_value, true, supported_values, deprecated_alias_mapping) }
++
++  describe "#set" do
++    context "when a deprecated alias is provided" do
++      let(:deprecated_alias_mapping) { {proposed_value => expected_result} }
++      let(:proposed_value) { "z" }
++      let(:expected_result) { "c" }
++
++      let(:deprecation_logger_stub) { double('DeprecationLogger').as_null_object }
++
++      before(:each) do
++        allow(coercible_setting).to receive(:deprecation_logger).and_return(deprecation_logger_stub)
++      end
++
++      it 'resolves the deprecated alias to the valid value' do
++        coercible_setting.set(proposed_value)
++
++        aggregate_failures do
++          expect(coercible_setting).to be_set
++          expect(coercible_setting).to have_attributes(value: expected_result)
++          expect(deprecation_logger_stub).to have_received(:deprecated).with(/is deprecated and may not be supported/)
++        end
++      end
++    end
++
++    context "when a supported coercible value is provided" do
++      let(:proposed_value) { :b }
++
++      it 'rejects the invalid value' do
++        coercible_setting.set(proposed_value)
++
++        aggregate_failures do
++          expect(coercible_setting).to be_set
++          expect(coercible_setting).to have_attributes(value: "b")
++        end
++      end
++    end
++
++    context "when an unsupported value is provided" do
++      let(:proposed_value) { "XXX" }
++
++      it 'rejects the invalid value' do
++        aggregate_failures do
++          expect { coercible_setting.set(proposed_value) }.to raise_error(ArgumentError, /Invalid value/)
++          expect(coercible_setting).to_not be_set
++          expect(coercible_setting).to have_attributes(value: default_value)
++        end
++      end
++    end
++  end
++end
+diff --git a/logstash-core/src/main/java/org/logstash/common/StringEscapeHelper.java b/logstash-core/src/main/java/org/logstash/common/StringEscapeHelper.java
+new file mode 100644
+index 00000000000..f7deed7f185
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/common/StringEscapeHelper.java
+@@ -0,0 +1,133 @@
++package org.logstash.common;
++
++import java.util.EnumSet;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++public class StringEscapeHelper {
++
++    public enum Feature {
++        LEGACY,
++        ZERO_NULL,
++        LOWER_X_CODEPOINT,
++        LOWER_U_CODEPOINT,
++    }
++
++    private static final char LITERAL_BACKSLASH = '\\';
++    private static final char LITERAL_QUOTE_SINGLE = '\'';
++    private static final char LITERAL_QUOTE_DOUBLE = '"';
++    private static final char LITERAL_LOWER_N = 'n';
++    private static final char LITERAL_LOWER_R = 'r';
++    private static final char LITERAL_LOWER_T = 't';
++    private static final char LITERAL_LOWER_U = 'u';
++    private static final char LITERAL_LOWER_X = 'x';
++    private static final char LITERAL_ZERO = '0';
++    private static final char LITERAL_NEWLINE = '\n';
++    private static final char LITERAL_RETURN = '\r';
++    private static final char LITERAL_TAB = '\t';
++    private static final char LITERAL_NULL = '\0';
++
++    private static final Pattern HEX_PAIR = Pattern.compile("[0-9A-F]{2}");
++    private static final Pattern HEX_QUAD = Pattern.compile("[0-9A-F]{4}");
++    private static final Pattern HEX_OCTET = Pattern.compile("[0-9A-F]{8}");
++
++    private final EnumSet<Feature> activeFeatures;
++
++    public static final StringEscapeHelper DISABLED = new StringEscapeHelper(EnumSet.noneOf(Feature.class));
++    public static final StringEscapeHelper MINIMAL = new StringEscapeHelper(EnumSet.of(Feature.LEGACY));
++    public static final StringEscapeHelper EXTENDED = new StringEscapeHelper(EnumSet.allOf(Feature.class));
++
++    public static StringEscapeHelper forMode(final String mode) {
++        switch(mode) {
++            case "disabled": return DISABLED;
++            case "minimal":  return MINIMAL;
++            case "extended": return EXTENDED;
++            default: throw new IllegalArgumentException(String.format("Unsupported string escape mode `%s`", mode));
++        }
++    }
++
++    private StringEscapeHelper(final EnumSet<Feature> features) {
++        activeFeatures = features;
++    }
++
++    public String unescape(final String escaped) {
++        if (activeFeatures.isEmpty()) { return escaped; }
++
++        final int escapedLength = escaped.length();
++        final StringBuilder unescaped = new StringBuilder(escapedLength);
++
++        for(int i = 0; i < escapedLength; i++) {
++            final char c = escaped.charAt(i);
++            if (c != LITERAL_BACKSLASH) {
++                unescaped.append(c);
++                continue;
++            }
++
++            i++; // consume the escaping backslash
++            if (i >= escapedLength) {
++                // Last char was an unescaped backslash, which is not technically legal.
++                // Emit the literal backslash
++                unescaped.append(LITERAL_BACKSLASH);
++                break;
++            }
++            final char seq = escaped.charAt(i);
++
++            switch (seq) {
++                // BACKSLASH-ESCAPED LITERALS
++                case LITERAL_BACKSLASH:
++                case LITERAL_QUOTE_SINGLE:
++                case LITERAL_QUOTE_DOUBLE:
++                    unescaped.append(seq);
++                    continue;
++
++                // BACKSLASH SHORTHAND EXPANSION
++                case LITERAL_LOWER_N:
++                    unescaped.append(LITERAL_NEWLINE);
++                    continue;
++                case LITERAL_LOWER_R:
++                    unescaped.append(LITERAL_RETURN);
++                    continue;
++                case LITERAL_LOWER_T:
++                    unescaped.append(LITERAL_TAB);
++                    continue;
++                case LITERAL_ZERO:
++                    if (!activeFeatures.contains(Feature.ZERO_NULL)) { break; }
++                    unescaped.append(LITERAL_NULL);
++                    continue;
++
++                // BACKSLASH-X CODEPOINTS
++                case LITERAL_LOWER_X:
++                    if (!activeFeatures.contains(Feature.LOWER_X_CODEPOINT)) { break; }
++                    if (escapedLength < i+3 || !HEX_PAIR.matcher(escaped.subSequence(i+1, 1+3)).matches()) { break; }
++
++                    final char codepoint = (char) Integer.parseInt(escaped.subSequence(i+1, i+3).toString(), 16);
++                    unescaped.append(codepoint);
++                    i += 2; // consume hex pair
++                    continue;
++                // BACKSLASH-U UNICODE SUPPORT
++                case LITERAL_LOWER_U:
++                    if (!activeFeatures.contains(Feature.LOWER_U_CODEPOINT)) { break; }
++                    if (escapedLength >= i+9 && HEX_OCTET.matcher(escaped.subSequence(i+1,i+9)).matches()) {
++                        final char[] chars = Character.toChars(Integer.parseInt(escaped.subSequence(i+1,i+9).toString(), 16));
++                        unescaped.append(chars);
++                        i += 8;
++                        continue;
++                    }
++                    if (escapedLength >= i+5 && HEX_QUAD.matcher(escaped.subSequence(i+1,i+5)).matches()) {
++                        final char[] chars = Character.toChars(Integer.parseInt(escaped.subSequence(i+1,i+5).toString(), 16));
++                        unescaped.append(chars);
++                        i += 4;
++                        continue;
++                    }
++                    break;
++
++            }
++
++            // Any character following a backslash that does _not_ fit
++            // into one of the above will be emitted as-is.
++            unescaped.append(seq);
++        }
++
++        return unescaped.toString();
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/ConfigCompiler.java b/logstash-core/src/main/java/org/logstash/config/ir/ConfigCompiler.java
+index f94a3ca47e0..3ebb83c0026 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/ConfigCompiler.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/ConfigCompiler.java
+@@ -20,12 +20,12 @@
+ 
+ package org.logstash.config.ir;
+ 
+-import org.jruby.RubyArray;
+ import org.jruby.RubyHash;
+ import org.jruby.javasupport.JavaUtil;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.logstash.RubyUtil;
+ import org.logstash.common.SourceWithMetadata;
++import org.logstash.common.StringEscapeHelper;
+ import org.logstash.config.ir.graph.Graph;
+ import org.logstash.config.ir.imperative.Statement;
+ 
+@@ -53,14 +53,20 @@ private ConfigCompiler() {
+      * @throws InvalidIRException if the the configuration contains errors
+      */
+     @SuppressWarnings("unchecked")
+-    public static PipelineIR configToPipelineIR(final List<SourceWithMetadata> sourcesWithMetadata,
++    static PipelineIR configToPipelineIR(final List<SourceWithMetadata> sourcesWithMetadata,
+                                                 final boolean supportEscapes) throws InvalidIRException {
+-        return compileSources(sourcesWithMetadata, supportEscapes);
++        final StringEscapeHelper escapeSequenceParser = supportEscapes ? StringEscapeHelper.MINIMAL : StringEscapeHelper.DISABLED;
++        return compileSources(sourcesWithMetadata, escapeSequenceParser);
++    }
++
++    public static PipelineIR configToPipelineIR(final List<SourceWithMetadata> sourcesWithMetadata,
++                                                final StringEscapeHelper stringEscapeHelper) throws InvalidIRException {
++        return compileSources(sourcesWithMetadata, stringEscapeHelper);
+     }
+ 
+-    public static PipelineIR compileSources(List<SourceWithMetadata> sourcesWithMetadata, boolean supportEscapes) throws InvalidIRException {
++    public static PipelineIR compileSources(List<SourceWithMetadata> sourcesWithMetadata, final StringEscapeHelper stringEscapeHelper) throws InvalidIRException {
+         Map<PluginDefinition.Type, List<Graph>> groupedPipelineSections = sourcesWithMetadata.stream()
+-                .map(swm -> compileGraph(swm, supportEscapes))
++                .map(swm -> compileGraph(swm, stringEscapeHelper))
+                 .flatMap(m -> m.entrySet().stream())
+                 .filter(e -> e.getValue() != null)
+                 .collect(groupingBy(Map.Entry::getKey,
+@@ -84,7 +90,7 @@ private static Graph chainWithUntypedException(Graph g1, Graph g2) {
+     }
+ 
+     private static Map<PluginDefinition.Type, Statement> compileImperative(SourceWithMetadata sourceWithMetadata,
+-                                                                           boolean supportEscapes) {
++                                                                           StringEscapeHelper stringEscapeHelper) {
+         final IRubyObject compiler = RubyUtil.RUBY.executeScript(
+                 "require 'logstash/compiler'\nLogStash::Compiler",
+                 ""
+@@ -93,7 +99,7 @@ private static Map<PluginDefinition.Type, Statement> compileImperative(SourceWit
+         final IRubyObject code = compiler.callMethod(RubyUtil.RUBY.getCurrentContext(), "compile_imperative",
+                 new IRubyObject[]{
+                         JavaUtil.convertJavaToRuby(RubyUtil.RUBY, sourceWithMetadata),
+-                        RubyUtil.RUBY.newBoolean(supportEscapes)
++                        JavaUtil.convertJavaToRuby(RubyUtil.RUBY, stringEscapeHelper)
+                 });
+         RubyHash hash = (RubyHash) code;
+         Map<PluginDefinition.Type, Statement> result = new HashMap<>();
+@@ -108,8 +114,8 @@ private static Statement readStatementFromRubyHash(RubyHash hash, String key) {
+         return inputValue.toJava(Statement.class);
+     }
+ 
+-    private static Map<PluginDefinition.Type, Graph> compileGraph(SourceWithMetadata swm, boolean supportEscapes) {
+-        Map<PluginDefinition.Type, Statement> pluginStatements = compileImperative(swm, supportEscapes);
++    private static Map<PluginDefinition.Type, Graph> compileGraph(SourceWithMetadata swm, final StringEscapeHelper stringEscapeHelper) {
++        Map<PluginDefinition.Type, Statement> pluginStatements = compileImperative(swm, stringEscapeHelper);
+         return pluginStatements.entrySet().stream()
+                 .collect(Collectors.toMap(Map.Entry::getKey, e -> toGraphWithUntypedException(e.getValue())));
+     }
+diff --git a/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java b/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
+index d08385be801..9da4b99e188 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
++++ b/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
+@@ -30,6 +30,7 @@
+ import java.time.Duration;
+ import java.util.Arrays;
+ import java.util.List;
++import java.util.Objects;
+ import java.util.UUID;
+ import org.apache.commons.codec.binary.Hex;
+ import org.apache.logging.log4j.LogManager;
+@@ -52,6 +53,7 @@
+ import org.logstash.ackedqueue.ext.JRubyWrappedAckedQueueExt;
+ import org.logstash.common.DeadLetterQueueFactory;
+ import org.logstash.common.SourceWithMetadata;
++import org.logstash.common.StringEscapeHelper;
+ import org.logstash.config.ir.ConfigCompiler;
+ import org.logstash.config.ir.InvalidIRException;
+ import org.logstash.config.ir.PipelineConfig;
+@@ -182,9 +184,12 @@ public final AbstractPipelineExt initialize(final ThreadContext context,
+                 );
+             }
+         }
+-        boolean supportEscapes = getSetting(context, "config.support_escapes").isTrue();
++
++        RubyString escapeSupportMode = (RubyString) getSetting(context, "config.support_escapes");
++        final StringEscapeHelper stringEscapeHelper = StringEscapeHelper.forMode(escapeSupportMode.asJavaString());
++
+         try {
+-            lir = ConfigCompiler.configToPipelineIR(configParts, supportEscapes);
++            lir = ConfigCompiler.configToPipelineIR(configParts, stringEscapeHelper);
+         } catch (InvalidIRException iirex) {
+             throw new IllegalArgumentException(iirex);
+         }
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/ConfigCompilerTest.java b/logstash-core/src/test/java/org/logstash/config/ir/ConfigCompilerTest.java
+index 379a67d0efc..bcc45d1e8f5 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/ConfigCompilerTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/ConfigCompilerTest.java
+@@ -32,6 +32,7 @@
+ 
+ import org.junit.Test;
+ import org.logstash.common.SourceWithMetadata;
++import org.logstash.common.StringEscapeHelper;
+ import org.logstash.config.ir.graph.Graph;
+ import org.logstash.config.ir.graph.PluginVertex;
+ 
+@@ -45,7 +46,7 @@ public class ConfigCompilerTest extends RubyEnvTestCase {
+     public void testConfigToPipelineIR() throws Exception {
+         SourceWithMetadata swm = new SourceWithMetadata("proto", "path", 1, 1, "input {stdin{}} output{stdout{}}");
+         final PipelineIR pipelineIR =
+-                ConfigCompiler.configToPipelineIR(Collections.singletonList(swm), false);
++                ConfigCompiler.configToPipelineIR(Collections.singletonList(swm), StringEscapeHelper.DISABLED);
+         assertThat(pipelineIR.getOutputPluginVertices().size(), is(1));
+         assertThat(pipelineIR.getFilterPluginVertices().size(), is(0));
+     }
+@@ -106,7 +107,7 @@ public void testCompileWithAnEmptySource() throws InvalidIRException {
+                 new SourceWithMetadata("str", "<empty>", 0, 0, "     ")
+         );
+ 
+-        PipelineIR pipeline = ConfigCompiler.compileSources(sourcesWithMetadata, false);
++        PipelineIR pipeline = ConfigCompiler.compileSources(sourcesWithMetadata, StringEscapeHelper.DISABLED);
+ 
+         assertEquals("should compile only the text parts", 2L, pipeline.pluginVertices().count());
+     }
+@@ -119,7 +120,7 @@ public void testCompileWithFullyCommentedSource() throws InvalidIRException {
+                 new SourceWithMetadata("str","out_plugin",0,0,"output { output_0 {} } ")
+         );
+ 
+-        PipelineIR pipeline = ConfigCompiler.compileSources(sourcesWithMetadata, false);
++        PipelineIR pipeline = ConfigCompiler.compileSources(sourcesWithMetadata, StringEscapeHelper.DISABLED);
+ 
+         assertEquals("should compile only non commented text parts", 2L, pipeline.pluginVertices().count());
+     }
+@@ -138,7 +139,7 @@ public void testCompilingPipelineWithMultipleSources() throws InvalidIRException
+                 new SourceWithMetadata(sourceProtocol + "_" + 0, sourceId + "_" + 0, 0, 0, sources[0]),
+                 new SourceWithMetadata(sourceProtocol + "_" + 1, sourceId + "_" + 1, 0, 0, sources[1]));
+ 
+-        PipelineIR pipeline = ConfigCompiler.compileSources(sourcesWithMetadata, false);
++        PipelineIR pipeline = ConfigCompiler.compileSources(sourcesWithMetadata, StringEscapeHelper.DISABLED);
+ 
+         assertFalse("should generate a hash", pipeline.uniqueHash().isEmpty());
+         assertEquals("should provide the original source", String.join("\n", sources),
+@@ -179,7 +180,7 @@ private void verifyComplexConfig(Path path) {
+         PipelineIR pipelineIR = null;
+         try {
+             SourceWithMetadata sourceWithMetadata = new SourceWithMetadata("test_proto", "fake_sourcefile", 0, 0, source);
+-            pipelineIR = ConfigCompiler.compileSources(Collections.singletonList(sourceWithMetadata), false);
++            pipelineIR = ConfigCompiler.compileSources(Collections.singletonList(sourceWithMetadata), StringEscapeHelper.DISABLED);
+         } catch (InvalidIRException iirex) {
+             fail("error compiling " + configName + ": " + iirex.getMessage());
+         }
+diff --git a/logstash-core/src/test/java/org/logstash/plugins/factory/PluginFactoryExtTest.java b/logstash-core/src/test/java/org/logstash/plugins/factory/PluginFactoryExtTest.java
+index e1137f5654e..b4a575247ae 100644
+--- a/logstash-core/src/test/java/org/logstash/plugins/factory/PluginFactoryExtTest.java
++++ b/logstash-core/src/test/java/org/logstash/plugins/factory/PluginFactoryExtTest.java
+@@ -26,6 +26,7 @@
+ import org.junit.Test;
+ import org.logstash.RubyUtil;
+ import org.logstash.common.SourceWithMetadata;
++import org.logstash.common.StringEscapeHelper;
+ import org.logstash.config.ir.ConfigCompiler;
+ import org.logstash.config.ir.InvalidIRException;
+ import org.logstash.config.ir.PipelineIR;
+@@ -106,7 +107,7 @@ public void testPluginIdResolvedWithEnvironmentVariables() throws InvalidIRExcep
+     }
+ 
+     private static PipelineIR compilePipeline(SourceWithMetadata sourceWithMetadata) throws InvalidIRException {
+-        return ConfigCompiler.configToPipelineIR(Collections.singletonList(sourceWithMetadata), false);
++        return ConfigCompiler.configToPipelineIR(Collections.singletonList(sourceWithMetadata), StringEscapeHelper.DISABLED);
+     }
+ 
+     private static ExecutionContextFactoryExt createExecutionContextFactory() {
+diff --git a/x-pack/spec/monitoring/inputs/metrics/state_event/lir_serializer_spec.rb b/x-pack/spec/monitoring/inputs/metrics/state_event/lir_serializer_spec.rb
+index a89800fc26d..4ae1fe49d23 100644
+--- a/x-pack/spec/monitoring/inputs/metrics/state_event/lir_serializer_spec.rb
++++ b/x-pack/spec/monitoring/inputs/metrics/state_event/lir_serializer_spec.rb
+@@ -22,9 +22,9 @@
+   end
+ 
+   let(:lir_pipeline) do
+-#     ::LogStash::Compiler.compile_sources(config_source_with_metadata, true)
+     java_import org.logstash.config.ir.ConfigCompiler
+-    ConfigCompiler.compileSources(config_source_with_metadata, true)
++    java_import org.logstash.common.StringEscapeHelper
++    ConfigCompiler.compileSources(config_source_with_metadata, StringEscapeHelper::MINIMAL)
+   end
+ 
+   describe "#serialize" do
