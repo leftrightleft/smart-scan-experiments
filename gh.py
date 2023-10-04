@@ -9,6 +9,11 @@ class Client:
             "Accept": "application/vnd.github.v3+json",
             "Content-Type": "application/json",
         }
+        self.diff_headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.v3.diff",
+            "Content-Type": "application/json",
+        }
         self.endpoint = "https://api.github.com"
 
     def get_diff_urls(self, repo, state="all"):
@@ -19,7 +24,7 @@ class Client:
             response = requests.get(url, params=params, headers=self.headers)
             prs = json.loads(response.text)
             for pr in prs:
-                diff_urls.append(pr['diff_url'])
+                diff_urls.append(pr['url'])
             if 'next' in response.links:
                 url = response.links['next']['url']
             else:
@@ -27,7 +32,7 @@ class Client:
         return diff_urls
 
     def get_diff(self, diff_url):
-        response = requests.get(diff_url, headers=self.headers)
+        response = requests.get(diff_url, headers=self.diff_headers)
         if response.status_code == 200:
             return response.text
         else:
