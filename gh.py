@@ -36,8 +36,8 @@ class Client:
         if response.status_code == 200:
             return response.text
         else:
-            e = f"Error retrieving diff.  Response: {response.json()}"
-            logging.error(e)
+            e = f"Error retrieving diff.  Response: {response.json()} Response code: {response.status_code}"
+            # logging.error(e)
             raise Exception(e)
         
     def get_alert_instance_urls(self, repo, tool_name="CodeQL"):
@@ -69,3 +69,25 @@ class Client:
             else:
                 instance_url = None
         return prs
+    
+    def get_prs(self, repo):
+        prs = []
+        url = f"{self.endpoint}/repos/{repo}/pulls?state=all&per_page=100"
+        while url:
+            response = requests.get(url, headers=self.headers)
+            prs.extend(json.loads(response.text))
+            if 'next' in response.links:
+                url = response.links['next']['url']
+            else:
+                url = None
+        return prs
+    
+    def get_failed_check_runs(self, ref, repo):
+        url = f"{self.endpoint}/repos/{repo}/commits/{ref}/check-runs"
+        response = requests.get(url, headers=self.headers)
+        runs = json.loads(response.text)
+        for run in runs['check_runs']:
+            if run['name'] == 'CodeQL' and run['conclusion'] == 'failure':
+                return True
+
+                
