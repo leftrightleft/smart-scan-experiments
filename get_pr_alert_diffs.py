@@ -13,7 +13,7 @@ def main():
         print(pr['html_url'])
         filename = f"data/diffs_with_alerts/{org_name}-{repo_name}-{pr['number']}"
         try:
-            if gh.get_failed_check_runs(pr['head']['ref'], repo):
+            if gh.get_failed_check_runs(pr['head']['sha'], repo):
                 print(pr['html_url'] + " has failed check runs")
                 try:
                     diff = gh.get_diff(pr['url'])
