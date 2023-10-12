@@ -1,0 +1,210 @@
+diff --git a/logstash-core/lib/logstash/settings.rb b/logstash-core/lib/logstash/settings.rb
+index 10ec1f5f7d3..2039303ad8a 100644
+--- a/logstash-core/lib/logstash/settings.rb
++++ b/logstash-core/lib/logstash/settings.rb
+@@ -1,5 +1,7 @@
+ # encoding: utf-8
+ require "logstash/util/loggable"
++require "fileutils"
++require "logstash/util/byte_value"
+ 
+ module LogStash
+   class Settings
+@@ -434,6 +436,33 @@ def value
+         end
+       end
+     end
++
++    class Bytes < Coercible
++      def initialize(name, default=nil, strict=true)
++        super(name, ::Fixnum, default, strict=true) { |value| valid?(value) }
++      end
++
++      def valid?(value)
++        value.is_a?(Fixnum) && value >= 0
++      end
++
++      def coerce(value)
++        case value
++        when ::Numeric
++          value
++        when ::String
++          LogStash::Util::ByteValue.parse(value)
++        else
++          raise ArgumentError.new("Could not coerce '#{value}' into a bytes value")
++        end
++      end
++
++      def validate(value)
++        unless valid?(value)
++          raise ArgumentError.new("Invalid byte value \"#{value}\".")
++        end
++      end
++    end
+   end
+ 
+   SETTINGS = Settings.new
+diff --git a/logstash-core/lib/logstash/util/byte_value.rb b/logstash-core/lib/logstash/util/byte_value.rb
+new file mode 100644
+index 00000000000..bc189a438a1
+--- /dev/null
++++ b/logstash-core/lib/logstash/util/byte_value.rb
+@@ -0,0 +1,61 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/util"
++
++module LogStash; module Util; module ByteValue
++  module_function
++
++  B = 1
++  KB = B << 10
++  MB = B << 20
++  GB = B << 30
++  TB = B << 40
++  PB = B << 50
++
++  def parse(text)
++    if !text.is_a?(String)
++      raise ArgumentError, "ByteValue::parse takes a String, got a `#{text.class.name}`"
++    end
++    number = text.to_f
++    factor = multiplier(text)
++
++    (number * factor).to_i
++  end
++
++  def multiplier(text)
++    case text
++      when /(?:k|kb)$/ 
++        KB
++      when /(?:m|mb)$/
++        MB
++      when /(?:g|gb)$/
++        GB
++      when /(?:t|tb)$/
++        TB
++      when /(?:p|pb)$/
++        PB
++      when /(?:b)$/
++        B
++      else 
++        raise ArgumentError, "Unknown bytes value '#{text}'"
++    end
++  end
++
++  def human_readable(number)
++    value, unit = if number > PB
++      [number / PB, "pb"]
++    elsif number > TB
++      [number / TB, "tb"]
++    elsif number > GB
++      [number / GB, "gb"]
++    elsif number > MB
++      [number / MB, "mb"]
++    elsif number > KB
++      [number / KB, "kb"]
++    else
++      [number, "b"]
++    end
++
++    format("%.2d%s", value, unit)
++  end
++end end end
+diff --git a/logstash-core/spec/logstash/settings/bytes_spec.rb b/logstash-core/spec/logstash/settings/bytes_spec.rb
+new file mode 100644
+index 00000000000..b4fe0aab765
+--- /dev/null
++++ b/logstash-core/spec/logstash/settings/bytes_spec.rb
+@@ -0,0 +1,53 @@
++# encoding: utf-8
++require "spec_helper"
++require "logstash/settings"
++
++describe LogStash::Setting::Bytes do
++  let(:multipliers) do
++    {
++      "b" => 1,
++      "kb" => 1 << 10,
++      "mb" => 1 << 20,
++      "gb" => 1 << 30,
++      "tb" => 1 << 40,
++      "pb" => 1 << 50,
++    }
++  end
++
++  let(:number) { Flores::Random.number(0..1000) }
++  let(:unit) { Flores::Random.item(multipliers.keys) }
++  let(:default) { "0b" }
++
++  subject { described_class.new("a byte value", default, false) }
++
++  describe "#set" do
++
++    # Hard-coded test just to make sure at least one known case is working
++    context "when given '10mb'" do
++      it "returns 10485760" do
++        expect(subject.set("10mb")).to be == 10485760
++      end
++    end
++
++    context "when given a string" do
++      context "which is a valid byte unit" do
++        let(:text) { "#{number}#{unit}" }
++
++        before { subject.set(text) }
++
++        it "should coerce it to a Fixnum" do
++          expect(subject.value).to be_a(Fixnum)
++        end
++      end
++
++      context "which is not a valid byte unit" do
++        values = [ "hello world", "1234", "", "-__-" ]
++        values.each do |value|
++          it "should fail" do
++            expect { subject.set(value) }.to raise_error
++          end
++        end
++      end
++    end
++  end
++end
+diff --git a/logstash-core/spec/logstash/util/byte_value_spec.rb b/logstash-core/spec/logstash/util/byte_value_spec.rb
+new file mode 100644
+index 00000000000..9181ef06024
+--- /dev/null
++++ b/logstash-core/spec/logstash/util/byte_value_spec.rb
+@@ -0,0 +1,32 @@
++require "logstash/util/byte_value"
++require "flores/random"
++
++describe LogStash::Util::ByteValue do
++  let(:multipliers) do
++    {
++      "b" => 1,
++      "kb" => 1 << 10,
++      "mb" => 1 << 20,
++      "gb" => 1 << 30,
++      "tb" => 1 << 40,
++      "pb" => 1 << 50,
++    }
++  end
++
++  let(:number) { Flores::Random.number(0..100000000000).to_i }
++  let(:unit) { Flores::Random.item(multipliers.keys) }
++  let(:text) { "#{number}#{unit}" }
++
++  describe "#parse" do
++    let(:expected) { number * multipliers[unit] }
++    subject { described_class.parse(text) }
++
++    it "should return a Numeric" do
++      expect(subject).to be_a(Numeric)
++    end
++
++    it "should have an expected byte value" do
++      expect(subject).to be == expected
++    end
++  end
++end

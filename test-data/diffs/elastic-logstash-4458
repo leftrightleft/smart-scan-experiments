@@ -1,0 +1,569 @@
+diff --git a/Gemfile b/Gemfile
+index 195f3d40842..f7cdaf7141c 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -17,6 +17,7 @@ gem "stud", "~> 0.0.22"
+ gem "fpm", "~> 1.3.3", :group => :build
+ gem "rubyzip", "~> 1.1.7", :group => :build
+ gem "gems", "~> 0.8.3", :group => :build
++gem "rack-test", require: "rack/test", :group => :development
+ gem "flores", "~> 0.0.6"
+ gem "logstash-output-elasticsearch"
+ gem "logstash-codec-plain", ">= 0"
+diff --git a/logstash-core/api/init.ru b/logstash-core/api/init.ru
+index 3cc433bba68..b19248591aa 100644
+--- a/logstash-core/api/init.ru
++++ b/logstash-core/api/init.ru
+@@ -4,16 +4,14 @@ Dir.glob('lib/**').each{ |d| $LOAD_PATH.unshift(File.join(ROOT, d)) }
+ 
+ require 'sinatra'
+ require 'app/root'
+-require 'app/pipeline'
+-require 'app/system'
++require 'app/stats'
+ 
+ env = ENV["RACK_ENV"].to_sym
+ set :environment, env
+ 
+ run LogStash::Api::Root
+ 
+-namespaces = { "/_pipeline" => LogStash::Api::Pipeline,
+-               "/_system"   => LogStash::Api::System }
++namespaces = { "/_stats" => LogStash::Api::Stats }
+ 
+ namespaces.each_pair do |namespace, app|
+   map(namespace) do
+diff --git a/logstash-core/api/lib/app/command_factory.rb b/logstash-core/api/lib/app/command_factory.rb
+index cda6837bebc..5b6328037f3 100644
+--- a/logstash-core/api/lib/app/command_factory.rb
++++ b/logstash-core/api/lib/app/command_factory.rb
+@@ -1,7 +1,7 @@
+ # encoding: utf-8
+ require "app/service"
+-require "app/system/info_command"
+-require "app/pipeline/stats_command"
++require "app/system/basicinfo_command"
++require "app/stats/events_command"
+ 
+ module LogStash::Api
+   class CommandFactory
+@@ -11,8 +11,8 @@ class CommandFactory
+     def initialize(service)
+       @service = service
+       @factory = {}.merge(
+-        :system_info => SystemInfoCommand,
+-        :stats_command => PipelineStatsCommand
++        :system_basic_info => SystemBasicInfoCommand,
++        :events_command => StatsEventsCommand
+       )
+     end
+ 
+diff --git a/logstash-core/api/lib/app/pipeline.rb b/logstash-core/api/lib/app/pipeline.rb
+deleted file mode 100644
+index 39d797fbaad..00000000000
+--- a/logstash-core/api/lib/app/pipeline.rb
++++ /dev/null
+@@ -1,42 +0,0 @@
+-# encoding: utf-8
+-require "app"
+-require "app/pipeline/stats_command"
+-
+-module LogStash::Api
+-  class Pipeline < BaseApp
+-
+-    helpers AppHelpers
+-
+-    # Show general information about the pipeline
+-    #  - pipeline status
+-    #  - pipeline uptime
+-    get "/info" do
+-      respond_with({ "pipeline" => { "info" => true}})
+-    end
+-
+-
+-    # Show stats information
+-    # (for ingested, emitted, dropped)
+-    # - #events since startup
+-    # - #data (bytes) since startup
+-    # - events/s
+-    # - bytes/s
+-    # - dropped events/s
+-    # - events in the pipeline
+-    get "/stats" do
+-      command = factory.build(:stats_command)
+-      respond_with command.run
+-    end
+-
+-    # Show information of
+-    # - list of active pipeline plugins (with versions)
+-    # - # of active input plugins
+-    # - # of active fitler plugins
+-    # - # of active codec plugins
+-    # - # of active output plugins
+-    get "/plugins" do
+-      respond_with({ "pipeline" => { "plugins" => true}})
+-    end
+-
+-  end
+-end
+diff --git a/logstash-core/api/lib/app/pipeline/stats_command.rb b/logstash-core/api/lib/app/pipeline/stats_command.rb
+deleted file mode 100644
+index 70d3d707444..00000000000
+--- a/logstash-core/api/lib/app/pipeline/stats_command.rb
++++ /dev/null
+@@ -1,20 +0,0 @@
+-# encoding: utf-8
+-require "app/command"
+-
+-class LogStash::Api::PipelineStatsCommand < LogStash::Api::Command
+-
+-  def run
+-    #return whatever is comming out of the snapshot event, this obvoiusly
+-    #need to be tailored to the right metrics for this command.
+-    stats = service.get(:pipeline_stats)
+-    snapshot = { "events" => {} }
+-    stats.each_pair do |key, value|
+-      if key.start_with?("events_")
+-        field = key.gsub("events_", "")
+-        snapshot["events"][field] = value
+-      end
+-    end
+-    snapshot
+-  end
+-
+-end
+diff --git a/logstash-core/api/lib/app/root.rb b/logstash-core/api/lib/app/root.rb
+index 4a47ede4eb7..cce80f2d443 100644
+--- a/logstash-core/api/lib/app/root.rb
++++ b/logstash-core/api/lib/app/root.rb
+@@ -1,14 +1,13 @@
+ # encoding: utf-8
+ require "app"
++require "app/system/basicinfo_command"
+ 
+ module LogStash::Api
+   class Root < BaseApp
+ 
+     get "/" do
+-      content = { "name" => "Logstash API",
+-                  "version" => { "number" => "0.1.0" },
+-                }
+-      respond_with content
++      command = factory.build(:system_basic_info)
++      respond_with command.run
+     end
+ 
+   end
+diff --git a/logstash-core/api/lib/app/service.rb b/logstash-core/api/lib/app/service.rb
+index 5a0b69f369a..409cfbd2028 100644
+--- a/logstash-core/api/lib/app/service.rb
++++ b/logstash-core/api/lib/app/service.rb
+@@ -1,22 +1,26 @@
+ # encoding: utf-8
+ require "logstash/instrument/collector"
++require "logstash/util/loggable"
+ 
+ class LogStash::Api::Service
+ 
+   include Singleton
++  include LogStash::Util::Loggable
+ 
+   def initialize
+     @snapshot_rotation_mutex = Mutex.new
+     @snapshot = nil
+-
++    logger.debug("[api-service] start") if logger.debug?
+     LogStash::Instrument::Collector.instance.add_observer(self)
+   end
+ 
+   def stop
++    logger.debug("[api-service] stop") if logger.debug?
+     LogStash::Instrument::Collector.instance.delete_observer(self)
+   end
+ 
+-  def update(time, snapshot)
++  def update(snapshot)
++    logger.debug("[api-service] snapshot received", :snapshot => snapshot) if logger.debug?
+     if @snapshot_rotation_mutex.try_lock
+       @snapshot = snapshot
+       @snapshot_rotation_mutex.unlock
+@@ -24,8 +28,9 @@ def update(time, snapshot)
+   end
+ 
+   def get(key=:service_metrics)
+-    @snapshot.to_event.to_hash
+-  rescue
++    metric_store = @snapshot.metric_store
++    { :base => metric_store.get(:root, :base) }
++    rescue
+     {}
+   end
+ end
+diff --git a/logstash-core/api/lib/app/stats.rb b/logstash-core/api/lib/app/stats.rb
+new file mode 100644
+index 00000000000..b9994e42fd2
+--- /dev/null
++++ b/logstash-core/api/lib/app/stats.rb
+@@ -0,0 +1,24 @@
++# encoding: utf-8
++require "app"
++require "app/stats/events_command"
++
++module LogStash::Api
++  class Stats < BaseApp
++
++    helpers AppHelpers
++
++    # Show all events stats information
++    # (for ingested, emitted, dropped)
++    # - #events since startup
++    # - #data (bytes) since startup
++    # - events/s
++    # - bytes/s
++    # - dropped events/s
++    # - events in the pipeline
++    get "/events" do
++      command = factory.build(:events_command)
++      respond_with command.run
++    end
++
++  end
++end
+diff --git a/logstash-core/api/lib/app/stats/events_command.rb b/logstash-core/api/lib/app/stats/events_command.rb
+new file mode 100644
+index 00000000000..0352dfa2f2d
+--- /dev/null
++++ b/logstash-core/api/lib/app/stats/events_command.rb
+@@ -0,0 +1,15 @@
++# encoding: utf-8
++require "app/command"
++
++class LogStash::Api::StatsEventsCommand < LogStash::Api::Command
++
++  def run
++    #return whatever is comming out of the snapshot event, this obvoiusly
++    #need to be tailored to the right metrics for this command.
++    stats = service.get(:events_stats)
++    { :in => stats[:base][:events_in].value, :filtered => stats[:base][:events_filtered].value } 
++  rescue
++    {}
++  end
++
++end
+diff --git a/logstash-core/api/lib/app/system.rb b/logstash-core/api/lib/app/system.rb
+deleted file mode 100644
+index d0719ef43f7..00000000000
+--- a/logstash-core/api/lib/app/system.rb
++++ /dev/null
+@@ -1,27 +0,0 @@
+-# encoding: utf-8
+-require "app"
+-require "app/system/info_command"
+-
+-module LogStash::Api
+-  class System < BaseApp
+-
+-    # Show general information about the system
+-    #  - Logstash version
+-    #  - host name
+-    #  - # of installed plugins
+-    #  - list of installed plugins (with versions)
+-    get "/" do
+-      command = factory.build(:system_info)
+-      respond_with command.run
+-    end
+-
+-    # Show stats information
+-    # - CPU
+-    # - Memory
+-    # - # open file descriptors
+-    get "/stats" do
+-      respond_with({ "system" => { "stats" => true}})
+-    end
+-
+-  end
+-end
+diff --git a/logstash-core/api/lib/app/system/basicinfo_command.rb b/logstash-core/api/lib/app/system/basicinfo_command.rb
+new file mode 100644
+index 00000000000..053fcecf08b
+--- /dev/null
++++ b/logstash-core/api/lib/app/system/basicinfo_command.rb
+@@ -0,0 +1,24 @@
++# encoding: utf-8
++require "app/command"
++
++class LogStash::Api::SystemBasicInfoCommand < LogStash::Api::Command
++
++  def run
++    {
++      "version"   => LOGSTASH_VERSION,
++      "hostname" => hostname,
++      "pipeline" => pipeline
++    }
++  end
++
++  private
++
++  def hostname
++    `hostname`.strip
++  end
++
++
++  def pipeline
++    { "status" => "ready", "uptime" => 1 }
++  end
++end
+diff --git a/logstash-core/api/lib/app/system/info_command.rb b/logstash-core/api/lib/app/system/info_command.rb
+deleted file mode 100644
+index 09942daed68..00000000000
+--- a/logstash-core/api/lib/app/system/info_command.rb
++++ /dev/null
+@@ -1,23 +0,0 @@
+-# encoding: utf-8
+-require "app/command"
+-
+-class LogStash::Api::SystemInfoCommand < LogStash::Api::Command
+-
+-  def run
+-    report = { "version"   => "1.0.0",
+-               "host_name" => "foobar",
+-               "plugins"   => { "count" => 10, "list" => [] }
+-    }
+-    report
+-  end
+-
+-  private
+-
+-  def type
+-    ["input", "output", "filter"][rand(3)]
+-  end
+-
+-  def name
+-    ["elasticsearch", "json", "yaml", "translate"][rand(4)]
+-  end
+-end
+diff --git a/logstash-core/api/spec/lib/api/pipeline_spec.rb b/logstash-core/api/spec/lib/api/pipeline_spec.rb
+deleted file mode 100644
+index 02c51b02abe..00000000000
+--- a/logstash-core/api/spec/lib/api/pipeline_spec.rb
++++ /dev/null
+@@ -1,29 +0,0 @@
+-# encoding: utf-8
+-require_relative "../../spec_helper"
+-require "sinatra"
+-require "app/pipeline"
+-
+-describe LogStash::Api::Pipeline do
+-
+-  include Rack::Test::Methods
+-
+-  def app()
+-    described_class
+-  end
+-
+-  it "respond to the info resource" do
+-    get "/info"
+-    expect(last_response).to be_ok
+-  end
+-
+-  it "respond to the stats resource" do
+-    get "/stats"
+-    expect(last_response).to be_ok
+-  end
+-
+-  it "respond to the stats resource" do
+-    get "/plugins"
+-    expect(last_response).to be_ok
+-  end
+-
+-end
+diff --git a/logstash-core/api/spec/lib/api/root_spec.rb b/logstash-core/api/spec/lib/api/root_spec.rb
+index e0f40408912..7f8b7e0877c 100644
+--- a/logstash-core/api/spec/lib/api/root_spec.rb
++++ b/logstash-core/api/spec/lib/api/root_spec.rb
+@@ -2,6 +2,7 @@
+ require_relative "../../spec_helper"
+ require "sinatra"
+ require "app/root"
++require "logstash/json"
+ 
+ describe LogStash::Api::Root do
+ 
+@@ -11,7 +12,7 @@ def app()
+     described_class
+   end
+ 
+-  let(:body) { JSON.parse(last_response.body) }
++  let(:body) { LogStash::Json.load(last_response.body) }
+ 
+   before(:each) do
+     get "/"
+@@ -22,11 +23,11 @@ def app()
+   end
+ 
+   it "contain a hostname" do
+-    expect(body).to include("name" => a_kind_of(String))
++    expect(body).to include("hostname" => a_kind_of(String))
+   end
+ 
+   it "contain a version number" do
+-    expect(body).to include("version" => { "number" => a_kind_of(String) } )
++    expect(body).to include("version" => a_kind_of(String) )
+   end
+ 
+ end
+diff --git a/logstash-core/api/spec/lib/api/stats_spec.rb b/logstash-core/api/spec/lib/api/stats_spec.rb
+new file mode 100644
+index 00000000000..02c01be7631
+--- /dev/null
++++ b/logstash-core/api/spec/lib/api/stats_spec.rb
+@@ -0,0 +1,19 @@
++# encoding: utf-8
++require_relative "../../spec_helper"
++require "sinatra"
++require "app/stats"
++
++describe LogStash::Api::Stats do
++
++  include Rack::Test::Methods
++
++  def app()
++    described_class
++  end
++
++  it "respond to the events resource" do
++    get "/events"
++    expect(last_response).to be_ok
++  end
++
++end
+diff --git a/logstash-core/api/spec/lib/api/system_spec.rb b/logstash-core/api/spec/lib/api/system_spec.rb
+deleted file mode 100644
+index 1db3fb97774..00000000000
+--- a/logstash-core/api/spec/lib/api/system_spec.rb
++++ /dev/null
+@@ -1,24 +0,0 @@
+-# encoding: utf-8
+-require_relative "../../spec_helper"
+-require "sinatra"
+-require "app/system"
+-
+-describe LogStash::Api::System do
+-
+-  include Rack::Test::Methods
+-
+-  def app()
+-    described_class
+-  end
+-
+-  it "respond to the root resource" do
+-    get "/"
+-    expect(last_response).to be_ok
+-  end
+-
+-   it "respond to the stats resource" do
+-    get "/stats"
+-    expect(last_response).to be_ok
+-  end
+-
+-end
+diff --git a/logstash-core/api/spec/lib/commands/events_spec.rb b/logstash-core/api/spec/lib/commands/events_spec.rb
+new file mode 100644
+index 00000000000..f484abddb89
+--- /dev/null
++++ b/logstash-core/api/spec/lib/commands/events_spec.rb
+@@ -0,0 +1,28 @@
++# encoding: utf-8
++require_relative "../../spec_helper"
++require "app/stats/events_command"
++require 'ostruct'
++
++describe LogStash::Api::StatsEventsCommand do
++
++  let(:service) { double("snapshot-service") }
++
++  subject { described_class.new(service) }
++
++  let(:stats) do
++    { :base => { :events_in => OpenStruct.new(:value => 100), :events_filtered => OpenStruct.new(:value => 200) } }
++  end
++
++  before(:each) do
++    allow(service).to receive(:get).with(:events_stats).and_return(stats)
++  end
++
++  context "#schema" do
++    let(:report) { subject.run }
++
++    it "return events information" do
++      expect(report).to include({:in => 100, :filtered => 200 })
++    end
++
++  end
++end
+diff --git a/logstash-core/api/spec/lib/commands/plugins_spec.rb b/logstash-core/api/spec/lib/commands/plugins_spec.rb
+deleted file mode 100644
+index 7d854a6c4cc..00000000000
+--- a/logstash-core/api/spec/lib/commands/plugins_spec.rb
++++ /dev/null
+@@ -1,27 +0,0 @@
+-# encoding: utf-8
+-require_relative "../../spec_helper"
+-require "app/pipeline/stats_command"
+-
+-describe LogStash::Api::PipelineStatsCommand do
+-
+-  let(:service) { double("snapshot-service") }
+-
+-  subject { described_class.new(service) }
+-
+-  let(:stats) do
+-    { "events_startup" => 10, "events_in" => 100, "events_filtered" => 200 }
+-  end
+-
+-  before(:each) do
+-    allow(service).to receive(:get).with(:pipeline_stats).and_return(stats)
+-  end
+-
+-  context "#schema" do
+-    let(:report) { subject.run }
+-
+-    it "return events information" do
+-      expect(report).to include("events" => { "startup" => 10, "in" => 100, "filtered" => 200 })
+-    end
+-
+-  end
+-end
+diff --git a/logstash-core/api/spec/lib/commands/systems_spec.rb b/logstash-core/api/spec/lib/commands/systems_spec.rb
+deleted file mode 100644
+index 88a9826fb3a..00000000000
+--- a/logstash-core/api/spec/lib/commands/systems_spec.rb
++++ /dev/null
+@@ -1,27 +0,0 @@
+-# encoding: utf-8
+-require_relative "../../spec_helper"
+-require "app/system/info_command"
+-
+-describe LogStash::Api::SystemInfoCommand do
+-
+-  let(:service) { double("snapshot-service") }
+-
+-  subject { described_class.new(service) }
+-
+-  context "#schema" do
+-    let(:report) { subject.run }
+-
+-    it "return a list of plugins" do
+-      expect(report).to include("plugins" => { "count" => a_kind_of(Fixnum), "list" => a_kind_of(Array)})
+-    end
+-
+-    it "include version information" do
+-      expect(report).to include("version" => a_kind_of(String))
+-    end
+-
+-    it "include hostname information" do
+-      expect(report).to include("host_name" => a_kind_of(String))
+-    end
+-
+-  end
+-end

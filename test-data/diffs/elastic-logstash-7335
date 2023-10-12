@@ -1,0 +1,565 @@
+diff --git a/bin/ingest-convert.sh b/bin/ingest-convert.sh
+new file mode 100755
+index 00000000000..1205cebc5c3
+--- /dev/null
++++ b/bin/ingest-convert.sh
+@@ -0,0 +1,4 @@
++#!/usr/bin/env bash
++
++java -cp "$(cd `dirname $0`/..; pwd)"'/tools/ingest-converter/build/libs/ingest-converter.jar:*' \
++ org.logstash.ingest.Pipeline "$@"
+diff --git a/rakelib/artifacts.rake b/rakelib/artifacts.rake
+index d0da36d19d2..d6f20069ac4 100644
+--- a/rakelib/artifacts.rake
++++ b/rakelib/artifacts.rake
+@@ -30,6 +30,7 @@ namespace "artifact" do
+       "logstash-core-plugin-api/*.gemspec",
+ 
+       "patterns/**/*",
++      "tools/ingest-converter/build/libs/ingest-converter.jar",
+       "vendor/??*/**/*",
+       # To include ruby-maven's hidden ".mvn" directory, we need to
+       # do add the line below. This directory contains a file called
+diff --git a/tools/ingest-converter/build.gradle b/tools/ingest-converter/build.gradle
+index 056dcce7b03..ce272b5a6f0 100644
+--- a/tools/ingest-converter/build.gradle
++++ b/tools/ingest-converter/build.gradle
+@@ -23,6 +23,7 @@ buildscript {
+ }
+ 
+ dependencies {
++  compile 'net.sf.jopt-simple:jopt-simple:5.0.3'
+   testCompile "junit:junit:4.12"
+ }
+ 
+@@ -37,3 +38,5 @@ shadowJar {
+   classifier = null
+   version = null
+ }
++
++assemble.dependsOn shadowJar
+diff --git a/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java b/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java
+index d58ff499051..3b827c6dc2d 100644
+--- a/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java
++++ b/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java
+@@ -3,6 +3,7 @@
+ import java.io.IOException;
+ import java.io.InputStreamReader;
+ import java.io.Reader;
++import java.net.URI;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+ import java.nio.file.Paths;
+@@ -10,6 +11,10 @@
+ import javax.script.ScriptEngine;
+ import javax.script.ScriptEngineManager;
+ import javax.script.ScriptException;
++import joptsimple.OptionException;
++import joptsimple.OptionParser;
++import joptsimple.OptionSet;
++import joptsimple.OptionSpec;
+ 
+ final class JsUtil {
+ 
+@@ -17,8 +22,10 @@ final class JsUtil {
+      * Script names used by the converter in correct load order.
+      */
+ 
+-    private static final String[] SCRIPTS =
+-        {"shared", "date", "grok", "geoip", "gsub", "pipeline", "convert", "append", "json", "rename"};
++    private static final String[] SCRIPTS = {
++        "shared", "date", "grok", "geoip", "gsub", "pipeline", "convert", "append", "json",
++        "rename", "lowercase"
++    };
+ 
+     private JsUtil() {
+         // Utility Class
+@@ -43,24 +50,57 @@ public static ScriptEngine engine() {
+ 
+     /**
+      * Converts the given files from ingest to LS conf using the javascript function
+-     * @param args
+-     * @param jsFunc
++     * @param args CLI Arguments
++     * @param jsFunc JS function to call
+      * @throws ScriptException
+      * @throws NoSuchMethodException
+      */
+-    public static void convert(final String[] args, final String jsFunc) throws ScriptException, NoSuchMethodException {
++    public static void convert(final String[] args, final String jsFunc)
++        throws ScriptException, NoSuchMethodException {
++        final OptionParser parser = new OptionParser();
++        final OptionSpec<URI> input = parser.accepts(
++            "input",
++            "Input JSON file location URI. Only supports 'file://' as URI schema."
++        ).withRequiredArg().ofType(URI.class).required().forHelp();
++        final OptionSpec<URI> output = parser.accepts(
++            "output",
++            "Output Logstash DSL file location URI. Only supports 'file://' as URI schema."
++        ).withRequiredArg().ofType(URI.class).required().forHelp();
+         try {
++            final OptionSet options;
++            try {
++                options = parser.parse(args);
++            } catch (final OptionException ex) {
++                parser.printHelpOn(System.out);
++                throw ex;
++            }
+             final ScriptEngine engine = JsUtil.engine();
+-            Files.write(Paths.get(args[1]), ((String) ((Invocable) engine).invokeFunction(
+-                jsFunc, new String(
+-                    Files.readAllBytes(Paths.get(args[0])), StandardCharsets.UTF_8
+-                )
+-            )).getBytes(StandardCharsets.UTF_8));
++            Files.write(
++                Paths.get(options.valueOf(output)),
++                ((String) ((Invocable) engine).invokeFunction(
++                    jsFunc, input(options.valueOf(input))
++                )).getBytes(StandardCharsets.UTF_8)
++            );
+         } catch (final IOException ex) {
+             throw new IllegalStateException(ex);
+         }
+     }
+ 
++    /**
++     * Retrieves the input Ingest JSON from a given {@link URI}.
++     * @param uri {@link URI} of Ingest JSON
++     * @return Json String
++     * @throws IOException On failure to load Ingest JSON 
++     */
++    private static String input(final URI uri) throws IOException {
++        if ("file".equals(uri.getScheme())) {
++            return new String(
++                Files.readAllBytes(Paths.get(uri)), StandardCharsets.UTF_8
++            );
++        }
++        throw new IllegalArgumentException("--input must be of schema file://");
++    }
++
+     private static void add(final ScriptEngine engine, final String file)
+         throws IOException, ScriptException {
+         try (final Reader reader =
+diff --git a/tools/ingest-converter/src/main/java/org/logstash/ingest/Lowercase.java b/tools/ingest-converter/src/main/java/org/logstash/ingest/Lowercase.java
+new file mode 100644
+index 00000000000..29fb397e4e1
+--- /dev/null
++++ b/tools/ingest-converter/src/main/java/org/logstash/ingest/Lowercase.java
+@@ -0,0 +1,17 @@
++package org.logstash.ingest;
++
++import javax.script.ScriptException;
++
++/**
++ * Ingest Lowercase DSL to Logstash mutate Transpiler.
++ */
++public final class Lowercase {
++
++    private Lowercase() {
++        // Utility Wrapper for JS Script.
++    }
++
++    public static void main(final String... args) throws ScriptException, NoSuchMethodException {
++        JsUtil.convert(args, "ingest_lowercase_to_logstash");
++    }
++}
+diff --git a/tools/ingest-converter/src/main/resources/ingest-lowercase.js b/tools/ingest-converter/src/main/resources/ingest-lowercase.js
+new file mode 100644
+index 00000000000..dabf2af5508
+--- /dev/null
++++ b/tools/ingest-converter/src/main/resources/ingest-lowercase.js
+@@ -0,0 +1,30 @@
++var IngestLowercase = {
++    has_lowercase: function (processor) {
++        return !!processor["lowercase"];
++    },
++    lowercase_hash: function (processor) {
++        return IngestConverter.create_field(
++            "lowercase", 
++            IngestConverter.quote_string(
++                IngestConverter.dots_to_square_brackets(processor["lowercase"]["field"])
++            )
++        );
++    }
++};
++
++/**
++ * Converts Ingest Lowercase JSON to LS mutate filter.
++ */
++function ingest_lowercase_to_logstash(json) {
++
++    function map_processor(processor) {
++
++        return IngestConverter.filter_hash(
++            IngestConverter.create_hash(
++                "mutate", IngestLowercase.lowercase_hash(processor)
++            )
++        );
++    }
++
++    return IngestConverter.filters_to_file(JSON.parse(json)["processors"].map(map_processor));
++}
+diff --git a/tools/ingest-converter/src/main/resources/ingest-pipeline.js b/tools/ingest-converter/src/main/resources/ingest-pipeline.js
+index 936afb76dd2..d7c867c186d 100644
+--- a/tools/ingest-converter/src/main/resources/ingest-pipeline.js
++++ b/tools/ingest-converter/src/main/resources/ingest-pipeline.js
+@@ -46,6 +46,11 @@ function ingest_pipeline_to_logstash(json) {
+                 IngestConverter.create_hash("mutate", IngestRename.rename_hash(processor))
+             );
+         }
++        if (IngestLowercase.has_lowercase(processor)) {
++            filter_blocks.push(
++                IngestConverter.create_hash("mutate", IngestLowercase.lowercase_hash(processor))
++            );
++        }
+         return IngestConverter.join_hash_fields(filter_blocks);
+     }
+ 
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/AppendTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/AppendTest.java
+index 994cb12871d..89a23ed2161 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/AppendTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/AppendTest.java
+@@ -3,8 +3,6 @@
+ import java.util.Arrays;
+ import org.junit.Test;
+ 
+-import static org.hamcrest.CoreMatchers.is;
+-import static org.hamcrest.MatcherAssert.assertThat;
+ import static org.junit.runners.Parameterized.Parameters;
+ 
+ public final class AppendTest extends IngestTest {
+@@ -16,10 +14,6 @@ public static Iterable<String> data() {
+ 
+     @Test
+     public void convertsAppendProcessorCorrectly() throws Exception {
+-        final String append = getResultPath(temp);
+-        Append.main(resourcePath(String.format("ingest%s.json", testCase)), append);
+-        assertThat(
+-            utf8File(append), is(utf8File(resourcePath(String.format("logstash%s.conf", testCase))))
+-        );
++        assertCorrectConversion(Append.class);
+     }
+ }
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/ConvertTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/ConvertTest.java
+index 7a1f04d145a..0ba7f9a9a7a 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/ConvertTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/ConvertTest.java
+@@ -3,8 +3,6 @@
+ import java.util.Arrays;
+ import org.junit.Test;
+ 
+-import static org.hamcrest.CoreMatchers.is;
+-import static org.hamcrest.MatcherAssert.assertThat;
+ import static org.junit.runners.Parameterized.Parameters;
+ 
+ public final class ConvertTest extends IngestTest {
+@@ -16,10 +14,6 @@ public static Iterable<String> data() {
+ 
+     @Test
+     public void convertsConvertProcessorCorrectly() throws Exception {
+-        final String convert = getResultPath(temp);
+-        Convert.main(resourcePath(String.format("ingest%s.json", testCase)), convert);
+-        assertThat(
+-            utf8File(convert), is(utf8File(resourcePath(String.format("logstash%s.conf", testCase))))
+-        );
++        assertCorrectConversion(Convert.class);
+     }
+ }
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/DateTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/DateTest.java
+index ae26f8ffc0a..dd8a4554218 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/DateTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/DateTest.java
+@@ -3,8 +3,6 @@
+ import java.util.Arrays;
+ import org.junit.Test;
+ 
+-import static org.hamcrest.CoreMatchers.is;
+-import static org.hamcrest.MatcherAssert.assertThat;
+ import static org.junit.runners.Parameterized.Parameters;
+ 
+ public final class DateTest extends IngestTest {
+@@ -16,10 +14,6 @@ public static Iterable<String> data() {
+ 
+     @Test
+     public void convertsDateFieldCorrectly() throws Exception {
+-        final String date = getResultPath(temp);
+-        Date.main(resourcePath(String.format("ingest%s.json", testCase)), date);
+-        assertThat(
+-            utf8File(date), is(utf8File(resourcePath(String.format("logstash%s.conf", testCase))))
+-        );
++        assertCorrectConversion(Date.class);
+     }
+ }
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/GeoIpTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/GeoIpTest.java
+index fb760781420..089747bc800 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/GeoIpTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/GeoIpTest.java
+@@ -3,8 +3,6 @@
+ import java.util.Arrays;
+ import org.junit.Test;
+ 
+-import static org.hamcrest.CoreMatchers.is;
+-import static org.hamcrest.MatcherAssert.assertThat;
+ import static org.junit.runners.Parameterized.Parameters;
+ 
+ public final class GeoIpTest extends IngestTest {
+@@ -16,10 +14,6 @@ public static Iterable<String> data() {
+ 
+     @Test
+     public void convertsGeoIpFieldCorrectly() throws Exception {
+-        final String date = getResultPath(temp);
+-        GeoIp.main(resourcePath(String.format("ingest%s.json", testCase)), date);
+-        assertThat(
+-            utf8File(date), is(utf8File(resourcePath(String.format("logstash%s.conf", testCase))))
+-        );
++        assertCorrectConversion(GeoIp.class);
+     }
+ }
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/GrokTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/GrokTest.java
+index b843a5f1f74..253b8b62d4a 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/GrokTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/GrokTest.java
+@@ -3,8 +3,6 @@
+ import java.util.Arrays;
+ import org.junit.Test;
+ 
+-import static org.hamcrest.CoreMatchers.is;
+-import static org.hamcrest.MatcherAssert.assertThat;
+ import static org.junit.runners.Parameterized.Parameters;
+ 
+ public final class GrokTest extends IngestTest {
+@@ -16,10 +14,6 @@ public static Iterable<String> data() {
+ 
+     @Test
+     public void convertsGrokFieldCorrectly() throws Exception {
+-        final String date = getResultPath(temp);
+-        Grok.main(resourcePath(String.format("ingest%s.json", testCase)), date);
+-        assertThat(
+-            utf8File(date), is(utf8File(resourcePath(String.format("logstash%s.conf", testCase))))
+-        );
++        assertCorrectConversion(Grok.class);
+     }
+ }
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/GsubTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/GsubTest.java
+index c3b92c1e397..6dc5b069b76 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/GsubTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/GsubTest.java
+@@ -3,8 +3,6 @@
+ import java.util.Collections;
+ import org.junit.Test;
+ 
+-import static org.hamcrest.CoreMatchers.is;
+-import static org.hamcrest.MatcherAssert.assertThat;
+ import static org.junit.runners.Parameterized.Parameters;
+ 
+ public final class GsubTest extends IngestTest {
+@@ -16,10 +14,6 @@ public static Iterable<String> data() {
+ 
+     @Test
+     public void convertsGsubCorrectly() throws Exception {
+-        final String date = getResultPath(temp);
+-        Gsub.main(resourcePath(String.format("ingest%s.json", testCase)), date);
+-        assertThat(
+-            utf8File(date), is(utf8File(resourcePath(String.format("logstash%s.conf", testCase))))
+-        );
++        assertCorrectConversion(Gsub.class);
+     }
+ }
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/IngestTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/IngestTest.java
+index dd326da478b..ba44db39b83 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/IngestTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/IngestTest.java
+@@ -9,7 +9,9 @@
+ import org.junit.runner.RunWith;
+ import org.junit.runners.Parameterized;
+ 
+-import static org.junit.runners.Parameterized.*;
++import static org.hamcrest.CoreMatchers.is;
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.junit.runners.Parameterized.Parameter;
+ 
+ /**
+  * Base class for ingest migration tests
+@@ -23,6 +25,20 @@ public abstract class IngestTest {
+     @Parameter
+     public String testCase;
+     
++    protected final void assertCorrectConversion(final Class clazz) throws Exception {
++        final String append = getResultPath(temp);
++        clazz.getMethod("main", String[].class).invoke(
++            null,
++            (Object) new String[]{
++                String.format("--input=file://%s", resourcePath(String.format("ingest%s.json", testCase))),
++                String.format("--output=file://%s", append)
++            }
++        );
++        assertThat(
++            utf8File(append), is(utf8File(resourcePath(String.format("logstash%s.conf", testCase))))
++        );
++    } 
++    
+     static String utf8File(final String path) throws IOException {
+         return new String(Files.readAllBytes(Paths.get(path)), StandardCharsets.UTF_8);
+     }
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/JsonTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/JsonTest.java
+index 256f9d61805..685f1e3f5ed 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/JsonTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/JsonTest.java
+@@ -3,8 +3,6 @@
+ import java.util.Arrays;
+ import org.junit.Test;
+ 
+-import static org.hamcrest.CoreMatchers.is;
+-import static org.hamcrest.MatcherAssert.assertThat;
+ import static org.junit.runners.Parameterized.Parameters;
+ 
+ public final class JsonTest extends IngestTest {
+@@ -16,10 +14,6 @@ public static Iterable<String> data() {
+ 
+     @Test
+     public void convertsConvertProcessorCorrectly() throws Exception {
+-        final String json = getResultPath(temp);
+-        Json.main(resourcePath(String.format("ingest%s.json", testCase)), json);
+-        assertThat(
+-            utf8File(json), is(utf8File(resourcePath(String.format("logstash%s.conf", testCase))))
+-        );
++        assertCorrectConversion(Json.class);
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/LowercaseTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/LowercaseTest.java
+new file mode 100644
+index 00000000000..ae188e24c8f
+--- /dev/null
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/LowercaseTest.java
+@@ -0,0 +1,19 @@
++package org.logstash.ingest;
++
++import java.util.Arrays;
++import org.junit.Test;
++
++import static org.junit.runners.Parameterized.Parameters;
++
++public final class LowercaseTest extends IngestTest {
++
++    @Parameters
++    public static Iterable<String> data() {
++        return Arrays.asList("LowercaseSimple", "LowercaseDots");
++    }
++
++    @Test
++    public void convertsAppendProcessorCorrectly() throws Exception {
++        assertCorrectConversion(Lowercase.class);
++    }
++}
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/PipelineTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/PipelineTest.java
+index 027efed05a3..12962c9e570 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/PipelineTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/PipelineTest.java
+@@ -4,8 +4,6 @@
+ import java.util.Collection;
+ import org.junit.Test;
+ 
+-import static org.hamcrest.CoreMatchers.is;
+-import static org.hamcrest.MatcherAssert.assertThat;
+ import static org.junit.runners.Parameterized.Parameters;
+ 
+ public final class PipelineTest extends IngestTest {
+@@ -23,15 +21,12 @@ public static Iterable<String> data() {
+         AppendTest.data().forEach(cases::add);
+         JsonTest.data().forEach(cases::add);
+         RenameTest.data().forEach(cases::add);
++        LowercaseTest.data().forEach(cases::add);
+         return cases;
+     }
+ 
+     @Test
+     public void convertsComplexCaseCorrectly() throws Exception {
+-        final String date = getResultPath(temp);
+-        Pipeline.main(resourcePath(String.format("ingest%s.json", testCase)), date);
+-        assertThat(
+-            utf8File(date), is(utf8File(resourcePath(String.format("logstash%s.conf", testCase))))
+-        );
++        assertCorrectConversion(Pipeline.class);
+     }
+ }
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/RenameTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/RenameTest.java
+index c17a3f30a2b..1734d119d78 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/RenameTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/RenameTest.java
+@@ -3,8 +3,6 @@
+ import java.util.Arrays;
+ import org.junit.Test;
+ 
+-import static org.hamcrest.CoreMatchers.is;
+-import static org.hamcrest.MatcherAssert.assertThat;
+ import static org.junit.runners.Parameterized.Parameters;
+ 
+ public final class RenameTest extends IngestTest {
+@@ -16,10 +14,6 @@ public static Iterable<String> data() {
+ 
+     @Test
+     public void convertsConvertProcessorCorrectly() throws Exception {
+-        final String rename = getResultPath(temp);
+-        Rename.main(resourcePath(String.format("ingest%s.json", testCase)), rename);
+-        assertThat(
+-            utf8File(rename), is(utf8File(resourcePath(String.format("logstash%s.conf", testCase))))
+-        );
++        assertCorrectConversion(Rename.class);
+     }
+ }
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestLowercaseDots.json b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestLowercaseDots.json
+new file mode 100644
+index 00000000000..2f375b36ef3
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestLowercaseDots.json
+@@ -0,0 +1,10 @@
++{
++  "description": "ExampleLowercase",
++  "processors": [
++    {
++      "lowercase": {
++        "field": "foo.bar"
++      }
++    }
++  ]
++}
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestLowercaseSimple.json b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestLowercaseSimple.json
+new file mode 100644
+index 00000000000..8ae738f1961
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestLowercaseSimple.json
+@@ -0,0 +1,10 @@
++{
++  "description": "ExampleLowercase",
++  "processors": [
++    {
++      "lowercase": {
++        "field": "foo"
++      }
++    }
++  ]
++}
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashLowercaseDots.conf b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashLowercaseDots.conf
+new file mode 100644
+index 00000000000..fdcd48e0fee
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashLowercaseDots.conf
+@@ -0,0 +1,5 @@
++filter {
++   mutate {
++      lowercase => "[foo][bar]"
++   }
++}
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashLowercaseSimple.conf b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashLowercaseSimple.conf
+new file mode 100644
+index 00000000000..b28140debde
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashLowercaseSimple.conf
+@@ -0,0 +1,5 @@
++filter {
++   mutate {
++      lowercase => "foo"
++   }
++}

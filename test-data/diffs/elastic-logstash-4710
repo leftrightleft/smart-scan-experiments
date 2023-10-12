@@ -1,0 +1,341 @@
+diff --git a/docs/static/configuration.asciidoc b/docs/static/configuration.asciidoc
+index fc28c22965c..72aaeae5731 100644
+--- a/docs/static/configuration.asciidoc
++++ b/docs/static/configuration.asciidoc
+@@ -599,6 +599,184 @@ output {
+ }
+ ----------------------------------
+ 
++[[environment-variables]]
++=== Using Environment Variables in Configuration
++==== Overview
++
++* You can set environment variable references into Logstash plugins configuration using `${var}` or `$var`.
++* Each reference will be replaced by environment variable value at Logstash startup.
++* The replacement is case-sensitive.
++* References to undefined variables raise a Logstash configuration error.
++* A default value can be given by using the form `${var:default value}`.
++* You can add environment variable references in any plugin option type : string, number, boolean, array or hash.
++* Environment variables are immutable. If you update the environment variable, you'll have to restart Logstash to pick the updated value.
++
++==== Examples
++
++[cols="a,a,a"]
++|==================================
++|Logstash config source	|Environment 	|Logstash config result
++
++|
++[source,ruby]
++----
++input {
++  tcp {
++    port => "$TCP_PORT"
++  }
++}
++----
++
++|
++[source,shell]
++----
++export TCP_PORT=12345
++----
++|
++[source,ruby]
++----
++input {
++  tcp {
++    port => 12345
++  }
++}
++----
++|
++[source,ruby]
++----
++input {
++  tcp {
++    port => "${TCP_PORT}"
++  }
++}
++----
++
++|
++[source,shell]
++----
++export TCP_PORT=12345
++----
++|
++[source,ruby]
++----
++input {
++  tcp {
++    port => 12345
++  }
++}
++----
++|
++[source,ruby]
++----
++input {
++  tcp {
++    port => "${TCP_PORT}"
++  }
++}
++----
++
++|
++No TCP_PORT defined
++|
++Raise a logstash configuration error
++|
++[source,ruby]
++----
++input {
++  tcp {
++    port => "${TCP_PORT:54321}"
++  }
++}
++----
++
++|
++No TCP_PORT defined
++|
++[source,ruby]
++----
++input {
++  tcp {
++    port => 54321
++  }
++}
++----
++|
++[source,ruby]
++----
++input {
++  tcp {
++    port => "${TCP_PORT:54321}"
++  }
++}
++----
++
++|
++[source,shell]
++----
++export TCP_PORT=12345
++----
++|
++[source,ruby]
++----
++input {
++  tcp {
++    port => 12345
++  }
++}
++----
++|
++[source,ruby]
++----
++filter {
++  mutate {
++    add_tag => [ "tag1", "${ENV_TAG}" ]
++  }
++}
++----
++
++|
++[source,shell]
++----
++export ENV_TAG="tag2"
++----
++|
++[source,ruby]
++----
++filter {
++  mutate {
++    add_tag => [ "tag1", "tag2" ]
++  }
++}
++----
++|
++[source,ruby]
++----
++filter {
++  mutate {
++    add_field => {
++      "my_path" => "${HOME}/file.log"
++    }
++  }
++}
++----
++|
++[source,shell]
++----
++export HOME="/path"
++----
++|
++[source,ruby]
++----
++filter {
++  mutate {
++    add_field => {
++      "my_path" => "/path/file.log"
++    }
++  }
++}
++----
++|==================================
++
+ [[config-examples]]
+ === Logstash Configuration Examples
+ The following examples illustrate how you can configure Logstash to filter events, process Apache logs and syslog messages, and use conditionals to control what events are processed by a filter or output.
+diff --git a/logstash-core/lib/logstash/config/mixin.rb b/logstash-core/lib/logstash/config/mixin.rb
+index cd20f36de6f..c02542b2931 100644
+--- a/logstash-core/lib/logstash/config/mixin.rb
++++ b/logstash-core/lib/logstash/config/mixin.rb
+@@ -37,6 +37,8 @@ module LogStash::Config::Mixin
+ 
+   PLUGIN_VERSION_1_0_0 = LogStash::Util::PluginVersion.new(1, 0, 0)
+   PLUGIN_VERSION_0_9_0 = LogStash::Util::PluginVersion.new(0, 9, 0)
++  
++  ENV_PLACEHOLDER_REGEX = /\$(?<name>\w+)|\$\{(?<name>\w+)(\:(?<default>[^}]*))?\}/
+ 
+   # This method is called when someone does 'include LogStash::Config'
+   def self.included(base)
+@@ -99,6 +101,23 @@ def config_init(params)
+       end
+     end
+ 
++    # Resolve environment variables references
++    params.each do |name, value|
++      if (value.is_a?(Hash))
++        value.each do |valueHashKey, valueHashValue|
++          value[valueHashKey.to_s] = replace_env_placeholders(valueHashValue)
++        end
++      else
++        if (value.is_a?(Array))
++          value.each_index do |valueArrayIndex|
++            value[valueArrayIndex] = replace_env_placeholders(value[valueArrayIndex])
++          end
++        else
++          params[name.to_s] = replace_env_placeholders(value)
++        end
++      end
++    end
++
+     if !self.class.validate(params)
+       raise LogStash::ConfigurationError,
+         I18n.t("logstash.runner.configuration.invalid_plugin_settings")
+@@ -126,6 +145,29 @@ def config_init(params)
+     @config = params
+   end # def config_init
+ 
++  # Replace all environment variable references in 'value' param by environment variable value and return updated value
++  # Process following patterns : $VAR, ${VAR}, ${VAR:defaultValue}
++  def replace_env_placeholders(value)
++    return value unless value.is_a?(String)
++    #raise ArgumentError, "Cannot replace ENV placeholders on non-strings. Got #{value.class}" if !value.is_a?(String)
++
++    value.gsub(ENV_PLACEHOLDER_REGEX) do |placeholder|
++      # Note: Ruby docs claim[1] Regexp.last_match is thread-local and scoped to
++      # the call, so this should be thread-safe.
++      #
++      # [1] http://ruby-doc.org/core-2.1.1/Regexp.html#method-c-last_match
++      name = Regexp.last_match(:name)
++      default = Regexp.last_match(:default)
++
++      replacement = ENV.fetch(name, default)
++      if replacement.nil?
++        raise LogStash::ConfigurationError, "Cannot evaluate `#{placeholder}`. Environment variable `#{name}` is not set and there is no default value given."
++      end
++      @logger.info? && @logger.info("Evaluating environment variable placeholder", :placeholder => placeholder, :replacement => replacement)
++      replacement
++    end
++  end # def replace_env_placeholders
++
+   module DSL
+     attr_accessor :flags
+ 
+diff --git a/logstash-core/spec/logstash/config/mixin_spec.rb b/logstash-core/spec/logstash/config/mixin_spec.rb
+index 7c73b805d63..02a182afdba 100644
+--- a/logstash-core/spec/logstash/config/mixin_spec.rb
++++ b/logstash-core/spec/logstash/config/mixin_spec.rb
+@@ -151,4 +151,80 @@
+       expect(subject.params).to include("password")
+     end
+   end
++
++  context "environment variable evaluation" do
++    let(:plugin_class) do
++      Class.new(LogStash::Filters::Base)  do
++        config_name "one_plugin"
++        config :oneString, :validate => :string
++        config :oneBoolean, :validate => :boolean
++        config :oneNumber, :validate => :number
++        config :oneArray, :validate => :array
++        config :oneHash, :validate => :hash
++      end
++    end
++    
++    context "when an environment variable is not set" do
++      context "and no default is given" do
++        before do
++          # Canary. Just in case somehow this is set.
++          expect(ENV["NoSuchVariable"]).to be_nil
++        end
++
++        it "should raise a configuration error" do
++          expect do
++            plugin_class.new("oneString" => "${NoSuchVariable}")
++          end.to raise_error(LogStash::ConfigurationError)
++        end
++      end
++
++      context "and a default is given" do
++        subject do
++          plugin_class.new(
++            "oneString" => "${notExistingVar:foo}",
++            "oneBoolean" => "${notExistingVar:true}",
++            "oneArray" => [ "first array value", "${notExistingVar:foo}", "${notExistingVar:}", "${notExistingVar: }", "${notExistingVar:foo bar}" ],
++            "oneHash" => { "key" => "${notExistingVar:foo}" }
++          )
++        end
++
++        it "should use the default" do
++          expect(subject.oneString).to(be == "foo")
++          expect(subject.oneBoolean).to be_truthy
++          expect(subject.oneArray).to(be == ["first array value", "foo", "", " ", "foo bar"])
++          expect(subject.oneHash).to(be == { "key" => "foo" })
++        end
++      end
++    end
++
++    context "when an environment variable is set" do
++      before do
++        ENV["FunString"] = "fancy"
++        ENV["FunBool"] = "true"
++      end
++
++      after do
++        ENV.delete("FunString")
++        ENV.delete("FunBool")
++      end
++
++      subject do
++        plugin_class.new(
++          "oneString" => "${FunString:foo}",
++          "oneBoolean" => "${FunBool:false}",
++          "oneArray" => [ "first array value", "${FunString:foo}" ],
++          "oneHash" => { "key1" => "${FunString:foo}", "key2" => "$FunString is ${FunBool}", "key3" => "${FunBool:false} or ${funbool:false}" }
++        )
++      end
++
++      it "should use the value in the variable" do
++        expect(subject.oneString).to(be == "fancy")
++        expect(subject.oneBoolean).to(be_truthy)
++        expect(subject.oneArray).to(be == [ "first array value", "fancy" ])
++        expect(subject.oneHash).to(be == { "key1" => "fancy", "key2" => "fancy is true", "key3" => "true or false" })
++      end
++
++    end
++  end
++
+ end

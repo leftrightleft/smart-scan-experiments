@@ -1,0 +1,490 @@
+diff --git a/logstash-core/lib/logstash/compiler.rb b/logstash-core/lib/logstash/compiler.rb
+index 56017eed70f..9fedb585351 100644
+--- a/logstash-core/lib/logstash/compiler.rb
++++ b/logstash-core/lib/logstash/compiler.rb
+@@ -8,31 +8,49 @@
+ module LogStash; class Compiler
+   include ::LogStash::Util::Loggable
+ 
+-  def self.compile_pipeline(config_str, source_file=nil)
+-    graph_sections = self.compile_graph(config_str, source_file)
+-    pipeline = org.logstash.config.ir.Pipeline.new(
+-      graph_sections[:input],
+-      graph_sections[:filter],
+-      graph_sections[:output]
+-    )
++  def self.compile_sources(*sources_with_metadata)
++    graph_sections = sources_with_metadata.map do |swm|
++      self.compile_graph(swm)
++    end
++
++    input_graph = org.logstash.config.ir.graph.Graph.combine(*graph_sections.map {|s| s[:input] }).graph
++    output_graph = org.logstash.config.ir.graph.Graph.combine(*graph_sections.map {|s| s[:output] }).graph
++
++    filter_graph = graph_sections.reduce(nil) do |acc, s| 
++      filter_section = s[:filter]
++
++      if acc.nil? 
++        filter_section
++      else
++        acc.chain(filter_section)
++      end
++    end
++
++    original_source = sources_with_metadata.join("\n")
++
++    org.logstash.config.ir.Pipeline.new(input_graph, filter_graph, output_graph, original_source)
+   end
+ 
+-  def self.compile_ast(config_str, source_file=nil)
++  def self.compile_ast(source_with_metadata)
++    if !source_with_metadata.is_a?(org.logstash.common.SourceWithMetadata)
++      raise ArgumentError, "Expected 'org.logstash.common.SourceWithMetadata', got #{source_with_metadata.class}"
++    end
++
+     grammar = LogStashCompilerLSCLGrammarParser.new
+-    config = grammar.parse(config_str)
++    config = grammar.parse(source_with_metadata.text)
+ 
+     if config.nil?
+       raise ConfigurationError, grammar.failure_reason
+     end
+ 
+-    config
++    config.compile(source_with_metadata)
+   end
+ 
+-  def self.compile_imperative(config_str, source_file=nil)
+-    compile_ast(config_str, source_file).compile(source_file)
++  def self.compile_imperative(source_with_metadata)
++    compile_ast(source_with_metadata)
+   end
+ 
+-  def self.compile_graph(config_str, source_file=nil)
+-    Hash[compile_imperative(config_str, source_file).map {|section,icompiled| [section, icompiled.toGraph]}]
++  def self.compile_graph(source_with_metadata)
++    Hash[compile_imperative(source_with_metadata).map {|section,icompiled| [section, icompiled.toGraph]}]
+   end
+ end; end
+diff --git a/logstash-core/lib/logstash/compiler/lscl.rb b/logstash-core/lib/logstash/compiler/lscl.rb
+index be649253e5b..59e729f57cc 100644
+--- a/logstash-core/lib/logstash/compiler/lscl.rb
++++ b/logstash-core/lib/logstash/compiler/lscl.rb
+@@ -10,15 +10,23 @@ module LogStashCompilerLSCLGrammar; module LogStash; module Compiler; module LSC
+   module Helpers
+     def source_meta
+       line, column = line_and_column
+-      org.logstash.common.SourceWithMetadata.new(source_file, line, column, self.text_value)
++      org.logstash.common.SourceWithMetadata.new(base_protocol, base_id, line, column, self.text_value)
+     end
+ 
+-    def source_file=(value)
+-      set_meta(:source_file, value)
++    def base_source_with_metadata=(value)
++      set_meta(:base_source_with_metadata, value)
+     end
+     
+-    def source_file
+-      get_meta(:source_file)
++    def base_source_with_metadata
++      get_meta(:base_source_with_metadata)
++    end
++
++    def base_protocol
++      self.base_source_with_metadata.protocol
++    end
++
++    def base_id
++      self.base_source_with_metadata.id
+     end
+ 
+     def compose(*statements)
+@@ -39,7 +47,7 @@ def line_and_column
+     end
+ 
+     def empty_source_meta()
+-      org.logstash.common.SourceWithMetadata.new()
++      org.logstash.common.SourceWithMetadata.new(base_protocol, base_id, nil)
+     end
+ 
+     def jdsl
+@@ -70,9 +78,9 @@ def section_type
+   class Config < Node
+     include Helpers
+     
+-    def compile(source_file=nil)
++    def compile(base_source_with_metadata=nil)
+       # There is no way to move vars across nodes in treetop :(
+-      self.source_file = source_file
++      self.base_source_with_metadata = base_source_with_metadata
+ 
+       sections = recursive_select(PluginSection)
+ 
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index 31ef278deca..2222884697c 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -73,7 +73,8 @@ def initialize(config_str, settings = SETTINGS, namespaced_metric = nil, agent =
+   end
+ 
+   def compile_lir
+-    LogStash::Compiler.compile_pipeline(self.config_str)
++    source_with_metadata = org.logstash.common.SourceWithMetadata.new("str", "pipeline", self.config_str)
++    LogStash::Compiler.compile_sources(source_with_metadata)
+   end
+ 
+   def plugin(plugin_type, name, *args)
+diff --git a/logstash-core/spec/logstash/compiler/compiler_spec.rb b/logstash-core/spec/logstash/compiler/compiler_spec.rb
+index 0f807c8af12..2b160a426af 100644
+--- a/logstash-core/spec/logstash/compiler/compiler_spec.rb
++++ b/logstash-core/spec/logstash/compiler/compiler_spec.rb
+@@ -8,15 +8,61 @@ def j
+     Java::OrgLogstashConfigIr::DSL
+   end
+ 
++  let(:source_protocol) { "test_proto" }
++
+   # Static import of these useful enums
+   INPUT = Java::OrgLogstashConfigIr::PluginDefinition::Type::INPUT
+   FILTER = Java::OrgLogstashConfigIr::PluginDefinition::Type::FILTER
+   OUTPUT = Java::OrgLogstashConfigIr::PluginDefinition::Type::OUTPUT
+   CODEC = Java::OrgLogstashConfigIr::PluginDefinition::Type::OUTPUT
+ 
++  shared_examples_for("component source_with_metadata") do
++    it "should set the correct protocol" do
++      expect(component.source_with_metadata.protocol).to eq(source_protocol)
++    end
++
++    it "should set the id to the source id" do
++      expect(component.source_with_metadata.id).to eq(source_id)
++    end
++  end
++
+   describe "compiling to Pipeline" do
+-    subject(:source_file) { "fake_sourcefile" }
+-    subject(:compiled) { described_class.compile_pipeline(source, source_file) }
++    subject(:source_id) { "fake_sourcefile" }
++    let(:source_with_metadata) { org.logstash.common.SourceWithMetadata.new(source_protocol, source_id, source) }
++    subject(:compiled) { described_class.compile_pipeline(source_with_metadata) }
++
++    describe "compiling multiple sources" do
++      let(:sources) do
++        [ 
++          "input { input_0 {} } filter { filter_0 {} } output { output_0 {} }",
++          "input { input_1 {} } filter { filter_1 {} } output { output_1 {} }"
++        ]
++      end
++      let(:sources_with_metadata) do
++        sources.map.with_index do |source, idx|
++          org.logstash.common.SourceWithMetadata.new("#{source_protocol}_#{idx}", "#{source_id}_#{idx}", source)
++        end
++      end
++
++      subject(:pipeline) { described_class.compile_sources(*sources_with_metadata) }
++
++      it "should compile cleanly" do
++        expect(pipeline).to be_a(org.logstash.config.ir.Pipeline)
++      end
++
++      describe "applying protocol and id metadata" do
++        it "should apply the correct source metadata to all components" do
++          pipeline.plugin_vertices.each do |pv| 
++            name_idx = pv.plugin_definition.name.split("_").last
++            source_protocol_idx = pv.source_with_metadata.protocol.split("_").last
++            source_id_idx = pv.source_with_metadata.id.split("_").last
++
++            expect(name_idx).to eq(source_protocol_idx)
++            expect(name_idx).to eq(source_id_idx)
++          end
++        end
++      end
++    end
+ 
+     describe "complex configs" do
+       shared_examples_for "compilable LSCL files" do |path|
+@@ -40,8 +86,9 @@ def j
+   end
+ 
+   describe "compiling imperative" do
+-    let(:source_file) { "fake_sourcefile" }
+-    subject(:compiled) { described_class.compile_imperative(source, source_file) }
++    let(:source_id) { "fake_sourcefile" }
++    let(:source_with_metadata) { org.logstash.common.SourceWithMetadata.new(source_protocol, source_id, source) }
++    subject(:compiled) { described_class.compile_imperative(source_with_metadata) }
+ 
+     describe "an empty file" do
+       let(:source) { "input {} output {}" }
+@@ -63,7 +110,7 @@ def j
+       let(:source) { "input { generator {} } output { }" }
+ 
+       it "should attach correct source text for components" do
+-        expect(compiled[:input].get_meta.getText).to eql("generator {}")
++        expect(compiled[:input].source_with_metadata.getText).to eql("generator {}")
+       end
+     end
+ 
+@@ -106,6 +153,10 @@ def j
+         it "should contain the single input" do
+           expect(input).to ir_eql(j.iPlugin(INPUT, "generator"))
+         end
++
++        it_should_behave_like("component source_with_metadata") do
++          let(:component) { input }
++        end
+       end
+ 
+       describe "two inputs" do
+@@ -190,12 +241,12 @@ def compose(*statements)
+         end
+ 
+         it "should attach source_with_metadata with correct info to the statements" do
+-          meta = compiled_section.statements.first.meta
++          meta = compiled_section.statements.first.source_with_metadata
+           expect(meta.text).to eql("aplugin { count => 1 }")
+           expect(meta.line).to eql(2)
+           expect(meta.column).to eql(13)
+-          expect(meta.id).to eql(source_file)
+-          expect(compiled_section.statements.first.meta)
++          expect(meta.id).to eql(source_id)
++          expect(compiled_section.statements.first.source_with_metadata)
+           expect(compiled_section)
+         end
+       end
+@@ -559,9 +610,13 @@ def compose(*statements)
+       describe "a single filter" do
+         let(:source) { "input { } filter { grok {} } output { }" }
+ 
+-        it "should contain the single input" do
++        it "should contain the single filter" do
+           expect(filter).to ir_eql(j.iPlugin(FILTER, "grok"))
+         end
++
++        it_should_behave_like("component source_with_metadata") do
++          let(:component) { filter }
++        end
+       end
+ 
+       it_should_behave_like "complex grammar", :filter
+@@ -576,6 +631,10 @@ def compose(*statements)
+         it "should contain the single input" do
+           expect(output).to ir_eql(j.iPlugin(OUTPUT, "stdout"))
+         end
++
++        it_should_behave_like("component source_with_metadata") do
++          let(:component) { output }
++        end
+       end
+ 
+       it_should_behave_like "complex grammar", :output
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/BaseSourceComponent.java b/logstash-core/src/main/java/org/logstash/config/ir/BaseSourceComponent.java
+index ea61a6d0797..0655365acd8 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/BaseSourceComponent.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/BaseSourceComponent.java
+@@ -16,7 +16,7 @@ public BaseSourceComponent(SourceWithMetadata meta) {
+         this.meta = meta;
+     }
+ 
+-    public SourceWithMetadata getMeta() {
++    public SourceWithMetadata getSourceWithMetadata() {
+         return meta;
+     }
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/Pipeline.java b/logstash-core/src/main/java/org/logstash/config/ir/Pipeline.java
+index 7c9fef7ef3c..8de81c2ee48 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/Pipeline.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/Pipeline.java
+@@ -1,5 +1,6 @@
+ package org.logstash.config.ir;
+ 
++import org.logstash.common.SourceWithMetadata;
+ import org.logstash.config.ir.graph.Graph;
+ import org.logstash.config.ir.graph.PluginVertex;
+ import org.logstash.config.ir.graph.QueueVertex;
+@@ -21,15 +22,15 @@ public QueueVertex getQueue() {
+         return queue;
+     }
+ 
+-    //public QueueVertex getFilterOut() {
+-    //    return filterOut;
+-    //}
+-
+     private final Graph graph;
+     private final QueueVertex queue;
+-    //private final QueueVertex filterOut;
++    // Temporary until we have LIR execution
++    // Then we will no longer need this property here
++    private final String originalSource;
++
++    public Pipeline(Graph inputSection, Graph filterSection, Graph outputSection, String originalSource) throws InvalidIRException {
++        this.originalSource = originalSource;
+ 
+-    public Pipeline(Graph inputSection, Graph filterSection, Graph outputSection) throws InvalidIRException {
+         // Validate all incoming graphs, we can't turn an invalid graph into a Pipeline!
+         inputSection.validate();
+         filterSection.validate();
+@@ -48,6 +49,10 @@ public Pipeline(Graph inputSection, Graph filterSection, Graph outputSection) th
+         this.graph = tempGraph.chain(outputSection);
+     }
+ 
++    public String getOriginalSource() {
++        return this.originalSource;
++    }
++
+     public List<Vertex> getPostQueue() throws InvalidIRException {
+        return graph.getSortedVerticesAfter(queue);
+     }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/PluginDefinition.java b/logstash-core/src/main/java/org/logstash/config/ir/PluginDefinition.java
+index 51a29fd4147..0fec8ca3d59 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/PluginDefinition.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/PluginDefinition.java
+@@ -97,7 +97,7 @@ public boolean sourceComponentEquals(SourceComponent o) {
+     }
+ 
+     @Override
+-    public SourceWithMetadata getMeta() {
++    public SourceWithMetadata getSourceWithMetadata() {
+         return null;
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/SourceComponent.java b/logstash-core/src/main/java/org/logstash/config/ir/SourceComponent.java
+index 026c3527f24..6b68d9a3092 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/SourceComponent.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/SourceComponent.java
+@@ -7,5 +7,5 @@
+  */
+ public interface SourceComponent {
+     boolean sourceComponentEquals(SourceComponent sourceComponent);
+-    SourceWithMetadata getMeta();
++    SourceWithMetadata getSourceWithMetadata();
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/graph/Edge.java b/logstash-core/src/main/java/org/logstash/config/ir/graph/Edge.java
+index 826dc1d4aa0..e942683d59d 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/graph/Edge.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/graph/Edge.java
+@@ -93,7 +93,7 @@ public boolean sourceComponentEquals(SourceComponent sourceComponent) {
+     public abstract String getId();
+ 
+     @Override
+-    public SourceWithMetadata getMeta() {
++    public SourceWithMetadata getSourceWithMetadata() {
+         return null;
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/graph/Graph.java b/logstash-core/src/main/java/org/logstash/config/ir/graph/Graph.java
+index ca574fbbbb8..09211570c39 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/graph/Graph.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/graph/Graph.java
+@@ -403,7 +403,7 @@ public boolean hasEquivalentVertex(Vertex otherV) {
+     }
+ 
+     @Override
+-    public SourceWithMetadata getMeta() {
++    public SourceWithMetadata getSourceWithMetadata() {
+         return null;
+     }
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/graph/IfVertex.java b/logstash-core/src/main/java/org/logstash/config/ir/graph/IfVertex.java
+index 83e73e220e7..f7c322670a5 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/graph/IfVertex.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/graph/IfVertex.java
+@@ -43,7 +43,7 @@ public boolean sourceComponentEquals(SourceComponent other) {
+ 
+     // An IfVertex has no real metadata in and of itself, but its expression does!
+     @Override
+-    public SourceWithMetadata getMeta() {
++    public SourceWithMetadata getSourceWithMetadata() {
+         return null;
+     }
+ 
+@@ -83,7 +83,7 @@ public Collection<BooleanEdge> getOutgoingBooleanEdgesByType(Boolean edgeType) {
+     // The easiest readable version of this for a human.
+     // If the original source is available we use that, otherwise we serialize the expression
+     public String humanReadableExpression() {
+-        String sourceText = this.booleanExpression.getMeta() != null ? this.booleanExpression.getMeta().getText() : null;
++        String sourceText = this.booleanExpression.getSourceWithMetadata() != null ? this.booleanExpression.getSourceWithMetadata().getText() : null;
+         if (sourceText != null) {
+             return sourceText;
+         } else {
+@@ -93,7 +93,7 @@ public String humanReadableExpression() {
+ 
+     @Override
+     public IfVertex copy() {
+-        return new IfVertex(getMeta(),getBooleanExpression());
++        return new IfVertex(getSourceWithMetadata(),getBooleanExpression());
+     }
+ 
+     @Override
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/graph/PluginVertex.java b/logstash-core/src/main/java/org/logstash/config/ir/graph/PluginVertex.java
+index 3e3bc967037..75ba504516f 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/graph/PluginVertex.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/graph/PluginVertex.java
+@@ -27,7 +27,7 @@ public PluginDefinition getPluginDefinition() {
+         return pluginDefinition;
+     }
+     @Override
+-    public SourceWithMetadata getMeta() {
++    public SourceWithMetadata getSourceWithMetadata() {
+         return meta;
+     }
+ 
+@@ -43,7 +43,7 @@ public PluginVertex(SourceWithMetadata meta, PluginDefinition pluginDefinition)
+     }
+ 
+     public String toString() {
+-        return "P[" + pluginDefinition + "|" + this.getMeta() + "]";
++        return "P[" + pluginDefinition + "|" + this.getSourceWithMetadata() + "]";
+     }
+ 
+     @Override
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/graph/QueueVertex.java b/logstash-core/src/main/java/org/logstash/config/ir/graph/QueueVertex.java
+index 996f0875716..81a079045c0 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/graph/QueueVertex.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/graph/QueueVertex.java
+@@ -38,7 +38,7 @@ public boolean sourceComponentEquals(SourceComponent other) {
+ 
+     // Special vertices really have no metadata
+     @Override
+-    public SourceWithMetadata getMeta() {
++    public SourceWithMetadata getSourceWithMetadata() {
+         return null;
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/imperative/IfStatement.java b/logstash-core/src/main/java/org/logstash/config/ir/imperative/IfStatement.java
+index bf97df63bc2..a77af33a7b4 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/imperative/IfStatement.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/imperative/IfStatement.java
+@@ -89,7 +89,7 @@ public Graph toGraph() throws InvalidIRException {
+         Collection<Vertex> trueRoots = trueGraph.roots().map(combination.oldToNewVertices::get).collect(Collectors.toList());
+         Collection<Vertex> falseRoots = falseGraph.roots().map(combination.oldToNewVertices::get).collect(Collectors.toList());
+ 
+-        IfVertex ifVertex = new IfVertex(this.getMeta(), this.booleanExpression);
++        IfVertex ifVertex = new IfVertex(this.getSourceWithMetadata(), this.booleanExpression);
+         newGraph.addVertex(ifVertex);
+ 
+         for (Vertex v : trueRoots) {
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/imperative/PluginStatement.java b/logstash-core/src/main/java/org/logstash/config/ir/imperative/PluginStatement.java
+index ebd8dd3c2a5..ba93e1fe490 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/imperative/PluginStatement.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/imperative/PluginStatement.java
+@@ -37,7 +37,7 @@ public String toString(int indent) {
+ 
+     @Override
+     public Graph toGraph() throws InvalidIRException {
+-        Vertex pluginVertex = new PluginVertex(getMeta(), pluginDefinition);
++        Vertex pluginVertex = new PluginVertex(getSourceWithMetadata(), pluginDefinition);
+         Graph g = Graph.empty();
+         g.addVertex(pluginVertex);
+         return g;
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/IRHelpers.java b/logstash-core/src/test/java/org/logstash/config/ir/IRHelpers.java
+index cce0d6c8a32..a7b4efb3cc2 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/IRHelpers.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/IRHelpers.java
+@@ -75,7 +75,7 @@ public boolean sourceComponentEquals(SourceComponent other) {
+         }
+ 
+         @Override
+-        public SourceWithMetadata getMeta() {
++        public SourceWithMetadata getSourceWithMetadata() {
+             return null;
+         }
+     }

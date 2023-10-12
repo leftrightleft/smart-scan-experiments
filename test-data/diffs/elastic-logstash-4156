@@ -1,0 +1,368 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index 00050092b65..d1e72afeab9 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -23,7 +23,7 @@ class LogStash::Agent < Clamp::Command
+   option ["-w", "--filterworkers"], "COUNT",
+     I18n.t("logstash.agent.flag.filterworkers"),
+     :attribute_name => :filter_workers,
+-    :default => LogStash::Config::CpuCoreStrategy.fifty_percent, &:to_i
++    :default => 0, &:to_i
+ 
+   option ["-l", "--log"], "FILE",
+     I18n.t("logstash.agent.flag.log"),
+@@ -143,7 +143,7 @@ def execute
+       configure_logging(log_file)
+     end
+ 
+-    pipeline.configure("filter-workers", filter_workers)
++    pipeline.configure("filter-workers", filter_workers) if filter_workers > 0
+ 
+     # Stop now if we are only asking for a config test.
+     if config_test?
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index b3081073704..069707f02e2 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -46,7 +46,7 @@ def initialize(configstr)
+     @filter_to_output = filters? ? SizedQueue.new(20) : @input_to_filter
+ 
+     @settings = {
+-      "filter-workers" => LogStash::Config::CpuCoreStrategy.fifty_percent
++      "default-filter-workers" => LogStash::Config::CpuCoreStrategy.fifty_percent
+     }
+ 
+     # @ready requires thread safety since it is typically polled from outside the pipeline thread
+@@ -59,14 +59,32 @@ def ready?
+   end
+ 
+   def configure(setting, value)
+-    if setting == "filter-workers" && value > 1
+-      # Abort if we have any filters that aren't threadsafe
+-      plugins = @filters.select { |f| !f.threadsafe? }.collect { |f| f.class.config_name }
+-      if !plugins.size.zero?
+-        raise LogStash::ConfigurationError, "Cannot use more than 1 filter worker because the following plugins don't work with more than one worker: #{plugins.join(", ")}"
++    @settings[setting] = value
++  end
++
++  def safe_filter_worker_count
++    default = @settings["default-filter-workers"]
++    thread_count = @settings["filter-workers"] #override from args "-w 8" or config
++    safe_filters, unsafe_filters = @filters.partition(&:threadsafe?)
++    if unsafe_filters.any?
++      plugins = unsafe_filters.collect { |f| f.class.config_name }
++      case thread_count
++      when nil
++        # user did not specify a worker thread count
++        # warn if the default is multiple
++        @logger.warn("Defaulting filter worker threads to 1 because there are some filters that might not work with multiple worker threads",
++          :count_was => default, :filters => plugins) if default > 1
++        1 # can't allow the default value to propagate if there are unsafe filters
++      when 0, 1
++        1
++      else
++        @logger.warn("Warning: Manual override - there are filters that might not work with multiple worker threads",
++          :worker_threads => thread_count, :filters => plugins)
++        thread_count # allow user to force this even if there are unsafe filters
+       end
++    else
++      thread_count || default
+     end
+-    @settings[setting] = value
+   end
+ 
+   def filters?
+@@ -149,7 +167,9 @@ def start_inputs
+ 
+   def start_filters
+     @filters.each(&:register)
+-    to_start = @settings["filter-workers"]
++    # dynamically get thread count based on filter threadsafety
++    # moved this test to here to allow for future config reloading
++    to_start = safe_filter_worker_count
+     @filter_threads = to_start.times.collect do
+       Thread.new { filterworker }
+     end
+diff --git a/logstash-core/lib/logstash/util/defaults_printer.rb b/logstash-core/lib/logstash/util/defaults_printer.rb
+index 13764e2414a..6dd850e1d50 100644
+--- a/logstash-core/lib/logstash/util/defaults_printer.rb
++++ b/logstash-core/lib/logstash/util/defaults_printer.rb
+@@ -20,7 +20,7 @@ def print
+     @printers.each do |printer|
+       printer.visit(collector)
+     end
+-    "Default settings used: " + collector.join(', ')
++    "Settings: " + collector.join(', ')
+   end
+ 
+   private
+diff --git a/logstash-core/lib/logstash/util/worker_threads_default_printer.rb b/logstash-core/lib/logstash/util/worker_threads_default_printer.rb
+index c8b086635cb..82e88196e96 100644
+--- a/logstash-core/lib/logstash/util/worker_threads_default_printer.rb
++++ b/logstash-core/lib/logstash/util/worker_threads_default_printer.rb
+@@ -6,11 +6,23 @@
+ module LogStash module Util class WorkerThreadsDefaultPrinter
+ 
+   def initialize(settings)
+-    @setting = settings.fetch('filter-workers', 1)
++    @setting = settings.fetch('filter-workers', 0)
++    @default = settings.fetch('default-filter-workers', 0)
+   end
+ 
+   def visit(collector)
+-    collector.push "Filter workers: #{@setting}"
++    visit_setting(collector)
++    visit_default(collector)
++  end
++
++  def visit_setting(collector)
++    return if @setting == 0
++    collector.push("User set filter workers: #{@setting}")
++  end
++
++  def visit_default(collector)
++    return if @default == 0
++    collector.push "Default filter workers: #{@default}"
+   end
+ 
+ end end end
+diff --git a/logstash-core/spec/logstash/pipeline_spec.rb b/logstash-core/spec/logstash/pipeline_spec.rb
+index d0021d4a396..15b32cb266b 100644
+--- a/logstash-core/spec/logstash/pipeline_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_spec.rb
+@@ -53,20 +53,127 @@ def close
+   end
+ end
+ 
++class DummyFilter < LogStash::Filters::Base
++  config_name "dummyfilter"
++  milestone 2
++
++  def register() end
++
++  def filter(event) end
++
++  def threadsafe?() false; end
++
++  def close() end
++end
++
++class DummySafeFilter < LogStash::Filters::Base
++  config_name "dummysafefilter"
++  milestone 2
++
++  def register() end
++
++  def filter(event) end
++
++  def threadsafe?() true; end
++
++  def close() end
++end
++
+ class TestPipeline < LogStash::Pipeline
+-  attr_reader :outputs
++  attr_reader :outputs, :filter_threads, :settings, :logger
+ end
+ 
+ describe LogStash::Pipeline do
++  let(:worker_thread_count)     { 8 }
++  let(:safe_thread_count)       { 1 }
++  let(:override_thread_count)   { 42 }
++
++  describe "defaulting the filter workers based on thread safety" do
++    before(:each) do
++      allow(LogStash::Plugin).to receive(:lookup).with("input", "dummyinput").and_return(DummyInput)
++      allow(LogStash::Plugin).to receive(:lookup).with("codec", "plain").and_return(DummyCodec)
++      allow(LogStash::Plugin).to receive(:lookup).with("output", "dummyoutput").and_return(DummyOutput)
++      allow(LogStash::Plugin).to receive(:lookup).with("filter", "dummyfilter").and_return(DummyFilter)
++      allow(LogStash::Plugin).to receive(:lookup).with("filter", "dummysafefilter").and_return(DummySafeFilter)
++      allow(LogStash::Config::CpuCoreStrategy).to receive(:fifty_percent).and_return(worker_thread_count)
++    end
++
++    context "when there are some not threadsafe filters" do
++      let(:test_config_with_filters) {
++        <<-eos
++        input {
++          dummyinput {}
++        }
++
++        filter {
++          dummyfilter {}
++        }
++
++        output {
++          dummyoutput {}
++        }
++        eos
++      }
++
++      context "when there is no command line -w N set" do
++        it "starts one filter thread" do
++          msg = "Defaulting filter worker threads to 1 because there are some" +
++                " filters that might not work with multiple worker threads"
++          pipeline = TestPipeline.new(test_config_with_filters)
++          expect(pipeline.logger).to receive(:warn).with(msg,
++            {:count_was=>worker_thread_count, :filters=>["dummyfilter"]})
++          pipeline.run
++          expect(pipeline.filter_threads.size).to eq(safe_thread_count)
++        end
++      end
++
++      context "when there is command line -w N set" do
++        it "starts multiple filter thread" do
++          msg = "Warning: Manual override - there are filters that might" +
++                " not work with multiple worker threads"
++          pipeline = TestPipeline.new(test_config_with_filters)
++          expect(pipeline.logger).to receive(:warn).with(msg,
++            {:worker_threads=> override_thread_count, :filters=>["dummyfilter"]})
++          pipeline.configure("filter-workers", override_thread_count)
++          pipeline.run
++          expect(pipeline.filter_threads.size).to eq(override_thread_count)
++        end
++      end
++    end
++
++    context "when there are threadsafe filters only" do
++      let(:test_config_with_filters) {
++        <<-eos
++        input {
++          dummyinput {}
++        }
++
++        filter {
++          dummysafefilter {}
++        }
+ 
+-context "close" do
++        output {
++          dummyoutput {}
++        }
++        eos
++      }
+ 
+-  before(:each) do
+-    allow(LogStash::Plugin).to receive(:lookup).with("input", "dummyinput").and_return(DummyInput)
+-    allow(LogStash::Plugin).to receive(:lookup).with("codec", "plain").and_return(DummyCodec)
+-    allow(LogStash::Plugin).to receive(:lookup).with("output", "dummyoutput").and_return(DummyOutput)
++      it "starts multiple filter threads" do
++        pipeline = TestPipeline.new(test_config_with_filters)
++        pipeline.run
++        expect(pipeline.filter_threads.size).to eq(worker_thread_count)
++      end
++    end
+   end
+ 
++  context "close" do
++    before(:each) do
++      allow(LogStash::Plugin).to receive(:lookup).with("input", "dummyinput").and_return(DummyInput)
++      allow(LogStash::Plugin).to receive(:lookup).with("codec", "plain").and_return(DummyCodec)
++      allow(LogStash::Plugin).to receive(:lookup).with("output", "dummyoutput").and_return(DummyOutput)
++    end
++
++
+     let(:test_config_without_output_workers) {
+       <<-eos
+       input {
+@@ -191,6 +298,5 @@ class TestPipeline < LogStash::Pipeline
+         expect(subject[2]["foo"]).to eq("bar")
+       end
+     end
+-
+   end
+ end
+diff --git a/logstash-core/spec/logstash/util/defaults_printer_spec.rb b/logstash-core/spec/logstash/util/defaults_printer_spec.rb
+index 3e50a7032cb..ed47cf7ca50 100644
+--- a/logstash-core/spec/logstash/util/defaults_printer_spec.rb
++++ b/logstash-core/spec/logstash/util/defaults_printer_spec.rb
+@@ -10,7 +10,7 @@
+   end
+ 
+   let(:workers)  { 1 }
+-  let(:expected) { "Default settings used: Filter workers: #{workers}" }
++  let(:expected) { "Settings: User set filter workers: #{workers}" }
+   let(:settings) { {} }
+ 
+   describe 'class methods API' do
+@@ -19,13 +19,13 @@
+     end
+ 
+     context 'when the settings hash is empty' do
++      let(:expected) { "Settings: " }
+       it_behaves_like "a defaults printer"
+     end
+ 
+     context 'when the settings hash has content' do
+       let(:workers) { 42 }
+       let(:settings) { {'filter-workers' => workers} }
+-
+       it_behaves_like "a defaults printer"
+     end
+   end
+@@ -36,6 +36,7 @@
+     end
+ 
+     context 'when the settings hash is empty' do
++      let(:expected) { "Settings: " }
+       it_behaves_like "a defaults printer"
+     end
+ 
+diff --git a/logstash-core/spec/logstash/util/worker_threads_default_printer_spec.rb b/logstash-core/spec/logstash/util/worker_threads_default_printer_spec.rb
+index 348b9d263e1..c2f5391cf38 100644
+--- a/logstash-core/spec/logstash/util/worker_threads_default_printer_spec.rb
++++ b/logstash-core/spec/logstash/util/worker_threads_default_printer_spec.rb
+@@ -3,24 +3,43 @@
+ require "logstash/util/worker_threads_default_printer"
+ 
+ describe LogStash::Util::WorkerThreadsDefaultPrinter do
+-  let(:settings) { {} }
++  let(:settings)  { {} }
+   let(:collector) { [] }
+ 
+   subject { described_class.new(settings) }
+ 
+-  context 'when the settings hash is empty' do
+-    it 'the #visit method returns a string with 1 filter worker' do
+-      subject.visit(collector)
+-      expect(collector.first).to eq("Filter workers: 1")
++  before { subject.visit(collector) }
++
++  describe "the #visit method" do
++    context 'when the settings hash is empty' do
++      it 'adds nothing to the collector' do
++        subject.visit(collector)
++        expect(collector).to eq([])
++      end
++    end
++
++    context 'when the settings hash has both user and default content' do
++      let(:settings) { {'filter-workers' => 42, 'default-filter-workers' => 5} }
++
++      it 'adds two strings' do
++        expect(collector).to eq(["User set filter workers: 42", "Default filter workers: 5"])
++      end
++    end
++
++    context 'when the settings hash has only user content' do
++      let(:settings) { {'filter-workers' => 42} }
++
++      it 'adds a string with user set filter workers' do
++        expect(collector.first).to eq("User set filter workers: 42")
++      end
+     end
+-  end
+ 
+-  context 'when the settings hash has content' do
+-    let(:settings) { {'filter-workers' => 42} }
++    context 'when the settings hash has only default content' do
++      let(:settings) { {'default-filter-workers' => 5} }
+ 
+-    it 'the #visit method returns a string with 42 filter workers' do
+-      subject.visit(collector)
+-      expect(collector.first).to eq("Filter workers: 42")
++      it 'adds a string with default filter workers' do
++        expect(collector.first).to eq("Default filter workers: 5")
++      end
+     end
+   end
+ end

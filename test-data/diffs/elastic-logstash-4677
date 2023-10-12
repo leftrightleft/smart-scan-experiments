@@ -1,0 +1,274 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index adb47db0a9e..c50b7d94e19 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -18,7 +18,9 @@
+ LogStash::Environment.load_locale!
+ 
+ class LogStash::Agent
+-  attr_reader :metric, :debug, :node_name, :started_at, :pipelines, :logger
++  STARTED_AT = Time.now.freeze
++
++  attr_reader :metric, :debug, :node_name, :pipelines, :logger
+ 
+   # initialize method for LogStash::Agent
+   # @param params [Hash] potential parameters are:
+@@ -32,7 +34,6 @@ def initialize(params)
+     @debug  = params.fetch(:debug, false)
+ 
+     @pipelines = {}
+-    @started_at = Time.now
+     @node_name = params[:node_name] || Socket.gethostname
+     @web_api_http_port = params[:web_api_http_port]
+ 
+@@ -41,7 +42,7 @@ def initialize(params)
+     @upgrade_mutex = Mutex.new
+ 
+     @collect_metric = params.fetch(:collect_metric, false)
+-    configure_metric
++    setup_metric_collection
+   end
+ 
+   def execute
+@@ -95,7 +96,7 @@ def reload_state!
+   #
+   # @return [Fixnum] Uptime in milliseconds
+   def uptime
+-    ((Time.now.to_f - started_at.to_f) * 1000.0).to_i
++    ((Time.now.to_f - STARTED_AT.to_f) * 1000.0).to_i
+   end
+ 
+   def shutdown
+@@ -123,24 +124,24 @@ def stop_webserver
+   end
+ 
+   def start_background_services
+-    if collect_metric?
++    if collect_metrics?
+       @logger.debug("Agent: Starting metric periodic pollers")
+       @periodic_pollers.start
+     end
+   end
+ 
+   def stop_background_services
+-    if collect_metric?
++    if collect_metrics?
+       @logger.debug("Agent: Stopping metric periodic pollers")
+       @periodic_pollers.stop
+     end
+   end
+ 
+-  def configure_metric
+-    if collect_metric?
++  def setup_metric_collection
++    if collect_metrics?
+       @logger.debug("Agent: Configuring metric collection")
+       LogStash::Instrument::Collector.instance.agent = self
+-      @metric = LogStash::Instrument::Metric.create
++      @metric = LogStash::Instrument::Metric.new
+     else
+       @metric = LogStash::Instrument::NullMetric.new
+     end
+@@ -148,7 +149,7 @@ def configure_metric
+     @periodic_pollers = LogStash::Instrument::PeriodicPollers.new(metric)
+   end
+ 
+-  def collect_metric?
++  def collect_metrics?
+     @collect_metric
+   end
+ 
+diff --git a/logstash-core/lib/logstash/api/lib/app/command.rb b/logstash-core/lib/logstash/api/lib/app/command.rb
+index 6a8bd3b85c2..1bae93c7194 100644
+--- a/logstash-core/lib/logstash/api/lib/app/command.rb
++++ b/logstash-core/lib/logstash/api/lib/app/command.rb
+@@ -23,7 +23,7 @@ def uptime
+     end
+ 
+     def started_at
+-      (service.agent.started_at.to_f*1000.0).to_i
++      (LogStash::Agent::STARTED_AT.to_f * 1000.0).to_i
+     end
+ 
+   end
+diff --git a/logstash-core/lib/logstash/instrument/metric.rb b/logstash-core/lib/logstash/instrument/metric.rb
+index ace6061e8ce..601c7b0ed4b 100644
+--- a/logstash-core/lib/logstash/instrument/metric.rb
++++ b/logstash-core/lib/logstash/instrument/metric.rb
+@@ -13,7 +13,7 @@ class MetricNoNamespaceProvided < MetricException; end
+   class Metric
+     attr_reader :collector
+ 
+-    def initialize(collector)
++    def initialize(collector = LogStash::Instrument::Collector.instance)
+       @collector = collector
+     end
+ 
+@@ -69,13 +69,6 @@ def namespace(name)
+       NamespacedMetric.new(self, name)
+     end
+ 
+-    # Create a Metric instrance using the default Collector singleton reference
+-    #
+-    #
+-    def self.create(collector = LogStash::Instrument::Collector.instance)
+-      Metric.new(collector)
+-    end
+-
+     private
+     def validate_key!(key)
+       raise MetricNoKeyProvided if key.nil? || key.empty?
+diff --git a/logstash-core/lib/logstash/instrument/metric_store.rb b/logstash-core/lib/logstash/instrument/metric_store.rb
+index 1e0e27d5562..53ff0cd6668 100644
+--- a/logstash-core/lib/logstash/instrument/metric_store.rb
++++ b/logstash-core/lib/logstash/instrument/metric_store.rb
+@@ -74,13 +74,16 @@ def fetch_or_store(namespaces, key, default_value = nil)
+     # of the map
+     #
+     # @param [Array] The path where values should be located
+-    # @return nil if the values are not found
++    # @return [Hash]
+     def get_with_path(path)
+       key_paths = path.gsub(/^#{KEY_PATH_SEPARATOR}+/, "").split(KEY_PATH_SEPARATOR)
+       get(*key_paths)
+     end
+ 
+-    # Use an array of symbols instead of path
++    # Similar to `get_with_path` but use symbols instead of string
++    #
++    # @param [Array<Symbol>
++    # @return [Hash]
+     def get(*key_paths)
+       # Normalize the symbols access
+       key_paths.map(&:to_sym)
+@@ -93,6 +96,9 @@ def get(*key_paths)
+ 
+     # Return all the individuals Metric,
+     # This call mimic a Enum's each if a block is provided
++    #
++    # @param path [String] The search path for metrics
++    # @param [Array] The metric for the specific path
+     def each(path = nil, &block)
+       metrics = if path.nil?
+         get_all
+@@ -109,6 +115,20 @@ def get_all
+       @fast_lookup.values
+     end
+ 
++    # This method take an array of keys and recursively search the metric store structure
++    # and return a filtered hash of the structure. This method also take into consideration
++    # getting two different branchs.
++    #
++    #
++    # If one part of the `key_paths` contains a filter key with the following format.
++    # "pipeline01, pipeline_02", It know that need to fetch the branch `pipeline01` and `pipeline02`
++    #
++    # Look at the rspec test for more usage.
++    #
++    # @param key_paths [Array<Symbol>] The list of keys part to filter
++    # @param map [Concurrent::Map] The the part of map to search in
++    # @param new_hash [Hash] The hash to populate with the results.
++    # @return Hash
+     def get_recursively(key_paths, map, new_hash)
+       key_candidates = extract_filter_keys(key_paths.shift)
+ 
+@@ -136,12 +156,25 @@ def extract_filter_keys(key)
+       key.to_s.strip.split(FILTER_KEYS_SEPARATOR).map(&:to_sym)
+     end
+ 
+-    def transform_to_array(map)
++    # Take a hash and recursively flatten it into an array.
++    # This is useful if you are only interested in the leaf of the tree.
++    # Mostly used with `each` to get all the metrics from a specific namespaces
++    #
++    # This could be moved to `LogStash::Util` once this api stabilize
++    #
++    # @return [Array] One dimension array
++     def transform_to_array(map)
+       map.values.collect do |value|
+         value.is_a?(Hash) ? transform_to_array(value) : value
+       end.flatten
+     end
+ 
++    # Transform the Concurrent::Map hash into a ruby hash format,
++    # This is used to be serialize at the web api layer.
++    #
++    # This could be moved to `LogStash::Util` once this api stabilize
++    #
++    # @return [Hash]
+     def transform_to_hash(map, new_hash = Hash.new)
+       map.each_pair do |key, value|
+         if value.is_a?(Concurrent::Map)
+@@ -155,20 +188,6 @@ def transform_to_hash(map, new_hash = Hash.new)
+       return new_hash
+     end
+ 
+-    # Recursively fetch only the leaf node that should be an instance
+-    # of the `MetricType`
+-    def each_recursively(values)
+-      events = []
+-      values.each_value do |value|
+-        if value.is_a?(Concurrent::Map)
+-          events << each_recursively(value)
+-        else
+-          events << value
+-        end
+-      end
+-      return events
+-    end
+-
+     # This method iterate through the namespace path and try to find the corresponding
+     # value for the path, if any part of the path is not found it will
+     # create it.
+diff --git a/logstash-core/lib/logstash/instrument/null_metric.rb b/logstash-core/lib/logstash/instrument/null_metric.rb
+index 947b8a13ecf..b8054b766dc 100644
+--- a/logstash-core/lib/logstash/instrument/null_metric.rb
++++ b/logstash-core/lib/logstash/instrument/null_metric.rb
+@@ -31,7 +31,7 @@ def time(key)
+    end
+ 
+    def namespace(key)
+-      self.class.new
++     self.class.new
+    end
+ 
+    private
+diff --git a/logstash-core/lib/logstash/plugin.rb b/logstash-core/lib/logstash/plugin.rb
+index a562e3e0d91..0ac1fc78ce5 100644
+--- a/logstash-core/lib/logstash/plugin.rb
++++ b/logstash-core/lib/logstash/plugin.rb
+@@ -32,7 +32,7 @@ class LogStash::Plugin
+   # ```
+   #
+   # If you don't explicitely set this variable Logstash will generate a unique name.
+-  config :id, :validate => :string, :default => ""
++  config :id, :validate => :string
+ 
+   def hash
+     params.hash ^
+diff --git a/logstash-core/spec/logstash/agent_spec.rb b/logstash-core/spec/logstash/agent_spec.rb
+index 1911d366417..b7ad9065e04 100644
+--- a/logstash-core/spec/logstash/agent_spec.rb
++++ b/logstash-core/spec/logstash/agent_spec.rb
+@@ -188,7 +188,7 @@
+ 
+   context "#started_at" do
+     it "return the start time when the agent is started" do
+-      expect(subject.started_at).to be_kind_of(Time)
++      expect(described_class::STARTED_AT).to be_kind_of(Time)
+     end
+   end
+ 
+diff --git a/logstash-core/spec/logstash/pipeline_spec.rb b/logstash-core/spec/logstash/pipeline_spec.rb
+index c3c3acc7eb6..d594a84592a 100644
+--- a/logstash-core/spec/logstash/pipeline_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_spec.rb
+@@ -532,7 +532,7 @@ class TestPipeline < LogStash::Pipeline
+   context "when collecting metric in the pipeline" do
+     subject { described_class.new(config, { :metric => metric, :pipeline_id => pipeline_id }) }
+     let(:pipeline_id) { :main }
+-    let(:metric) { LogStash::Instrument::Metric.create }
++    let(:metric) { LogStash::Instrument::Metric.new }
+     let(:number_of_events) { 1000 }
+     let(:config) do
+       <<-EOS

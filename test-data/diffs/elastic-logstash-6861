@@ -1,0 +1,157 @@
+diff --git a/docs/static/offline-plugins.asciidoc b/docs/static/offline-plugins.asciidoc
+index 48012af78a2..508b79fe71b 100644
+--- a/docs/static/offline-plugins.asciidoc
++++ b/docs/static/offline-plugins.asciidoc
+@@ -28,14 +28,15 @@ access the Internet.
+ +
+ [source, shell]
+ -------------------------------------------------------------------------------
+-bin/logstash-plugin prepare-offline-pack --output OUTPUT [PLUGINS]
++bin/logstash-plugin prepare-offline-pack --output OUTPUT [PLUGINS] --overwrite
+ -------------------------------------------------------------------------------
+ +
+ where:
+ +
+-* `OUTPUT` specifies the location where the compressed plugin pack will be written. The default location is
+-+/LOGSTASH_HOME/logstash-offline-plugins-{logstash_version}.zip+.
++* `OUTPUT` specifies the zip file where the compressed plugin pack will be written. The default file is
+++/LOGSTASH_HOME/logstash-offline-plugins-{logstash_version}.zip+. If you are using 5.2.x and 5.3.0, this location should be a zip file whose contents will be overwritten.
+ * `[PLUGINS]` specifies one or more plugins that you want to include in the pack.
++* `--overwrite` specifies if you want to override an existing file at the location
+ 
+ Examples:
+ 
+diff --git a/lib/pluginmanager/prepare_offline_pack.rb b/lib/pluginmanager/prepare_offline_pack.rb
+index 8cd9736bcf5..0860c3b602b 100644
+--- a/lib/pluginmanager/prepare_offline_pack.rb
++++ b/lib/pluginmanager/prepare_offline_pack.rb
+@@ -4,7 +4,8 @@
+ 
+ class LogStash::PluginManager::PrepareOfflinePack < LogStash::PluginManager::Command
+   parameter "[PLUGIN] ...", "plugin name(s)", :attribute_name => :plugins_arg
+-  option "--output", "OUTPUT", "output file", :default => ::File.join(LogStash::Environment::LOGSTASH_HOME, "logstash-offline-plugins-#{LOGSTASH_VERSION}.zip")
++  option "--output", "OUTPUT", "output zip file", :default => ::File.join(LogStash::Environment::LOGSTASH_HOME, "logstash-offline-plugins-#{LOGSTASH_VERSION}.zip")
++  option "--overwrite", :flag, "overwrite a previously generated package file", :default => false
+ 
+   def execute
+     validate_arguments!
+@@ -21,7 +22,21 @@ def execute
+     # To silence some of debugs/info statements
+     Paquet.ui = Paquet::SilentUI unless debug?
+ 
+-    FileUtils.rm_rf(output) if ::File.exist?(output)
++    if File.directory?(output)
++      signal_error("Package creation cancelled: The specified output is a directory, you must specify a filename with a zip extension, provided output: #{output}.")
++    else
++      if File.extname(output).downcase != ".zip"
++        signal_error("Package creation cancelled: You must specify the zip extension for the provided filename: #{output}.")
++      end
++
++      if ::File.exists?(output)
++        if overwrite?
++          File.delete(output)
++        else
++          signal_error("Package creation cancelled: output file destination #{output} already exists.")
++        end
++      end
++    end
+ 
+     LogStash::PluginManager::OfflinePluginPackager.package(plugins_arg, output)
+ 
+diff --git a/spec/unit/plugin_manager/prepare_offline_pack_spec.rb b/spec/unit/plugin_manager/prepare_offline_pack_spec.rb
+index f86be95bdd2..aa9376c91cf 100644
+--- a/spec/unit/plugin_manager/prepare_offline_pack_spec.rb
++++ b/spec/unit/plugin_manager/prepare_offline_pack_spec.rb
+@@ -5,6 +5,7 @@
+ require "pluginmanager/offline_plugin_packager"
+ require "stud/temporary"
+ require "fileutils"
++require "webmock"
+ 
+ # This Test only handle the interaction with the OfflinePluginPackager class
+ # any test for bundler will need to be done as rats test
+@@ -19,7 +20,7 @@
+   let(:tmp_zip_file) { ::File.join(temporary_dir, "myspecial.zip") }
+   let(:offline_plugin_packager) { double("offline_plugin_packager") }
+   let(:cmd_args) { ["--output", tmp_zip_file, "logstash-input-stdin"] }
+-  let(:cmd) { "install" }
++  let(:cmd) { "prepare-offline-pack" }
+ 
+   before do
+     FileUtils.mkdir_p(temporary_dir)
+@@ -43,17 +44,6 @@
+       subject.run(cmd_args)
+     end
+ 
+-    context "when file target already exist" do
+-      before do
+-        FileUtils.touch(tmp_zip_file)
+-      end
+-
+-      it "overrides the file" do
+-        expect(FileUtils).to receive(:rm_rf).with(tmp_zip_file)
+-        subject.run(cmd_args)
+-      end
+-    end
+-
+     context "when trying to use a core gem" do
+       let(:exception) { LogStash::PluginManager::UnpackablePluginError }
+ 
+@@ -79,6 +69,57 @@
+         subject.run(cmd_args)
+       end
+     end
++
++
++    context "if the output is directory" do
++      let(:tmp_zip_file) { f = Stud::Temporary.pathname; FileUtils.mkdir_p(f); f }
++      let(:cmd) { "prepare-offline-pack" }
++
++      before do
++        expect(LogStash::PluginManager::OfflinePluginPackager).not_to receive(:package).with(anything)
++      end
++
++      it "fails to do any action" do
++        expect { subject.run(cmd_args) }.to raise_error Clamp::ExecutionError, /you must specify a filename/
++      end
++    end
++
++    context "if the output doesn't have a zip extension" do
++      let(:tmp_zip_file) { ::File.join(temporary_dir, "myspecial.rs") }
++
++      before do
++        expect(LogStash::PluginManager::OfflinePluginPackager).not_to receive(:package).with(anything)
++      end
++
++      it "fails to create the package" do
++        expect { subject.run(cmd_args) }.to raise_error Clamp::ExecutionError, /the zip extension/
++      end
++    end
++
++    context "if the file already exist" do
++      before do
++        FileUtils.touch(tmp_zip_file)
++      end
++
++      context "without `--overwrite`" do
++        before do
++          expect(LogStash::PluginManager::OfflinePluginPackager).not_to receive(:package).with(anything)
++        end
++
++        it "should fails" do
++          expect { subject.run(cmd_args) }.to raise_error Clamp::ExecutionError, /output file destination #{tmp_zip_file} already exist/
++        end
++      end
++
++      context "with `--overwrite`" do
++        let(:cmd_args) { ["--overwrite", "--output", tmp_zip_file, "logstash-input-stdin"] }
++
++        it "succeed" do
++          expect(LogStash::PluginManager::OfflinePluginPackager).to receive(:package).with(anything, tmp_zip_file)
++          subject.run(cmd_args)
++        end
++      end
++    end
+   end
+ 
+   context "when debugging" do

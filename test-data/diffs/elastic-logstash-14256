@@ -1,0 +1,288 @@
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueReader.java b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueReader.java
+index 3db994cb4a8..d0357255eea 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueReader.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueReader.java
+@@ -42,9 +42,12 @@
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ import org.logstash.DLQEntry;
++import org.logstash.FileLockFactory;
++import org.logstash.LockException;
+ import org.logstash.Timestamp;
+ 
+ import java.io.IOException;
++import java.nio.channels.FileLock;
+ import java.nio.file.FileSystems;
+ import java.nio.file.Files;
+ import java.nio.file.NoSuchFileException;
+@@ -64,7 +67,7 @@
+ 
+ import static java.nio.file.StandardWatchEventKinds.ENTRY_CREATE;
+ import static java.nio.file.StandardWatchEventKinds.ENTRY_DELETE;
+-import static org.logstash.common.io.DeadLetterQueueWriter.getSegmentPaths;
++import static org.logstash.common.io.DeadLetterQueueUtils.listSegmentPaths;
+ 
+ public final class DeadLetterQueueReader implements Closeable {
+     private static final Logger logger = LogManager.getLogger(DeadLetterQueueReader.class);
+@@ -78,6 +81,7 @@ public final class DeadLetterQueueReader implements Closeable {
+ 
+     // config settings
+     private final boolean cleanConsumed;
++    private FileLock fileLock;
+ 
+     public DeadLetterQueueReader(Path queuePath) throws IOException {
+         this(queuePath, false, null);
+@@ -90,13 +94,21 @@ public DeadLetterQueueReader(Path queuePath, boolean cleanConsumed, SegmentListe
+         this.segments = new ConcurrentSkipListSet<>(
+                 Comparator.comparingInt(DeadLetterQueueUtils::extractSegmentId)
+         );
+-        segments.addAll(getSegmentPaths(queuePath).collect(Collectors.toList()));
++        segments.addAll(listSegmentPaths(queuePath).collect(Collectors.toList()));
+         this.cleanConsumed = cleanConsumed;
+         if (cleanConsumed && segmentCallback == null) {
+             throw new IllegalArgumentException("When cleanConsumed is enabled must be passed also a valid segment listener");
+         }
+         this.segmentCallback = segmentCallback;
+         this.lastConsumedReader = null;
++        if (cleanConsumed) {
++            // force single DLQ reader when clean consumed is requested
++            try {
++                fileLock = FileLockFactory.obtainLock(queuePath, "dlq_reader.lock");
++            } catch (LockException ex) {
++                throw new LockException("Existing `dlg_reader.lock` file in [" + queuePath + "]. Only one DeadLetterQueueReader with `cleanConsumed` set is allowed per Dead Letter Queue.", ex);
++            }
++        }
+     }
+ 
+     public void seekToNextEvent(Timestamp timestamp) throws IOException {
+@@ -170,11 +182,11 @@ private void pollNewSegments() throws IOException {
+     private void pollSegmentsOnWatch(WatchKey key) throws IOException {
+         for (WatchEvent<?> watchEvent : key.pollEvents()) {
+             if (watchEvent.kind() == StandardWatchEventKinds.ENTRY_CREATE) {
+-                segments.addAll(getSegmentPaths(queuePath).collect(Collectors.toList()));
++                segments.addAll(listSegmentPaths(queuePath).collect(Collectors.toList()));
+             } else if (watchEvent.kind() == StandardWatchEventKinds.ENTRY_DELETE) {
+                 final int oldSize = segments.size();
+                 segments.clear();
+-                segments.addAll(getSegmentPaths(queuePath).collect(Collectors.toList()));
++                segments.addAll(listSegmentPaths(queuePath).collect(Collectors.toList()));
+                 logger.debug("Notified of segment removal, switched from {} to {} segments", oldSize, segments.size());
+             }
+             key.reset();
+@@ -331,7 +343,7 @@ private void removeSegmentsBefore(Path validSegment) throws IOException {
+         final Comparator<Path> fileTimeAndName = ((Comparator<Path>) this::compareByFileTimestamp)
+                 .thenComparingInt(DeadLetterQueueUtils::extractSegmentId);
+ 
+-        try (final Stream<Path> segmentFiles = DeadLetterQueueWriter.getSegmentPaths(queuePath)) {
++        try (final Stream<Path> segmentFiles = listSegmentPaths(queuePath)) {
+             segmentFiles.filter(p -> fileTimeAndName.compare(p, validSegment) < 0)
+                   .forEach(this::deleteSegment);
+         }
+@@ -389,9 +401,15 @@ public long getCurrentPosition() {
+ 
+     @Override
+     public void close() throws IOException {
+-        if (currentReader != null) {
+-            currentReader.close();
++        try {
++            if (currentReader != null) {
++                currentReader.close();
++            }
++            this.watchService.close();
++        } finally {
++            if (this.cleanConsumed) {
++                FileLockFactory.releaseLock(this.fileLock);
++            }
+         }
+-        this.watchService.close();
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueUtils.java b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueUtils.java
+index 16146feebed..7e03758d10f 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueUtils.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueUtils.java
+@@ -18,11 +18,26 @@
+  */
+ package org.logstash.common.io;
+ 
++import java.io.IOException;
++import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.util.stream.Collectors;
++import java.util.stream.Stream;
+ 
+ class DeadLetterQueueUtils {
+ 
+     static int extractSegmentId(Path p) {
+         return Integer.parseInt(p.getFileName().toString().split("\\.log")[0]);
+     }
++
++    static Stream<Path> listFiles(Path path, String suffix) throws IOException {
++        try(final Stream<Path> files = Files.list(path)) {
++            return files.filter(p -> p.toString().endsWith(suffix))
++                    .collect(Collectors.toList()).stream();
++        }
++    }
++
++    static Stream<Path> listSegmentPaths(Path path) throws IOException {
++        return listFiles(path, ".log");
++    }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
+index 8f3f3729b0d..5ebaf129166 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
+@@ -55,8 +55,6 @@
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.LongAdder;
+ import java.util.concurrent.locks.ReentrantLock;
+-import java.util.stream.Collectors;
+-import java.util.stream.Stream;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import org.apache.logging.log4j.LogManager;
+@@ -67,6 +65,8 @@
+ import org.logstash.FileLockFactory;
+ import org.logstash.Timestamp;
+ 
++import static org.logstash.common.io.DeadLetterQueueUtils.listFiles;
++import static org.logstash.common.io.DeadLetterQueueUtils.listSegmentPaths;
+ import static org.logstash.common.io.RecordIOReader.SegmentStatus;
+ import static org.logstash.common.io.RecordIOWriter.RECORD_HEADER_SIZE;
+ 
+@@ -114,7 +114,7 @@ public DeadLetterQueueWriter(final Path queuePath, final long maxSegmentSize, fi
+         this.currentQueueSize.add(getStartupQueueSize());
+ 
+         cleanupTempFiles();
+-        currentSegmentIndex = getSegmentPaths(queuePath)
++        currentSegmentIndex = listSegmentPaths(queuePath)
+                 .map(s -> s.getFileName().toString().split("\\.")[0])
+                 .mapToInt(Integer::parseInt)
+                 .max().orElse(0);
+@@ -173,10 +173,6 @@ public void close() {
+         }
+     }
+ 
+-    static Stream<Path> getSegmentPaths(Path path) throws IOException {
+-        return listFiles(path, ".log");
+-    }
+-
+     @VisibleForTesting
+     void writeEntry(DLQEntry entry) throws IOException {
+         lock.lock();
+@@ -223,7 +219,7 @@ private void innerWriteEntry(DLQEntry entry) throws IOException {
+     // package-private for testing
+     void dropTailSegment() throws IOException {
+         // remove oldest segment
+-        final Optional<Path> oldestSegment = getSegmentPaths(queuePath)
++        final Optional<Path> oldestSegment = listSegmentPaths(queuePath)
+                 .min(Comparator.comparingInt(DeadLetterQueueUtils::extractSegmentId));
+         if (!oldestSegment.isPresent()) {
+             throw new IllegalStateException("Listing of DLQ segments resulted in empty set during storage policy size(" + maxQueueSize + ") check");
+@@ -297,7 +293,7 @@ private void createFlushScheduler() {
+     }
+ 
+     private long getStartupQueueSize() throws IOException {
+-        return getSegmentPaths(queuePath)
++        return listSegmentPaths(queuePath)
+                 .mapToLong((p) -> {
+                     try {
+                         return Files.size(p);
+@@ -330,17 +326,10 @@ private void nextWriter() throws IOException {
+     // segment file with the same base name exists, or rename the
+     // temp file to the segment file, which can happen when a process ends abnormally
+     private void cleanupTempFiles() throws IOException {
+-        DeadLetterQueueWriter.listFiles(queuePath, ".log.tmp")
++        listFiles(queuePath, ".log.tmp")
+                 .forEach(this::cleanupTempFile);
+     }
+ 
+-    private static Stream<Path> listFiles(Path path, String suffix) throws IOException {
+-        try(final Stream<Path> files = Files.list(path)) {
+-            return files.filter(p -> p.toString().endsWith(suffix))
+-                    .collect(Collectors.toList()).stream();
+-        }
+-    }
+-
+     // check if there is a corresponding .log file - if yes delete the temp file, if no atomic move the
+     // temp file to be a new segment file..
+     private void cleanupTempFile(final Path tempFile) {
+diff --git a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
+index 17a1dbe9a89..b718cf63b87 100644
+--- a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
++++ b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
+@@ -27,6 +27,7 @@
+ import org.junit.rules.TemporaryFolder;
+ import org.logstash.DLQEntry;
+ import org.logstash.Event;
++import org.logstash.LockException;
+ import org.logstash.Timestamp;
+ import org.logstash.ackedqueue.StringElement;
+ 
+@@ -54,14 +55,7 @@
+ import java.util.stream.Stream;
+ 
+ import static org.hamcrest.MatcherAssert.assertThat;
+-import static org.hamcrest.Matchers.containsString;
+-import static org.hamcrest.Matchers.equalTo;
+-import static org.hamcrest.Matchers.greaterThan;
+-import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+-import static org.hamcrest.Matchers.is;
+-import static org.hamcrest.Matchers.lessThan;
+-import static org.hamcrest.Matchers.notNullValue;
+-import static org.hamcrest.Matchers.nullValue;
++import static org.hamcrest.Matchers.*;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertNull;
+@@ -952,7 +946,12 @@ public void testReaderWithCleanConsumedIsEnabledDeleteFullyConsumedSegmentsAfter
+                 reader.markForDelete();
+             }
+ 
+-            assertEquals(1, Files.list(dir).count());
++            // Verify
++            Set<String> segments = DeadLetterQueueUtils.listSegmentPaths(dir)
++                    .map(Path::getFileName)
++                    .map(Path::toString)
++                    .collect(Collectors.toSet());
++            assertEquals("Only head segment file MUST be present", Set.of("2.log"), segments);
+             assertTrue("Reader's client must be notified of the segment deletion", callback.notified);
+         }
+     }
+@@ -969,8 +968,8 @@ public void testReaderWithCleanConsumedIsEnabledWhenSetCurrentPositionCleanupTra
+             reader.setCurrentReaderAndPosition(lastSegmentPath, VERSION_SIZE);
+ 
+             // verify
+-            Set<Path> segmentFiles = Files.list(dir).collect(Collectors.toSet());
+-            assertEquals(Collections.singleton(lastSegmentPath), segmentFiles);
++            Set<Path> segmentFiles = DeadLetterQueueUtils.listSegmentPaths(dir).collect(Collectors.toSet());
++            assertEquals(Set.of(lastSegmentPath), segmentFiles);
+         }
+     }
+ 
+@@ -983,7 +982,7 @@ private void verifySegmentFiles(List<Path> allSegments, String... fileNames) {
+     }
+ 
+     private List<Path> listSegmentsSorted(Path dir) throws IOException {
+-        return DeadLetterQueueWriter.getSegmentPaths(dir)
++        return DeadLetterQueueUtils.listSegmentPaths(dir)
+                 .sorted(Comparator.comparingInt(DeadLetterQueueUtils::extractSegmentId))
+                 .collect(Collectors.toList());
+     }
+@@ -1025,4 +1024,16 @@ public void testReaderCleanMultipleConsumedSegmentsAfterMarkForDelete() throws I
+             }
+         }
+     }
++
++    @Test
++    @SuppressWarnings("try")
++    public void testReaderLockProhibitMultipleInstances() throws IOException {
++        try (DeadLetterQueueReader reader = new DeadLetterQueueReader(dir, true, this::silentCallback)) {
++            try (DeadLetterQueueReader secondReader = new DeadLetterQueueReader(dir, true, this::silentCallback)) {
++            } catch (LockException lockException) {
++                // ok it's expected to happen here
++                assertThat(lockException.getMessage(), startsWith("Existing `dlg_reader.lock` file"));
++            }
++        }
++    }
+ }

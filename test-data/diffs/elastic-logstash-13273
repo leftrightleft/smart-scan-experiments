@@ -1,0 +1,106 @@
+diff --git a/logstash-core/logstash-core.gemspec b/logstash-core/logstash-core.gemspec
+index e511cd1ec8c..9ece194c28d 100644
+--- a/logstash-core/logstash-core.gemspec
++++ b/logstash-core/logstash-core.gemspec
+@@ -75,7 +75,6 @@ Gem::Specification.new do |gem|
+ 
+   # xpack geoip database service
+   gem.add_development_dependency 'logstash-filter-geoip', '>= 7.2.1' # breaking change of DatabaseManager
+-  gem.add_dependency 'faraday' #(MIT license)
+   gem.add_dependency 'down', '~> 5.2.0' #(MIT license)
+   gem.add_dependency 'tzinfo-data' #(MIT license)
+   gem.add_dependency 'rufus-scheduler' #(MIT license)
+diff --git a/x-pack/lib/filters/geoip/download_manager.rb b/x-pack/lib/filters/geoip/download_manager.rb
+index e3fa70025e7..38b4e103b49 100644
+--- a/x-pack/lib/filters/geoip/download_manager.rb
++++ b/x-pack/lib/filters/geoip/download_manager.rb
+@@ -7,7 +7,6 @@
+ require_relative "util"
+ require_relative "database_metadata"
+ require "logstash-filter-geoip_jars"
+-require "faraday"
+ require "json"
+ require "zlib"
+ require "stud/try"
+@@ -27,6 +26,19 @@ def initialize(metadata)
+   GEOIP_PATH = "/v1/database".freeze
+   GEOIP_ENDPOINT = "#{GEOIP_HOST}#{GEOIP_PATH}".freeze
+ 
++  class BadResponseCodeError < Error
++    attr_reader :response_code, :response_body
++
++    def initialize(response_code, response_body)
++      @response_code = response_code
++      @response_body = response_body
++    end
++
++    def message
++      "GeoIP service response code '#{response_code}', body '#{response_body}'"
++    end
++  end
++
+   public
+   # Check available update and download them. Unzip and validate the file.
+   # if the download failed, valid_download return false
+@@ -52,7 +64,11 @@ def fetch_database
+   # return Array of new database information [database_type, db_info]
+   def check_update
+     res = rest_client.get(service_endpoint)
+-    logger.debug("check update", :endpoint => service_endpoint.to_s, :response => res.status)
++    logger.debug("check update", :endpoint => service_endpoint.to_s, :response => res.code)
++
++    if res.code < 200 || res.code > 299
++      raise BadResponseCodeError.new(res.code, res.body)
++    end
+ 
+     service_resp = JSON.parse(res.body)
+ 
+@@ -102,10 +118,7 @@ def assert_database!(database_path)
+   end
+ 
+   def rest_client
+-    @client ||= Faraday.new do |conn|
+-      conn.use Faraday::Response::RaiseError
+-      conn.adapter :net_http
+-    end
++    @client ||= Manticore::Client.new(request_timeout: 15, connect_timeout: 5)
+   end
+ 
+   def uuid
+diff --git a/x-pack/spec/filters/geoip/download_manager_spec.rb b/x-pack/spec/filters/geoip/download_manager_spec.rb
+index 4cfd1e3307a..74ed9a277bf 100644
+--- a/x-pack/spec/filters/geoip/download_manager_spec.rb
++++ b/x-pack/spec/filters/geoip/download_manager_spec.rb
+@@ -26,17 +26,18 @@
+     end
+ 
+     # this is disabled until https://github.com/elastic/logstash/issues/13261 is solved
+-    xcontext "rest client" do
+-  
++    context "rest client" do
++
+       it "can call endpoint" do
+         conn = download_manager.send(:rest_client)
+         res = conn.get("#{GEOIP_STAGING_ENDPOINT}?key=#{SecureRandom.uuid}&elastic_geoip_service_tos=agree")
+-        expect(res.status).to eq(200)
++        expect(res.code).to eq(200)
+       end
+ 
+       it "should raise error when endpoint response 4xx" do
+-        conn = download_manager.send(:rest_client)
+-        expect { conn.get("#{GEOIP_STAGING_HOST}?key=#{SecureRandom.uuid}&elastic_geoip_service_tos=agree") }.to raise_error /404/
++        bad_uri = URI("#{GEOIP_STAGING_HOST}?key=#{SecureRandom.uuid}&elastic_geoip_service_tos=agree")
++        expect(download_manager).to receive(:service_endpoint).and_return(bad_uri).twice
++        expect { download_manager.send(:check_update) }.to raise_error(LogStash::Filters::Geoip::DownloadManager::BadResponseCodeError, /404/)
+       end
+     end
+ 
+@@ -45,7 +46,7 @@
+         expect(download_manager).to receive(:uuid).and_return(SecureRandom.uuid)
+         mock_resp = double("geoip_endpoint",
+                            :body => ::File.read(::File.expand_path("./fixtures/normal_resp.json", ::File.dirname(__FILE__))),
+-                           :status => 200)
++                           :code => 200)
+         allow(download_manager).to receive_message_chain("rest_client.get").and_return(mock_resp)
+       end
+ 

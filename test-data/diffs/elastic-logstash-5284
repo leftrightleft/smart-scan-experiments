@@ -1,0 +1,154 @@
+diff --git a/logstash-core-event-java/spec/event_spec.rb b/logstash-core-event-java/spec/event_spec.rb
+index 8ccae4f6cf9..7b380323e73 100644
+--- a/logstash-core-event-java/spec/event_spec.rb
++++ b/logstash-core-event-java/spec/event_spec.rb
+@@ -34,6 +34,18 @@
+     end
+   end
+ 
++  context "to_json_with_metadata" do
++    it "should serialize metadata" do
++      e = LogStash::Event.new({TIMESTAMP => "2015-05-28T23:02:05.350Z"})
++      e.set("foo", "bar")
++      e.set("bar", 1)
++      e.set("baz", 1.0)
++      e.set("[fancy][pants][socks]", "shoes")
++      e.set("[@metadata][foo", "bar")
++      expect(JSON.parse(e.to_json_with_metadata)).to eq(JSON.parse("{\"@metadata\":{\"foo\":\"bar\"},\"@timestamp\":\"2015-05-28T23:02:05.350Z\",\"@version\":\"1\",\"foo\":\"bar\",\"bar\":1,\"baz\":1.0,\"fancy\":{\"pants\":{\"socks\":\"shoes\"}}}"))
++    end
++  end
++
+   context "[]" do
+     it "should get simple values" do
+       e = LogStash::Event.new({"foo" => "bar", "bar" => 1, "baz" => 1.0, TIMESTAMP => "2015-05-28T23:02:05.350Z"})
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/Event.java b/logstash-core-event-java/src/main/java/com/logstash/Event.java
+index bf62eb4ea3b..facf46c722d 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/Event.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/Event.java
+@@ -153,10 +153,12 @@ public boolean includes(String reference) {
+         }
+     }
+ 
+-    public String toJson()
+-            throws IOException
+-    {
+-        return mapper.writeValueAsString((Map<String, Object>)this.data);
++    public String toJson() throws IOException {
++        return mapper.writeValueAsString(this.data);
++    }
++
++    public String toJsonWithMetadata() throws IOException {
++        return mapper.writeValueAsString(this.toMapWithMetadata());
+     }
+ 
+     public static Event[] fromJson(String json)
+@@ -189,7 +191,16 @@ public static Event[] fromJson(String json)
+     }
+ 
+     public Map toMap() {
+-        return this.data;
++        return Cloner.deep(this.data);
++    }
++
++    @SuppressWarnings("unchecked")
++    public Map toMapWithMetadata() {
++        Map data = toMap();
++        if (!this.metadata.isEmpty()) {
++            data.put(Event.METADATA, Cloner.deep(this.metadata));
++        }
++        return data;
+     }
+ 
+     public Event overwrite(Event e) {
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyEventExtLibrary.java b/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyEventExtLibrary.java
+index 8cf5024f339..8bd998f7aef 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyEventExtLibrary.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/ext/JrubyEventExtLibrary.java
+@@ -245,19 +245,13 @@ public IRubyObject ruby_to_s(ThreadContext context)
+         @JRubyMethod(name = "to_hash")
+         public IRubyObject ruby_to_hash(ThreadContext context) throws IOException
+         {
+-            return Rubyfier.deep(context.runtime, this.event.toMap());
++            return Rubyfier.deep(context.runtime, this.event.getData());
+         }
+ 
+         @JRubyMethod(name = "to_hash_with_metadata")
+         public IRubyObject ruby_to_hash_with_metadata(ThreadContext context) throws IOException
+         {
+-            Map data = this.event.toMap();
+-            Map metadata = this.event.getMetadata();
+-
+-            if (!metadata.isEmpty()) {
+-                data.put(Event.METADATA, metadata);
+-            }
+-            return Rubyfier.deep(context.runtime, data);
++            return Rubyfier.deep(context.runtime, this.event.toMapWithMetadata());
+         }
+ 
+         @JRubyMethod(name = "to_java")
+@@ -276,6 +270,15 @@ public IRubyObject ruby_to_json(ThreadContext context, IRubyObject[] args)
+             }
+         }
+ 
++        @JRubyMethod(name = "to_json_with_metadata")
++        public IRubyObject ruby_to_json_with_metadata(ThreadContext context, IRubyObject[] args) {
++            try {
++                return RubyString.newString(context.runtime, event.toJsonWithMetadata());
++            } catch (Exception e) {
++                throw new RaiseException(context.runtime, GENERATOR_ERROR, e.getMessage(), true);
++            }
++        }
++
+         // @param value [String] the json string. A json object/map will convert to an array containing a single Event.
+         // and a json array will convert each element into individual Event
+         // @return Array<Event> array of events
+diff --git a/logstash-core-event-java/src/test/java/com/logstash/EventTest.java b/logstash-core-event-java/src/test/java/com/logstash/EventTest.java
+index 505a0593535..928cb151c5c 100644
+--- a/logstash-core-event-java/src/test/java/com/logstash/EventTest.java
++++ b/logstash-core-event-java/src/test/java/com/logstash/EventTest.java
+@@ -4,6 +4,9 @@
+ 
+ import java.io.IOException;
+ import java.util.*;
++
++import static org.hamcrest.CoreMatchers.not;
++import static org.hamcrest.CoreMatchers.sameInstance;
+ import static org.junit.Assert.*;
+ import static net.javacrumbs.jsonunit.JsonAssert.assertJsonEquals;
+ 
+@@ -59,6 +62,35 @@ public void testDeepMapFieldToJson() throws Exception {
+         assertJsonEquals("{\"@timestamp\":\"" + e.getTimestamp().toIso8601() + "\",\"foo\":{\"0\":{\"baz\":1}},\"@version\":\"1\"}", e.toJson());
+     }
+ 
++    @Test
++    public void testToJsonWithMetadata() throws Exception {
++        Event e = new Event();
++        e.setField("[foo]", 123);
++        e.setField("[@metadata][bar]", 321);
++        assertJsonEquals("{\"@metadata\":{\"bar\": 321},\"@timestamp\":\"" + e.getTimestamp().toIso8601() + "\",\"foo\": 123,\"@version\":\"1\"}", e.toJsonWithMetadata());
++        // and assert that the original Event was not affected
++        assertJsonEquals("{\"@timestamp\":\"" + e.getTimestamp().toIso8601() + "\",\"foo\": 123,\"@version\":\"1\"}", e.toJson());
++    }
++
++    @Test
++    public void testToMap() throws Exception {
++        Event e = new Event();
++        Map original = e.getData();
++        Map clone = e.toMap();
++        assertThat(original, not(sameInstance(clone)));
++        assertEquals(original, clone);
++    }
++
++    @Test
++    public void testToMapWithMetadata() throws Exception {
++        Event e = new Event();
++        e.setField("[@metadata][foo]", "bar");
++        Map mapWithMetadata = e.toMapWithMetadata();
++        assertEquals(Collections.singletonMap("foo", "bar"), mapWithMetadata.get(Event.METADATA));
++        assertEquals(e.getTimestamp(), mapWithMetadata.get(Event.TIMESTAMP));
++        assertEquals(Event.VERSION_ONE, mapWithMetadata.get(Event.VERSION));
++    }
++
+     @Test
+     public void testGetFieldList() throws Exception {
+         Map data = new HashMap();

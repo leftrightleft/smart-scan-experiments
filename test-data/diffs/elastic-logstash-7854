@@ -1,0 +1,569 @@
+diff --git a/logstash-core/src/main/java/org/logstash/Event.java b/logstash-core/src/main/java/org/logstash/Event.java
+index 6d78b877d04..2415a32f1e9 100644
+--- a/logstash-core/src/main/java/org/logstash/Event.java
++++ b/logstash-core/src/main/java/org/logstash/Event.java
+@@ -9,10 +9,11 @@
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ import org.joda.time.DateTime;
++import org.jruby.RubyString;
+ import org.jruby.RubySymbol;
+ import org.logstash.ackedqueue.Queueable;
++import org.logstash.bivalues.BiValues;
+ import org.logstash.bivalues.NullBiValue;
+-import org.logstash.bivalues.StringBiValue;
+ import org.logstash.bivalues.TimeBiValue;
+ import org.logstash.bivalues.TimestampBiValue;
+ import org.logstash.ext.JrubyTimestampExtLibrary;
+@@ -54,7 +55,7 @@ public Event()
+     /**
+      * Constructor from a map that will be copied and the copy will have its contents converted to
+      * Java objects.
+-     * @param data Map that is assumed to have either {@link String} or {@link org.jruby.RubyString}
++     * @param data Map that is assumed to have either {@link String} or {@link RubyString}
+      * keys and may contain Java and Ruby objects.
+      */
+     public Event(Map data) {
+@@ -204,9 +205,7 @@ private static Map<String, Map<String, Object>> fromBinaryToMap(byte[] source) t
+         }
+     }
+ 
+-    public String toJson()
+-            throws IOException
+-    {
++    public String toJson() throws IOException {
+         return JSON_MAPPER.writeValueAsString(this.data);
+     }
+ 
+@@ -310,8 +309,8 @@ private static Timestamp parseTimestamp(final Object o) {
+             if (o instanceof String) {
+                 // second most frequent
+                 return new Timestamp((String) o);
+-            } else if (o instanceof StringBiValue) {
+-                return new Timestamp(((StringBiValue) o).javaValue());
++            } else if (o instanceof RubyString) {
++                return new Timestamp(o.toString());
+             } else if (o instanceof TimeBiValue) {
+                 return new Timestamp(((TimeBiValue) o).javaValue());
+             } else if (o instanceof JrubyTimestampExtLibrary.RubyTimestamp) {
+@@ -351,7 +350,7 @@ public void tag(final String tag) {
+      */
+     private void initTag(final String tag) {
+         final ConvertedList list = new ConvertedList(1);
+-        list.add(new StringBiValue(tag));
++        list.add(BiValues.RUBY.newString(tag));
+         Accessors.set(data, TAGS_FIELD, list);
+     }
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/Javafier.java b/logstash-core/src/main/java/org/logstash/Javafier.java
+index b83df77a445..a1ca10167ae 100644
+--- a/logstash-core/src/main/java/org/logstash/Javafier.java
++++ b/logstash-core/src/main/java/org/logstash/Javafier.java
+@@ -1,6 +1,7 @@
+ package org.logstash;
+ 
+ 
++import org.jruby.RubyString;
+ import org.logstash.bivalues.BiValue;
+ import org.logstash.bivalues.BiValues;
+ 
+@@ -15,6 +16,12 @@ public class Javafier {
+     private Javafier(){}
+ 
+     public static Object deep(Object o) {
++        if (o instanceof RubyString) {
++            return o.toString();
++        }
++        if (o instanceof String) {
++            return o;
++        }
+         if (o instanceof BiValue) {
+             return ((BiValue)o).javaValue();
+         } else if(o instanceof ConvertedMap) {
+diff --git a/logstash-core/src/main/java/org/logstash/ObjectMappers.java b/logstash-core/src/main/java/org/logstash/ObjectMappers.java
+index 4e3bfb1aea9..65cd098ca86 100644
+--- a/logstash-core/src/main/java/org/logstash/ObjectMappers.java
++++ b/logstash-core/src/main/java/org/logstash/ObjectMappers.java
+@@ -1,19 +1,49 @@
+ package org.logstash;
+ 
++import com.fasterxml.jackson.core.JsonGenerator;
+ import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.SerializerProvider;
++import com.fasterxml.jackson.databind.module.SimpleModule;
++import com.fasterxml.jackson.databind.ser.std.NonTypedScalarSerializerBase;
+ import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
+ import com.fasterxml.jackson.dataformat.cbor.CBORGenerator;
+ import com.fasterxml.jackson.module.afterburner.AfterburnerModule;
++import java.io.IOException;
++import org.jruby.RubyString;
+ 
+ public final class ObjectMappers {
+ 
++    private static final SimpleModule RUBY_STRING_SERIALIZER =
++        new SimpleModule("RubyStringSerializer")
++            .addSerializer(RubyString.class, new RubyStringSerializer());
++
+     public static final ObjectMapper JSON_MAPPER = new ObjectMapper()
+-        .registerModule(new AfterburnerModule());
++        .registerModule(new AfterburnerModule()).registerModule(RUBY_STRING_SERIALIZER);
+ 
+     public static final ObjectMapper CBOR_MAPPER = new ObjectMapper(
+         new CBORFactory().configure(CBORGenerator.Feature.WRITE_MINIMAL_INTS, false)
+-    ).registerModule(new AfterburnerModule());
++    ).registerModule(new AfterburnerModule()).registerModule(RUBY_STRING_SERIALIZER);
+ 
+     private ObjectMappers() {
+     }
++
++    /**
++     * Serializer for {@link RubyString} since Jackson can't handle that type natively, so we
++     * simply serialize it as if it were a {@link String}.
++     */
++    private static final class RubyStringSerializer
++        extends NonTypedScalarSerializerBase<RubyString> {
++
++        RubyStringSerializer() {
++            super(RubyString.class, true);
++        }
++
++        @Override
++        public void serialize(final RubyString value, final JsonGenerator generator,
++            final SerializerProvider provider)
++            throws IOException {
++            generator.writeString(value.asJavaString());
++        }
++
++    }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/Rubyfier.java b/logstash-core/src/main/java/org/logstash/Rubyfier.java
+index 96e81e6aa55..503cac975f5 100644
+--- a/logstash-core/src/main/java/org/logstash/Rubyfier.java
++++ b/logstash-core/src/main/java/org/logstash/Rubyfier.java
+@@ -1,15 +1,15 @@
+ package org.logstash;
+ 
+-import org.logstash.bivalues.BiValue;
+-import org.logstash.bivalues.BiValues;
++import java.util.Collection;
++import java.util.List;
++import java.util.Map;
+ import org.jruby.Ruby;
+ import org.jruby.RubyArray;
+ import org.jruby.RubyHash;
++import org.jruby.RubyString;
+ import org.jruby.runtime.builtin.IRubyObject;
+-
+-import java.util.Collection;
+-import java.util.List;
+-import java.util.Map;
++import org.logstash.bivalues.BiValue;
++import org.logstash.bivalues.BiValues;
+ 
+ public final class Rubyfier {
+     private static final String ERR_TEMPLATE = "Missing Java class handling for full class name=%s, simple name=%s";
+@@ -26,6 +26,8 @@ private Rubyfier() {
+     }
+ 
+     public static IRubyObject deep(Ruby runtime, final Object input) {
++        if (input instanceof RubyString) return (RubyString) input;
++        if (input instanceof String) return BiValues.RUBY.newString((String) input);
+         if (input instanceof BiValue) return ((BiValue) input).rubyValue(runtime);
+         if (input instanceof Map) return deepMap(runtime, (Map) input);
+         if (input instanceof List) return deepList(runtime, (List) input);
+diff --git a/logstash-core/src/main/java/org/logstash/Valuefier.java b/logstash-core/src/main/java/org/logstash/Valuefier.java
+index 4557734dae5..6f8c114f68a 100644
+--- a/logstash-core/src/main/java/org/logstash/Valuefier.java
++++ b/logstash-core/src/main/java/org/logstash/Valuefier.java
+@@ -1,12 +1,12 @@
+ package org.logstash;
+ 
+ import java.io.Serializable;
+-import org.logstash.bivalues.BiValue;
+-import org.logstash.bivalues.BiValues;
+-import org.logstash.ext.JrubyTimestampExtLibrary;
++import java.util.List;
++import java.util.Map;
+ import org.joda.time.DateTime;
+ import org.jruby.RubyArray;
+ import org.jruby.RubyHash;
++import org.jruby.RubyString;
+ import org.jruby.RubyTime;
+ import org.jruby.java.proxies.ArrayJavaProxy;
+ import org.jruby.java.proxies.ConcreteJavaProxy;
+@@ -14,9 +14,9 @@
+ import org.jruby.java.proxies.MapJavaProxy;
+ import org.jruby.javasupport.JavaUtil;
+ import org.jruby.runtime.builtin.IRubyObject;
+-
+-import java.util.List;
+-import java.util.Map;
++import org.logstash.bivalues.BiValue;
++import org.logstash.bivalues.BiValues;
++import org.logstash.ext.JrubyTimestampExtLibrary;
+ 
+ public class Valuefier {
+     private static final String PROXY_ERR_TEMPLATE = "Missing Valuefier handling for full class name=%s, simple name=%s, wrapped object=%s";
+@@ -53,6 +53,12 @@ public static Object convertNonCollection(Object o) {
+     }
+ 
+     public static Object convert(Object o) throws IllegalArgumentException {
++        if (o instanceof RubyString) {
++            return o;
++        }
++        if (o instanceof String) {
++            return BiValues.RUBY.newString((String) o);
++        }
+         if (o instanceof ConvertedMap || o instanceof ConvertedList) {
+             return o;
+         }
+diff --git a/logstash-core/src/main/java/org/logstash/bivalues/BiValues.java b/logstash-core/src/main/java/org/logstash/bivalues/BiValues.java
+index db646c3c2ed..82ee72e8ad3 100644
+--- a/logstash-core/src/main/java/org/logstash/bivalues/BiValues.java
++++ b/logstash-core/src/main/java/org/logstash/bivalues/BiValues.java
+@@ -3,11 +3,11 @@
+ import java.math.BigDecimal;
+ import java.math.BigInteger;
+ import java.util.HashMap;
++import org.jruby.Ruby;
+ import org.jruby.RubyBignum;
+ import org.jruby.RubyBoolean;
+ import org.jruby.RubyFloat;
+ import org.jruby.RubyInteger;
+-import org.jruby.RubyString;
+ import org.jruby.RubySymbol;
+ import org.jruby.ext.bigdecimal.RubyBigDecimal;
+ import org.jruby.java.proxies.JavaProxy;
+@@ -23,7 +23,6 @@ public enum BiValues {
+     JAVA_LANG_FLOAT(BiValueType.FLOAT),
+     JAVA_LANG_INTEGER(BiValueType.INT),
+     JAVA_LANG_LONG(BiValueType.LONG),
+-    JAVA_LANG_STRING(BiValueType.STRING),
+     JAVA_MATH_BIGDECIMAL(BiValueType.DECIMAL),
+     JAVA_MATH_BIGINTEGER(BiValueType.BIGINT),
+     ORG_JRUBY_EXT_BIGDECIMAL_RUBYBIGDECIMAL(BiValueType.DECIMAL),
+@@ -36,7 +35,6 @@ public enum BiValues {
+     ORG_JRUBY_RUBYFLOAT(BiValueType.DOUBLE),
+     ORG_JRUBY_RUBYINTEGER(BiValueType.LONG),
+     ORG_JRUBY_RUBYNIL(BiValueType.NULL),
+-    ORG_JRUBY_RUBYSTRING(BiValueType.STRING),
+     ORG_JRUBY_RUBYSYMBOL(BiValueType.SYMBOL), // one way conversion, a Java string will use STRING
+     NULL(BiValueType.NULL);
+ 
+@@ -67,6 +65,8 @@ private static HashMap<String, String> initCache() {
+         return hm;
+     }
+ 
++    public static final Ruby RUBY = Ruby.getGlobalRuntime();
++
+     public static final NullBiValue NULL_BI_VALUE = NullBiValue.newNullBiValue();
+ 
+     private final BiValueType biValueType;
+@@ -105,14 +105,6 @@ private static String cacheName(final String cls) {
+     }
+ 
+     private enum BiValueType {
+-        STRING {
+-            BiValue build(Object value) {
+-                if (value instanceof IRubyObject) {
+-                    return new StringBiValue((RubyString) value);
+-                }
+-                return new StringBiValue((String) value);
+-            }
+-        },
+         SYMBOL {
+             BiValue build(Object value) {
+                 if (value instanceof IRubyObject) {
+diff --git a/logstash-core/src/main/java/org/logstash/bivalues/StringBiValue.java b/logstash-core/src/main/java/org/logstash/bivalues/StringBiValue.java
+deleted file mode 100644
+index ed94f65cf9e..00000000000
+--- a/logstash-core/src/main/java/org/logstash/bivalues/StringBiValue.java
++++ /dev/null
+@@ -1,57 +0,0 @@
+-package org.logstash.bivalues;
+-
+-import com.fasterxml.jackson.annotation.JsonValue;
+-import java.io.ObjectStreamException;
+-import org.jruby.Ruby;
+-import org.jruby.RubyString;
+-
+-public final class StringBiValue extends BiValue<RubyString, String> {
+-
+-    public StringBiValue(RubyString rubyValue) {
+-        this.rubyValue = rubyValue;
+-    }
+-
+-    public StringBiValue(String javaValue) {
+-        this.javaValue = javaValue;
+-        rubyValue = null;
+-    }
+-
+-    private StringBiValue() {
+-    }
+-
+-    @Override
+-    @JsonValue
+-    public String javaValue() {
+-        return rubyValue != null ? rubyValue.toString() : javaValue;
+-    }
+-
+-    @Override
+-    public boolean equals(Object o) {
+-        if (this == o) return true;
+-        if (o instanceof BiValue) {
+-            final BiValue<?, ?> other = (BiValue<?, ?>) o;
+-            return other.hasRubyValue() && other.rubyValueUnconverted().equals(rubyValue) ||
+-                (other.hasJavaValue() && other.javaValue().equals(this.javaValue()));
+-        } else {
+-            return String.class.isAssignableFrom(o.getClass()) && this.javaValue().equals(o);
+-        }
+-    }
+-
+-    protected void addRuby(Ruby runtime) {
+-        rubyValue = RubyString.newUnicodeString(runtime, javaValue);
+-    }
+-
+-    @Override
+-    protected void addJava() {
+-    }
+-
+-    @Override
+-    public boolean hasJavaValue() {
+-        return true;
+-    }
+-
+-    // Called when object is to be serialized on a stream to allow the object to substitute a proxy for itself.
+-    private Object writeReplace() throws ObjectStreamException {
+-        return newProxy(this);
+-    }
+-}
+diff --git a/logstash-core/src/test/java/org/logstash/AccessorsTest.java b/logstash-core/src/test/java/org/logstash/AccessorsTest.java
+index b5833c91d3b..80d357b3e5a 100644
+--- a/logstash-core/src/test/java/org/logstash/AccessorsTest.java
++++ b/logstash-core/src/test/java/org/logstash/AccessorsTest.java
+@@ -6,7 +6,7 @@
+ import java.util.List;
+ import java.util.Map;
+ import org.junit.Test;
+-import org.logstash.bivalues.StringBiValue;
++import org.logstash.bivalues.BiValues;
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+@@ -20,7 +20,9 @@ public void testBareGet() throws Exception {
+         Map<Serializable, Object> data = new HashMap<>();
+         data.put("foo", "bar");
+         String reference = "foo";
+-        assertEquals(new StringBiValue("bar"), get(ConvertedMap.newFromMap(data), reference));
++        assertEquals(
++            BiValues.RUBY.newString("bar"), get(ConvertedMap.newFromMap(data), reference)
++        );
+     }
+ 
+     @Test
+@@ -36,7 +38,9 @@ public void testBareBracketsGet() throws Exception {
+         Map<Serializable, Object>  data = new HashMap<>();
+         data.put("foo", "bar");
+         String reference = "[foo]";
+-        assertEquals(new StringBiValue("bar"), get(ConvertedMap.newFromMap(data), reference));
++        assertEquals(
++            BiValues.RUBY.newString("bar"), get(ConvertedMap.newFromMap(data), reference)
++        );
+     }
+ 
+     @Test
+@@ -46,7 +50,9 @@ public void testDeepMapGet() throws Exception {
+         data.put("foo", inner);
+         inner.put("bar", "baz");
+         String reference = "[foo][bar]";
+-        assertEquals(new StringBiValue("baz"), get(ConvertedMap.newFromMap(data), reference));
++        assertEquals(
++            BiValues.RUBY.newString("baz"), get(ConvertedMap.newFromMap(data), reference)
++        );
+     }
+ 
+     @Test
+@@ -66,7 +72,9 @@ public void testDeepListGet() throws Exception {
+         data.put("foo", inner);
+         inner.add("bar");
+         String reference = "[foo][0]";
+-        assertEquals(new StringBiValue("bar"), get(ConvertedMap.newFromMap(data), reference));
++        assertEquals(
++            BiValues.RUBY.newString("bar"), get(ConvertedMap.newFromMap(data), reference)
++        );
+     }
+ 
+     @Test
+diff --git a/logstash-core/src/test/java/org/logstash/ValuefierTest.java b/logstash-core/src/test/java/org/logstash/ValuefierTest.java
+index b95fe90c9f8..4609c46def6 100644
+--- a/logstash-core/src/test/java/org/logstash/ValuefierTest.java
++++ b/logstash-core/src/test/java/org/logstash/ValuefierTest.java
+@@ -1,8 +1,10 @@
+ package org.logstash;
+ 
+-import org.logstash.bivalues.BiValue;
+-import org.logstash.bivalues.BiValues;
+-import org.logstash.bivalues.TimestampBiValue;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
+ import org.joda.time.DateTime;
+ import org.jruby.RubyClass;
+ import org.jruby.RubyMatchData;
+@@ -16,12 +18,8 @@
+ import org.junit.Rule;
+ import org.junit.Test;
+ import org.junit.rules.ExpectedException;
+-
+-import java.util.ArrayList;
+-import java.util.HashMap;
+-import java.util.HashSet;
+-import java.util.List;
+-import java.util.Map;
++import org.logstash.bivalues.BiValue;
++import org.logstash.bivalues.TimestampBiValue;
+ 
+ import static junit.framework.TestCase.assertEquals;
+ 
+@@ -37,8 +35,6 @@ public void testMapJavaProxy() {
+         Object result = Valuefier.convert(mjp);
+         assertEquals(ConvertedMap.class, result.getClass());
+         ConvertedMap m = (ConvertedMap) result;
+-        BiValue bv = BiValues.newBiValue("bar");
+-        assertEquals(bv.javaValue(), ((BiValue) m.get("foo")).javaValue());
+     }
+ 
+     @Test
+@@ -50,8 +46,6 @@ public void testArrayJavaProxy() {
+         Object result = Valuefier.convert(ajp);
+         assertEquals(ConvertedList.class, result.getClass());
+         List<Object> a = (ConvertedList) result;
+-        BiValue bv = BiValues.newBiValue("foo");
+-        assertEquals(bv.javaValue(), ((BiValue) a.get(0)).javaValue());
+     }
+ 
+     @Test
+@@ -63,15 +57,12 @@ public void testConcreteJavaProxy() {
+         Object result = Valuefier.convert(cjp);
+         assertEquals(ConvertedList.class, result.getClass());
+         List<Object> a = (ConvertedList) result;
+-        BiValue bv = BiValues.newBiValue("foo");
+-        assertEquals(bv.javaValue(), ((BiValue) a.get(0)).javaValue());
+     }
+ 
+     @Test
+     public void testRubyTime() {
+         RubyTime ro = RubyTime.newTime(ruby, DateTime.now());
+         Object result = Valuefier.convert(ro);
+-
+         assertEquals(TimestampBiValue.class, result.getClass());
+     }
+ 
+diff --git a/logstash-core/src/test/java/org/logstash/bivalues/BiValueTest.java b/logstash-core/src/test/java/org/logstash/bivalues/BiValueTest.java
+index 0ed71759a39..9f87ce08b33 100644
+--- a/logstash-core/src/test/java/org/logstash/bivalues/BiValueTest.java
++++ b/logstash-core/src/test/java/org/logstash/bivalues/BiValueTest.java
+@@ -12,7 +12,6 @@
+ import org.jruby.RubyFixnum;
+ import org.jruby.RubyFloat;
+ import org.jruby.RubyInteger;
+-import org.jruby.RubyString;
+ import org.jruby.RubySymbol;
+ import org.jruby.RubyTime;
+ import org.jruby.ext.bigdecimal.RubyBigDecimal;
+@@ -24,23 +23,6 @@
+ import static org.junit.Assert.assertTrue;
+ 
+ public class BiValueTest extends TestBase {
+-    @Test
+-    public void testStringBiValueFromRuby() {
+-        String s = "foo bar baz";
+-        StringBiValue subject = new StringBiValue(RubyString.newString(ruby, s));
+-        assertTrue(subject.hasRubyValue());
+-        assertTrue(subject.hasJavaValue());
+-        assertEquals(s, subject.javaValue());
+-    }
+-
+-    @Test
+-    public void testStringBiValueFromJava() {
+-        RubyString v = RubyString.newString(ruby, "foo bar baz");
+-        StringBiValue subject = new StringBiValue("foo bar baz");
+-        assertFalse(subject.hasRubyValue());
+-        assertTrue(subject.hasJavaValue());
+-        assertEquals(v, subject.rubyValue(ruby));
+-    }
+ 
+     @Test
+     public void testSymbolBiValueFromRuby() {
+diff --git a/logstash-core/src/test/java/org/logstash/bivalues/BiValuesTest.java b/logstash-core/src/test/java/org/logstash/bivalues/BiValuesTest.java
+index 267da0567a9..83ce7f6b2d4 100644
+--- a/logstash-core/src/test/java/org/logstash/bivalues/BiValuesTest.java
++++ b/logstash-core/src/test/java/org/logstash/bivalues/BiValuesTest.java
+@@ -1,22 +1,20 @@
+ package org.logstash.bivalues;
+ 
+-import org.logstash.TestBase;
+-import org.logstash.Timestamp;
+-import org.logstash.ext.JrubyTimestampExtLibrary.RubyTimestamp;
++import java.math.BigDecimal;
++import java.math.BigInteger;
+ import org.jruby.RubyBignum;
+ import org.jruby.RubyBoolean;
+ import org.jruby.RubyFixnum;
+ import org.jruby.RubyFloat;
+ import org.jruby.RubyInteger;
+ import org.jruby.RubyNil;
+-import org.jruby.RubyString;
+ import org.jruby.RubySymbol;
+ import org.jruby.ext.bigdecimal.RubyBigDecimal;
+ import org.jruby.javasupport.JavaUtil;
+ import org.junit.Test;
+-
+-import java.math.BigDecimal;
+-import java.math.BigInteger;
++import org.logstash.TestBase;
++import org.logstash.Timestamp;
++import org.logstash.ext.JrubyTimestampExtLibrary.RubyTimestamp;
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+@@ -25,30 +23,6 @@
+ 
+ public class BiValuesTest extends TestBase {
+ 
+-    @Test
+-    public void testBiValuesStringRuby() {
+-        String js = "double";
+-        RubyString rs = RubyString.newUnicodeString(ruby, js);
+-        BiValue subject = BiValues.newBiValue(rs);
+-
+-        assertEquals(rs, subject.rubyValueUnconverted());
+-        assertEquals(rs.getClass(), subject.rubyValue(ruby).getClass());
+-        assertEquals(js, subject.javaValue());
+-        assertEquals(String.class, subject.javaValue().getClass());
+-    }
+-
+-    @Test
+-    public void testBiValuesStringJava() {
+-        String js = "double";
+-        RubyString rs = RubyString.newUnicodeString(ruby, js);
+-        BiValue subject = BiValues.newBiValue(js);
+-
+-        assertEquals(js, subject.javaValue());
+-        assertEquals(String.class, subject.javaValue().getClass());
+-        assertEquals(rs, subject.rubyValue(ruby));
+-        assertEquals(rs.getClass(), subject.rubyValue(ruby).getClass());
+-    }
+-
+     @Test
+     public void testBiValuesSymbolRuby() {
+         String js = "double";
+@@ -277,4 +251,4 @@ public void testBiValuesIntegerJava() {
+         assertEquals(ro.getClass(), subject.rubyValue(ruby).getClass());
+     }
+ 
+-}
+\ No newline at end of file
++}

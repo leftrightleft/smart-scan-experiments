@@ -1,0 +1,1224 @@
+diff --git a/lib/logstash/agent.rb b/lib/logstash/agent.rb
+index 2fc743fe359..4023f4be3ad 100644
+--- a/lib/logstash/agent.rb
++++ b/lib/logstash/agent.rb
+@@ -52,6 +52,11 @@ class LogStash::Agent < Clamp::Command
+     I18n.t("logstash.agent.flag.configtest"),
+     :attribute_name => :config_test
+ 
++  option "--[no-]force-shutdown", :flag,
++    I18n.t("logstash.agent.flag.force_shutdown"),
++    :attribute_name => :force_shutdown,
++    :default => false
++
+   # Emit a warning message.
+   def warn(message)
+     # For now, all warnings are fatal.
+@@ -77,6 +82,9 @@ def execute
+     require "logstash/plugin"
+     @logger = Cabin::Channel.get(LogStash)
+ 
++    LogStash::ShutdownController.force_shutdown = force_shutdown?
++    LogStash::DeadLetterPostOffice.logger = @logger
++
+     if version?
+       show_version
+       return 0
+@@ -116,6 +124,7 @@ def execute
+ 
+     begin
+       pipeline = LogStash::Pipeline.new(@config_string)
++      LogStash::DeadLetterPostOffice.destination = LogStash::DeadLetterPostOffice::Destination::Pipeline.new(pipeline)
+     rescue LoadError => e
+       fail("Configuration problem.")
+     end
+diff --git a/lib/logstash/codecs/base.rb b/lib/logstash/codecs/base.rb
+index 662f054dfde..189ae15fd90 100644
+--- a/lib/logstash/codecs/base.rb
++++ b/lib/logstash/codecs/base.rb
+@@ -5,46 +5,42 @@
+ require "logstash/logging"
+ 
+ # This is the base class for logstash codecs.
+-module LogStash::Codecs; class Base < LogStash::Plugin
+-  include LogStash::Config::Mixin
+-  config_name "codec"
+-
+-  def initialize(params={})
+-    super
+-    config_init(params)
+-    register if respond_to?(:register)
++module LogStash::Codecs
++  class Base < LogStash::Plugin
++    include LogStash::Config::Mixin
++    config_name "codec"
++
++    def initialize(params={})
++      super
++      config_init(params)
++      register if respond_to?(:register)
++    end
++
++    def decode(data)
++      raise "#{self.class}#decode must be overidden"
++    end # def decode
++
++    alias_method :<<, :decode
++
++    def encode(event)
++      raise "#{self.class}#encode must be overidden"
++    end # def encode
++
++    def teardown
++      # override if needed
++    end
++
++    # @param block [Proc(event, data)] the callback proc passing the original event and the encoded event
++    def on_event(&block)
++      @on_event = block
++    end
++
++    def flush(&block)
++      # override if needed
++    end
++
++    def clone
++      return self.class.new(params)
++    end
+   end
+-
+-  public
+-  def decode(data)
+-    raise "#{self.class}#decode must be overidden"
+-  end # def decode
+-
+-  alias_method :<<, :decode
+-
+-  public
+-  def encode(event)
+-    raise "#{self.class}#encode must be overidden"
+-  end # def encode
+-
+-  public 
+-  def teardown; end;
+-
+-  # @param block [Proc(event, data)] the callback proc passing the original event and the encoded event
+-  public
+-  def on_event(&block)
+-    @on_event = block
+-  end
+-
+-  public
+-  def flush(&block)
+-    # does nothing by default.
+-    # if your codec needs a flush method (like you are spooling things)
+-    # you must implement this.
+-  end
+-
+-  public
+-  def clone
+-    return self.class.new(params)
+-  end
+-end; end # class LogStash::Codecs::Base
++end
+diff --git a/lib/logstash/config/config_ast.rb b/lib/logstash/config/config_ast.rb
+index ace7322fedb..bd063dd7a33 100644
+--- a/lib/logstash/config/config_ast.rb
++++ b/lib/logstash/config/config_ast.rb
+@@ -92,6 +92,7 @@ def compile
+         @inputs = []
+         @filters = []
+         @outputs = []
++        @dead_letters = []
+         @periodic_flushers = []
+         @shutdown_flushers = []
+       CODE
+@@ -104,7 +105,7 @@ def compile
+       # start inputs
+       definitions = []
+ 
+-      ["filter", "output"].each do |type|
++      ["filter", "output", "dead_letters"].each do |type|
+         # defines @filter_func and @output_func
+ 
+         definitions << "def #{type}_func(event)"
+@@ -203,7 +204,8 @@ def plugin_type
+       if recursive_select_parent(Plugin).any?
+         return "codec"
+       else
+-        return recursive_select_parent(PluginSection).first.plugin_type.text_value
++        ret = recursive_select_parent(PluginSection).first.plugin_type.text_value
++        ret == "dead_letters" ? "output" : ret
+       end
+     end
+ 
+@@ -238,6 +240,8 @@ def compile
+         CODE
+       when "output"
+         return "#{variable_name}.handle(event)\n"
++      when "dead_letters"
++        return "#{variable_name}.handle(event)\n"
+       when "codec"
+         settings = attributes.recursive_select(Attribute).collect(&:compile).reject(&:empty?)
+         attributes_code = "LogStash::Util.hash_merge_many(#{settings.map { |c| "{ #{c} }" }.join(", ")})"
+diff --git a/lib/logstash/config/grammar.rb b/lib/logstash/config/grammar.rb
+index af56cf3a16a..72d753793ef 100644
+--- a/lib/logstash/config/grammar.rb
++++ b/lib/logstash/config/grammar.rb
+@@ -460,8 +460,19 @@ def _nt_plugin_type
+         if r3
+           r0 = r3
+         else
+-          @index = i0
+-          r0 = nil
++          if has_terminal?("dead_letters", false, index)
++            r4 = instantiate_node(SyntaxNode,input, index...(index + 12))
++            @index += 12
++          else
++            terminal_parse_failure("dead_letters")
++            r4 = nil
++          end
++          if r4
++            r0 = r4
++          else
++            @index = i0
++            r0 = nil
++          end
+         end
+       end
+     end
+diff --git a/lib/logstash/config/grammar.treetop b/lib/logstash/config/grammar.treetop
+index e46fc55307a..6d78f402e50 100644
+--- a/lib/logstash/config/grammar.treetop
++++ b/lib/logstash/config/grammar.treetop
+@@ -30,7 +30,7 @@ grammar LogStashConfig
+   end
+ 
+   rule plugin_type
+-    ("input" / "filter" / "output")
++    ("input" / "filter" / "output" / "dead_letters")
+   end
+ 
+   rule plugins
+diff --git a/lib/logstash/dead_letter_post_office.rb b/lib/logstash/dead_letter_post_office.rb
+new file mode 100644
+index 00000000000..e4d48c9ebd4
+--- /dev/null
++++ b/lib/logstash/dead_letter_post_office.rb
+@@ -0,0 +1,68 @@
++# encoding: utf-8
++
++class LogStash::DeadLetterPostOffice
++
++  def self.logger=(logger)
++    @logger = logger
++  end
++
++  def self.logger
++    @logger ||= Cabin::Channel.get(LogStash)
++  end
++
++  def self.destination=(destination)
++    logger.info("Dead letter events will be sent to \"#{destination.location}\".")
++    @destination = destination
++  end
++
++  def self.<<(events)
++    events = [events] unless events.is_a?(Array)
++
++    events.each do |event|
++      logger.warn("dead letter received!", :event => event.to_hash)
++      event.tag("_dead_letter")
++      event.cancel
++      @destination << event
++    end
++  end
++
++  module Destination
++
++    class Base
++      def location; end
++      def <<(event); end
++    end
++
++    class Pipeline
++      def location; end
++
++      def initialize(pipeline)
++        @pipeline = pipeline
++      end
++
++      def <<(event)
++        @pipeline.dead_letters_func(event)
++      end
++
++    end
++
++    class File < Base
++
++      START_TIME = Time.now
++      DUMP_PATH = ::File.join("/tmp", "dump.#{START_TIME.strftime("%Y%m%d%H%M%S")}")
++
++      def initialize(path=DUMP_PATH)
++        @path = path
++        @file = ::File.open(path, "w")
++      end
++
++      def location
++        @path
++      end
++
++      def <<(event)
++        @file.puts(event.to_json)
++      end
++    end
++  end
++end
+diff --git a/lib/logstash/filters/base.rb b/lib/logstash/filters/base.rb
+index 61bf7887554..8f187ff57ba 100644
+--- a/lib/logstash/filters/base.rb
++++ b/lib/logstash/filters/base.rb
+@@ -130,22 +130,19 @@ class LogStash::Filters::Base < LogStash::Plugin
+ 
+   RESERVED = ["type", "tags", "exclude_tags", "include_fields", "exclude_fields", "add_tag", "remove_tag", "add_field", "remove_field", "include_any", "exclude_any"]
+ 
+-  public
+   def initialize(params)
+     super
+     config_init(params)
+     @threadsafe = true
+-  end # def initialize
++  end
+ 
+-  public
+   def register
+     raise "#{self.class}#register must be overidden"
+-  end # def register
++  end
+ 
+-  public
+   def filter(event)
+     raise "#{self.class}#filter must be overidden"
+-  end # def filter
++  end
+ 
+   # in 1.5.0 multi_filter is meant to be used in the generated filter function in LogStash::Config::AST::Plugin only
+   # and is temporary until we refactor the filter method interface to accept events list and return events list,
+@@ -154,7 +151,6 @@ def filter(event)
+   #
+   # @param events [Array<LogStash::Event] list of events to filter
+   # @return [Array<LogStash::Event] filtered events and any new events generated by the filter
+-  public
+   def multi_filter(events)
+     result = []
+     events.each do |event|
+@@ -166,19 +162,22 @@ def multi_filter(events)
+     result
+   end
+ 
+-  public
+   def execute(event, &block)
+     filter(event, &block)
+   end # def execute
+ 
+-  public
+   def threadsafe?
+     @threadsafe
+   end
+ 
++  def teardown
++    # override if needed
++  end
++
++  protected
++
+   # a filter instance should call filter_matched from filter if the event
+   # matches the filter's conditions (right type, etc)
+-  protected
+   def filter_matched(event)
+     LogStash::Util::Decorators.add_fields(@add_field,event,"filters/#{self.class.name}")
+ 
+@@ -198,9 +197,8 @@ def filter_matched(event)
+                                        :tag => tag)
+       event["tags"].delete(tag)
+     end
+-  end # def filter_matched
++  end
+ 
+-  protected
+   def filter?(event)
+     if !@type.empty?
+       if event["type"] != @type
+@@ -233,9 +231,4 @@ def filter?(event)
+ 
+     return true
+   end
+-
+-  public
+-  def teardown
+-    # Nothing to do by default.
+-  end
+-end # class LogStash::Filters::Base
++end
+diff --git a/lib/logstash/inputs/base.rb b/lib/logstash/inputs/base.rb
+index f28d04e0e98..c26304d1ea3 100644
+--- a/lib/logstash/inputs/base.rb
++++ b/lib/logstash/inputs/base.rb
+@@ -81,31 +81,28 @@ def initialize(params={})
+ 
+     # Backwards compat for the 'format' setting
+     case @format
+-      when "plain"; # do nothing
+-      when "json"
+-        @codec = LogStash::Plugin.lookup("codec", "json").new
+-      when "json_event"
+-        @codec = LogStash::Plugin.lookup("codec", "oldlogstashjson").new
++    when "plain"; # do nothing
++    when "json"
++      @codec = LogStash::Plugin.lookup("codec", "json").new
++    when "json_event"
++      @codec = LogStash::Plugin.lookup("codec", "oldlogstashjson").new
+     end
++  end
+ 
+-  end # def initialize
+-
+-  public
+   def register
+     raise "#{self.class}#register must be overidden"
+   end # def register
+ 
+-  public
+   def tag(newtag)
+     @tags << newtag
+   end # def tag
+ 
+   protected
++
+   def to_event(raw, source)
+     raise LogStash::ThisMethodWasRemoved("LogStash::Inputs::Base#to_event - you should use codecs now instead of to_event. Not sure what this means? Get help on https://discuss.elastic.co/c/logstash")
+   end # def to_event
+ 
+-  protected
+   def decorate(event)
+     # Only set 'type' if not already set. This is backwards-compatible behavior
+     event["type"] = @type if @type && !event.include?("type")
+@@ -114,19 +111,18 @@ def decorate(event)
+     LogStash::Util::Decorators.add_tags(@tags,event,"inputs/#{self.class.name}")
+   end
+ 
+-  protected
+   def fix_streaming_codecs
+     require "logstash/codecs/plain"
+     require "logstash/codecs/line"
+     require "logstash/codecs/json"
+     require "logstash/codecs/json_lines"
+     case @codec
+-      when LogStash::Codecs::Plain
+-        @logger.info("Automatically switching from #{@codec.class.config_name} to line codec", :plugin => self.class.config_name)
+-        @codec = LogStash::Codecs::Line.new("charset" => @codec.charset)
+-      when LogStash::Codecs::JSON
+-        @logger.info("Automatically switching from #{@codec.class.config_name} to json_lines codec", :plugin => self.class.config_name)
+-        @codec = LogStash::Codecs::JSONLines.new("charset" => @codec.charset)
++    when LogStash::Codecs::Plain
++      @logger.info("Automatically switching from #{@codec.class.config_name} to line codec", :plugin => self.class.config_name)
++      @codec = LogStash::Codecs::Line.new("charset" => @codec.charset)
++    when LogStash::Codecs::JSON
++      @logger.info("Automatically switching from #{@codec.class.config_name} to json_lines codec", :plugin => self.class.config_name)
++      @codec = LogStash::Codecs::JSONLines.new("charset" => @codec.charset)
+     end
+   end
+-end # class LogStash::Inputs::Base
++end
+diff --git a/lib/logstash/inputs/threadable.rb b/lib/logstash/inputs/threadable.rb
+index 04d834b722c..f02d5d5eb4d 100644
+--- a/lib/logstash/inputs/threadable.rb
++++ b/lib/logstash/inputs/threadable.rb
+@@ -2,17 +2,16 @@
+ require "logstash/namespace"
+ require "logstash/inputs/base"
+ 
+-# This is the threadable class for logstash inputs. 
++# This is the threadable class for logstash inputs.
+ # Use this class in your inputs if it can support multiple threads
+ class LogStash::Inputs::Threadable < LogStash::Inputs::Base
+ 
+   # Set this to the number of threads you want this input to spawn.
+   # This is the same as declaring the input multiple times
+   config :threads, :validate => :number, :default => 1
+- 
++
+   def initialize(params)
+     super
+     @threadable = true
+   end
+-
+-end # class LogStash::Inputs::Threadable
++end
+diff --git a/lib/logstash/outputs/base.rb b/lib/logstash/outputs/base.rb
+index 831f5fb806d..af86d759a34 100644
+--- a/lib/logstash/outputs/base.rb
++++ b/lib/logstash/outputs/base.rb
+@@ -35,8 +35,12 @@ class LogStash::Outputs::Base < LogStash::Plugin
+ 
+   attr_reader :worker_plugins, :worker_queue
+ 
+-  public
+-  def workers_not_supported(message=nil)
++  def initialize(params = {})
++    super
++    config_init(params)
++  end
++
++  def workers_not_supported(message = nil)
+     return if @workers == 1
+     if message
+       @logger.warn(I18n.t("logstash.pipeline.output-worker-unsupported-with-message", :plugin => self.class.config_name, :worker_count => @workers, :message => message))
+@@ -46,23 +50,18 @@ def workers_not_supported(message=nil)
+     @workers = 1
+   end
+ 
+-  public
+-  def initialize(params={})
+-    super
+-    config_init(params)
+-  end
+-
+-  public
+   def register
+     raise "#{self.class}#register must be overidden"
+-  end # def register
++  end
+ 
+-  public
+   def receive(event)
+     raise "#{self.class}#receive must be overidden"
+-  end # def receive
++  end
++
++  def teardown
++    # override if needed
++  end
+ 
+-  public
+   def worker_setup
+     if @workers == 1
+       @worker_plugins = [self]
+@@ -83,16 +82,16 @@ def worker_setup
+     end
+   end
+ 
+-  public
+   def handle(event)
+     receive(event)
+-  end # def handle
++  end
+ 
+   def handle_worker(event)
+     @worker_queue.push(event)
+   end
+ 
+   private
++
+   def output?(event)
+     if !@type.empty?
+       if event["type"] != @type
+@@ -121,4 +120,4 @@ def output?(event)
+ 
+     return true
+   end
+-end # class LogStash::Outputs::Base
++end
+diff --git a/lib/logstash/pipeline.rb b/lib/logstash/pipeline.rb
+index 0089e3f1688..66081b5d51a 100644
+--- a/lib/logstash/pipeline.rb
++++ b/lib/logstash/pipeline.rb
+@@ -8,14 +8,16 @@
+ require "logstash/filters/base"
+ require "logstash/inputs/base"
+ require "logstash/outputs/base"
+-require "logstash/util/reporter"
++require "logstash/shutdown_controller"
++require "logstash/dead_letter_post_office"
+ 
+-class LogStash::Pipeline
++module LogStash; class Pipeline
+ 
+   def initialize(configstr)
+     @logger = Cabin::Channel.get(LogStash)
+     grammar = LogStashConfigParser.new
+     @config = grammar.parse(configstr)
++
+     if @config.nil?
+       raise LogStash::ConfigurationError, grammar.failure_reason
+     end
+@@ -49,7 +51,7 @@ def initialize(configstr)
+     @ready = false
+     @started = false
+     @input_threads = []
+-  end # def initialize
++  end
+ 
+   def ready?
+     @run_mutex.synchronize{@ready}
+@@ -98,12 +100,14 @@ def run
+     shutdown_outputs
+     wait_outputs
+ 
++    shutdown_dead_letters
++
+     @logger.info("Pipeline shutdown complete.")
+     @logger.terminal("Logstash shutdown completed")
+ 
+     # exit code
+     return 0
+-  end # def run
++  end
+ 
+   def wait_inputs
+     @input_threads.each(&:join)
+@@ -134,6 +138,10 @@ def wait_outputs
+     @output_threads.each(&:join)
+   end
+ 
++  def shutdown_dead_letters
++    @dead_letters.each {|plugin| plugin.teardown rescue nil }
++  end
++
+   def start_inputs
+     moreinputs = []
+     @inputs.each do |input|
+@@ -175,64 +183,59 @@ def inputworker(plugin)
+     LogStash::Util::set_thread_name("<#{plugin.class.config_name}")
+     begin
+       plugin.run(@input_to_filter)
+-    rescue LogStash::ShutdownSignal
+-      # ignore and quit
+     rescue => e
++      # if plugin is stopping, ignore uncatched exceptions and exit worker
++      if plugin.stop?
++        @logger.debug("Ignoring stopping plugin exception", :exception => e, "backtrace" => e.backtrace)
++        return
++      end
++
++      # otherwise, report error and restart
+       if @logger.debug?
+-        @logger.error(I18n.t("logstash.pipeline.worker-error-debug",
+-                             :plugin => plugin.inspect, :error => e.to_s,
+-                             :exception => e.class,
+-                             :stacktrace => e.backtrace.join("\n")))
++        @logger.error(
++          I18n.t("logstash.pipeline.worker-error-debug",
++            :plugin => plugin.inspect,
++            :error => e.to_s,
++            :exception => e,
++            :stacktrace => e.backtrace.join("\n")
++          )
++        )
+       else
+-        @logger.error(I18n.t("logstash.pipeline.worker-error",
+-                             :plugin => plugin.inspect, :error => e))
++        @logger.error(I18n.t("logstash.pipeline.worker-error", :plugin => plugin.inspect, :error => e))
+       end
+-      puts e.backtrace if @logger.debug?
+-      # input teardown must be synchronized since is can be called concurrently by
+-      # the input worker thread and from the pipeline thread shutdown method.
+-      # this means that input teardown methods must support multiple calls.
+-      @run_mutex.synchronize{plugin.teardown}
+-      sleep 1
+-      retry
+-    end
+-  ensure
+-    begin
+-      # input teardown must be synchronized since is can be called concurrently by
+-      # the input worker thread and from the pipeline thread shutdown method.
+-      # this means that input teardown methods must support multiple calls.
+-      @run_mutex.synchronize{plugin.teardown}
+-    rescue LogStash::ShutdownSignal
+-      # teardown could receive the ShutdownSignal, retry it
++
++      sleep(1)
+       retry
++    ensure
++      plugin.teardown
+     end
+-  end # def inputworker
++  end
+ 
+   def filterworker
+     LogStash::Util::set_thread_name("|worker")
+-    begin
+-      while true
+-        event = @input_to_filter.pop
+-
+-        case event
+-        when LogStash::Event
+-          # filter_func returns all filtered events, including cancelled ones
+-          filter_func(event).each { |e| @filter_to_output.push(e) unless e.cancelled? }
+-        when LogStash::FlushEvent
+-          # handle filter flushing here so that non threadsafe filters (thus only running one filterworker)
+-          # don't have to deal with thread safety implementing the flush method
+-          flush_filters_to_output!
+-        when LogStash::ShutdownEvent
+-          # pass it down to any other filterworker and stop this worker
+-          @input_to_filter.push(event)
+-          break
+-        end
++
++    while true
++      event = @input_to_filter.pop
++
++      case event
++      when LogStash::Event
++        # filter_func returns all filtered events, including cancelled ones
++        filter_func(event).each { |e| @filter_to_output.push(e) unless e.cancelled? }
++      when LogStash::FlushEvent
++        # handle filter flushing here so that non threadsafe filters (thus only running one filterworker)
++        # don't have to deal with thread safety implementing the flush method
++        flush_filters_to_output!
++      when LogStash::ShutdownEvent
++        # pass it down to any other filterworker and stop this worker
++        @input_to_filter.push(event)
++        break
+       end
+-    rescue => e
+-      @logger.error("Exception in filterworker", "exception" => e, "backtrace" => e.backtrace)
+     end
+-
++  rescue => e
++    @logger.error("Exception in filterworker", "exception" => e, "backtrace" => e.backtrace)
++  ensure
+     @filters.each(&:teardown)
+-  end # def filterworker
++  end
+ 
+   def outputworker
+     LogStash::Util::set_thread_name(">output")
+@@ -242,34 +245,20 @@ def outputworker
+       event = @filter_to_output.pop
+       break if event == LogStash::SHUTDOWN
+       output_func(event)
+-    end # while true
+-
++    end
++  ensure
+     @outputs.each do |output|
+       output.worker_plugins.each(&:teardown)
+     end
+-  end # def outputworker
++  end
+ 
+   # Shutdown this pipeline.
+   #
+   # This method is intended to be called from another thread
+   def shutdown
+-    InflightEventsReporter.logger = @logger
+-    InflightEventsReporter.start(@input_to_filter, @filter_to_output, @outputs)
+-    @input_threads.each do |thread|
+-      # Interrupt all inputs
+-      @logger.info("Sending shutdown signal to input thread", :thread => thread)
+-
+-      # synchronize both ShutdownSignal and teardown below. by synchronizing both
+-      # we will avoid potentially sending a shutdown signal when the inputworker is
+-      # executing the teardown method.
+-      @run_mutex.synchronize do
+-        thread.raise(LogStash::ShutdownSignal)
+-        begin
+-          thread.wakeup # in case it's in blocked IO or sleeping
+-        rescue ThreadError
+-        end
+-      end
+-    end
++    shutdown_controller = ::LogStash::ShutdownController.new(self)
++    shutdown_controller.logger = @logger
++    shutdown_controller.start
+ 
+     # sometimes an input is stuck in a blocking I/O so we need to tell it to teardown directly
+     @inputs.each do |input|
+@@ -277,17 +266,18 @@ def shutdown
+         # input teardown must be synchronized since is can be called concurrently by
+         # the input worker thread and from the pipeline thread shutdown method.
+         # this means that input teardown methods must support multiple calls.
+-        @run_mutex.synchronize{input.teardown}
++        @run_mutex.synchronize{input.stop}
+       rescue LogStash::ShutdownSignal
+         # teardown could receive the ShutdownSignal, retry it
+         retry
+       end
+     end
+-
+-    # No need to send the ShutdownEvent to the filters/outputs nor to wait for
+-    # the inputs to finish, because in the #run method we wait for that anyway.
+   end # def shutdown
+ 
++  def force_exit
++    exit(-1)
++  end
++
+   def plugin(plugin_type, name, *args)
+     args << {} if args.empty?
+     klass = LogStash::Plugin.lookup(plugin_type, name)
+@@ -322,6 +312,33 @@ def flush_filters_to_output!(options = {})
+         @filter_to_output.push(event)
+       end
+     end
+-  end # flush_filters_to_output!
++  end
++
++  def inflight_count
++    data = {
++      "input_to_filter" => @input_to_filter.size,
++      "filter_to_output" => @filter_to_output.size,
++      "outputs" => []
++    }
++    @outputs.each do |output|
++      next unless output.worker_queue && output.worker_queue.size > 0
++      data["outputs"] << [output.inspect, output.worker_queue.size]
++    end
+ 
+-end # class Pipeline
++    data["total"] = data["input_to_filter"] + data["filter_to_output"] +
++                    data["outputs"].map(&:last).inject(0, :+)
++    data
++  end
++
++  def dump
++    dump = []
++    [@input_to_filter].each do |queue|
++      until queue.empty? do
++        event = queue.pop(true) rescue ThreadError # non-block pop
++        next unless event.is_a?(LogStash::Event)
++        dump << event
++      end
++    end
++    dump
++  end
++end; end
+diff --git a/lib/logstash/plugin.rb b/lib/logstash/plugin.rb
+index 76d3eeb43fb..d694079e0d6 100644
+--- a/lib/logstash/plugin.rb
++++ b/lib/logstash/plugin.rb
+@@ -3,6 +3,8 @@
+ require "logstash/logging"
+ require "logstash/config/mixin"
+ require "cabin"
++require "concurrent_ruby"
++
+ 
+ class LogStash::Plugin
+   attr_accessor :params
+@@ -10,106 +12,40 @@ class LogStash::Plugin
+ 
+   NL = "\n"
+ 
+-  public
+   def hash
+-    params.hash ^
+-    self.class.name.hash
++    params.hash ^ self.class.name.hash
+   end
+ 
+-  public
+   def eql?(other)
+     self.class.name == other.class.name && @params == other.params
+   end
+ 
+-  public
+   def initialize(params=nil)
+     @params = params
+     @logger = Cabin::Channel.get(LogStash)
++    @stop_called = Concurrent::AtomicBoolean.new(false)
+   end
+ 
+-  # This method is called when someone or something wants this plugin to shut
+-  # down. When you successfully shutdown, you must call 'finished'
+-  # You must also call 'super' in any subclasses.
+-  public
+-  def shutdown(queue)
+-    # By default, shutdown is assumed a no-op for all plugins.
+-    # If you need to take special efforts to shutdown (like waiting for
+-    # an operation to complete, etc)
+-    teardown
+-    @logger.info("Received shutdown signal", :plugin => self)
+-
+-    @shutdown_queue = queue
+-    if @plugin_state == :finished
+-      finished
+-    else
+-      @plugin_state = :terminating
+-    end
+-  end # def shutdown
+-
+-  # You should call this method when you (the plugin) are done with work
+-  # forever.
+-  public
+-  def finished
+-    # TODO(sissel): I'm not sure what I had planned for this shutdown_queue
+-    # thing
+-    if @shutdown_queue
+-      @logger.info("Sending shutdown event to agent queue", :plugin => self)
+-      @shutdown_queue << self
+-    end
+-
+-    if @plugin_state != :finished
+-      @logger.info("Plugin is finished", :plugin => self)
+-      @plugin_state = :finished
+-    end
+-  end # def finished
+-
+-  # Subclasses should implement this teardown method if you need to perform any
+-  # special tasks during shutdown (like flushing, etc.)
+-  public
+-  def teardown
+-    # nothing by default
+-    finished
++  # if you override stop, don't forget to call super
++  def stop
++    @logger.debug("stopping", :plugin => self)
++    @stop_called.make_true
+   end
+ 
+-  # This method is called when a SIGHUP triggers a reload operation
+-  public
+-  def reload
+-    # Do nothing by default
++  # stop? should never be overriden
++  def stop?
++    @stop_called.value
+   end
+ 
+-  public
+-  def finished?
+-    return @plugin_state == :finished
+-  end # def finished?
+-
+-  public
+-  def running?
+-    return @plugin_state != :finished
+-  end # def finished?
+-
+-  public
+-  def terminating?
+-    return @plugin_state == :terminating
+-  end # def terminating?
+-
+-  public
+-  def to_s
+-    return "#{self.class.name}: #{@params}"
+-  end
+-
+-  protected
+-  def update_watchdog(state)
+-    Thread.current[:watchdog] = Time.now
+-    Thread.current[:watchdog_state] = state
++  # if you override teardown, don't forget to call super
++  def teardown
++    @logger.debug("closing", :plugin => self)
+   end
+ 
+-  protected
+-  def clear_watchdog
+-    Thread.current[:watchdog] = nil
+-    Thread.current[:watchdog_state] = nil
++  def to_s
++    "#{self.class.name}: #{@params}"
+   end
+ 
+-  public
+   def inspect
+     if !@params.nil?
+       description = @params
+@@ -121,8 +57,12 @@ def inspect
+     end
+   end
+ 
++  def dead_letter(event)
++    return unless event.is_a?(LogStash::Event)
++    LogStash::DeadLetterPostOffice << event
++  end
++
+   # Look up a plugin by type and name.
+-  public
+   def self.lookup(type, name)
+     path = "logstash/#{type}s/#{name}"
+ 
+@@ -142,6 +82,18 @@ def self.lookup(type, name)
+     raise(LogStash::PluginLoadingError, I18n.t("logstash.pipeline.plugin-loading-error", :type => type, :name => name, :path => path, :error => e.to_s))
+   end
+ 
++  protected
++
++  def update_watchdog(state)
++    Thread.current[:watchdog] = Time.now
++    Thread.current[:watchdog_state] = state
++  end
++
++  def clear_watchdog
++    Thread.current[:watchdog] = nil
++    Thread.current[:watchdog_state] = nil
++  end
++
+   private
+ 
+   # lookup a plugin by type and name in the existing LogStash module namespace
+diff --git a/lib/logstash/shutdown_controller.rb b/lib/logstash/shutdown_controller.rb
+new file mode 100644
+index 00000000000..4c063a2fbf5
+--- /dev/null
++++ b/lib/logstash/shutdown_controller.rb
+@@ -0,0 +1,62 @@
++# encoding: utf-8
++module LogStash
++  class ShutdownController
++
++    REPORT_CYCLE = 5 # seconds
++    REPORTS = []
++    NUM_REPORTS = 3
++
++    def self.force_shutdown=(boolean)
++      @force_shutdown = boolean
++    end
++
++    def self.force_shutdown?
++      @force_shutdown
++    end
++
++    def logger=(logger)
++      @logger = logger
++    end
++
++    def logger
++      @logger ||= Cabin::Channel.get(LogStash)
++    end
++
++    def initialize(pipeline)
++      @pipeline = pipeline
++    end
++
++    def start(cycle=REPORT_CYCLE)
++      @thread ||= Thread.new do
++        Stud.interval(cycle) do
++          REPORTS << @pipeline.inflight_count
++          REPORTS.delete_at(0) if REPORTS.size > NUM_REPORTS # expire old report
++          report(REPORTS.last)
++          if self.class.force_shutdown? && stalled?
++            logger.fatal("Stalled pipeline detected. Forcefully quitting logstash..")
++            DeadLetterPostOffice << @pipeline.dump
++            @pipeline.force_exit()
++            break
++          end
++        end
++      end
++    end
++
++    def stop!
++      @thread.terminate if @thread.is_a?(Thread)
++      @thread = nil
++    end
++
++    def report(report)
++      logger.warn ["INFLIGHT_EVENTS_REPORT", Time.now.iso8601, report]
++    end
++
++    def stalled?
++      return false unless REPORTS.size == NUM_REPORTS
++      # check if inflight count is either constant or increasing
++      REPORTS.each_cons(2).all? do |prev_report, next_report|
++        prev_report["total"] <= next_report["total"]
++      end
++    end
++  end
++end
+diff --git a/lib/logstash/util/reporter.rb b/lib/logstash/util/reporter.rb
+deleted file mode 100644
+index 7ea5f260ebf..00000000000
+--- a/lib/logstash/util/reporter.rb
++++ /dev/null
+@@ -1,27 +0,0 @@
+-class InflightEventsReporter
+-  def self.logger=(logger)
+-    @logger = logger
+-  end
+-
+-  def self.start(input_to_filter, filter_to_output, outputs)
+-    Thread.new do
+-      loop do
+-        sleep 5
+-        report(input_to_filter, filter_to_output, outputs)
+-      end
+-    end
+-  end
+-
+-  def self.report(input_to_filter, filter_to_output, outputs)
+-    report = {
+-      "input_to_filter" => input_to_filter.size,
+-      "filter_to_output" => filter_to_output.size,
+-      "outputs" => []
+-    }
+-    outputs.each do |output|
+-      next unless output.worker_queue && output.worker_queue.size > 0
+-      report["outputs"] << [output.inspect, output.worker_queue.size]
+-    end
+-    @logger.warn ["INFLIGHT_EVENTS_REPORT", Time.now.iso8601, report]
+-  end
+-end
+diff --git a/locales/en.yml b/locales/en.yml
+index 129d459dff3..9c29ab2ef64 100644
+--- a/locales/en.yml
++++ b/locales/en.yml
+@@ -189,3 +189,8 @@ en:
+         debug: |+
+           Most verbose logging. This causes 'debug'
+           level logs to be emitted.
++        force_shutdown: |+
++          Force logstash to exit during shutdown even
++          if there are still inflight events in memory.
++          By default, logstash will refuse to quit until all
++          received events have been pushed to the outputs.
+diff --git a/logstash-core.gemspec b/logstash-core.gemspec
+index 2df64952a60..615de270af4 100644
+--- a/logstash-core.gemspec
++++ b/logstash-core.gemspec
+@@ -20,9 +20,12 @@ Gem::Specification.new do |gem|
+   gem.add_runtime_dependency "cabin", "~> 0.7.0" #(Apache 2.0 license)
+   gem.add_runtime_dependency "pry", "~> 0.10.1"  #(Ruby license)
+   gem.add_runtime_dependency "stud", "~> 0.0.19" #(Apache 2.0 license)
+-  gem.add_runtime_dependency "clamp", "~> 0.6.5" #(MIT license) for command line args/flags
+-  gem.add_runtime_dependency "filesize", "0.0.4" #(MIT license) for :bytes config validator
+   gem.add_runtime_dependency "gems", "~> 0.8.3"  #(MIT license)
++  # clamp for command line args/flags
++  gem.add_runtime_dependency "clamp", "~> 0.6.5" #(MIT license)
++  # filesize for :bytes config validator
++  gem.add_runtime_dependency "filesize", "0.0.4" #(MIT license)
++  gem.add_runtime_dependency "concurrent-ruby", "~> 0.8.0" #(MIT license)
+ 
+   # TODO(sissel): Treetop 1.5.x doesn't seem to work well, but I haven't
+   # investigated what the cause might be. -Jordan
+diff --git a/spec/core/dead_letter_post_office_spec.rb b/spec/core/dead_letter_post_office_spec.rb
+new file mode 100644
+index 00000000000..3c42b57e569
+--- /dev/null
++++ b/spec/core/dead_letter_post_office_spec.rb
+@@ -0,0 +1,46 @@
++# encoding: utf-8
++require "spec_helper"
++
++describe LogStash::DeadLetterPostOffice do
++
++  describe ".<<" do
++    subject { LogStash::DeadLetterPostOffice }
++    let(:filter) { LogStash::Filter::Base.new }
++    let(:event) { LogStash::Event.new("message" => "test") }
++    let(:destination) { LogStash::DeadLetterPostOffice::Destination::Base.new }
++
++    before :each do
++      subject.destination = destination
++      allow(destination).to receive(:<<) {|event|  }
++    end
++
++    it "should send event to destination" do
++      expect(destination).to receive(:<<).with(event)
++      subject << event
++    end
++
++    it "should tag the event with \"_dead_letter\"" do
++      subject << event
++      expect(event["tags"]).to include("_dead_letter")
++    end
++
++    it "should cancel the event" do
++      subject << event
++      expect(event).to be_cancelled
++    end
++
++    context "array of events" do
++      let(:event1) { LogStash::Event.new("message" => "test1") }
++      let(:event2) { LogStash::Event.new("message" => "test2") }
++      let(:event3) { LogStash::Event.new("message" => "test3") }
++      let(:events) { [event1, event2, event3] }
++
++      it "should push each event to the destination" do
++        expect(destination).to receive(:<<).with(event1)
++        expect(destination).to receive(:<<).with(event2)
++        expect(destination).to receive(:<<).with(event3)
++        subject << events
++      end
++    end
++  end
++end
+diff --git a/spec/core/shutdown_controller_spec.rb b/spec/core/shutdown_controller_spec.rb
+new file mode 100644
+index 00000000000..579a57c6789
+--- /dev/null
++++ b/spec/core/shutdown_controller_spec.rb
+@@ -0,0 +1,70 @@
++# encoding: utf-8
++require "spec_helper"
++require "logstash/shutdown_controller"
++
++describe LogStash::ShutdownController do
++
++  subject { LogStash::ShutdownController.new(pipeline) }
++  let(:num_reports) { LogStash::ShutdownController::NUM_REPORTS }
++  let(:pipeline) { double("pipeline") }
++
++  before :each do
++    LogStash::ShutdownController::REPORTS.clear
++    allow(LogStash::DeadLetterPostOffice).to receive(:<<)
++    allow(pipeline).to receive(:dump)
++    allow(pipeline).to receive(:force_exit)
++    allow(pipeline).to receive(:inflight_count) do
++      subject.stop! if return_values.empty?
++      { "total" => (return_values.shift || 0) }
++    end
++  end
++
++  after :each do
++    subject.stop!
++  end
++
++  context "when force_shutdown is true" do
++
++    before :each do
++      subject.class.force_shutdown = true
++    end
++
++    context "with a non-stalled pipeline" do
++      let(:return_values) { [8,7,6,5,4,3,2,1] }
++
++      it "should request more than NUM_REPORTS \"inflight_count\"" do
++        expect(pipeline).to receive(:inflight_count).at_least(num_reports + 1).times
++        subject.start(0).join
++      end
++
++      it "shouldn't force exit after NUM_REPORTS cycles" do
++        expect(pipeline).to_not receive(:force_exit)
++        subject.start(0).join
++      end
++
++      it "shouldn't dump the pipeline" do
++        expect(pipeline).to_not receive(:dump)
++        subject.start(0).join
++      end
++    end
++
++    context "with a stalled pipeline" do
++      let(:return_values) { [5,5,6,6,6,6,6] }
++
++      it "should force exit after NUM_REPORTS cycles" do
++        expect(pipeline).to receive(:force_exit).once 
++        subject.start(0).join
++      end
++
++      it "should dump all contents " do
++        expect(pipeline).to receive(:dump).once
++        subject.start(0).join
++      end
++
++      it "should post pipeline contents to DeadLetterPostOffice" do
++        expect(LogStash::DeadLetterPostOffice).to receive(:<<).once
++        subject.start(0).join
++      end
++    end
++  end
++end

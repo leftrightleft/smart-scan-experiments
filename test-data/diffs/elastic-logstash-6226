@@ -1,0 +1,162 @@
+diff --git a/logstash-core-event-java/spec/event_spec.rb b/logstash-core-event-java/spec/event_spec.rb
+index 3402270c92b..1ed0a9777a5 100644
+--- a/logstash-core-event-java/spec/event_spec.rb
++++ b/logstash-core-event-java/spec/event_spec.rb
+@@ -61,6 +61,16 @@
+       expect(e.get("[foo][2]")).to eq(1.0)
+       expect(e.get("[foo][3]")).to be_nil
+     end
++
++    context "negative array values" do
++      it "should index from the end of the array" do
++        list = ["bar", 1, 1.0]
++        e = LogStash::Event.new({"foo" => list})
++        expect(e.get("[foo][-3]")).to eq(list[-3])
++        expect(e.get("[foo][-2]")).to eq(list[-2])
++        expect(e.get("[foo][-1]")).to eq(list[-1])
++      end
++    end
+   end
+ 
+   context "#set" do
+diff --git a/logstash-core-event-java/src/main/java/org/logstash/Accessors.java b/logstash-core-event-java/src/main/java/org/logstash/Accessors.java
+index bdf6c622b83..c4cfd492c7d 100644
+--- a/logstash-core-event-java/src/main/java/org/logstash/Accessors.java
++++ b/logstash-core-event-java/src/main/java/org/logstash/Accessors.java
+@@ -34,10 +34,12 @@ public Object del(String reference) {
+                 return ((Map<String, Object>) target).remove(field.getKey());
+             } else if (target instanceof List) {
+                 int i = Integer.parseInt(field.getKey());
+-                if (i < 0 || i >= ((List) target).size()) {
++                try {
++                    int offset = listIndex(i, ((List) target).size());
++                    return ((List)target).remove(offset);
++                } catch (IndexOutOfBoundsException e) {
+                     return null;
+                 }
+-                return ((List<Object>) target).remove(i);
+             } else {
+                 throw newCollectionException(target);
+             }
+@@ -112,10 +114,13 @@ private Object findCreateTarget(FieldReference field) {
+     }
+ 
+     private boolean foundInList(List<Object> target, int index) {
+-        if (index < 0 || index >= target.size()) {
++        try {
++            int offset = listIndex(index, target.size());
++            return target.get(offset) != null;
++        } catch (IndexOutOfBoundsException e) {
+             return false;
+         }
+-        return target.get(index) != null;
++
+     }
+ 
+     private boolean foundInMap(Map<String, Object> target, String key) {
+@@ -127,12 +132,12 @@ private Object fetch(Object target, String key) {
+             Object result = ((Map<String, Object>) target).get(key);
+             return result;
+         } else if (target instanceof List) {
+-            int i = Integer.parseInt(key);
+-            if (i < 0 || i >= ((List) target).size()) {
++            try {
++                int offset = listIndex(Integer.parseInt(key), ((List) target).size());
++                return ((List<Object>) target).get(offset);
++            } catch (IndexOutOfBoundsException e) {
+                 return null;
+             }
+-            Object result = ((List<Object>) target).get(i);
+-            return result;
+         } else if (target == null) {
+             return null;
+         } else {
+@@ -156,7 +161,8 @@ private Object store(Object target, String key, Object value) {
+                 }
+                 ((List<Object>) target).add(value);
+             } else {
+-                ((List<Object>) target).set(i, value);
++                int offset = listIndex(i, ((List) target).size());
++                ((List<Object>) target).set(offset, value);
+             }
+         } else {
+             throw newCollectionException(target);
+@@ -174,4 +180,23 @@ private boolean isCollection(Object target) {
+     private ClassCastException newCollectionException(Object target) {
+         return new ClassCastException("expecting List or Map, found "  + target.getClass());
+     }
++
++    /* 
++     * Returns a positive integer offset for a list of known size.
++     *
++     * @param i if positive, and offset from the start of the list. If negative, the offset from the end of the list, where -1 means the last element.
++     * @param size the size of the list.
++     * @return the positive integer offset for the list given by index i.
++     */
++    public static int listIndex(int i, int size) {
++        if (i >= size || i < -size) {
++            throw new IndexOutOfBoundsException("Index " + i + " is out of bounds for a list with size " + size);
++        }
++
++        if (i < 0) { // Offset from the end of the array.
++            return size + i;
++        } else {
++            return i;
++        }
++    }
+ }
+diff --git a/logstash-core-event-java/src/test/java/org/logstash/AccessorsTest.java b/logstash-core-event-java/src/test/java/org/logstash/AccessorsTest.java
+index df0a56c5f09..634ef9ad88a 100644
+--- a/logstash-core-event-java/src/test/java/org/logstash/AccessorsTest.java
++++ b/logstash-core-event-java/src/test/java/org/logstash/AccessorsTest.java
+@@ -1,5 +1,11 @@
+ package org.logstash;
+ 
++import org.junit.experimental.theories.DataPoint;
++import org.junit.Rule;
++import org.junit.rules.ExpectedException;
++import org.junit.experimental.theories.Theories;
++import org.junit.experimental.theories.Theory;
++import org.junit.runner.RunWith;
+ import org.junit.Test;
+ 
+ import static org.junit.Assert.*;
+@@ -207,4 +213,38 @@ public void testStaleTargetCache() throws Exception {
+         assertEquals(accessors.get("[foo][bar]"), null);
+         assertEquals(accessors.get("[foo]"), "boom");
+     }
++
++    @RunWith(Theories.class)
++    public static class TestListIndexFailureCases {
++      private static final int size = 10;
++
++      @DataPoint
++      public static final int tooLarge = size;
++
++      @DataPoint
++      public static final int tooLarge1 = size+1;
++
++      @DataPoint
++      public static final int tooLargeNegative = -size - 1;
++
++      @Rule
++      public ExpectedException exception = ExpectedException.none();
++
++      @Theory
++      public void testListIndexOutOfBounds(int i) {
++        exception.expect(IndexOutOfBoundsException.class);
++        Accessors.listIndex(i, size);
++      }
++    }
++
++    public static class TestListIndex {
++      public void testListIndexOutOfBounds() {
++        assertEquals(Accessors.listIndex(0, 10), 0);
++        assertEquals(Accessors.listIndex(1, 10), 1);
++        assertEquals(Accessors.listIndex(9, 10), 9);
++        assertEquals(Accessors.listIndex(-1, 10), 9);
++        assertEquals(Accessors.listIndex(-9, 10), 1);
++        assertEquals(Accessors.listIndex(-10, 10), 0);
++      }
++    }
+ }

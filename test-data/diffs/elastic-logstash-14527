@@ -1,0 +1,909 @@
+diff --git a/logstash-core/lib/logstash/api/commands/stats.rb b/logstash-core/lib/logstash/api/commands/stats.rb
+index 0694782516a..6fb3d703649 100644
+--- a/logstash-core/lib/logstash/api/commands/stats.rb
++++ b/logstash-core/lib/logstash/api/commands/stats.rb
+@@ -81,16 +81,6 @@ def events
+           {}
+         end
+ 
+-        def flow
+-          extract_metrics(
+-            [:stats, :flow],
+-            :worker_concurrency, :queue_backpressure, :output_throughput, :filter_throughput, :input_throughput
+-          )
+-        rescue LogStash::Instrument::MetricStore::MetricNotFound
+-          # if the stats/events metrics have not yet been populated, return an empty map
+-          {}
+-        end
+-
+         def pipeline(pipeline_id = nil, opts={})
+           extended_stats = LogStash::Config::PipelinesInfo.format_pipelines_info(
+             service.agent,
+diff --git a/logstash-core/lib/logstash/api/modules/node_stats.rb b/logstash-core/lib/logstash/api/modules/node_stats.rb
+index 2bd017458fc..5f1ffae2ba2 100644
+--- a/logstash-core/lib/logstash/api/modules/node_stats.rb
++++ b/logstash-core/lib/logstash/api/modules/node_stats.rb
+@@ -35,7 +35,6 @@ class NodeStats < ::LogStash::Api::Modules::Base
+             :jvm => jvm_payload,
+             :process => process_payload,
+             :events => events_payload,
+-            :flow => flow_payload,
+             :pipelines => pipeline_payload,
+             :reloads => reloads_payload,
+             :os => os_payload,
+@@ -62,10 +61,6 @@ def events_payload
+           @stats.events
+         end
+ 
+-        def flow_payload
+-          @stats.flow
+-        end
+-
+         def jvm_payload
+           @stats.jvm
+         end
+diff --git a/logstash-core/lib/logstash/config/pipelines_info.rb b/logstash-core/lib/logstash/config/pipelines_info.rb
+index 716460c22bf..ce38306c1b8 100644
+--- a/logstash-core/lib/logstash/config/pipelines_info.rb
++++ b/logstash-core/lib/logstash/config/pipelines_info.rb
+@@ -33,7 +33,6 @@ def self.format_pipelines_info(agent, metric_store, extended_performance_collect
+           "hash" => pipeline.lir.unique_hash,
+           "ephemeral_id" => pipeline.ephemeral_id,
+           "events" => format_pipeline_events(p_stats[:events]),
+-          "flow" => format_pipeline_flow(p_stats[:flow]),
+           "queue" => format_queue_stats(pipeline_id, metric_store),
+           "reloads" => {
+             "successes" => (p_stats.dig(:reloads, :successes)&.value || 0),
+@@ -53,20 +52,6 @@ def self.format_pipeline_events(stats)
+       result
+     end
+ 
+-    def self.format_pipeline_flow(stats, result = {})
+-      (stats || {}).each do |stage, counter|
+-        if counter.class.eql?(Hash)
+-          result[stage.to_s] = {}
+-          (counter || {}).each do |key, value|
+-            result[stage.to_s] = format_pipeline_flow(counter, result[stage.to_s])
+-          end
+-        else
+-          result[stage.to_s] = counter.value
+-        end
+-      end
+-      result
+-    end
+-
+     def self.format_pipeline_vertex_stats(stats, pipeline)
+       return nil unless stats
+       
+diff --git a/logstash-core/spec/logstash/agent/metrics_spec.rb b/logstash-core/spec/logstash/agent/metrics_spec.rb
+index 5e14b007d42..4a7186ff427 100644
+--- a/logstash-core/spec/logstash/agent/metrics_spec.rb
++++ b/logstash-core/spec/logstash/agent/metrics_spec.rb
+@@ -245,14 +245,16 @@ def mhash(*path_elements)
+         # so we try a few times
+         try(20) do
+           expect { mhash(:stats, :pipelines, :main, :events) }.not_to raise_error , "Events pipeline stats should exist"
++          expect { mhash(:stats, :pipelines, :main, :flow) }.not_to raise_error , "Events pipeline stats should exist"
+           expect { mhash(:stats, :pipelines, :main, :plugins) }.not_to raise_error, "Plugins pipeline stats should exist"
+         end
+ 
+         expect(subject.converge_state_and_update.success?).to be_truthy
+ 
+         # We do have to retry here, since stopping a pipeline is a blocking operation
+-        expect { mhash(:stats, :pipelines, :main, :plugins) }.to raise_error
+-        expect { mhash(:stats, :pipelines, :main, :events) }.to raise_error
++        expect { mhash(:stats, :pipelines, :main, :plugins) }.to raise_error LogStash::Instrument::MetricStore::MetricNotFound
++        expect { mhash(:stats, :pipelines, :main, :flow) }.to raise_error LogStash::Instrument::MetricStore::MetricNotFound
++        expect { mhash(:stats, :pipelines, :main, :events) }.to raise_error LogStash::Instrument::MetricStore::MetricNotFound
+       end
+     end
+   end
+diff --git a/logstash-core/spec/logstash/api/commands/stats_spec.rb b/logstash-core/spec/logstash/api/commands/stats_spec.rb
+index 4f6eb30a7df..eed8cdff93d 100644
+--- a/logstash-core/spec/logstash/api/commands/stats_spec.rb
++++ b/logstash-core/spec/logstash/api/commands/stats_spec.rb
+@@ -75,20 +75,6 @@
+     end
+   end
+ 
+-  # TODO: complete test case and run
+-  describe "#metric flows" do
+-    let(:report_method) { :flow }
+-
+-    it "return metric flow information" do
+-      expect(report.keys).to include(
+-                               :input_throughput,
+-                               :output_throughput,
+-                               :filter_throughput,
+-                               :queue_backpressure,
+-                               :worker_concurrency)
+-    end
+-  end
+-
+   describe "#hot_threads" do
+     let(:report_method) { :hot_threads }
+ 
+@@ -158,7 +144,7 @@
+       it "returns information on pipeline" do
+         expect(report[:main].keys).to include(
+           :events,
+-          :flows,
++          :flow,
+           :plugins,
+           :reloads,
+           :queue,
+@@ -177,8 +163,8 @@
+         expect(report[:main][:flow].keys).to include(
+                                                  :output_throughput,
+                                                  :filter_throughput,
+-                                                 :backpressure,
+-                                                 :concurrency,
++                                                 :queue_backpressure,
++                                                 :worker_concurrency,
+                                                  :input_throughput
+                                                )
+       end
+diff --git a/logstash-core/spec/logstash/api/modules/node_stats_spec.rb b/logstash-core/spec/logstash/api/modules/node_stats_spec.rb
+index d776c2bb60b..789be64a9f2 100644
+--- a/logstash-core/spec/logstash/api/modules/node_stats_spec.rb
++++ b/logstash-core/spec/logstash/api/modules/node_stats_spec.rb
+@@ -88,7 +88,7 @@
+         # load_average is not supported on Windows, set it below
+       }
+     },
+-   "pipelines" => {
++    "pipelines" => {
+      "main" => {
+        "events" => {
+          "duration_in_millis" => Numeric,
+@@ -98,26 +98,11 @@
+          "queue_push_duration_in_millis" => Numeric
+        },
+        "flow" => {
+-         "output_throughput" => {
+-           "lifetime" => Numeric,
+-           "current" => Numeric
+-         },
+-         "filter_throughput" => {
+-           "lifetime" => Numeric,
+-           "current" => Numeric
+-         },
+-         "queue_backpressure" => {
+-           "lifetime" => Numeric,
+-           "current" => Numeric
+-         },
+-         "worker_concurrency" => {
+-           "lifetime" => Numeric,
+-           "current" => Numeric
+-         },
+-         "input_throughput" => {
+-           "lifetime" => Numeric,
+-           "current" => Numeric
+-         }
++         "output_throughput" => Hash,
++         "filter_throughput" => Hash,
++         "queue_backpressure" => Hash,
++         "worker_concurrency" => Hash,
++         "input_throughput" => Hash
+        },
+        "plugins" => {
+           "inputs" => Array,
+diff --git a/logstash-core/spec/logstash/instrument/wrapped_write_client_spec.rb b/logstash-core/spec/logstash/instrument/wrapped_write_client_spec.rb
+index efd4ff24007..23301abae57 100644
+--- a/logstash-core/spec/logstash/instrument/wrapped_write_client_spec.rb
++++ b/logstash-core/spec/logstash/instrument/wrapped_write_client_spec.rb
+@@ -110,29 +110,6 @@ def threaded_read_client
+           expect(snapshot_metric[:pipelines][:main][:plugins][:inputs][myid][:events][:queue_push_duration_in_millis].value).to be_kind_of(Integer)
+         end
+       end
+-
+-      context "with flow metrics" do
+-        it "records input throughput metrics" do
+-          expect(snapshot_metric[:flow][:input_throughput][:current].value).to be_kind_of(Numeric)
+-          expect(snapshot_metric[:flow][:input_throughput][:lifetime].value).to be_kind_of(Numeric)
+-        end
+-        it "records output throughput metrics" do
+-          expect(snapshot_metric[:flow][:output_throughput][:current].value).to be_kind_of(Numeric)
+-          expect(snapshot_metric[:flow][:output_throughput][:lifetime].value).to be_kind_of(Numeric)
+-        end
+-        it "records filter throughput metrics" do
+-          expect(snapshot_metric[:flow][:filter_throughput][:current].value).to be_kind_of(Numeric)
+-          expect(snapshot_metric[:flow][:filter_throughput][:lifetime].value).to be_kind_of(Numeric)
+-        end
+-        it "records queue_backpressure metrics" do
+-          expect(snapshot_metric[:flow][:queue_backpressure][:current].value).to be_kind_of(Numeric)
+-          expect(snapshot_metric[:flow][:queue_backpressure][:lifetime].value).to be_kind_of(Numeric)
+-        end
+-        it "records worker_concurrency metrics" do
+-          expect(snapshot_metric[:flow][:worker_concurrency][:current].value).to be_kind_of(Numeric)
+-          expect(snapshot_metric[:flow][:worker_concurrency][:lifetime].value).to be_kind_of(Numeric)
+-        end
+-      end
+     end
+   end
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java b/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
+index e5771f4b7a8..b0fa9ef5b65 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
++++ b/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
+@@ -72,7 +72,6 @@
+ import org.logstash.instrument.metrics.AbstractNamespacedMetricExt;
+ import org.logstash.instrument.metrics.FlowMetric;
+ import org.logstash.instrument.metrics.Metric;
+-import org.logstash.instrument.metrics.MetricKeys;
+ import org.logstash.instrument.metrics.NullMetricExt;
+ import org.logstash.instrument.metrics.UptimeMetric;
+ import org.logstash.instrument.metrics.counter.LongCounter;
+@@ -80,6 +79,8 @@
+ import org.logstash.secret.store.SecretStore;
+ import org.logstash.secret.store.SecretStoreExt;
+ 
++import static org.logstash.instrument.metrics.MetricKeys.*;
++
+ /**
+  * JRuby extension to provide ancestor class for Ruby's Pipeline and JavaPipeline classes.
+  * */
+@@ -96,45 +97,8 @@ public class AbstractPipelineExt extends RubyBasicObject {
+     private static final @SuppressWarnings("rawtypes") RubyArray DATA_NAMESPACE =
+         RubyArray.newArray(RubyUtil.RUBY, RubyUtil.RUBY.newSymbol("data"));
+ 
+-    private static final RubySymbol PAGE_CAPACITY_IN_BYTES =
+-        RubyUtil.RUBY.newSymbol("page_capacity_in_bytes");
+-
+-    private static final RubySymbol MAX_QUEUE_SIZE_IN_BYTES =
+-        RubyUtil.RUBY.newSymbol("max_queue_size_in_bytes");
+-
+-    private static final RubySymbol MAX_QUEUE_UNREAD_EVENTS =
+-        RubyUtil.RUBY.newSymbol("max_unread_events");
+-
+-    private static final RubySymbol QUEUE_SIZE_IN_BYTES =
+-        RubyUtil.RUBY.newSymbol("queue_size_in_bytes");
+-
+-    private static final RubySymbol FREE_SPACE_IN_BYTES =
+-        RubyUtil.RUBY.newSymbol("free_space_in_bytes");
+-
+-    private static final RubySymbol STORAGE_TYPE = RubyUtil.RUBY.newSymbol("storage_type");
+-
+-    private static final RubySymbol PATH = RubyUtil.RUBY.newSymbol("path");
+-
+-    private static final RubySymbol TYPE_KEY = RubyUtil.RUBY.newSymbol("type");
+-
+-    private static final RubySymbol QUEUE_KEY = RubyUtil.RUBY.newSymbol("queue");
+-
+-    private static final RubySymbol DLQ_KEY = RubyUtil.RUBY.newSymbol("dlq");
+-
+-    private static final RubySymbol STORAGE_POLICY =
+-            RubyUtil.RUBY.newSymbol("storage_policy");
+-
+-    private static final RubySymbol DROPPED_EVENTS =
+-            RubyUtil.RUBY.newSymbol("dropped_events");
+-
+-    private static final RubySymbol EXPIRED_EVENTS =
+-            RubyUtil.RUBY.newSymbol("expired_events");
+-
+-    private static final RubySymbol LAST_ERROR =
+-            RubyUtil.RUBY.newSymbol("last_error");
+-
+     private static final @SuppressWarnings("rawtypes") RubyArray EVENTS_METRIC_NAMESPACE = RubyArray.newArray(
+-        RubyUtil.RUBY, new IRubyObject[]{MetricKeys.STATS_KEY, MetricKeys.EVENTS_KEY}
++        RubyUtil.RUBY, new IRubyObject[]{STATS_KEY, EVENTS_KEY}
+     );
+ 
+     @SuppressWarnings("serial")
+@@ -222,7 +186,7 @@ public final AbstractPipelineExt initialize(final ThreadContext context,
+     }
+ 
+     /**
+-     * queue opening needs to happen out of the the initialize method because the
++     * queue opening needs to happen out of the initialize method because the
+      * AbstractPipeline is used for pipeline config validation and the queue
+      * should not be opened for this. This should be called only in the actual
+      * Pipeline/JavaPipeline initialisation.
+@@ -247,8 +211,10 @@ public final IRubyObject openQueue(final ThreadContext context) {
+                 RubyArray.newArray(
+                     context.runtime,
+                     new IRubyObject[]{
+-                        MetricKeys.STATS_KEY, MetricKeys.PIPELINES_KEY,
+-                        pipelineId.convertToString().intern(), MetricKeys.EVENTS_KEY
++                            STATS_KEY,
++                            PIPELINES_KEY,
++                            pipelineId.convertToString().intern(),
++                            EVENTS_KEY
+                     }
+                 )
+             )
+@@ -377,26 +343,32 @@ public final PipelineReporterExt reporter() {
+     public final IRubyObject collectDlqStats(final ThreadContext context) {
+         if (dlqEnabled(context).isTrue()) {
+             getDlqMetric(context).gauge(
+-                context, QUEUE_SIZE_IN_BYTES,
+-                dlqWriter(context).callMethod(context, "get_current_queue_size")
++                    context,
++                    QUEUE_SIZE_IN_BYTES_KEY,
++                    dlqWriter(context).callMethod(context, "get_current_queue_size")
+             );
+             getDlqMetric(context).gauge(
+-                    context, STORAGE_POLICY,
++                    context,
++                    STORAGE_POLICY_KEY,
+                     dlqWriter(context).callMethod(context, "get_storage_policy")
+             );
+             getDlqMetric(context).gauge(
+-                    context, MAX_QUEUE_SIZE_IN_BYTES,
++                    context,
++                    MAX_QUEUE_SIZE_IN_BYTES_KEY,
+                     getSetting(context, "dead_letter_queue.max_bytes").convertToInteger());
+             getDlqMetric(context).gauge(
+-                    context, DROPPED_EVENTS,
++                    context,
++                    DROPPED_EVENTS_KEY,
+                     dlqWriter(context).callMethod(context, "get_dropped_events")
+             );
+             getDlqMetric(context).gauge(
+-                    context, LAST_ERROR,
++                    context,
++                    LAST_ERROR_KEY,
+                     dlqWriter(context).callMethod(context, "get_last_error")
+             );
+             getDlqMetric(context).gauge(
+-                    context, EXPIRED_EVENTS,
++                    context,
++                    EXPIRED_EVENTS_KEY,
+                     dlqWriter(context).callMethod(context, "get_expired_events")
+             );
+         }
+@@ -419,9 +391,12 @@ public final IRubyObject collectStats(final ThreadContext context) throws IOExce
+             context,
+             RubyArray.newArray(
+                 context.runtime,
+-                Arrays.asList(MetricKeys.STATS_KEY, MetricKeys.PIPELINES_KEY, pipelineId.asString().intern(), QUEUE_KEY)
+-            )
+-        );
++                Arrays.asList(
++                        STATS_KEY,
++                        PIPELINES_KEY,
++                        pipelineId.asString().intern(),
++                        QUEUE_KEY)));
++
+         pipelineMetric.gauge(context, TYPE_KEY, getSetting(context, "queue.type"));
+         if (queue instanceof JRubyWrappedAckedQueueExt) {
+             final JRubyAckedQueueExt inner = ((JRubyWrappedAckedQueueExt) queue).rubyGetQueue();
+@@ -429,63 +404,71 @@ public final IRubyObject collectStats(final ThreadContext context) throws IOExce
+             final AbstractNamespacedMetricExt capacityMetrics =
+                 pipelineMetric.namespace(context, CAPACITY_NAMESPACE);
+             capacityMetrics.gauge(
+-                context, PAGE_CAPACITY_IN_BYTES, inner.ruby_page_capacity(context)
++                context, PAGE_CAPACITY_IN_BYTES_KEY, inner.ruby_page_capacity(context)
+             );
+             capacityMetrics.gauge(
+-                context, MAX_QUEUE_SIZE_IN_BYTES, inner.ruby_max_size_in_bytes(context)
++                context, MAX_QUEUE_SIZE_IN_BYTES_KEY, inner.ruby_max_size_in_bytes(context)
+             );
+             capacityMetrics.gauge(
+-                context, MAX_QUEUE_UNREAD_EVENTS, inner.ruby_max_unread_events(context)
++                context, MAX_QUEUE_UNREAD_EVENTS_KEY, inner.ruby_max_unread_events(context)
+             );
+             capacityMetrics.gauge(
+-                context, QUEUE_SIZE_IN_BYTES, inner.ruby_persisted_size_in_bytes(context)
++                context, QUEUE_SIZE_IN_BYTES_KEY, inner.ruby_persisted_size_in_bytes(context)
+             );
+             final AbstractNamespacedMetricExt dataMetrics =
+                 pipelineMetric.namespace(context, DATA_NAMESPACE);
+             final FileStore fileStore = Files.getFileStore(Paths.get(dirPath.asJavaString()));
+             dataMetrics.gauge(
+-                context, FREE_SPACE_IN_BYTES,
++                context,
++                FREE_SPACE_IN_BYTES_KEY,
+                 context.runtime.newFixnum(fileStore.getUnallocatedSpace())
+             );
+-            dataMetrics.gauge(context, STORAGE_TYPE, context.runtime.newString(fileStore.type()));
+-            dataMetrics.gauge(context, PATH, dirPath);
+-            pipelineMetric.gauge(context, MetricKeys.EVENTS_KEY, inner.ruby_unread_count(context));
++            dataMetrics.gauge(context, STORAGE_TYPE_KEY, context.runtime.newString(fileStore.type()));
++            dataMetrics.gauge(context, PATH_KEY, dirPath);
++            pipelineMetric.gauge(context, EVENTS_KEY, inner.ruby_unread_count(context));
+         }
+         return context.nil;
+     }
+ 
+     @JRubyMethod(name = "initialize_flow_metrics")
+     public final IRubyObject initializeFlowMetrics(final ThreadContext context) {
+-        final UptimeMetric uptimeInMillis = initOrGetUptimeMetric(context, buildNamespace(), context.runtime.newSymbol("uptime_in_millis"));
+-        final UptimeMetric uptimeInSeconds = uptimeInMillis.withTimeUnit("uptime_in_seconds", TimeUnit.SECONDS);
++        if (metric.collector(context).isNil()) { return context.nil; }
+ 
+-        final RubySymbol flowKey = context.runtime.newSymbol("flow");
+-        final RubySymbol[] flowNamespace = buildNamespace(flowKey);
++        final UptimeMetric uptimeInMillis = initOrGetUptimeMetric(context, buildNamespace(),
++                RubyUtil.RUBY.newSymbol(UPTIME_IN_MILLIS_KEY.asJavaString()));
++        final UptimeMetric uptimeInSeconds = uptimeInMillis.withTimeUnit(UPTIME_IN_SECONDS_KEY.asJavaString(),
++                TimeUnit.SECONDS);
+ 
+-        final RubySymbol[] eventsNamespace = buildNamespace(MetricKeys.EVENTS_KEY);
++        final RubySymbol[] flowNamespace = buildNamespace(FLOW_KEY);
++        final RubySymbol[] eventsNamespace = buildNamespace(EVENTS_KEY);
+ 
+-        final LongCounter eventsInCounter = initOrGetCounterMetric(context, eventsNamespace, MetricKeys.IN_KEY);
+-        final FlowMetric inputThroughput = new FlowMetric("input_throughput", eventsInCounter, uptimeInSeconds);
++        final LongCounter eventsInCounter = initOrGetCounterMetric(context, eventsNamespace, IN_KEY);
++        final FlowMetric inputThroughput = new FlowMetric(INPUT_THROUGHPUT_KEY.asJavaString(),
++                eventsInCounter, uptimeInSeconds);
+         this.flowMetrics.add(inputThroughput);
+         storeMetric(context, flowNamespace, inputThroughput);
+ 
+-        final LongCounter eventsFilteredCounter = initOrGetCounterMetric(context, eventsNamespace, MetricKeys.FILTERED_KEY);
+-        final FlowMetric filterThroughput = new FlowMetric("filter_throughput", eventsFilteredCounter, uptimeInSeconds);
++        final LongCounter eventsFilteredCounter = initOrGetCounterMetric(context, eventsNamespace, FILTERED_KEY);
++        final FlowMetric filterThroughput = new FlowMetric(FILTER_THROUGHPUT_KEY.asJavaString(),
++                eventsFilteredCounter, uptimeInSeconds);
+         this.flowMetrics.add(filterThroughput);
+         storeMetric(context, flowNamespace, filterThroughput);
+ 
+-        final LongCounter eventsOutCounter = initOrGetCounterMetric(context, eventsNamespace, MetricKeys.OUT_KEY);
+-        final FlowMetric outputThroughput = new FlowMetric("output_throughput", eventsOutCounter, uptimeInSeconds);
++        final LongCounter eventsOutCounter = initOrGetCounterMetric(context, eventsNamespace, OUT_KEY);
++        final FlowMetric outputThroughput = new FlowMetric(OUTPUT_THROUGHPUT_KEY.asJavaString(),
++                eventsOutCounter, uptimeInSeconds);
+         this.flowMetrics.add(outputThroughput);
+         storeMetric(context, flowNamespace, outputThroughput);
+ 
+-        final LongCounter queuePushWaitInMillis = initOrGetCounterMetric(context, eventsNamespace, JRubyWrappedWriteClientExt.PUSH_DURATION_KEY);
+-        final FlowMetric backpressureFlow = new FlowMetric("queue_backpressure", queuePushWaitInMillis, uptimeInMillis);
++        final LongCounter queuePushWaitInMillis = initOrGetCounterMetric(context, eventsNamespace, PUSH_DURATION_KEY);
++        final FlowMetric backpressureFlow = new FlowMetric(QUEUE_BACKPRESSURE_KEY.asJavaString(),
++                queuePushWaitInMillis, uptimeInMillis);
+         this.flowMetrics.add(backpressureFlow);
+         storeMetric(context, flowNamespace, backpressureFlow);
+ 
+-        final LongCounter durationInMillis = initOrGetCounterMetric(context, eventsNamespace, MetricKeys.DURATION_IN_MILLIS_KEY);
+-        final FlowMetric concurrencyFlow = new FlowMetric("worker_concurrency", durationInMillis, uptimeInMillis);
++        final LongCounter durationInMillis = initOrGetCounterMetric(context, eventsNamespace, DURATION_IN_MILLIS_KEY);
++        final FlowMetric concurrencyFlow = new FlowMetric(WORKER_CONCURRENCY_KEY.asJavaString(),
++                durationInMillis, uptimeInMillis);
+         this.flowMetrics.add(concurrencyFlow);
+         storeMetric(context, flowNamespace, concurrencyFlow);
+ 
+@@ -518,7 +501,6 @@ UptimeMetric initOrGetUptimeMetric(final ThreadContext context,
+         return retrievedMetric.toJava(UptimeMetric.class);
+     }
+ 
+-
+     <T> void storeMetric(final ThreadContext context,
+                          final RubySymbol[] subPipelineNamespacePath,
+                          final Metric<T> metric) {
+@@ -532,11 +514,10 @@ <T> void storeMetric(final ThreadContext context,
+         } else {
+             LOGGER.debug(String.format("Flow metric registered: `%s` in namespace `%s`", metricKey, fullNamespace));
+         }
+-
+     }
+ 
+-    RubySymbol[] fullNamespacePath(RubySymbol... subPipelineNamespacePath){
+-        final RubySymbol[] pipelineNamespacePath = new RubySymbol[] { MetricKeys.STATS_KEY, MetricKeys.PIPELINES_KEY, pipelineId.asString().intern() };
++    RubySymbol[] fullNamespacePath(RubySymbol... subPipelineNamespacePath) {
++        final RubySymbol[] pipelineNamespacePath = new RubySymbol[] { STATS_KEY, PIPELINES_KEY, pipelineId.asString().intern() };
+         if (subPipelineNamespacePath.length == 0) {
+             return pipelineNamespacePath;
+         }
+@@ -549,7 +530,6 @@ RubySymbol[] buildNamespace(final RubySymbol... namespace) {
+         return namespace;
+     }
+ 
+-
+     @JRubyMethod(name = "input_queue_client")
+     public final JRubyAbstractQueueWriteClientExt inputQueueClient() {
+         return inputQueueClient;
+@@ -628,11 +608,10 @@ private AbstractNamespacedMetricExt getDlqMetric(final ThreadContext context) {
+                 context, RubyArray.newArray(
+                     context.runtime,
+                     Arrays.asList(
+-                        MetricKeys.STATS_KEY, MetricKeys.PIPELINES_KEY,
+-                        pipelineId.asString().intern(), DLQ_KEY
+-                    )
+-                )
+-            );
++                            STATS_KEY,
++                            PIPELINES_KEY,
++                            pipelineId.asString().intern(),
++                            DLQ_KEY)));
+         }
+         return dlqMetric;
+     }
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JRubyWrappedWriteClientExt.java b/logstash-core/src/main/java/org/logstash/ext/JRubyWrappedWriteClientExt.java
+index ad3e684624a..c12ea262d89 100644
+--- a/logstash-core/src/main/java/org/logstash/ext/JRubyWrappedWriteClientExt.java
++++ b/logstash-core/src/main/java/org/logstash/ext/JRubyWrappedWriteClientExt.java
+@@ -27,7 +27,6 @@
+ import org.jruby.RubyArray;
+ import org.jruby.RubyClass;
+ import org.jruby.RubyObject;
+-import org.jruby.RubySymbol;
+ import org.jruby.anno.JRubyClass;
+ import org.jruby.anno.JRubyMethod;
+ import org.jruby.runtime.ThreadContext;
+@@ -44,18 +43,18 @@ public final class JRubyWrappedWriteClientExt extends RubyObject implements Queu
+ 
+     private static final long serialVersionUID = 1L;
+ 
+-    public static final RubySymbol PUSH_DURATION_KEY =
+-        RubyUtil.RUBY.newSymbol("queue_push_duration_in_millis");
+-
+     private JRubyAbstractQueueWriteClientExt writeClient;
+ 
+     private transient LongCounter eventsMetricsCounter;
++
+     private transient LongCounter eventsMetricsTime;
+ 
+     private transient LongCounter pipelineMetricsCounter;
++
+     private transient LongCounter pipelineMetricsTime;
+ 
+     private transient LongCounter pluginMetricsCounter;
++
+     private transient LongCounter pluginMetricsTime;
+ 
+     public JRubyWrappedWriteClientExt(final Ruby runtime, final RubyClass metaClass) {
+@@ -70,27 +69,44 @@ public JRubyWrappedWriteClientExt initialize(final ThreadContext context,
+     }
+ 
+     public JRubyWrappedWriteClientExt initialize(
+-        final JRubyAbstractQueueWriteClientExt queueWriteClientExt, final String pipelineId,
+-        final AbstractMetricExt metric, final IRubyObject pluginId) {
++        final JRubyAbstractQueueWriteClientExt queueWriteClientExt,
++        final String pipelineId,
++        final AbstractMetricExt metric,
++        final IRubyObject pluginId) {
+         this.writeClient = queueWriteClientExt;
+         // Synchronize on the metric since setting up new fields on it is not threadsafe
+         synchronized (metric) {
+             final AbstractNamespacedMetricExt eventsMetrics =
+-                getMetric(metric, "stats", "events");
++                getMetric(metric,
++                        MetricKeys.STATS_KEY.asJavaString(),
++                        MetricKeys.EVENTS_KEY.asJavaString());
++
+             eventsMetricsCounter = LongCounter.fromRubyBase(eventsMetrics, MetricKeys.IN_KEY);
+-            eventsMetricsTime = LongCounter.fromRubyBase(eventsMetrics, PUSH_DURATION_KEY);
+-            final AbstractNamespacedMetricExt pipelineMetrics =
+-                getMetric(metric, "stats", "pipelines", pipelineId, "events");
+-            pipelineMetricsCounter = LongCounter.fromRubyBase(pipelineMetrics, MetricKeys.IN_KEY);
+-            pipelineMetricsTime = LongCounter.fromRubyBase(pipelineMetrics, PUSH_DURATION_KEY);
++            eventsMetricsTime = LongCounter.fromRubyBase(eventsMetrics, MetricKeys.PUSH_DURATION_KEY);
++
++            final AbstractNamespacedMetricExt pipelineEventMetrics =
++                getMetric(metric,
++                        MetricKeys.STATS_KEY.asJavaString(),
++                        MetricKeys.PIPELINES_KEY.asJavaString(),
++                        pipelineId,
++                        MetricKeys.EVENTS_KEY.asJavaString());
++
++            pipelineMetricsCounter = LongCounter.fromRubyBase(pipelineEventMetrics, MetricKeys.IN_KEY);
++            pipelineMetricsTime = LongCounter.fromRubyBase(pipelineEventMetrics, MetricKeys.PUSH_DURATION_KEY);
++
+             final AbstractNamespacedMetricExt pluginMetrics = getMetric(
+-                metric, "stats", "pipelines", pipelineId, "plugins", "inputs",
+-                pluginId.asJavaString(), "events"
+-            );
++                    metric,
++                    MetricKeys.STATS_KEY.asJavaString(),
++                    MetricKeys.PIPELINES_KEY.asJavaString(),
++                    pipelineId,
++                    MetricKeys.PLUGINS_KEY.asJavaString(),
++                    MetricKeys.INPUTS_KEY.asJavaString(),
++                    pluginId.asJavaString(), MetricKeys.EVENTS_KEY.asJavaString());
+             pluginMetricsCounter =
+                 LongCounter.fromRubyBase(pluginMetrics, MetricKeys.OUT_KEY);
+-            pluginMetricsTime = LongCounter.fromRubyBase(pluginMetrics, PUSH_DURATION_KEY);
++            pluginMetricsTime = LongCounter.fromRubyBase(pluginMetrics, MetricKeys.PUSH_DURATION_KEY);
+         }
++
+         return this;
+     }
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/FlowMetric.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/FlowMetric.java
+index c62c5425862..dbba3079270 100644
+--- a/logstash-core/src/main/java/org/logstash/instrument/metrics/FlowMetric.java
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/FlowMetric.java
+@@ -38,7 +38,7 @@ public void capture() {
+         instant.set(previousHead);
+     }
+ 
+-    public Map<String,Double> getValue() {
++    public Map<String, Double> getValue() {
+         final Capture headCapture = head.get();
+         if (Objects.isNull(headCapture)) {
+             return Map.of();
+@@ -86,6 +86,9 @@ Double calculateRate(final Capture baseline) {
+             final double deltaNumerator = this.numerator.doubleValue() - baseline.numerator.doubleValue();
+             final double deltaDenominator = this.denominator.doubleValue() - baseline.denominator.doubleValue();
+ 
++            // divide-by-zero safeguard
++            if (deltaDenominator == 0.0) { return null; }
++
+             // To prevent the appearance of false-precision, we round to 3 decimal places.
+             return BigDecimal.valueOf(deltaNumerator)
+                     .divide(BigDecimal.valueOf(deltaDenominator), 3, RoundingMode.HALF_UP)
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/MetricKeys.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/MetricKeys.java
+index eb7b6fcc1d2..21e8ca84885 100644
+--- a/logstash-core/src/main/java/org/logstash/instrument/metrics/MetricKeys.java
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/MetricKeys.java
+@@ -39,10 +39,60 @@ private MetricKeys() {
+ 
+     public static final RubySymbol IN_KEY = RubyUtil.RUBY.newSymbol("in");
+ 
+-    public static final RubySymbol DURATION_IN_MILLIS_KEY =
+-        RubyUtil.RUBY.newSymbol("duration_in_millis");
++    public static final RubySymbol PLUGINS_KEY = RubyUtil.RUBY.newSymbol("plugins");
++
++    public static final RubySymbol INPUTS_KEY = RubyUtil.RUBY.newSymbol("inputs");
++
++    public static final RubySymbol DURATION_IN_MILLIS_KEY = RubyUtil.RUBY.newSymbol("duration_in_millis");
++
++    public static final RubySymbol PUSH_DURATION_KEY = RubyUtil.RUBY.newSymbol("queue_push_duration_in_millis");
++
++    public static final RubySymbol PAGE_CAPACITY_IN_BYTES_KEY = RubyUtil.RUBY.newSymbol("page_capacity_in_bytes");
++
++    public static final RubySymbol MAX_QUEUE_SIZE_IN_BYTES_KEY = RubyUtil.RUBY.newSymbol("max_queue_size_in_bytes");
++
++    public static final RubySymbol MAX_QUEUE_UNREAD_EVENTS_KEY = RubyUtil.RUBY.newSymbol("max_unread_events");
++
++    public static final RubySymbol QUEUE_SIZE_IN_BYTES_KEY = RubyUtil.RUBY.newSymbol("queue_size_in_bytes");
++
++    public static final RubySymbol FREE_SPACE_IN_BYTES_KEY = RubyUtil.RUBY.newSymbol("free_space_in_bytes");
++
++    public static final RubySymbol STORAGE_TYPE_KEY = RubyUtil.RUBY.newSymbol("storage_type");
++
++    public static final RubySymbol PATH_KEY = RubyUtil.RUBY.newSymbol("path");
++
++    public static final RubySymbol TYPE_KEY = RubyUtil.RUBY.newSymbol("type");
++
++    public static final RubySymbol QUEUE_KEY = RubyUtil.RUBY.newSymbol("queue");
++
++    public static final RubySymbol DLQ_KEY = RubyUtil.RUBY.newSymbol("dlq");
++
++    public static final RubySymbol STORAGE_POLICY_KEY = RubyUtil.RUBY.newSymbol("storage_policy");
++
++    public static final RubySymbol DROPPED_EVENTS_KEY = RubyUtil.RUBY.newSymbol("dropped_events");
++
++    public static final RubySymbol EXPIRED_EVENTS_KEY = RubyUtil.RUBY.newSymbol("expired_events");
++
++    public static final RubySymbol LAST_ERROR_KEY = RubyUtil.RUBY.newSymbol("last_error");
+ 
+     public static final RubySymbol FILTERED_KEY = RubyUtil.RUBY.newSymbol("filtered");
+ 
+     public static final RubySymbol STATS_KEY = RubyUtil.RUBY.newSymbol("stats");
++
++    // Flow metric keys
++    public static final RubySymbol FLOW_KEY = RubyUtil.RUBY.newSymbol("flow");
++
++    public static final RubySymbol INPUT_THROUGHPUT_KEY = RubyUtil.RUBY.newSymbol("input_throughput");
++
++    public static final RubySymbol OUTPUT_THROUGHPUT_KEY = RubyUtil.RUBY.newSymbol("output_throughput");
++
++    public static final RubySymbol FILTER_THROUGHPUT_KEY = RubyUtil.RUBY.newSymbol("filter_throughput");
++
++    public static final RubySymbol QUEUE_BACKPRESSURE_KEY = RubyUtil.RUBY.newSymbol("queue_backpressure");
++
++    public static final RubySymbol WORKER_CONCURRENCY_KEY = RubyUtil.RUBY.newSymbol("worker_concurrency");
++
++    public static final RubySymbol UPTIME_IN_SECONDS_KEY = RubyUtil.RUBY.newSymbol("uptime_in_seconds");
++
++    public static final RubySymbol UPTIME_IN_MILLIS_KEY = RubyUtil.RUBY.newSymbol("uptime_in_millis");
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/UptimeMetric.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/UptimeMetric.java
+index d01957ef3c4..8f637fdf3de 100644
+--- a/logstash-core/src/main/java/org/logstash/instrument/metrics/UptimeMetric.java
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/UptimeMetric.java
+@@ -19,7 +19,7 @@ public class UptimeMetric extends AbstractMetric<Long> {
+      * Constructs an {@link UptimeMetric} whose name is "uptime_in_millis" and whose units are milliseconds
+      */
+     public UptimeMetric() {
+-        this("uptime_in_millis");
++        this(MetricKeys.UPTIME_IN_MILLIS_KEY.asJavaString());
+     }
+ 
+     public UptimeMetric(final String name) {
+diff --git a/logstash-core/src/main/java/org/logstash/plugins/factory/PluginMetricsFactoryExt.java b/logstash-core/src/main/java/org/logstash/plugins/factory/PluginMetricsFactoryExt.java
+index 339ee7f3f50..e0286a589ac 100644
+--- a/logstash-core/src/main/java/org/logstash/plugins/factory/PluginMetricsFactoryExt.java
++++ b/logstash-core/src/main/java/org/logstash/plugins/factory/PluginMetricsFactoryExt.java
+@@ -21,8 +21,6 @@ public final class PluginMetricsFactoryExt extends RubyBasicObject {
+ 
+     private static final long serialVersionUID = 1L;
+ 
+-    private static final RubySymbol PLUGINS = RubyUtil.RUBY.newSymbol("plugins");
+-
+     private RubySymbol pipelineId;
+ 
+     private AbstractMetricExt metric;
+@@ -49,10 +47,10 @@ AbstractNamespacedMetricExt getRoot(final ThreadContext context) {
+             RubyArray.newArray(
+                 context.runtime,
+                 Arrays.asList(
+-                    MetricKeys.STATS_KEY, MetricKeys.PIPELINES_KEY, pipelineId, PLUGINS
+-                )
+-            )
+-        );
++                        MetricKeys.STATS_KEY,
++                        MetricKeys.PIPELINES_KEY,
++                        pipelineId,
++                        MetricKeys.PLUGINS_KEY)));
+     }
+ 
+     @JRubyMethod
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/compiler/OutputDelegatorTest.java b/logstash-core/src/test/java/org/logstash/config/ir/compiler/OutputDelegatorTest.java
+index a808fec3be8..0c16697bee2 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/compiler/OutputDelegatorTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/compiler/OutputDelegatorTest.java
+@@ -32,6 +32,7 @@
+ import org.junit.Ignore;
+ import org.junit.Test;
+ import org.logstash.Event;
++import org.logstash.instrument.metrics.MetricKeys;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.junit.Assert.assertEquals;
+@@ -202,7 +203,7 @@ private OutputDelegatorExt constructOutputDelegator() {
+     }
+ 
+     private RubyHash getMetricStore() {
+-        return getMetricStore(new String[]{"output", "foo", "events"});
++        return getMetricStore(new String[]{"output", "foo", MetricKeys.EVENTS_KEY.asJavaString()});
+     }
+ 
+     private long getMetricLongValue(String symbolName) {
+diff --git a/logstash-core/src/test/java/org/logstash/instrument/metrics/FlowMetricTest.java b/logstash-core/src/test/java/org/logstash/instrument/metrics/FlowMetricTest.java
+index 901d2e15f81..1652b943f09 100644
+--- a/logstash-core/src/test/java/org/logstash/instrument/metrics/FlowMetricTest.java
++++ b/logstash-core/src/test/java/org/logstash/instrument/metrics/FlowMetricTest.java
+@@ -18,7 +18,7 @@ public class FlowMetricTest {
+     @Test
+     public void testBaselineFunctionality() {
+         final ManualAdvanceClock clock = new ManualAdvanceClock(Instant.now());
+-        final LongCounter numeratorMetric = new LongCounter("events");
++        final LongCounter numeratorMetric = new LongCounter(MetricKeys.EVENTS_KEY.asJavaString());
+         final Metric<Long> denominatorMetric = new UptimeMetric("uptime", TimeUnit.SECONDS, clock::nanoTime);
+         final FlowMetric instance = new FlowMetric("flow", numeratorMetric, denominatorMetric);
+ 
+diff --git a/logstash-core/src/test/java/org/logstash/instrument/metrics/UptimeMetricTest.java b/logstash-core/src/test/java/org/logstash/instrument/metrics/UptimeMetricTest.java
+index a7b7de05f05..2378cba16a2 100644
+--- a/logstash-core/src/test/java/org/logstash/instrument/metrics/UptimeMetricTest.java
++++ b/logstash-core/src/test/java/org/logstash/instrument/metrics/UptimeMetricTest.java
+@@ -13,7 +13,7 @@ public class UptimeMetricTest {
+     @Test
+     public void testDefaultConstructor() {
+         final UptimeMetric defaultConstructorUptimeMetric = new UptimeMetric();
+-        assertEquals("uptime_in_millis", defaultConstructorUptimeMetric.getName());
++        assertEquals(MetricKeys.UPTIME_IN_MILLIS_KEY.asJavaString(), defaultConstructorUptimeMetric.getName());
+         assertEquals(TimeUnit.MILLISECONDS, defaultConstructorUptimeMetric.getTimeUnit());
+     }
+ 
+diff --git a/qa/integration/specs/monitoring_api_spec.rb b/qa/integration/specs/monitoring_api_spec.rb
+index c68c8ec3b85..386bfcfc37e 100644
+--- a/qa/integration/specs/monitoring_api_spec.rb
++++ b/qa/integration/specs/monitoring_api_spec.rb
+@@ -245,6 +245,38 @@
+     logging_get_assert logstash_service, "INFO", "TRACE"
+   end
+ 
++  it "should retrieve the pipeline flow statuses" do
++    logstash_service = @fixture.get_service("logstash")
++    logstash_service.start_with_stdin
++    logstash_service.wait_for_logstash
++    number_of_events.times {
++      logstash_service.write_to_stdin("Testing flow metrics")
++      sleep(1)
++    }
++
++    Stud.try(max_retry.times, [StandardError, RSpec::Expectations::ExpectationNotMetError]) do
++      # node_stats can fail if the stats subsystem isn't ready
++      result = logstash_service.monitoring_api.node_stats rescue nil
++      expect(result).not_to be_nil
++      # we use fetch here since we want failed fetches to raise an exception
++      # and trigger the retry block
++      expect(result).to include('pipelines' => hash_including('main' => hash_including('flow')))
++      flow_status = result.dig("pipelines", "main", "flow")
++      expect(flow_status).to_not be_nil
++      expect(flow_status).to include(
++        # due to three-decimal-place rounding, it is easy for our worker_concurrency and queue_backpressure
++        # to be zero, so we are just looking for these to be _populated_
++        'worker_concurrency' => hash_including('current' => a_value >= 0, 'lifetime' => a_value >= 0),
++        'queue_backpressure' => hash_including('current' => a_value >= 0, 'lifetime' => a_value >= 0),
++        # depending on flow capture interval, our current rate can easily be zero, but our lifetime rates
++        # should be non-zero so long as pipeline uptime is less than ~10 minutes.
++        'input_throughput'   => hash_including('current' => a_value >= 0, 'lifetime' => a_value >  0),
++        'filter_throughput'  => hash_including('current' => a_value >= 0, 'lifetime' => a_value >  0),
++        'output_throughput'  => hash_including('current' => a_value >= 0, 'lifetime' => a_value >  0)
++      )
++    end
++  end
++
+   private
+ 
+   def logging_get_assert(logstash_service, logstash_level, slowlog_level, skip: '')
+diff --git a/qa/integration/specs/reload_config_spec.rb b/qa/integration/specs/reload_config_spec.rb
+index f3f3cdf9a70..71c38e55ef9 100644
+--- a/qa/integration/specs/reload_config_spec.rb
++++ b/qa/integration/specs/reload_config_spec.rb
+@@ -25,6 +25,9 @@
+ require "logstash/util"
+ 
+ describe "Test Logstash service when config reload is enabled" do
++
++  define_negated_matcher :exclude, :include
++
+   before(:all) {
+     @fixture = Fixture.new(__FILE__)
+   }
+@@ -44,6 +47,8 @@
+   let(:initial_config_file) { config_to_temp_file(@fixture.config("initial", { :port => initial_port, :file => output_file1 })) }
+   let(:reload_config_file) { config_to_temp_file(@fixture.config("reload", { :port => reload_port, :file => output_file2 })) }
+ 
++  let(:max_retry) { 30 }
++
+   it "can reload when changes are made to TCP port and grok pattern" do
+     logstash_service = @fixture.get_service("logstash")
+     logstash_service.spawn_logstash("-f", "#{initial_config_file}", "--config.reload.automatic", "true")
+@@ -60,7 +65,13 @@
+     result = logstash_service.monitoring_api.event_stats
+     expect(result["in"]).to eq(1)
+     expect(result["out"]).to eq(1)
+-    
++
++    # make sure the pipeline flow has non-zero input throughput after receiving data
++    Stud.try(max_retry.times, [StandardError, RSpec::Expectations::ExpectationNotMetError]) do
++      pipeline_flow_stats = logstash_service.monitoring_api.pipeline_stats("main")["flow"]
++      expect(pipeline_flow_stats['input_throughput']).to include('lifetime' => (a_value >  0))
++    end
++
+     # do a reload
+     logstash_service.reload_config(initial_config_file, reload_config_file)
+ 
+@@ -69,7 +80,20 @@
+     
+     # make sure old socket is closed
+     expect(is_port_open?(initial_port)).to be false
+-    
++
++    # check pipeline flow metrics. They should be both present and reset.
++    # since we have processed zero events since the reload, we expect their rates to be either unavailable or zero.
++    pipeline_flow_stats = logstash_service.monitoring_api.pipeline_stats("main")["flow"]
++    expect(pipeline_flow_stats).to_not be_nil
++    expect(pipeline_flow_stats).to include('input_throughput', 'queue_backpressure')
++    aggregate_failures do
++      expect(pipeline_flow_stats['input_throughput']).to exclude('lifetime').or(include('lifetime' => 0))
++      expect(pipeline_flow_stats['input_throughput']).to exclude('current').or(include('current' => 0))
++      expect(pipeline_flow_stats['queue_backpressure']).to exclude('lifetime').or(include('lifetime' => 0))
++      expect(pipeline_flow_stats['queue_backpressure']).to exclude('current').or(include('current' => 0))
++    end
++
++    # send data, and wait for at least some of the events to make it through the output.
+     send_data(reload_port, sample_data)
+     Stud.try(retry_attempts.times, RSpec::Expectations::ExpectationNotMetError) do
+       expect(LogStash::Util.blank?(IO.read(output_file2))).to be false
+@@ -84,7 +108,24 @@
+     pipeline_event_stats = logstash_service.monitoring_api.pipeline_stats("main")["events"]
+     expect(pipeline_event_stats["in"]).to eq(1)
+     expect(pipeline_event_stats["out"]).to eq(1)
+-    
++
++    # make sure the pipeline flow has non-zero input/output throughput after receiving data
++    Stud.try(max_retry.times, [StandardError, RSpec::Expectations::ExpectationNotMetError]) do
++      pipeline_flow_stats = logstash_service.monitoring_api.pipeline_stats("main")["flow"]
++      expect(pipeline_flow_stats).to_not be_nil
++      expect(pipeline_flow_stats).to include(
++        # due to three-decimal-place rounding, it is easy for our worker_concurrency and queue_backpressure
++        # to be zero, so we are just looking for these to be _populated_
++        'worker_concurrency' => hash_including('current' => a_value >= 0, 'lifetime' => a_value >= 0),
++        'queue_backpressure' => hash_including('current' => a_value >= 0, 'lifetime' => a_value >= 0),
++        # depending on flow capture interval, our current rate can easily be zero, but our lifetime rates
++        # should be non-zero so long as pipeline uptime is less than ~10 minutes.
++        'input_throughput'   => hash_including('current' => a_value >= 0, 'lifetime' => a_value >  0),
++        'filter_throughput'  => hash_including('current' => a_value >= 0, 'lifetime' => a_value >  0),
++        'output_throughput'  => hash_including('current' => a_value >= 0, 'lifetime' => a_value >  0)
++      )
++    end
++
+     # check reload stats
+     pipeline_reload_stats = logstash_service.monitoring_api.pipeline_stats("main")["reloads"]
+     instance_reload_stats = logstash_service.monitoring_api.node_stats["reloads"]

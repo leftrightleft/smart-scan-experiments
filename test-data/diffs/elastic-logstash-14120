@@ -1,0 +1,1214 @@
+diff --git a/build.gradle b/build.gradle
+index bd325b438e3..f60a1e44bcc 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -51,8 +51,8 @@ allprojects {
+   apply plugin: 'idea'
+   apply plugin: 'java-library'
+ 
+-  project.sourceCompatibility = JavaVersion.VERSION_1_8
+-  project.targetCompatibility = JavaVersion.VERSION_1_8
++  project.sourceCompatibility = JavaVersion.VERSION_11
++  project.targetCompatibility = JavaVersion.VERSION_11
+ 
+   tasks.withType(JavaCompile).configureEach {
+       options.compilerArgs.add("-Xlint:all")
+diff --git a/logstash-core/build.gradle b/logstash-core/build.gradle
+index 1574c64f51d..0528fbaad34 100644
+--- a/logstash-core/build.gradle
++++ b/logstash-core/build.gradle
+@@ -190,4 +190,7 @@ dependencies {
+     testImplementation 'net.javacrumbs.json-unit:json-unit:2.3.0'
+     testImplementation 'org.elasticsearch:securemock:1.2'
+     testImplementation 'org.assertj:assertj-core:3.11.1'
++
++    api group: 'org.apache.httpcomponents', name: 'httpclient', version: '4.5.13'
++    api group: 'org.apache.httpcomponents', name: 'httpcore', version: '4.4.14'
+ }
+diff --git a/logstash-core/lib/logstash/config/mixin.rb b/logstash-core/lib/logstash/config/mixin.rb
+index c4d204025b0..f26c42b7554 100644
+--- a/logstash-core/lib/logstash/config/mixin.rb
++++ b/logstash-core/lib/logstash/config/mixin.rb
+@@ -622,6 +622,15 @@ def validate_value(value, validator)
+             return [false, "Expected a valid field reference, got `#{candidate.inspect}`"] unless org.logstash.FieldReference.isValid(candidate)
+ 
+             return [true, candidate]
++          when :sha_256_hex # since 8.3
++            return [false, "Expected exactly one hex-encoded SHA-256 fingerprint, got `#{value.inspect}`"] unless value.kind_of?(Array) && value.size <= 1
++            return [true, nil] if value.empty? || value.first.nil? || value.first.empty?
++
++            candidate = value.first
++
++            return [false, "Expected a hex-encoded SHA-256 fingerprint, got `#{candidate.inspect}`"] unless candidate.kind_of?(String) && candidate =~ /\A(?:[[:xdigit:]]{2}:?){32}\z/
++
++            return [true, candidate.upcase.tr('^0-9A-F','')]
+           else
+             return false, "Unknown validator symbol #{validator}"
+         end # case validator
+diff --git a/logstash-core/lib/logstash/patches/manticore/trust_strategies.rb b/logstash-core/lib/logstash/patches/manticore/trust_strategies.rb
+new file mode 100644
+index 00000000000..831e8f5265c
+--- /dev/null
++++ b/logstash-core/lib/logstash/patches/manticore/trust_strategies.rb
+@@ -0,0 +1,43 @@
++# encoding: utf-8
++
++require 'manticore'
++
++unless defined?(::Manticore::Client::TrustStrategies)
++  module ManticoreTrustStrategiesBackport
++    # @override
++    def setup_trust_store(ssl_options, context, trust_strategy)
++      if ssl_options.include?(:trust_strategy)
++        trust_strategy = TrustStrategies.combine(trust_strategy, ssl_options.fetch(:trust_strategy))
++      end
++
++      super(ssl_options, context, trust_strategy)
++    end
++
++    module TrustStrategies
++      def self.combine(lhs, rhs)
++        return rhs if lhs.nil?
++        return lhs if rhs.nil?
++
++        Combined.new(lhs, rhs)
++      end
++
++      class Combined
++        include ::Java::OrgApacheHttpConnSSL::TrustStrategy
++
++        def initialize(lhs, rhs)
++          @lhs = lhs
++          @rhs = rhs
++          super()
++        end
++
++        # boolean isTrusted(X509Certificate[] chain, String authType) throws CertificateException;
++        def trusted?(x509_certificate_chain, auth_type)
++          return true if @lhs.trusted?(x509_certificate_chain, auth_type)
++
++          @rhs.trusted?(x509_certificate_chain, auth_type)
++        end
++      end
++    end
++  end
++  ::Manticore::Client.send(:prepend, ManticoreTrustStrategiesBackport)
++end
+\ No newline at end of file
+diff --git a/logstash-core/lib/logstash/plugin.rb b/logstash-core/lib/logstash/plugin.rb
+index 9c4d445dc59..8a73ecdef9d 100644
+--- a/logstash-core/lib/logstash/plugin.rb
++++ b/logstash-core/lib/logstash/plugin.rb
+@@ -19,6 +19,7 @@
+ require "logstash/plugins/ecs_compatibility_support"
+ require "concurrent"
+ require "logstash/plugins/event_factory_support"
++require "logstash/plugins/ca_trusted_fingerprint_support"
+ require "securerandom"
+ 
+ require_relative 'plugin_metadata'
+diff --git a/logstash-core/lib/logstash/plugins/ca_trusted_fingerprint_support.rb b/logstash-core/lib/logstash/plugins/ca_trusted_fingerprint_support.rb
+new file mode 100644
+index 00000000000..542c3fbbdf8
+--- /dev/null
++++ b/logstash-core/lib/logstash/plugins/ca_trusted_fingerprint_support.rb
+@@ -0,0 +1,19 @@
++module LogStash
++  module Plugins
++    module CATrustedFingerprintSupport
++      def self.included(base)
++        fail(ArgumentError) unless base < LogStash::Plugin
++
++        base.config(:ca_trusted_fingerprint, :validate => :sha_256_hex, :list => true)
++      end
++
++      extend LogStash::Util::ThreadSafeAttributes
++
++      lazy_init_attr(:trust_strategy_for_ca_trusted_fingerprint,
++                     variable: :@_trust_strategy_for_ca_trusted_fingerprint) do
++        require 'logstash/patches/manticore/trust_strategies'
++        @ca_trusted_fingerprint && org.logstash.util.CATrustedFingerprintTrustStrategy.new(@ca_trusted_fingerprint)
++      end
++    end
++  end
++end
+diff --git a/logstash-core/spec/logstash/plugins/ca_trusted_fingerprint_support_spec.rb b/logstash-core/spec/logstash/plugins/ca_trusted_fingerprint_support_spec.rb
+new file mode 100644
+index 00000000000..6cadf9e779f
+--- /dev/null
++++ b/logstash-core/spec/logstash/plugins/ca_trusted_fingerprint_support_spec.rb
+@@ -0,0 +1,112 @@
++require "spec_helper"
++
++require "logstash/plugin"
++
++require 'logstash/inputs/base'
++require 'logstash/filters/base'
++require 'logstash/codecs/base'
++require 'logstash/outputs/base'
++
++describe LogStash::Plugins::CATrustedFingerprintSupport do
++
++  let(:ca_trusted_fingerprint_support) { described_class }
++
++  [
++      LogStash::Inputs::Base,
++      LogStash::Filters::Base,
++      LogStash::Codecs::Base,
++      LogStash::Outputs::Base
++  ].each do |base_class|
++
++    context "that inherits from `#{base_class}`" do
++
++      let(:plugin_base_class) { base_class }
++
++      subject(:plugin_class) do
++        Class.new(plugin_base_class) do
++          config_name 'sample'
++
++          include LogStash::Plugins::CATrustedFingerprintSupport
++        end
++      end
++
++      it 'defines a `trust_strategy_for_ca_trusted_fingerprint` method' do
++        expect(plugin_class.method_defined?(:trust_strategy_for_ca_trusted_fingerprint)).to be true
++      end
++
++      let(:options) { Hash.new }
++      let(:plugin) { plugin_class.new(options) }
++
++      context '#initialize' do
++
++        shared_examples 'normalizes fingerprints' do
++          context '#ca_trusted_fingerprint' do
++            it "normalizes to an array of capital hex fingerprints" do
++              expect(plugin.ca_trusted_fingerprint).to eq(normalized)
++            end
++          end
++          context '#trust_strategy_for_ca_trusted_fingerprint' do
++            it 'builds an appropriate trust strategy' do
++              expect(org.logstash.util.CATrustedFingerprintTrustStrategy).to receive(:new).with(normalized).and_call_original
++              expect(plugin.trust_strategy_for_ca_trusted_fingerprint).to be_a_kind_of(org.apache.http.conn.ssl.TrustStrategy)
++            end
++          end
++        end
++
++        shared_examples 'rejects bad input in the usual way' do
++          let(:logger_stub) { double('Logger').as_null_object }
++          before(:each) do
++            allow(plugin_class).to receive(:logger).and_return(logger_stub)
++          end
++          it 'logs helpfully and raises an exception' do
++            expect{plugin}.to raise_exception(LogStash::ConfigurationError)
++            expect(logger_stub).to have_received(:error).with(a_string_including "Expected a hex-encoded SHA-256 fingerprint")
++          end
++        end
++
++        context 'without a `ca_trusted_fingerprint`' do
++          context '#ca_trusted_fingerprint' do
++            it 'returns nil' do
++              expect(plugin.ca_trusted_fingerprint).to be_nil
++            end
++          end
++          context '#trust_strategy_for_ca_trusted_fingerprint' do
++            it 'returns nil' do
++              expect(plugin.trust_strategy_for_ca_trusted_fingerprint).to be_nil
++            end
++          end
++        end
++
++        context 'with a single `ca_trusted_fingerprint`' do
++          let(:options) { super().merge('ca_trusted_fingerprint' => input) }
++          context 'that is valid' do
++            let(:input) { "1b:ad:1d:ea:"*8 }
++            include_examples('normalizes fingerprints') do
++              let(:normalized) { ['1BAD1DEA'*8] }
++            end
++          end
++          context 'that is not valid' do
++            let(:input) { "NOPE" }
++            include_examples('rejects bad input in the usual way')
++          end
++        end
++
++        context 'with multiple `ca_trusted_fingerprint` values' do
++          let(:options) { super().merge('ca_trusted_fingerprint' => input) }
++          context 'that are valid' do
++            let(:input) { ["1b:ad:1d:ea:"*8,'BEefCaB1'*8] }
++            include_examples('normalizes fingerprints') do
++              let(:normalized) { ["1BAD1DEA"*8,"BEEFCAB1"*8] }
++            end
++          end
++          context 'that is not valid' do
++            let(:input) { ["NOPE","1BAD1DEA"*8] }
++
++            include_examples('rejects bad input in the usual way')
++          end
++        end
++      end
++    end
++  end
++
++end
+diff --git a/logstash-core/src/main/java/org/logstash/util/CATrustedFingerprintTrustStrategy.java b/logstash-core/src/main/java/org/logstash/util/CATrustedFingerprintTrustStrategy.java
+new file mode 100644
+index 00000000000..cb3cb54d4f5
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/util/CATrustedFingerprintTrustStrategy.java
+@@ -0,0 +1,137 @@
++package org.logstash.util;
++
++import com.google.common.io.BaseEncoding;
++import org.apache.http.conn.ssl.TrustStrategy;
++
++import java.security.InvalidKeyException;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.security.NoSuchProviderException;
++import java.security.SignatureException;
++import java.security.cert.CertificateException;
++import java.security.cert.X509Certificate;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Date;
++import java.util.Set;
++import java.util.function.Supplier;
++import java.util.stream.Collectors;
++
++public class CATrustedFingerprintTrustStrategy implements TrustStrategy {
++
++    private final Set<Fingerprint> trustedFingerprints;
++    private final Supplier<Date> dateSupplier;
++
++    public CATrustedFingerprintTrustStrategy(final String hexEncodedTrustedFingerprint) {
++        this(hexEncodedTrustedFingerprint, Date::new);
++    }
++
++    public CATrustedFingerprintTrustStrategy(final String hexEncodedTrustedFingerprint, final Supplier<Date> dateSupplier) {
++        this(Set.of(Fingerprint.fromHex(hexEncodedTrustedFingerprint)), dateSupplier);
++    }
++
++    public CATrustedFingerprintTrustStrategy(final Collection<String> hexEncodedTrustedFingerprints) {
++        this(hexEncodedTrustedFingerprints, Date::new);
++    }
++
++    public CATrustedFingerprintTrustStrategy(final Collection<String> hexEncodedTrustedFingerprints, final Supplier<Date> dateSupplier) {
++        this(hexEncodedTrustedFingerprints.stream()
++                .map(Fingerprint::fromHex)
++                .collect(Collectors.toUnmodifiableSet()),
++             dateSupplier);
++    }
++
++    CATrustedFingerprintTrustStrategy(final Set<Fingerprint> trustedFingerprints) {
++        this(trustedFingerprints, Date::new);
++    }
++
++    /**
++     *
++     * @param trustedFingerprints one or more {@link Fingerprint}s
++     * @param dateSupplier a {@link Date} from this {@link Supplier} is used when checking the validitiy of
++     *                     a matching certificate
++     */
++    CATrustedFingerprintTrustStrategy(final Set<Fingerprint> trustedFingerprints, final Supplier<Date> dateSupplier) {
++        this.trustedFingerprints = Set.copyOf(trustedFingerprints);
++        this.dateSupplier = dateSupplier;
++    }
++
++    @Override
++    public boolean isTrusted(X509Certificate[] chain, String authType) throws CertificateException {
++        if (chain.length == 0 || this.trustedFingerprints.isEmpty()) { return false; }
++
++        final MessageDigest sha256Digest = sha256();
++
++        // traverse up the chain until we find one whose fingerprint matches
++        for (int i = 0; i < chain.length; i++) {
++            final X509Certificate currentCandidate = chain[i];
++            final byte[] derEncoding = currentCandidate.getEncoded();
++            Fingerprint candidateFingerprint = new Fingerprint(sha256Digest.digest(derEncoding));
++            if (this.trustedFingerprints.contains(candidateFingerprint)) {
++                final Date currentDate = dateSupplier.get();
++                currentCandidate.checkValidity(currentDate);
++
++                // zip back down the chain and make sure everything is valid
++                for(; i > 0; i--) {
++                    final X509Certificate signer = chain[i];
++                    final X509Certificate signed = chain[i-1];
++
++                    verifyAndValidate(signed, signer, currentDate);
++                }
++                return true;
++            }
++        }
++        return false;
++    }
++
++    private MessageDigest sha256() {
++        try {
++            return MessageDigest.getInstance("SHA-256");
++        } catch (NoSuchAlgorithmException e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    private void verifyAndValidate(final X509Certificate signed, final X509Certificate signer, final Date currentDate) throws CertificateException {
++        try {
++            signed.verify(signer.getPublicKey());
++            signed.checkValidity(currentDate);
++        } catch (SignatureException e) {
++            throw new CertificateException(e);
++        } catch (NoSuchAlgorithmException | InvalidKeyException | NoSuchProviderException e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    private static class Fingerprint {
++        private static final BaseEncoding HEX_ENCODING = BaseEncoding.base16().upperCase();
++
++        static Fingerprint fromHex(final String hexEncodedFingerprint) {
++            try {
++                final byte[] bytes = HEX_ENCODING.decode(hexEncodedFingerprint.toUpperCase());
++                return new Fingerprint(bytes);
++            } catch (Exception e) {
++                throw new IllegalStateException(String.format("BAD INPUT: `%s`", hexEncodedFingerprint), e);
++            }
++        }
++
++        private final byte[] value;
++
++        private Fingerprint(final byte[] fingerprint) {
++            this.value = fingerprint;
++        }
++
++        @Override
++        public boolean equals(Object o) {
++            if (this == o) return true;
++            if (o == null || getClass() != o.getClass()) return false;
++            Fingerprint that = (Fingerprint) o;
++            return Arrays.equals(value, that.value);
++        }
++
++        @Override
++        public int hashCode() {
++            return Arrays.hashCode(value);
++        }
++    }
++}
+diff --git a/logstash-core/src/test/java/org/logstash/util/CATrustedFingerprintTrustStrategyTest.java b/logstash-core/src/test/java/org/logstash/util/CATrustedFingerprintTrustStrategyTest.java
+new file mode 100644
+index 00000000000..08b81894662
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/util/CATrustedFingerprintTrustStrategyTest.java
+@@ -0,0 +1,110 @@
++package org.logstash.util;
++
++import org.junit.Before;
++import org.junit.Test;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import java.security.cert.CertificateException;
++import java.security.cert.CertificateFactory;
++import java.security.cert.X509Certificate;
++import java.text.ParseException;
++import java.text.SimpleDateFormat;
++import java.time.temporal.ChronoUnit;
++import java.util.Date;
++
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++public class CATrustedFingerprintTrustStrategyTest {
++    private static final X509Certificate CERTIFICATE_ROOT = loadX509Certificate("x509_certificates/generated/root.crt");
++    private static final X509Certificate CERTIFICATE_INTERMEDIATE = loadX509Certificate("x509_certificates/generated/intermediate-ca.crt");
++    private static final X509Certificate CERTIFICATE_SERVER = loadX509Certificate("x509_certificates/generated/server_from_intermediate.crt");
++
++    private static final String FINGERPRINT_ROOT = loadFingerprint("x509_certificates/generated/root.der.sha256");
++    private static final String FINGERPRINT_INTERMEDIATE = loadFingerprint("x509_certificates/generated/intermediate-ca.der.sha256");
++    private static final String FINGERPRINT_SERVER = loadFingerprint("x509_certificates/generated/server_from_intermediate.der.sha256");
++
++    private static final Date DATE_CERTS_GENERATION = loadGeneratedDate("x509_certificates/generated/GENERATED_AT");
++    private static final Date DATE_CERTS_VALID = Date.from(DATE_CERTS_GENERATION.toInstant().plus(5, ChronoUnit.MINUTES));
++    private static final Date DATE_CERTS_EXPIRED = Date.from(DATE_CERTS_GENERATION.toInstant().plus(5000, ChronoUnit.DAYS));
++
++    @Before
++    public void puts() {
++        System.out.format("ROOT: `%s` (%s)\n", FINGERPRINT_ROOT, CERTIFICATE_ROOT.getSubjectX500Principal());
++        System.out.format("INTR: `%s` (%s)\n", FINGERPRINT_INTERMEDIATE, CERTIFICATE_INTERMEDIATE.getSubjectX500Principal());
++        System.out.format("SRVR: `%s` (%s)\n", FINGERPRINT_SERVER, CERTIFICATE_SERVER.getSubjectX500Principal());
++    }
++
++    @Test
++    public void testIsTrustedWhenAMatchingValidCertificateIsRootOfTheChain() throws CertificateException {
++        final CATrustedFingerprintTrustStrategy trustStrategy = new CATrustedFingerprintTrustStrategy(FINGERPRINT_ROOT, ()-> DATE_CERTS_VALID);
++        final X509Certificate[] chain = {CERTIFICATE_SERVER, CERTIFICATE_INTERMEDIATE, CERTIFICATE_ROOT};
++
++        assertTrue(trustStrategy.isTrusted(chain, "noop"));
++    }
++
++    @Test
++    public void testIsTrustedWhenAMatchingValidCertificateIsIntermediateOfTheChain() throws CertificateException {
++        final CATrustedFingerprintTrustStrategy trustStrategy = new CATrustedFingerprintTrustStrategy(FINGERPRINT_INTERMEDIATE, ()-> DATE_CERTS_VALID);
++        final X509Certificate[] chain = {CERTIFICATE_SERVER, CERTIFICATE_INTERMEDIATE, CERTIFICATE_ROOT};
++
++        assertTrue(trustStrategy.isTrusted(chain, "noop"));
++    }
++
++    @Test(expected = CertificateException.class)
++    public void testIsTrustedWhenAMatchingExpiredCertificateIsOnTheChain() throws CertificateException {
++        final CATrustedFingerprintTrustStrategy trustStrategy = new CATrustedFingerprintTrustStrategy(FINGERPRINT_ROOT, ()-> DATE_CERTS_EXPIRED);
++        final X509Certificate[] chain = {CERTIFICATE_SERVER, CERTIFICATE_INTERMEDIATE, CERTIFICATE_ROOT};
++
++        trustStrategy.isTrusted(chain, "noop");
++    }
++
++    @Test
++    public void testIsTrustedWhenNoMatchingCertificateIsOnTheChain() throws CertificateException {
++        final CATrustedFingerprintTrustStrategy trustStrategy = new CATrustedFingerprintTrustStrategy("abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea", ()-> DATE_CERTS_VALID);
++        final X509Certificate[] chain = {CERTIFICATE_SERVER, CERTIFICATE_INTERMEDIATE, CERTIFICATE_ROOT};
++
++        assertFalse(trustStrategy.isTrusted(chain, "noop"));
++    }
++
++    @Test(expected = CertificateException.class)
++    public void testIsTrustedWhenDisjointedChainPresented() throws CertificateException {
++        final CATrustedFingerprintTrustStrategy trustStrategy = new CATrustedFingerprintTrustStrategy(FINGERPRINT_ROOT, ()-> DATE_CERTS_VALID);
++        final X509Certificate[] chain = {CERTIFICATE_SERVER, CERTIFICATE_ROOT};
++
++        trustStrategy.isTrusted(chain, "noop");
++    }
++
++    private static InputStream getResource(final String name) {
++        return CATrustedFingerprintTrustStrategyTest.class.getResourceAsStream(name);
++    }
++
++    private static X509Certificate loadX509Certificate(final String name) {
++        try {
++            final CertificateFactory cf = CertificateFactory.getInstance("X.509");
++            return (X509Certificate) cf.generateCertificate(getResource(name));
++        } catch (CertificateException e) {
++            throw new IllegalStateException(String.format("FILE: %s", name), e);
++        }
++    }
++
++    private static String loadFingerprint(final String name) {
++        final InputStream inputStream = getResource(name);
++        try {
++            return new String(inputStream.readAllBytes(), StandardCharsets.UTF_8).trim();
++        } catch (IOException e) {
++            throw new IllegalStateException(String.format("FILE: %s", name), e);
++        }
++    }
++
++    private static Date loadGeneratedDate(final String name) {
++        try {
++            final String generatedDate = new String(getResource(name).readAllBytes(), StandardCharsets.UTF_8);
++            return new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX").parse(generatedDate);
++        } catch (IOException | ParseException e) {
++            throw new IllegalStateException(String.format("FILE: %s", name), e);
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generate.sh b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generate.sh
+new file mode 100755
+index 00000000000..59baddfb255
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generate.sh
+@@ -0,0 +1,51 @@
++# warning: do not use the certificates produced by this tool in production. This is for testing purposes only
++set -e
++
++cd "$(dirname "$0")"
++
++rm -rf generated
++mkdir generated
++cd generated
++
++echo "GENERATED CERTIFICATES FOR TESTING ONLY." >> ./README.txt
++echo "DO NOT USE THESE CERTIFICATES IN PRODUCTION" >> ./README.txt
++
++# certificate authority
++openssl genrsa -out root.key 4096
++openssl req -new -x509 -days 1826 -extensions ca -key root.key -out root.crt -subj "/C=PT/ST=NA/L=Lisbon/O=MyLab/CN=root" -config ../openssl.cnf
++openssl x509 -in root.crt -inform pem -outform der | sha256sum | awk '{print $1}' > root.der.sha256
++
++# intermediate CA
++openssl genrsa -out intermediate-ca.key 4096
++openssl req -new -key intermediate-ca.key -out intermediate-ca.csr -subj "/C=PT/ST=NA/L=Lisbon/O=MyLab/CN=intermediate-ca" -config ../openssl.cnf
++openssl x509 -req -days 1000 -extfile ../openssl.cnf -extensions intermediate_ca -in intermediate-ca.csr -CA root.crt -CAkey root.key -out intermediate-ca.crt -set_serial 01
++openssl x509 -in intermediate-ca.crt -inform pem -outform der | sha256sum | awk '{print $1}' > intermediate-ca.der.sha256
++
++# server certificate from intermediate CA
++openssl genrsa -out server_from_intermediate.key 4096
++openssl req -new -key server_from_intermediate.key -out server_from_intermediate.csr -subj "/C=PT/ST=NA/L=Lisbon/O=MyLab/CN=server" -config ../openssl.cnf
++openssl x509 -req -extensions server_cert -extfile ../openssl.cnf -days 1000 -in server_from_intermediate.csr -CA intermediate-ca.crt -CAkey intermediate-ca.key -set_serial 02 -out server_from_intermediate.crt
++openssl x509 -in server_from_intermediate.crt -inform pem -outform der | sha256sum | awk '{print $1}' > server_from_intermediate.der.sha256
++
++# server certificate from root
++openssl genrsa -out server_from_root.key 4096
++openssl req -new -key server_from_root.key -out server_from_root.csr -subj "/C=PT/ST=NA/L=Lisbon/O=MyLab/CN=server" -config ../openssl.cnf
++openssl x509 -req -extensions server_cert -extfile ../openssl.cnf -days 1000 -in server_from_root.csr -CA root.crt -CAkey root.key -set_serial 03 -out server_from_root.crt
++openssl x509 -in server_from_root.crt -inform pem -outform der | sha256sum | awk '{print $1}'  > server_from_root.der.sha256
++
++# create server chain pems.
++cat intermediate-ca.crt server_from_intermediate.crt > server_from_intermediate.chain.crt
++cat server_from_root.crt > server_from_root.chain.crt
++
++# verify :allthethings
++openssl verify -CAfile root.crt intermediate-ca.crt
++openssl verify -CAfile root.crt server_from_root.crt
++openssl verify -CAfile root.crt -untrusted intermediate-ca.crt server_from_intermediate.crt
++openssl verify -CAfile root.crt server_from_root.chain.crt
++openssl verify -CAfile root.crt server_from_intermediate.chain.crt
++
++# output ISO8601 timestamp to file
++date -Iseconds > GENERATED_AT
++
++# cleanup csr, we don't need them
++rm -rf *.csr
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/GENERATED_AT b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/GENERATED_AT
+new file mode 100644
+index 00000000000..e0e2b16c3e9
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/GENERATED_AT
+@@ -0,0 +1 @@
++2022-05-17T20:07:57+00:00
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/README.txt b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/README.txt
+new file mode 100644
+index 00000000000..e4fa8b79fdb
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/README.txt
+@@ -0,0 +1,2 @@
++GENERATED CERTIFICATES FOR TESTING ONLY.
++DO NOT USE THESE CERTIFICATES IN PRODUCTION
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/intermediate-ca.crt b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/intermediate-ca.crt
+new file mode 100644
+index 00000000000..236feff5681
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/intermediate-ca.crt
+@@ -0,0 +1,32 @@
++-----BEGIN CERTIFICATE-----
++MIIFgDCCA2igAwIBAgIBATANBgkqhkiG9w0BAQUFADBKMQswCQYDVQQGEwJQVDEL
++MAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxDTAL
++BgNVBAMMBHJvb3QwHhcNMjIwNTE3MjAwNzU1WhcNMjUwMjEwMjAwNzU1WjBVMQsw
++CQYDVQQGEwJQVDELMAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UE
++CgwFTXlMYWIxGDAWBgNVBAMMD2ludGVybWVkaWF0ZS1jYTCCAiIwDQYJKoZIhvcN
++AQEBBQADggIPADCCAgoCggIBANUt3f0Jfn8LWBGklt/jzuseLGbkZqFDwGX+hbCQ
++MSKKyL/5GRKCP8iMfBntISGtOWbF+3rQvNXi91Oj9ZEWVR/CWLae/zezSKZOiEaX
++VZow8g3I1K3WZBfvBmoO8kQTaux600LjCcJksEDsjTdiwtL4Cng+MHNpWve9Hh1D
++IquTISpHbGC/5Uyqq3Fw0bEM715QfyWqfjZnD9TZdu+u3SNM/RRbKK3Fe5govOom
++nj2bhfikBurlj8KpvVS8/HmXTkNeOMHmzrwEGSeeU1/Mmo88qGzM55HRA3DPqn78
++Hh02otlceEhKopTTG9nDOa6i8lRtNOTzGq+/CSdZ2ERpG5gVC25Meeio2m8v6iXQ
++I4SuGsMVzsNgk1pCsnKn6xpFPsjHNC4ITY2Lr+j66Sbp7vU8GqUX8e6w1y4hGAyj
++Yia313/b7HMxCHvxL/PJrw0sF635Q/DYif3zrywFzPVHKfwg4IdSALtQggaRFuXB
++siF+XX5X3xTKv1rNCXeNaxbx24jXKhd7v/GV1oG5M3pluj43u9+QvxZ+WOWpoGdc
++EVOPi/82hPyl0Cq/z5zNEOkuaqDTolAHEifbWXF9sKq22D9fT2ogz2omFgT63Qhj
++/XnHfLjYSwnQStyiOxGrUmcYfBHHM/OchAMKFH1+/IXZsyYmFBXreyk+dSejxZBB
++SgfPAgMBAAGjZjBkMB0GA1UdDgQWBBQYyP9goG/0xiQSOLAqF5OqBfL0hjAfBgNV
++HSMEGDAWgBTZKG+SIPcMoSX0oibvlgtOoQnGnjASBgNVHRMBAf8ECDAGAQH/AgEA
++MA4GA1UdDwEB/wQEAwIBhjANBgkqhkiG9w0BAQUFAAOCAgEAVAeVrYH6p12N9cPf
++VtUgTSpZ619fifNpTRbXpdVxEVZfinZ6+6hNy5jIg4wL+8nbD8OmpVPWgxYcEWTt
++yer2B6hh2D+P9XkIChJ2OF+TiZ0dBpnMNk04Uzoty9eu/PzRq4ZSJSTApzFnO6ZZ
++o2yDlpBmeAWxldj8t12732AFSJ+WxXrP+QSHeJQDNNG/rPr+mkrq9uveFpb2+zKg
++hkyy2AZAIqEoj+U+E83kxl4kchNbjatiaq9wVYLChpYPAY1sUgMRE5g+82R3R3Ak
++Km33dWgKRDSu0A/p2WS4xDm7Jh5nB76Py9VxYqX0boP+1X+XiDgHaxbfizD+xs23
++D1T1Mppxciw4TNtiCsCeS+vUnv0RAic1FNAL7n+DgY5ImeWFQeO4HFof2aQ3pnIp
++iRDWS68lgy2Fd5iHPZSSUBC5/QW59u7n9KiRO5CVCmA2AMx0fCL6t7SQ6lKhr6Cw
++KqgzTWQmIfaOAcm2ARUofW4fXdQi0hIxuzx0rn81B1bL1Ktzj30VraQK1KiR3Tx3
++udunxqjTuWWyKu00dCLPNRfGyM/W+DWxjYvZF9JHB292aaa4riCoOtySZ0WwsNqU
++qLjN9pRXtWpe03LQgylK4o9KqAmaR7nAGCr2icqVSiY0W3U02+j+dhi4FfIUBA8W
++wDjYHXJ545BUr7lkujJ24tO8tBE=
++-----END CERTIFICATE-----
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/intermediate-ca.der.sha256 b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/intermediate-ca.der.sha256
+new file mode 100644
+index 00000000000..636f7ef8506
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/intermediate-ca.der.sha256
+@@ -0,0 +1 @@
++dfb69ff77651063393dc3e77423382390a3c21859253457259f6a637a2515cda
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/intermediate-ca.key b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/intermediate-ca.key
+new file mode 100644
+index 00000000000..c37b848b8e7
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/intermediate-ca.key
+@@ -0,0 +1,51 @@
++-----BEGIN RSA PRIVATE KEY-----
++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
++-----END RSA PRIVATE KEY-----
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/root.crt b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/root.crt
+new file mode 100644
+index 00000000000..bf5dce052b5
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/root.crt
+@@ -0,0 +1,32 @@
++-----BEGIN CERTIFICATE-----
++MIIFejCCA2KgAwIBAgIJAPoiDTMR74nBMA0GCSqGSIb3DQEBCwUAMEoxCzAJBgNV
++BAYTAlBUMQswCQYDVQQIDAJOQTEPMA0GA1UEBwwGTGlzYm9uMQ4wDAYDVQQKDAVN
++eUxhYjENMAsGA1UEAwwEcm9vdDAeFw0yMjA1MTcyMDA3NTRaFw0yNzA1MTcyMDA3
++NTRaMEoxCzAJBgNVBAYTAlBUMQswCQYDVQQIDAJOQTEPMA0GA1UEBwwGTGlzYm9u
++MQ4wDAYDVQQKDAVNeUxhYjENMAsGA1UEAwwEcm9vdDCCAiIwDQYJKoZIhvcNAQEB
++BQADggIPADCCAgoCggIBAPMU1j0wYpZhsqlqtzJr3aba6wEFqU3G77Ul2tkW80VL
++r3+e86Nz8sw55Qa5lMejR/5Qbc8ssR4jNDG8qBMHL8Tugyj+TLFz+sxExIjEt0kD
++2v9wxITTucP74oxe7onW+w1+XNkGXKbY1+HxhVxGCR3XQxYum7ecfgWdx4E6WXOj
++04+l5SpWYUEb2bwOdiDOChe59v5ARKapNlaSkOxRAHMNfAcs2zw6UDK62Gry3YJZ
++P3XE+95TR6JxIVUgYvM8Iu/4hdhnOijt/Q4v8LdyhVVi9gtukat6y6EVnWiconWe
++56Rx97paMxkE0GcrWZki60UT5dBmZrt6VxEl1mHUgaUqdV2HVlH50xkBdTfKfcfg
++Xi54WbfETrmmZHtYCu0uCbjPruXHyt9Rgljl0kD5+A/ee+A8TJsjIOvaUhywLnqK
++cEkhtbjIfRhzvepHJ4kKu7OVqJOjZxLcSlsjIWkXXty66tsXx/KmY4f53EkSBEGL
++36h/bKa3UfX4uKr9jEdfxrNPWwQ5AVBVurdHZe5tQ/Ybt5g7QaDqETod8bomqK0Q
++fgiBmbo/NQTfCh8bWfplmWvGIFTqVd2OfC4z1NQvX94opzxd3RrgqjcEh8pU9YLA
++H0TNYvW04fOH6wBkOzU8TZElq7kfBRRupvp4TpMAKn/ULyGaDbjzmepfQ4asAyG1
++AgMBAAGjYzBhMB0GA1UdDgQWBBTZKG+SIPcMoSX0oibvlgtOoQnGnjAfBgNVHSME
++GDAWgBTZKG+SIPcMoSX0oibvlgtOoQnGnjAPBgNVHRMBAf8EBTADAQH/MA4GA1Ud
++DwEB/wQEAwIBhjANBgkqhkiG9w0BAQsFAAOCAgEAAKONXFVQlB0To5BTBF5oF0FW
++6lNRFgMNma85xVu6qcZHcm7CsOlyHAaMgwRrilxOlPP6adgCLafu7lFtSE4+XNRA
++HP0RTFGGVUM89VNYPo3OIDh3fYBgR+JlEuOqRMPBO65XyYSqDL32UHPPhMX90D5e
++KY5jyT7NTLT3AhapIGVOpJBosItf8XwzGCElAnywmupgZ3zRg9BA2YojizpNQgv/
++xnXiouDvTDoPYvMlUFgM9g4AsdXJ2quwx+cXNryqISMAp8QB/mMXLREv5oWNk2v7
++N6FMYv57yZp4VO1ACYEZk5H/6aA4yhKoy/t+bIXvVPW94NwWB/KTH3NYPCWPt0pN
++lGITyWovH+Hp5aUjWBXfFZd4THh2pdUoq9JynH+l/fI5tj1r7YyDYRioGLgDMM7O
++8Gl/BxiZ8329Hh/BC+03CMQYW0/98XEkRJS5Vo55IEf5efY6K5n5JM6XWuqh0NxZ
++J0FUnvdLsJ0X2jQYzYBq6onTJO75WI/FkdT8Ir8Jl+3IXSsKdeLc1k5sjQHBUccE
++JUa/qJPPS3rdZEvBrL+SxrPoxXNTpNYOQJE6QaEDYs0yXozj/0OQCAUGYdK/fY4u
++9HeyVweix9u9axqGZVFlgSMuxEwOs5QFtgoEKHAaHibLcZlzaPW7Yupz74Z4Xd8c
++mylbGbi2vUDX2qibwLo=
++-----END CERTIFICATE-----
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/root.der.sha256 b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/root.der.sha256
+new file mode 100644
+index 00000000000..375a9ae774e
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/root.der.sha256
+@@ -0,0 +1 @@
++3700208913f1b4955cf4df3cfcd241a5d98c00131966da6a78fe70532c22696c
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/root.key b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/root.key
+new file mode 100644
+index 00000000000..223f7bbb4c5
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/root.key
+@@ -0,0 +1,51 @@
++-----BEGIN RSA PRIVATE KEY-----
++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
++-----END RSA PRIVATE KEY-----
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_intermediate.chain.crt b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_intermediate.chain.crt
+new file mode 100644
+index 00000000000..df220bbaad5
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_intermediate.chain.crt
+@@ -0,0 +1,68 @@
++-----BEGIN CERTIFICATE-----
++MIIFgDCCA2igAwIBAgIBATANBgkqhkiG9w0BAQUFADBKMQswCQYDVQQGEwJQVDEL
++MAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxDTAL
++BgNVBAMMBHJvb3QwHhcNMjIwNTE3MjAwNzU1WhcNMjUwMjEwMjAwNzU1WjBVMQsw
++CQYDVQQGEwJQVDELMAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UE
++CgwFTXlMYWIxGDAWBgNVBAMMD2ludGVybWVkaWF0ZS1jYTCCAiIwDQYJKoZIhvcN
++AQEBBQADggIPADCCAgoCggIBANUt3f0Jfn8LWBGklt/jzuseLGbkZqFDwGX+hbCQ
++MSKKyL/5GRKCP8iMfBntISGtOWbF+3rQvNXi91Oj9ZEWVR/CWLae/zezSKZOiEaX
++VZow8g3I1K3WZBfvBmoO8kQTaux600LjCcJksEDsjTdiwtL4Cng+MHNpWve9Hh1D
++IquTISpHbGC/5Uyqq3Fw0bEM715QfyWqfjZnD9TZdu+u3SNM/RRbKK3Fe5govOom
++nj2bhfikBurlj8KpvVS8/HmXTkNeOMHmzrwEGSeeU1/Mmo88qGzM55HRA3DPqn78
++Hh02otlceEhKopTTG9nDOa6i8lRtNOTzGq+/CSdZ2ERpG5gVC25Meeio2m8v6iXQ
++I4SuGsMVzsNgk1pCsnKn6xpFPsjHNC4ITY2Lr+j66Sbp7vU8GqUX8e6w1y4hGAyj
++Yia313/b7HMxCHvxL/PJrw0sF635Q/DYif3zrywFzPVHKfwg4IdSALtQggaRFuXB
++siF+XX5X3xTKv1rNCXeNaxbx24jXKhd7v/GV1oG5M3pluj43u9+QvxZ+WOWpoGdc
++EVOPi/82hPyl0Cq/z5zNEOkuaqDTolAHEifbWXF9sKq22D9fT2ogz2omFgT63Qhj
++/XnHfLjYSwnQStyiOxGrUmcYfBHHM/OchAMKFH1+/IXZsyYmFBXreyk+dSejxZBB
++SgfPAgMBAAGjZjBkMB0GA1UdDgQWBBQYyP9goG/0xiQSOLAqF5OqBfL0hjAfBgNV
++HSMEGDAWgBTZKG+SIPcMoSX0oibvlgtOoQnGnjASBgNVHRMBAf8ECDAGAQH/AgEA
++MA4GA1UdDwEB/wQEAwIBhjANBgkqhkiG9w0BAQUFAAOCAgEAVAeVrYH6p12N9cPf
++VtUgTSpZ619fifNpTRbXpdVxEVZfinZ6+6hNy5jIg4wL+8nbD8OmpVPWgxYcEWTt
++yer2B6hh2D+P9XkIChJ2OF+TiZ0dBpnMNk04Uzoty9eu/PzRq4ZSJSTApzFnO6ZZ
++o2yDlpBmeAWxldj8t12732AFSJ+WxXrP+QSHeJQDNNG/rPr+mkrq9uveFpb2+zKg
++hkyy2AZAIqEoj+U+E83kxl4kchNbjatiaq9wVYLChpYPAY1sUgMRE5g+82R3R3Ak
++Km33dWgKRDSu0A/p2WS4xDm7Jh5nB76Py9VxYqX0boP+1X+XiDgHaxbfizD+xs23
++D1T1Mppxciw4TNtiCsCeS+vUnv0RAic1FNAL7n+DgY5ImeWFQeO4HFof2aQ3pnIp
++iRDWS68lgy2Fd5iHPZSSUBC5/QW59u7n9KiRO5CVCmA2AMx0fCL6t7SQ6lKhr6Cw
++KqgzTWQmIfaOAcm2ARUofW4fXdQi0hIxuzx0rn81B1bL1Ktzj30VraQK1KiR3Tx3
++udunxqjTuWWyKu00dCLPNRfGyM/W+DWxjYvZF9JHB292aaa4riCoOtySZ0WwsNqU
++qLjN9pRXtWpe03LQgylK4o9KqAmaR7nAGCr2icqVSiY0W3U02+j+dhi4FfIUBA8W
++wDjYHXJ545BUr7lkujJ24tO8tBE=
++-----END CERTIFICATE-----
++-----BEGIN CERTIFICATE-----
++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
++-----END CERTIFICATE-----
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_intermediate.crt b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_intermediate.crt
+new file mode 100644
+index 00000000000..b7fd7724bd5
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_intermediate.crt
+@@ -0,0 +1,36 @@
++-----BEGIN CERTIFICATE-----
++MIIGSTCCBDGgAwIBAgIBAjANBgkqhkiG9w0BAQUFADBVMQswCQYDVQQGEwJQVDEL
++MAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxGDAW
++BgNVBAMMD2ludGVybWVkaWF0ZS1jYTAeFw0yMjA1MTcyMDA3NTVaFw0yNTAyMTAy
++MDA3NTVaMEwxCzAJBgNVBAYTAlBUMQswCQYDVQQIDAJOQTEPMA0GA1UEBwwGTGlz
++Ym9uMQ4wDAYDVQQKDAVNeUxhYjEPMA0GA1UEAwwGc2VydmVyMIICIjANBgkqhkiG
++9w0BAQEFAAOCAg8AMIICCgKCAgEA3H9kFpqEFrdMDsF+SkaZIheXBaZFVW7QZuZI
++Du2dQL5mKN6rO/XAc5GBXR/z/XfZRKlH22fCzoWGJzJEsQ4GX8Ztl5CNMBWc2WCJ
++dWY/YALRGLLbL4fQkzZe3MaKZ6jFLk7acd2cYGX53R5He8XhxUC8Z0b7OlVe0/hP
++R6QgB/+xyfWwndqsvEjbECbhdjDydM43ruPaeWDXeFFFXLs+t89bChc7PjDOQK35
++RmnPC8M6ddDewTSNH1GhzPSnsnoLlpaAsGfcU3Iik/VNhx6QYZZeojH57mWPaFUN
++skIZXzo41TNpb1SzYT8LkuxVkFV2ifCCoFgCU0xBMu1LvAzaPdiJIhzU7Sg87gxF
++K57lT5EamO4ezg0M415nXbwRNArZ+5674FAjxeBEojAuXw+4K8NvmLtckddG+uwc
++cOw/mqZxm1G4sTP0e0ve/JA+PRNznTBKnLRdPFPQkWBiDpB2fyWHWKSoXugPNApm
++CrysSjptIGvzyPVGSTc1WpATaOELub9kpolJtcI7VFYIu923MHRpKTNktKgcHo/L
++xg51oIIGvctPWQc/tur2pCEL3ohFtxeQwnX9PaaVwc2/c8n2VL8WKXQrLAifILcB
+++NZhtaZswXja4pA4CKAC0PURgHJrtSDHVgKr/1SvNLH0rvTdbqlmNda5wzYRjYj+
++7wcxgekCAwEAAaOCASswggEnMAkGA1UdEwQCMAAwEQYJYIZIAYb4QgEBBAQDAgZA
++MDMGCWCGSAGG+EIBDQQmFiRPcGVuU1NMIEdlbmVyYXRlZCBTZXJ2ZXIgQ2VydGlm
++aWNhdGUwHQYDVR0OBBYEFGQFgN29vgmD/5PDU8NTa5i29O6cMHIGA1UdIwRrMGmA
++FBjI/2Cgb/TGJBI4sCoXk6oF8vSGoU6kTDBKMQswCQYDVQQGEwJQVDELMAkGA1UE
++CAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxDTALBgNVBAMM
++BHJvb3SCAQEwDgYDVR0PAQH/BAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMBoG
++A1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQUFAAOCAgEABFfy
++fmp5yQUUHXu4LZTndGXgbmexLqsH6HjDL/MarRihjlPTcBJxjxvA1R6xEs3lQ21b
++DWFNA/t+hl53+hcG6A6+/Q1l64shP2N4mXmPjHJW1ctYeCU6SzaUGw1vshRw51w/
++IIC8Cd0hpksRXzJOJi8qH1pG4D0zgXUuWjN6LKolDrJ/sY9uJDXQAw4xYhjhWchQ
++S44WHQjrM2qlqq6I2nVm8rHcz+LqrpKBxe0gVXpHUFv/xX65se7VRIamXQFsrFvt
++17edQrjjU8asDOypNFNUfh8VLscNtkXLU6jNZmkmHeOQAJkB8L7Nx+kqiidjhOJq
++rRa4mqTZYgMIQ4IW9yyxRmbjWV1dpkg5hOX+GyEEWYlJM5b0TSTsrE5c/NSedKoO
++27866ih/WNvbtHJ6cTyBLG9dZA8kLDWnYFTTMRL2zjbrYCz32ftx6IjxjJ4ZyTLX
++zHj79FfBuha6fCPAE76u1qyJuL9yK5HULnPGRJ0MDwx1r7XLVsuV4FYnXMA9vijT
++PhZmWaUp9f6HiuTGR/Fk9ga+TCr7vL8/RYumfb7Z2i6GrJz4tACfuJSeSfMB6E/h
++hCtxHXGnkqKnpxw/+99jo8Gf4EhAhxoXdbCv7Q95WqAjbPnK0hboadn5U/J7ELbd
++5GqVUDvupKTC/6Z1iACH9Nn0LymPLrbwskWfB3o=
++-----END CERTIFICATE-----
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_intermediate.der.sha256 b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_intermediate.der.sha256
+new file mode 100644
+index 00000000000..99ba032a432
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_intermediate.der.sha256
+@@ -0,0 +1 @@
++ddf798cd453f19ee4300c4e4ac1f56b897ebbd9853f406d1947419b0e0fb91b2
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_intermediate.key b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_intermediate.key
+new file mode 100644
+index 00000000000..0f57ae9b446
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_intermediate.key
+@@ -0,0 +1,51 @@
++-----BEGIN RSA PRIVATE KEY-----
++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
++-----END RSA PRIVATE KEY-----
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_root.chain.crt b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_root.chain.crt
+new file mode 100644
+index 00000000000..fc96342f3ff
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_root.chain.crt
+@@ -0,0 +1,36 @@
++-----BEGIN CERTIFICATE-----
++MIIGRjCCBC6gAwIBAgIBAzANBgkqhkiG9w0BAQUFADBKMQswCQYDVQQGEwJQVDEL
++MAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxDTAL
++BgNVBAMMBHJvb3QwHhcNMjIwNTE3MjAwNzU3WhcNMjUwMjEwMjAwNzU3WjBMMQsw
++CQYDVQQGEwJQVDELMAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UE
++CgwFTXlMYWIxDzANBgNVBAMMBnNlcnZlcjCCAiIwDQYJKoZIhvcNAQEBBQADggIP
++ADCCAgoCggIBANCH7xGzfyrjlsSEphVulAv5KyDfjnvWhN0SsbkLiO3w7sTOCaDQ
++0yAyLnpkkNPuqb3RkBhJA6exK4b2AaEO+L6fWaxB2Uto1INzy+Mdq5QTFjC1Ze6K
++i9M8pKeXt/cqWBx61hBaS7sj1T8znr4qeCc5BGa2OJuos+Y+fYcnL4QyG9FJqx6C
++NG840vhOdwPIRgEfRiX4ia0NkqFBtCbVGOLLUbAwqYqZFKS7NmZkejUxq7n2hQle
++Q/OHEmzNAZaqAQbZHwIzIDsqqbxYUHkcWue7H2nNt/KYhBbuAN7/ZsuOYklju9TH
++6L1R6utmSWyCakHWY2+wYNIMYam89lsXWKul6gDIxwLgnHiE8X0qyZ/K5MIoY16K
++lD4RxuPwlg1EIj5QZ1Po4wPfzSkv9gGJF/MxYQxTy8n+TrSg7q6uN4GrWRJFXpMg
++PAuHLcg+oxOIrraPcliPNyKh4vNVnXRdVLOhEnb9RL2DZGdzmQFD+dJmKitxRrNV
++RAMZ3IgCfxr5jTXAhOxpY+aPI+tdixsLHL+ESwcQ4kcaazhM06Tw2B/wRqsr8+xN
++ObpaD+kzybl5XYd/y3zTYKsxDEyeIIBg/uGhk1V84zYIGxYTdZEYzenKKi+OnhEI
++fu0eG7hTY5WT4hxFecbsWw3OYrCNJUxp2OlEQ/kwHUc5+kXcmW0Z6Fc1AgMBAAGj
++ggEzMIIBLzAJBgNVHRMEAjAAMBEGCWCGSAGG+EIBAQQEAwIGQDAzBglghkgBhvhC
++AQ0EJhYkT3BlblNTTCBHZW5lcmF0ZWQgU2VydmVyIENlcnRpZmljYXRlMB0GA1Ud
++DgQWBBT6GmW3MZKpAOVt5yVI2DrpnPsSYTB6BgNVHSMEczBxgBTZKG+SIPcMoSX0
++oibvlgtOoQnGnqFOpEwwSjELMAkGA1UEBhMCUFQxCzAJBgNVBAgMAk5BMQ8wDQYD
++VQQHDAZMaXNib24xDjAMBgNVBAoMBU15TGFiMQ0wCwYDVQQDDARyb290ggkA+iIN
++MxHvicEwDgYDVR0PAQH/BAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMBoGA1Ud
++EQQTMBGCCWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQUFAAOCAgEAxwH91Q4r
++1JJNTF/XyeXGc8nmeBFtdbs3W8TvfF/3sEqPUQZSl+IWejaGw3USc9S0NV8PGQVz
++qHOLVJfiLtTSGukaIwOAtTfIRSHmLMD8adtdxtmaNB0IfmMBrKgC0D+Sv5iA4HFG
++d20ExeTamJtk4XVnWb9yAd333GYSpRi/IvYjy2U+5NL/9r0G+esLTt4VQG84g+ec
++IWitlFqEhyhX2ioYoMC1cYIkeAm8AirQjNCqAyM/pMLWpogLtooRMIZbfLSqtNXY
++paP328hum5s98JpjPaNqOClRmewUjLBPDzrgHX422j+gkhd9GnhfKLVe9X6AVnki
++poaPh3TWry28o8dMspxBn5EtJEdb64N4aSdrJxiU2TqKy1TM8dRBmDcvkamt5Lvj
++2VlT2Xz2SlYTKL4HA8XlJcOqm0EN5OymNvnbS/5Ydh45EQA9ZtMmlSWlqw73kT/O
++/QVoIDfUboGTuL3YYxD+NAneYF6ed2ZAaAbYrm3iM9ZV1LP/qcle2A2g34uSvkXb
++iWTgPCJvmqrKg5WUY4DWUaHQY4XifhNU9FXi+WX2KyyTpY9yNxMlBrg8RbVZ2HC8
++3PEEjIYZkJPwxWEfcEdd4pkNpLsKH3EivDvze7ZPe2yWQ/+njZykp/RouwZ55+nc
++NE/tbmPF1WCC9FcXlnrgYq5WcQ2PFr/t/ko=
++-----END CERTIFICATE-----
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_root.crt b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_root.crt
+new file mode 100644
+index 00000000000..fc96342f3ff
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_root.crt
+@@ -0,0 +1,36 @@
++-----BEGIN CERTIFICATE-----
++MIIGRjCCBC6gAwIBAgIBAzANBgkqhkiG9w0BAQUFADBKMQswCQYDVQQGEwJQVDEL
++MAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxDTAL
++BgNVBAMMBHJvb3QwHhcNMjIwNTE3MjAwNzU3WhcNMjUwMjEwMjAwNzU3WjBMMQsw
++CQYDVQQGEwJQVDELMAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UE
++CgwFTXlMYWIxDzANBgNVBAMMBnNlcnZlcjCCAiIwDQYJKoZIhvcNAQEBBQADggIP
++ADCCAgoCggIBANCH7xGzfyrjlsSEphVulAv5KyDfjnvWhN0SsbkLiO3w7sTOCaDQ
++0yAyLnpkkNPuqb3RkBhJA6exK4b2AaEO+L6fWaxB2Uto1INzy+Mdq5QTFjC1Ze6K
++i9M8pKeXt/cqWBx61hBaS7sj1T8znr4qeCc5BGa2OJuos+Y+fYcnL4QyG9FJqx6C
++NG840vhOdwPIRgEfRiX4ia0NkqFBtCbVGOLLUbAwqYqZFKS7NmZkejUxq7n2hQle
++Q/OHEmzNAZaqAQbZHwIzIDsqqbxYUHkcWue7H2nNt/KYhBbuAN7/ZsuOYklju9TH
++6L1R6utmSWyCakHWY2+wYNIMYam89lsXWKul6gDIxwLgnHiE8X0qyZ/K5MIoY16K
++lD4RxuPwlg1EIj5QZ1Po4wPfzSkv9gGJF/MxYQxTy8n+TrSg7q6uN4GrWRJFXpMg
++PAuHLcg+oxOIrraPcliPNyKh4vNVnXRdVLOhEnb9RL2DZGdzmQFD+dJmKitxRrNV
++RAMZ3IgCfxr5jTXAhOxpY+aPI+tdixsLHL+ESwcQ4kcaazhM06Tw2B/wRqsr8+xN
++ObpaD+kzybl5XYd/y3zTYKsxDEyeIIBg/uGhk1V84zYIGxYTdZEYzenKKi+OnhEI
++fu0eG7hTY5WT4hxFecbsWw3OYrCNJUxp2OlEQ/kwHUc5+kXcmW0Z6Fc1AgMBAAGj
++ggEzMIIBLzAJBgNVHRMEAjAAMBEGCWCGSAGG+EIBAQQEAwIGQDAzBglghkgBhvhC
++AQ0EJhYkT3BlblNTTCBHZW5lcmF0ZWQgU2VydmVyIENlcnRpZmljYXRlMB0GA1Ud
++DgQWBBT6GmW3MZKpAOVt5yVI2DrpnPsSYTB6BgNVHSMEczBxgBTZKG+SIPcMoSX0
++oibvlgtOoQnGnqFOpEwwSjELMAkGA1UEBhMCUFQxCzAJBgNVBAgMAk5BMQ8wDQYD
++VQQHDAZMaXNib24xDjAMBgNVBAoMBU15TGFiMQ0wCwYDVQQDDARyb290ggkA+iIN
++MxHvicEwDgYDVR0PAQH/BAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMBoGA1Ud
++EQQTMBGCCWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQUFAAOCAgEAxwH91Q4r
++1JJNTF/XyeXGc8nmeBFtdbs3W8TvfF/3sEqPUQZSl+IWejaGw3USc9S0NV8PGQVz
++qHOLVJfiLtTSGukaIwOAtTfIRSHmLMD8adtdxtmaNB0IfmMBrKgC0D+Sv5iA4HFG
++d20ExeTamJtk4XVnWb9yAd333GYSpRi/IvYjy2U+5NL/9r0G+esLTt4VQG84g+ec
++IWitlFqEhyhX2ioYoMC1cYIkeAm8AirQjNCqAyM/pMLWpogLtooRMIZbfLSqtNXY
++paP328hum5s98JpjPaNqOClRmewUjLBPDzrgHX422j+gkhd9GnhfKLVe9X6AVnki
++poaPh3TWry28o8dMspxBn5EtJEdb64N4aSdrJxiU2TqKy1TM8dRBmDcvkamt5Lvj
++2VlT2Xz2SlYTKL4HA8XlJcOqm0EN5OymNvnbS/5Ydh45EQA9ZtMmlSWlqw73kT/O
++/QVoIDfUboGTuL3YYxD+NAneYF6ed2ZAaAbYrm3iM9ZV1LP/qcle2A2g34uSvkXb
++iWTgPCJvmqrKg5WUY4DWUaHQY4XifhNU9FXi+WX2KyyTpY9yNxMlBrg8RbVZ2HC8
++3PEEjIYZkJPwxWEfcEdd4pkNpLsKH3EivDvze7ZPe2yWQ/+njZykp/RouwZ55+nc
++NE/tbmPF1WCC9FcXlnrgYq5WcQ2PFr/t/ko=
++-----END CERTIFICATE-----
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_root.der.sha256 b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_root.der.sha256
+new file mode 100644
+index 00000000000..3aebaf8868f
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_root.der.sha256
+@@ -0,0 +1 @@
++9a1ceb7664315d5d62bd382ca9258704746a8056922bb36ca263762932e528fa
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_root.key b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_root.key
+new file mode 100644
+index 00000000000..647cd2486cc
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/generated/server_from_root.key
+@@ -0,0 +1,51 @@
++-----BEGIN RSA PRIVATE KEY-----
++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
++-----END RSA PRIVATE KEY-----
+diff --git a/logstash-core/src/test/resources/org/logstash/util/x509_certificates/openssl.cnf b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/openssl.cnf
+new file mode 100644
+index 00000000000..83bd0699e67
+--- /dev/null
++++ b/logstash-core/src/test/resources/org/logstash/util/x509_certificates/openssl.cnf
+@@ -0,0 +1,53 @@
++[ req ]
++distinguished_name= req_distinguished_name
++attributes= req_attributes
++
++[ req_distinguished_name ]
++countryName= Country Name (2 letter code)
++countryName_min= 2
++countryName_max= 2
++stateOrProvinceName= State or Province Name (full name)
++localityName= Locality Name (eg, city)
++0.organizationName= Organization Name (eg, company)
++organizationalUnitName= Organizational Unit Name (eg, section)
++commonName= Common Name (eg, fully qualified host name)
++commonName_max= 64
++emailAddress= Email Address
++emailAddress_max= 64
++
++[ req_attributes ]
++challengePassword= A challenge password
++challengePassword_min= 4
++challengePassword_max= 20
++
++[ ca ]
++subjectKeyIdentifier = hash
++authorityKeyIdentifier = keyid:always,issuer
++basicConstraints = critical, CA:true
++keyUsage = critical, digitalSignature, cRLSign, keyCertSign
++
++[ intermediate_ca ]
++subjectKeyIdentifier = hash
++authorityKeyIdentifier = keyid:always,issuer
++basicConstraints = critical, CA:true, pathlen:0
++keyUsage = critical, digitalSignature, cRLSign, keyCertSign
++
++[ client_cert ]
++basicConstraints = CA:FALSE
++nsCertType = client, email
++nsComment = "OpenSSL Generated Client Certificate"
++subjectKeyIdentifier = hash
++authorityKeyIdentifier = keyid,issuer
++keyUsage = critical, nonRepudiation, digitalSignature, keyEncipherment
++extendedKeyUsage = clientAuth, emailProtection
++subjectAltName = "DNS:localhost, IP:127.0.0.1"
++
++[ server_cert ]
++basicConstraints = CA:FALSE
++nsCertType = server
++nsComment = "OpenSSL Generated Server Certificate"
++subjectKeyIdentifier = hash
++authorityKeyIdentifier = keyid,issuer:always
++keyUsage = critical, digitalSignature, keyEncipherment
++extendedKeyUsage = serverAuth
++subjectAltName = "DNS:localhost, IP:127.0.0.1"
+diff --git a/tools/dependencies-report/src/main/resources/licenseMapping.csv b/tools/dependencies-report/src/main/resources/licenseMapping.csv
+index 81ee1dd14af..eada37088c8 100644
+--- a/tools/dependencies-report/src/main/resources/licenseMapping.csv
++++ b/tools/dependencies-report/src/main/resources/licenseMapping.csv
+@@ -101,6 +101,8 @@ dependency,dependencyUrl,licenseOverride,copyright,sourceURL
+ "nio4r:","https://github.com/socketry/nio4r",MIT
+ "nokogiri:","http://nokogiri.org/",MIT
+ "openssl_pkcs8_pure:",http://github.com/cielavenir/openssl_pkcs8_pure,Ruby
++"org.apache.httpcomponents:httpclient:",https://hc.apache.org/,Apache-2.0
++"org.apache.httpcomponents:httpcore:",https://hc.apache.org/,Apache-2.0
+ "org.apache.logging.log4j:log4j-1.2-api:",https://logging.apache.org/log4j/2.x/index.html,Apache-2.0
+ "org.apache.logging.log4j:log4j-api:",https://logging.apache.org/log4j/2.x/index.html,Apache-2.0
+ "org.apache.logging.log4j:log4j-core:",https://logging.apache.org/log4j/2.x/index.html,Apache-2.0
+diff --git a/tools/dependencies-report/src/main/resources/notices/org.apache.httpcomponents!httpclient-NOTICE.txt b/tools/dependencies-report/src/main/resources/notices/org.apache.httpcomponents!httpclient-NOTICE.txt
+new file mode 100644
+index 00000000000..89123447666
+--- /dev/null
++++ b/tools/dependencies-report/src/main/resources/notices/org.apache.httpcomponents!httpclient-NOTICE.txt
+@@ -0,0 +1,7 @@
++source: https://github.com/apache/httpcomponents-client/blob/4.5.x/NOTICE.txt
++
++Apache HttpComponents Client
++Copyright 1999-2021 The Apache Software Foundation
++
++This product includes software developed at
++The Apache Software Foundation (http://www.apache.org/).
+diff --git a/tools/dependencies-report/src/main/resources/notices/org.apache.httpcomponents!httpcore-NOTICE.txt b/tools/dependencies-report/src/main/resources/notices/org.apache.httpcomponents!httpcore-NOTICE.txt
+new file mode 100644
+index 00000000000..f51188eadea
+--- /dev/null
++++ b/tools/dependencies-report/src/main/resources/notices/org.apache.httpcomponents!httpcore-NOTICE.txt
+@@ -0,0 +1,7 @@
++source: https://github.com/apache/httpcomponents-core/blob/4.4.x/NOTICE.txt
++
++Apache HttpComponents Core
++Copyright 2005-2021 The Apache Software Foundation
++
++This product includes software developed at
++The Apache Software Foundation (http://www.apache.org/).

@@ -1,0 +1,108 @@
+diff --git a/lib/logstash/outputs/base.rb b/lib/logstash/outputs/base.rb
+index d1554408d5f..9d81c031788 100644
+--- a/lib/logstash/outputs/base.rb
++++ b/lib/logstash/outputs/base.rb
+@@ -33,6 +33,16 @@ class LogStash::Outputs::Base < LogStash::Plugin
+   # Note that this setting may not be useful for all outputs.
+   config :workers, :validate => :number, :default => 1
+ 
++  # The number of retries if some exception happens.
++  # Optional.
++  config :retries, :validate => :number, :default => 0
++
++  # The strategy to use when an exception is raised.
++  # Use 'shutdown', default, to terminate logstash.
++  # Use 'ignore' to keep going and ignore and log the error.
++  # Optional.
++  config :on_error_strategy, :validate => :string, :default => "shutdown"
++
+   attr_reader :worker_plugins
+ 
+   public
+@@ -83,9 +93,24 @@ def worker_setup
+     end
+   end
+ 
++  public
++  def safe_handle(event, attempt = 0)
++    begin
++      receive(event)
++    rescue Exception => e
++      if attempt < retries
++        safe_handle(event, attempt += 1)
++      elsif @on_error_strategy == "ignore"
++        @logger.warn(I18n.t("logstash.pipeline.output-worker-ignore-error", :plugin => self.class.config_name, :event => event, :exception => e))
++      else
++        raise e
++      end
++    end
++  end # def deal
++
+   public
+   def handle(event)
+-    receive(event)
++    safe_handle(event)
+   end # def handle
+ 
+   def handle_worker(event)
+diff --git a/locales/en.yml b/locales/en.yml
+index 7fd62833ef1..ec22e319bc4 100644
+--- a/locales/en.yml
++++ b/locales/en.yml
+@@ -33,6 +33,11 @@ en:
+         %{plugin} output plugin: setting 'workers => %{worker_count}' is not
+         supported by this plugin. I will continue working as if you had not set
+         this setting.
++      output-worker-ignore-error: >-
++        %{plugin} output plugin: when trying to send the event: '%{event}'
++        the error: '%{exception}' was raised.
++        As I am configured to ignore errors: 'on_error_strategy => "ignore"'
++        I will continue working as if nothing happened.
+     plugin:
+       deprecated_milestone: >-
+         %{plugin} plugin is using the 'milestone' method to declare the version
+diff --git a/spec/outputs/base_spec.rb b/spec/outputs/base_spec.rb
+index 50c517fdfdf..1ae730dc96b 100644
+--- a/spec/outputs/base_spec.rb
++++ b/spec/outputs/base_spec.rb
+@@ -32,4 +32,40 @@ def receive(event)
+     expect(output.receive(LogStash::Event.new({"tags" => ["value"]}))).to eq(false)
+     expect(output.receive(LogStash::Event.new({"tags" => ["notvalue"]}))).to eq(true)
+   end
++
++  it "should receive only one time with default 'retries'" do
++    output = LogStash::Outputs::NOOP.new()
++
++    output.should_receive(:receive).once
++
++    output.handle(LogStash::Event.new())
++
++  end
++
++  it "should call receive one time plus 'retries'" do
++    retries = 3
++    output = LogStash::Outputs::NOOP.new("retries" => retries)
++
++    output.stub(:receive) { raise "any unrescued error from the output" }
++    output.should_receive(:receive).exactly(1 + retries).times
++
++    expect{ output.handle(LogStash::Event.new()) }.to raise_error
++  end
++
++  it "should shutdown when exception is raised and on_error_strategy is default 'shutdown'" do
++    output = LogStash::Outputs::NOOP.new()
++
++    output.stub(:receive) { raise "any unrescued error from the output" }
++
++    expect{ output.handle(LogStash::Event.new()) }.to raise_error
++  end
++
++  it "should ignore when exception is raised and on_error_strategy is 'ignore'" do
++    output = LogStash::Outputs::NOOP.new("on_error_strategy" => "ignore")
++
++    output.stub(:receive) { raise "any unrescued error from the output" }
++
++    expect{ output.handle(LogStash::Event.new()) }.to_not raise_error
++  end
++
+ end

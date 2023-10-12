@@ -1,0 +1,394 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index 086d98c0cf6..12554635cef 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -104,8 +104,8 @@ def execute
+       return 1 if clean_state?
+ 
+       while !Stud.stop?
+-        if clean_state? || running_pipelines?
+-          sleep 0.5
++        if clean_state? || running_user_defined_pipelines?
++          sleep(0.5)
+         else
+           break
+         end
+@@ -243,6 +243,18 @@ def running_pipelines?
+     end
+   end
+ 
++  def running_user_defined_pipelines?
++    running_user_defined_pipelines.any?
++  end
++
++  def running_user_defined_pipelines
++    @pipelines_mutex.synchronize do
++      @pipelines.select do |_, pipeline|
++        pipeline.running? && !pipeline.system?
++      end
++    end
++  end
++
+   def close_pipeline(id)
+     pipeline = @pipelines[id]
+     if pipeline
+diff --git a/logstash-core/lib/logstash/config/pipeline_config.rb b/logstash-core/lib/logstash/config/pipeline_config.rb
+index e4bbcd53cfc..1713de9006c 100644
+--- a/logstash-core/lib/logstash/config/pipeline_config.rb
++++ b/logstash-core/lib/logstash/config/pipeline_config.rb
+@@ -23,6 +23,10 @@ def config_string
+       @config_string = config_parts.collect(&:config_string).join("\n")
+     end
+ 
++    def system?
++      @settings.get("pipeline.system")
++    end
++
+     def ==(other)
+       config_hash == other.config_hash && pipeline_id == other.pipeline_id
+     end
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 481ecaf150c..708c18ef9cb 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -25,6 +25,7 @@ module Environment
+            Setting::Numeric.new("config.reload.interval", 3), # in seconds
+            Setting::Boolean.new("metric.collect", true),
+             Setting::String.new("pipeline.id", "main"),
++           Setting::Boolean.new("pipeline.system", false),
+    Setting::PositiveInteger.new("pipeline.workers", LogStash::Config::CpuCoreStrategy.maximum),
+    Setting::PositiveInteger.new("pipeline.output.workers", 1),
+    Setting::PositiveInteger.new("pipeline.batch.size", 125),
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index 5d66c9b1e5f..42a650023d8 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -323,6 +323,10 @@ def stopped?
+     @running.false?
+   end
+ 
++  def system?
++    settings.get_value("pipeline.system")
++  end
++
+   # register_plugin simply calls the plugin #register method and catches & logs any error
+   # @param plugin [Plugin] the plugin to register
+   # @return [Plugin] the registered plugin
+diff --git a/logstash-core/lib/logstash/pipeline_action.rb b/logstash-core/lib/logstash/pipeline_action.rb
+index 2cc6f2dc4ee..79ce2fb80fa 100644
+--- a/logstash-core/lib/logstash/pipeline_action.rb
++++ b/logstash-core/lib/logstash/pipeline_action.rb
+@@ -5,9 +5,9 @@
+ require "logstash/pipeline_action/reload"
+ 
+ module LogStash module PipelineAction
+-  ORDERING = [
+-    LogStash::PipelineAction::Create,
+-    LogStash::PipelineAction::Reload,
+-    LogStash::PipelineAction::Stop
+-  ]
++  ORDERING = {
++    LogStash::PipelineAction::Create => 100,
++    LogStash::PipelineAction::Reload => 200,
++    LogStash::PipelineAction::Stop => 300
++  }
+ end end
+diff --git a/logstash-core/lib/logstash/pipeline_action/base.rb b/logstash-core/lib/logstash/pipeline_action/base.rb
+index 23c53bb384b..81931da258d 100644
+--- a/logstash-core/lib/logstash/pipeline_action/base.rb
++++ b/logstash-core/lib/logstash/pipeline_action/base.rb
+@@ -6,7 +6,6 @@
+ # Some actions could be retryable, or have a delay or timeout.
+ module LogStash module PipelineAction
+   class Base
+-
+     # Only used for debugging purpose and in the logger statement.
+     def inspect
+       "#{self.class.name}/pipeline_id:#{pipeline_id}"
+@@ -17,8 +16,13 @@ def execute(agent, pipelines)
+       raise "`#execute` Not implemented!"
+     end
+ 
++    # See the definition in `logstash/pipeline_action.rb` for the default ordering
++    def execution_priority
++      ORDERING.fetch(self.class)
++    end
++
+     def <=>(other)
+-      order = ORDERING.index(self.class) <=> ORDERING.index(other.class)
++      order = self.execution_priority <=> other.execution_priority
+       order.nonzero? ? order : self.pipeline_id <=> other.pipeline_id
+     end
+   end
+diff --git a/logstash-core/lib/logstash/pipeline_action/create.rb b/logstash-core/lib/logstash/pipeline_action/create.rb
+index 2c7aea549f2..1e5628d0c54 100644
+--- a/logstash-core/lib/logstash/pipeline_action/create.rb
++++ b/logstash-core/lib/logstash/pipeline_action/create.rb
+@@ -21,6 +21,14 @@ def pipeline_id
+       @pipeline_config.pipeline_id
+     end
+ 
++    # Make sure we execution system pipeline like the monitoring
++    # before any user defined pipelines, system pipeline register hooks into the system that will be
++    # triggered by the user defined pipeline.
++    def execution_priority
++      default_priority = super
++      @pipeline_config.system? ? default_priority * -1 : default_priority
++    end
++
+     # The execute assume that the thread safety access of the pipeline
+     # is managed by the caller.
+     def execute(agent, pipelines)
+diff --git a/logstash-core/spec/logstash/agent/converge_spec.rb b/logstash-core/spec/logstash/agent/converge_spec.rb
+index b65f6f2a726..dd8063f92f6 100644
+--- a/logstash-core/spec/logstash/agent/converge_spec.rb
++++ b/logstash-core/spec/logstash/agent/converge_spec.rb
+@@ -43,7 +43,7 @@
+       TestSourceLoader.new(finite_pipeline_config)
+     end
+ 
+-    context "when the pipeline is execution limite (finite)" do
++    context "when the pipeline execution is finite" do
+       let(:finite_pipeline_config) { mock_pipeline_config(:main, "input { generator { count => 1000 } } output { null {} }") }
+ 
+       it "execute the pipeline and stop execution" do
+@@ -59,6 +59,38 @@
+       end
+     end
+ 
++    context "system pipeline" do
++      let(:finite_pipeline_config) { mock_pipeline_config(:main, "input { generator { count => 1000 } } output { null {} }") }
++      let(:system_pipeline_config) { mock_pipeline_config(:system_pipeline, "input { generator { } } output { null {} }", { "pipeline.system" => true }) }
++
++      let(:source_loader) do
++        TestSourceLoader.new(finite_pipeline_config, system_pipeline_config)
++      end
++
++      context "when we have a finite pipeline and a system pipeline running" do
++        it "execute the pipeline and stop execution" do
++          expect(subject.execute).to eq(0)
++        end
++      end
++
++      describe "#running_user_defined_pipelines" do
++        it "returns the user defined pipelines" do
++          agent_task = start_agent(subject)
++          expect(subject.running_user_defined_pipelines.keys).to include(:main)
++          expect(subject.running_user_defined_pipelines.keys).not_to include(:system_pipeline)
++          subject.shutdown
++        end
++      end
++
++      describe "#running_user_defined_pipelines?" do
++        it "returns true" do
++          agent_task = start_agent(subject)
++          expect(subject.running_user_defined_pipelines?).to be_truthy
++          subject.shutdown
++        end
++      end
++    end
++
+     context "when `config.reload.automatic`" do
+       let(:pipeline_config) { mock_pipeline_config(:main, "input { generator {} } output { null {} }") }
+ 
+diff --git a/logstash-core/spec/logstash/agent_spec.rb b/logstash-core/spec/logstash/agent_spec.rb
+index 8411bbdab16..aabc2090421 100644
+--- a/logstash-core/spec/logstash/agent_spec.rb
++++ b/logstash-core/spec/logstash/agent_spec.rb
+@@ -111,7 +111,7 @@
+ 
+       context "if state is clean" do
+         before :each do
+-          allow(subject).to receive(:running_pipelines?).and_return(true)
++          allow(subject).to receive(:running_user_defined_pipelines?).and_return(true)
+           allow(subject).to receive(:clean_state?).and_return(false)
+         end
+ 
+diff --git a/logstash-core/spec/logstash/config/pipeline_config_spec.rb b/logstash-core/spec/logstash/config/pipeline_config_spec.rb
+index abfa327b480..7e4bb78f946 100644
+--- a/logstash-core/spec/logstash/config/pipeline_config_spec.rb
++++ b/logstash-core/spec/logstash/config/pipeline_config_spec.rb
+@@ -57,4 +57,20 @@
+     not_same_pipeline_id = described_class.new(source, :another_pipeline, unordered_config_parts, settings)
+     expect(subject).not_to eq(not_same_pipeline_id)
+   end
++
++  describe "#system?" do
++    context "when the pipeline is a system pipeline" do
++      let(:settings) { mock_settings({ "pipeline.system" => true })}
++
++      it "returns true if the pipeline is a system pipeline" do
++        expect(subject.system?).to be_truthy
++      end
++    end
++
++    context "when is not a system pipeline" do
++      it "returns false if the pipeline is not a system pipeline" do
++        expect(subject.system?).to be_falsey
++      end
++    end
++  end
+ end
+diff --git a/logstash-core/spec/logstash/pipeline_action/create_spec.rb b/logstash-core/spec/logstash/pipeline_action/create_spec.rb
+index ce915cbc081..c67bc209cca 100644
+--- a/logstash-core/spec/logstash/pipeline_action/create_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_action/create_spec.rb
+@@ -1,6 +1,7 @@
+ # encoding: utf-8
+ require "spec_helper"
+ require_relative "../../support/helpers"
++require_relative "../../support/matchers"
+ require "logstash/pipeline_action/create"
+ require "logstash/instrument/null_metric"
+ require "logstash/inputs/generator"
+@@ -66,4 +67,17 @@
+       end
+     end
+   end
++
++  context "when sorting create action" do
++    let(:pipeline_config) { mock_pipeline_config(:main, "input { generator { id => '123' } } output { null {} }") }
++    let(:system_pipeline_config) { mock_pipeline_config(:main_2, "input { generator { id => '123' } } output { null {} }", { "pipeline.system" => true }) }
++
++    it "should give higher priority to system pipeline" do
++      action_user_pipeline = described_class.new(pipeline_config, metric)
++      action_system_pipeline = described_class.new(system_pipeline_config, metric)
++
++      sorted = [action_user_pipeline, action_system_pipeline].sort
++      expect(sorted).to eq([action_system_pipeline, action_user_pipeline])
++    end
++  end
+ end
+diff --git a/logstash-core/spec/logstash/pipeline_spec.rb b/logstash-core/spec/logstash/pipeline_spec.rb
+index 3dc774a3ae0..c49ce3c7365 100644
+--- a/logstash-core/spec/logstash/pipeline_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_spec.rb
+@@ -855,6 +855,26 @@ class TestPipeline < LogStash::Pipeline
+     end
+   end
+ 
++  context "#system" do
++    after do
++      pipeline.close # close the queue
++    end
++
++    context "when the pipeline is a system pipeline" do
++      let(:pipeline) { LogStash::Pipeline.new("input { generator {} } output { null {} }", mock_settings("pipeline.system" => true)) }
++      it "returns true" do
++        expect(pipeline.system?).to be_truthy
++      end
++    end
++
++    context "when the pipeline is not a system pipeline" do
++      let(:pipeline) { LogStash::Pipeline.new("input { generator {} } output { null {} }", mock_settings("pipeline.system" => false)) }
++      it "returns true" do
++        expect(pipeline.system?).to be_falsey
++      end
++    end
++  end
++
+   context "#reloadable?" do
+     after do
+       pipeline.close # close the queue
+diff --git a/logstash-core/spec/logstash/state_resolver_spec.rb b/logstash-core/spec/logstash/state_resolver_spec.rb
+index a6103d4b55a..392d1c13b34 100644
+--- a/logstash-core/spec/logstash/state_resolver_spec.rb
++++ b/logstash-core/spec/logstash/state_resolver_spec.rb
+@@ -18,6 +18,11 @@
+     clear_data_dir
+   end
+ 
++  after do
++    # ensure that the the created pipeline are closed
++    running_pipelines.each { |_, pipeline| pipeline.close }
++  end
++
+   context "when no pipeline is running" do
+     let(:running_pipelines) { {} }
+ 
+@@ -44,12 +49,6 @@
+     context "when a pipeline is running" do
+       let(:running_pipelines) { { :main => mock_pipeline(:main) } }
+ 
+-
+-      after do
+-        # ensure that the the created pipeline are closed
+-        running_pipelines.each { |_, pipeline| pipeline.close }
+-      end
+-
+       context "when the pipeline config contains a new one and the existing" do
+         let(:pipeline_configs) { [mock_pipeline_config(:hello_world), mock_pipeline_config(:main)] }
+ 
+@@ -104,26 +103,54 @@
+         }
+       end
+ 
+-      let(:pipeline_configs) do
+-        [
+-          mock_pipeline_config(:main1),
+-          mock_pipeline_config(:main9),
+-          mock_pipeline_config(:main5, "input { generator {}}"),
+-          mock_pipeline_config(:main3, "input { generator {}}"),
+-          mock_pipeline_config(:main7)
+-        ]
++      context "without system pipeline" do
++        let(:pipeline_configs) do
++          [
++            mock_pipeline_config(:main1),
++            mock_pipeline_config(:main9),
++            mock_pipeline_config(:main5, "input { generator {}}"),
++            mock_pipeline_config(:main3, "input { generator {}}"),
++            mock_pipeline_config(:main7)
++          ]
++        end
++
++        it "generates actions required to converge" do
++          expect(subject.resolve(running_pipelines, pipeline_configs)).to have_actions(
++            [:create, :main7],
++            [:create, :main9],
++            [:reload, :main3],
++            [:reload, :main5],
++            [:stop, :main2],
++            [:stop, :main4],
++            [:stop, :main6]
++          )
++        end
+       end
+ 
+-      it "generates actions required to converge" do
+-        expect(subject.resolve(running_pipelines, pipeline_configs)).to have_actions(
+-          [:create, :main7],
+-          [:create, :main9],
+-          [:reload, :main3],
+-          [:reload, :main5],
+-          [:stop, :main2],
+-          [:stop, :main4],
+-          [:stop, :main6]
+-        )
++      context "with system pipeline" do
++        let(:pipeline_configs) do
++          [
++            mock_pipeline_config(:main1),
++            mock_pipeline_config(:main9),
++            mock_pipeline_config(:main5, "input { generator {}}"),
++            mock_pipeline_config(:main3, "input { generator {}}"),
++            mock_pipeline_config(:main7),
++            mock_pipeline_config(:monitoring, "input { generator {}}", { "pipeline.system" => true }),
++          ]
++        end
++
++        it "creates the system pipeline before user defined pipelines" do
++          expect(subject.resolve(running_pipelines, pipeline_configs)).to have_actions(
++            [:create, :monitoring],
++            [:create, :main7],
++            [:create, :main9],
++            [:reload, :main3],
++            [:reload, :main5],
++            [:stop, :main2],
++            [:stop, :main4],
++            [:stop, :main6]
++          )
++        end
+       end
+     end
+   end

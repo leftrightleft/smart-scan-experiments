@@ -1,0 +1,126 @@
+diff --git a/logstash-core/lib/logstash/api/commands/hot_threads_reporter.rb b/logstash-core/lib/logstash/api/commands/hot_threads_reporter.rb
+index bd28e60abc9..384280b20f0 100644
+--- a/logstash-core/lib/logstash/api/commands/hot_threads_reporter.rb
++++ b/logstash-core/lib/logstash/api/commands/hot_threads_reporter.rb
+@@ -17,7 +17,12 @@ def to_s
+     report << '=' * STRING_SEPARATOR_LENGTH
+     report << "\n"
+     hash[:threads].each do |thread|
+-      thread_report = "#{I18n.t("logstash.web_api.hot_threads.thread_title", :percent_of_cpu_time => thread[:percent_of_cpu_time], :thread_state => thread[:state], :thread_name => thread[:name])} \n"
++      line_str = I18n.t("logstash.web_api.hot_threads.thread_title", 
++        :percent_of_cpu_time => thread[:percent_of_cpu_time], 
++        :thread_state => thread[:state], 
++        :thread_name => thread[:name],
++        :thread_id => thread[:thread_id])
++      thread_report = "#{line_str} \n"
+       thread_report << "#{thread[:path]}\n" if thread[:path]
+       thread[:traces].each do |trace|
+         thread_report << "\t#{trace}\n"
+@@ -31,9 +36,10 @@ def to_s
+ 
+   def to_hash
+     hash = { :time => Time.now.iso8601, :busiest_threads => @thread_dump.top_count, :threads => [] }
+-    @thread_dump.each do |thread_name, _hash|
++    @thread_dump.each do |_hash|
+       thread_name, thread_path = _hash["thread.name"].split(": ")
+       thread = { :name => thread_name,
++                 :thread_id => _hash["thread.id"],
+                  :percent_of_cpu_time => cpu_time_as_percent(_hash),
+                  :state => _hash["thread.state"]
+       }
+diff --git a/logstash-core/lib/logstash/util/thread_dump.rb b/logstash-core/lib/logstash/util/thread_dump.rb
+index 800e6c06b29..b504f3a9028 100644
+--- a/logstash-core/lib/logstash/util/thread_dump.rb
++++ b/logstash-core/lib/logstash/util/thread_dump.rb
+@@ -19,12 +19,13 @@ def initialize(options={})
+ 
+       def each(&block)
+         i=0
+-        dump.each_pair do |thread_name, _hash|
++        dump.each do |hash|
++          thread_name = hash["thread.name"]
+           break if i >= top_count
+           if ignore
+-            next if idle_thread?(thread_name, _hash)
++            next if idle_thread?(thread_name, hash)
+           end
+-          block.call(thread_name, _hash)
++          block.call(hash)
+           i += 1
+         end
+       end
+diff --git a/logstash-core/locales/en.yml b/logstash-core/locales/en.yml
+index 15a5a7ac4b8..1faa166edfd 100644
+--- a/logstash-core/locales/en.yml
++++ b/logstash-core/locales/en.yml
+@@ -79,7 +79,7 @@ en:
+           ::: {%{hostname}}
+           Hot threads at %{time}, busiestThreads=%{top_count}:
+         thread_title: |-
+-          %{percent_of_cpu_time} % of cpu usage, state: %{thread_state}, thread name: '%{thread_name}'
++          %{percent_of_cpu_time} % of cpu usage, state: %{thread_state}, thread name: '%{thread_name}', thread id: %{thread_id}
+       logging:
+         unrecognized_option: |-
+           unrecognized option [%{option}]
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/monitors/HotThreadsMonitor.java b/logstash-core/src/main/java/org/logstash/instrument/monitors/HotThreadsMonitor.java
+index 2ea76fc58c6..abbeb9bf3be 100644
+--- a/logstash-core/src/main/java/org/logstash/instrument/monitors/HotThreadsMonitor.java
++++ b/logstash-core/src/main/java/org/logstash/instrument/monitors/HotThreadsMonitor.java
+@@ -39,6 +39,7 @@ public static class ThreadReport {
+         private static final String THREAD_NAME = "thread.name";
+         private static final String THREAD_STATE = "thread.state";
+         private static final String THREAD_STACKTRACE = "thread.stacktrace";
++        private static final String THREAD_ID = "thread.id";
+ 
+         private Map<String, Object> map = new HashMap<>();
+ 
+@@ -49,6 +50,7 @@ public static class ThreadReport {
+             map.put(WAITED_COUNT, info.getWaitedCount());
+             map.put(WAITED_TIME, info.getWaitedTime());
+             map.put(THREAD_NAME, info.getThreadName());
++            map.put(THREAD_ID, info.getThreadId());
+             map.put(THREAD_STATE, info.getThreadState().name().toLowerCase());
+             map.put(THREAD_STACKTRACE, stackTraceAsString(info.getStackTrace()));
+         }
+@@ -71,6 +73,10 @@ public String getThreadName() {
+             return (String) map.get(THREAD_NAME);
+         }
+ 
++        public long getThreadId() {
++            return (long) map.get(THREAD_ID);
++        }
++
+         @Override
+         public String toString() {
+             StringBuilder sb = new StringBuilder();
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/reports/ThreadsReport.java b/logstash-core/src/main/java/org/logstash/instrument/reports/ThreadsReport.java
+index 3c07adaa945..f0f96f7a811 100644
+--- a/logstash-core/src/main/java/org/logstash/instrument/reports/ThreadsReport.java
++++ b/logstash-core/src/main/java/org/logstash/instrument/reports/ThreadsReport.java
+@@ -21,14 +21,13 @@ public class ThreadsReport {
+      *                      stacktrace_size - max depth of stack trace
+      * @return A Map containing hot threads information
+      */
+-    public static Map<String, Object> generate(Map<String, String> options) {
++    public static List<Map<String, Object>> generate(Map<String, String> options) {
+         HotThreadsMonitor reporter = new HotThreadsMonitor();
+         List<HotThreadsMonitor.ThreadReport> reports = reporter.detect(options);
+         return reports
+                 .stream()
+-                .collect(Collectors
+-                    .toMap(HotThreadsMonitor.ThreadReport::getThreadName,
+-                           HotThreadsMonitor.ThreadReport::toMap));
++                .map(HotThreadsMonitor.ThreadReport::toMap)
++                .collect(Collectors.toList());
+     }
+ 
+ 
+@@ -36,7 +35,7 @@ public static Map<String, Object> generate(Map<String, String> options) {
+      * Generate a report with current Thread information
+      * @return A Map containing the hot threads information
+      */
+-    public static Map<String, Object> generate() {
++    public static List<Map<String, Object>> generate() {
+         Map<String, String> options = new HashMap<>();
+         options.put("order_by", "cpu");
+         return generate(options);

@@ -1,0 +1,123 @@
+diff --git a/logstash-core/lib/logstash/util.rb b/logstash-core/lib/logstash/util.rb
+index b04192659bf..614dcf1eab6 100644
+--- a/logstash-core/lib/logstash/util.rb
++++ b/logstash-core/lib/logstash/util.rb
+@@ -11,10 +11,8 @@ module LogStash::Util
+   def self.set_thread_name(name)
+     previous_name = Java::java.lang.Thread.currentThread.getName() if block_given?
+ 
+-    if RUBY_ENGINE == "jruby"
+-      # Keep java and ruby thread names in sync.
+-      Java::java.lang.Thread.currentThread.setName(name)
+-    end
++    # Keep java and ruby thread names in sync.
++    Java::java.lang.Thread.currentThread.setName(name)
+     Thread.current[:name] = name
+ 
+     if UNAME == "linux"
+@@ -37,18 +35,10 @@ def self.set_thread_plugin(plugin)
+     Thread.current[:plugin] = plugin
+   end
+ 
+-  def self.get_thread_id(thread)
+-    if RUBY_ENGINE == "jruby"
+-      JRuby.reference(thread).native_thread.id
+-    else
+-      raise Exception.new("Native thread IDs aren't supported outside of JRuby")
+-    end
+-  end
+-
+   def self.thread_info(thread)
+     # When the `thread` is dead, `Thread#backtrace` returns `nil`; fall back to an empty array.
+     backtrace = (thread.backtrace || []).map do |line|
+-      line.gsub(LogStash::Environment::LOGSTASH_HOME, "[...]")
++      line.sub(LogStash::Environment::LOGSTASH_HOME, "[...]")
+     end
+ 
+     blocked_on = case backtrace.first
+@@ -58,7 +48,7 @@ def self.thread_info(thread)
+                  end
+ 
+     {
+-      "thread_id" => get_thread_id(thread),
++      "thread_id" => get_thread_id(thread), # might be nil for dead threads
+       "name" => thread[:name],
+       "plugin" => (thread[:plugin] ? thread[:plugin].debug_info : nil),
+       "backtrace" => backtrace,
+diff --git a/logstash-core/spec/logstash/util_spec.rb b/logstash-core/spec/logstash/util_spec.rb
+index 3f0c23eda7a..201c7a0a4a7 100644
+--- a/logstash-core/spec/logstash/util_spec.rb
++++ b/logstash-core/spec/logstash/util_spec.rb
+@@ -67,4 +67,23 @@ class TestKlass
+       end
+     end
+   end
++
++  describe ".get_thread_id" do
++    it "returns native identifier" do
++      thread_id = LogStash::Util.get_thread_id(Thread.current)
++      expect( thread_id ).to be_a Integer
++      expect( thread_id ).to eq(java.lang.Thread.currentThread.getId)
++    end
++
++    context "when a (native) thread is collected" do
++      let(:dead_thread) { Thread.new { 42 }.tap { |t| sleep(0.01) while t.status } }
++
++      it "returns nil as id" do
++        thread = dead_thread
++        p thread if $VERBOSE
++        java.lang.System.gc
++        expect(LogStash::Util.get_thread_id(thread)).to be nil
++      end
++    end
++  end
+ end
+diff --git a/logstash-core/src/main/java/org/logstash/RubyUtil.java b/logstash-core/src/main/java/org/logstash/RubyUtil.java
+index d760999a67a..df207064f50 100644
+--- a/logstash-core/src/main/java/org/logstash/RubyUtil.java
++++ b/logstash-core/src/main/java/org/logstash/RubyUtil.java
+@@ -55,6 +55,7 @@
+ import org.logstash.plugins.HooksRegistryExt;
+ import org.logstash.plugins.PluginFactoryExt;
+ import org.logstash.plugins.UniversalPluginExt;
++import org.logstash.util.UtilExt;
+ 
+ import java.util.stream.Stream;
+ 
+@@ -308,6 +309,7 @@ public final class RubyUtil {
+         NULL_TIMED_EXECUTION_CLASS.defineAnnotatedMethods(NullMetricExt.NullTimedExecution.class);
+         NULL_COUNTER_CLASS.defineAnnotatedMethods(NullNamespacedMetricExt.NullCounter.class);
+         UTIL_MODULE = LOGSTASH_MODULE.defineModuleUnder("Util");
++        UTIL_MODULE.defineAnnotatedMethods(UtilExt.class);
+         ABSTRACT_DLQ_WRITER_CLASS = UTIL_MODULE.defineClassUnder(
+             "AbstractDeadLetterQueueWriterExt", RUBY.getObject(),
+             ObjectAllocator.NOT_ALLOCATABLE_ALLOCATOR
+diff --git a/logstash-core/src/main/java/org/logstash/util/UtilExt.java b/logstash-core/src/main/java/org/logstash/util/UtilExt.java
+new file mode 100644
+index 00000000000..57bf0a3103f
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/util/UtilExt.java
+@@ -0,0 +1,23 @@
++package org.logstash.util;
++
++import org.jruby.RubyThread;
++import org.jruby.anno.JRubyMethod;
++import org.jruby.anno.JRubyModule;
++import org.jruby.runtime.ThreadContext;
++import org.jruby.runtime.builtin.IRubyObject;
++
++@JRubyModule(name = "Util") // LogStash::Util
++public class UtilExt {
++
++    @JRubyMethod(module = true)
++    public static IRubyObject get_thread_id(final ThreadContext context, IRubyObject self, IRubyObject thread) {
++        if (!(thread instanceof RubyThread)) {
++            throw context.runtime.newTypeError(thread, context.runtime.getThread());
++        }
++        final Thread javaThread = ((RubyThread) thread).getNativeThread(); // weak-reference
++        // even if thread is dead the RubyThread instance might stick around while the Java thread
++        // instance already could have been garbage collected - let's return nil for dead meat :
++        return javaThread == null ? context.nil : context.runtime.newFixnum(javaThread.getId());
++    }
++
++}

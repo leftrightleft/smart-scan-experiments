@@ -1,0 +1,1019 @@
+diff --git a/lib/logstash/inputs/rabbitmq.rb b/lib/logstash/inputs/rabbitmq.rb
+index 157c007b7a8..70d6fc7316c 100644
+--- a/lib/logstash/inputs/rabbitmq.rb
++++ b/lib/logstash/inputs/rabbitmq.rb
+@@ -1,6 +1,5 @@
+ require "logstash/inputs/threadable"
+ require "logstash/namespace"
+-require "cgi" # for CGI.escape
+ 
+ # Pull events from a RabbitMQ exchange.
+ #
+@@ -15,45 +14,44 @@
+ class LogStash::Inputs::RabbitMQ < LogStash::Inputs::Threadable
+ 
+   config_name "rabbitmq"
+-  plugin_status "unsupported"
++  plugin_status "beta"
+ 
+-  # Your amqp broker's custom arguments. For mirrored queues in RabbitMQ: [ "x-ha-policy", "all" ]
+-  config :arguments, :validate => :array, :default => []
++  #
++  # Connection
++  #
+ 
+-  # Your amqp server address
++  # RabbitMQ server address
+   config :host, :validate => :string, :required => true
+ 
+-  # The AMQP port to connect on
++  # RabbitMQ port to connect on
+   config :port, :validate => :number, :default => 5672
+ 
+-  # Your amqp username
++  # RabbitMQ username
+   config :user, :validate => :string, :default => "guest"
+ 
+-  # Your amqp password
++  # RabbitMQ password
+   config :password, :validate => :password, :default => "guest"
+ 
+-  # The name of the queue. Depricated due to conflicts with puppet naming convention.
+-  # Replaced by 'queue' variable. See LOGSTASH-755
+-  config :name, :validate => :string, :deprecated => true
++  # The vhost to use. If you don't know what this is, leave the default.
++  config :vhost, :validate => :string, :default => "/"
+ 
+-  # The name of the queue.
+-  config :queue, :validate => :string, :default => ""
++  # Enable or disable SSL
++  config :ssl, :validate => :boolean, :default => false
+ 
+-  # The name of the exchange to bind the queue. This is analogous to the 'amqp
+-  # output' [config 'name'](../outputs/amqp)
+-  config :exchange, :validate => :string, :required => true
++  # Validate SSL certificate
++  config :verify_ssl, :validate => :boolean, :default => false
+ 
+-  # The routing key to use. This is only valid for direct or fanout exchanges
+-  #
+-  # * Routing keys are ignored on topic exchanges.
+-  # * Wildcards are not valid on direct exchanges.
+-  config :key, :validate => :string, :default => "logstash"
++  # Enable or disable logging
++  config :debug, :validate => :boolean, :default => false
+ 
+-  # The vhost to use. If you don't know what this is, leave the default.
+-  config :vhost, :validate => :string, :default => "/"
+ 
+-  # Passive queue creation? Useful for checking queue existance without modifying server state
+-  config :passive, :validate => :boolean, :default => false
++
++  #
++  # Queue & Consumer
++  #
++
++  # The name of the queue Logstash will consume events from.
++  config :queue, :validate => :string, :default => ""
+ 
+   # Is this queue durable? (aka; Should it survive a broker restart?)
+   config :durable, :validate => :boolean, :default => false
+@@ -67,96 +65,53 @@ class LogStash::Inputs::RabbitMQ < LogStash::Inputs::Threadable
+   # Is the queue exclusive? (aka: Will other clients connect to this named queue?)
+   config :exclusive, :validate => :boolean, :default => true
+ 
++  # Extra queue arguments as an array.
++  # To make a RabbitMQ queue mirrored, use: {"x-ha-policy" => "all"}
++  config :arguments, :validate => :array, :default => {}
++
+   # Prefetch count. Number of messages to prefetch
+-  config :prefetch_count, :validate => :number, :default => 1
++  config :prefetch_count, :validate => :number, :default => 256
+ 
+   # Enable message acknowledgement
+   config :ack, :validate => :boolean, :default => true
+ 
+-  # Enable or disable debugging
+-  config :debug, :validate => :boolean, :default => false
++  # Passive queue creation? Useful for checking queue existance without modifying server state
++  config :passive, :validate => :boolean, :default => false
+ 
+-  # Enable or disable SSL
+-  config :ssl, :validate => :boolean, :default => false
+ 
+-  # Validate SSL certificate
+-  config :verify_ssl, :validate => :boolean, :default => false
+ 
+-  public
+-  def initialize(params)
+-    super
+-
+-    @format ||= "json_event"
+-
+-  end # def initialize
+-
+-  public
+-  def register
+-
+-    if @name
+-      if @queue
+-        @logger.error("'name' and 'queue' are the same setting, but 'name' is deprecated. Please use only 'queue'")
+-      end
+-      @queue = @name
+-    end   
+-
+-    @logger.info("Registering input #{@url}")
+-    require "bunny" # rubygem 'bunny'
+-    @vhost ||= "/"
+-    @port ||= 5672
+-    @key ||= "#"
+-    @amqpsettings = {
+-      :vhost => @vhost,
+-      :host => @host,
+-      :port => @port,
+-    }
+-    @amqpsettings[:user] = @user if @user
+-    @amqpsettings[:pass] = @password.value if @password
+-    @amqpsettings[:logging] = @debug
+-    @amqpsettings[:ssl] = @ssl if @ssl
+-    @amqpsettings[:verify_ssl] = @verify_ssl if @verify_ssl
+-    @amqpurl = "amqp://"
+-    if @user
+-      @amqpurl << @user if @user
+-      @amqpurl << ":#{CGI.escape(@password.to_s)}" if @password
+-      @amqpurl << "@"
+-    end
+-    @amqpurl += "#{@host}:#{@port}#{@vhost}/#{@queue}"
+-  end # def register
+-
+-  def run(queue)
+-    begin
+-      @logger.debug("Connecting with AMQP settings #{@amqpsettings.inspect} to set up queue #{@queue.inspect}")
+-      @bunny = Bunny.new(@amqpsettings)
+-      return if terminating?
+-      @bunny.start
+-      @bunny.qos({:prefetch_count => @prefetch_count})
+-
+-      @arguments_hash = Hash[*@arguments]
+-
+-      @bunnyqueue = @bunny.queue(@queue, {:durable => @durable, :auto_delete => @auto_delete, :exclusive => @exclusive, :arguments => @arguments_hash })
+-      @bunnyqueue.bind(@exchange, :key => @key)
+-
+-      @bunnyqueue.subscribe({:ack => @ack}) do |data|
+-        e = to_event(data[:payload], @amqpurl)
+-        if e
+-          queue << e
+-        end
+-      end # @bunnyqueue.subscribe
+-
+-    rescue *[Bunny::ConnectionError, Bunny::ServerDownError] => e
+-      @logger.error("AMQP connection error, will reconnect: #{e}")
+-      # Sleep for a bit before retrying.
+-      # TODO(sissel): Write 'backoff' method?
+-      sleep(1)
+-      retry
+-    end # begin/rescue
+-  end # def run
+-
+-  def teardown
+-    @bunnyqueue.unsubscribe unless @durable == true
+-    @bunnyqueue.delete unless @durable == true
+-    @bunny.close if @bunny
+-    finished
+-  end # def teardown
++  #
++  # (Optional, backwards compatibility) Exchange binding
++  #
++
++  # Optional.
++  #
++  # The name of the exchange to bind the queue to.
++  config :exchange, :validate => :string
++
++  # Optional.
++  #
++  # The routing key to use when binding a queue to the exchange.
++  # This is only relevant for direct or topic exchanges.
++  #
++  # * Routing keys are ignored on fanout exchanges.
++  # * Wildcards are not valid on direct exchanges.
++  config :key, :validate => :string, :default => "logstash"
++
++  # Use HotBunnies on JRuby to avoid IO#select CPU spikes
++  # (see github.com/ruby-amqp/bunny/issues/95).
++  #
++  # On MRI, use Bunny 0.9.
++  #
++  # See http://rubybunny.info and http://hotbunnies.info
++  # for the docs.
++  if RUBY_ENGINE == "jruby"
++    require "logstash/inputs/rabbitmq/hot_bunnies"
++
++    include HotBunniesImpl
++  else
++    require "logstash/inputs/rabbitmq/bunny"
++
++    include BunnyImpl
++  end
+ end # class LogStash::Inputs::RabbitMQ
+diff --git a/lib/logstash/inputs/rabbitmq/bunny.rb b/lib/logstash/inputs/rabbitmq/bunny.rb
+new file mode 100644
+index 00000000000..8011c41f331
+--- /dev/null
++++ b/lib/logstash/inputs/rabbitmq/bunny.rb
+@@ -0,0 +1,126 @@
++class LogStash::Inputs::RabbitMQ
++  module BunnyImpl
++    def register
++      require "bunny"
++
++      @vhost       ||= Bunny::DEFAULT_HOST
++      # 5672. Will be switched to 5671 by Bunny if TLS is enabled.
++      @port        ||= AMQ::Protocol::DEFAULT_PORT
++      @routing_key ||= "#"
++
++      @settings = {
++        :vhost => @vhost,
++        :host  => @host,
++        :port  => @port,
++        :automatically_recover => false
++      }
++      @settings[:user]      = @user || Bunny::DEFAULT_USER
++      @settings[:pass]      = if @password
++                                @password.value
++                              else
++                                Bunny::DEFAULT_PASSWORD
++                              end
++
++      @settings[:log_level] = if @debug
++                                :debug
++                              else
++                                :error
++                              end
++
++      @settings[:tls]        = @ssl if @ssl
++      @settings[:verify_ssl] = @verify_ssl if @verify_ssl
++
++      proto                  = if @ssl
++                                 "amqp"
++                               else
++                                 "amqps"
++                               end
++      @connection_url        = "#{proto}://#{@user}@#{@host}:#{@port}#{vhost}/#{@queue}"
++
++      @logger.info("Registering input #{@connection_url}")
++    end
++
++    def run(output_queue)
++      @output_queue = output_queue
++
++      begin
++        setup
++        consume(output_queue)
++      rescue Bunny::NetworkFailure, Bunny::ConnectionClosedError, Bunny::ConnectionLevelException, Bunny::TCPConnectionFailed => e
++        n = Bunny::Session::DEFAULT_NETWORK_RECOVERY_INTERVAL * 2
++
++        # Because we manually reconnect instead of letting Bunny
++        # handle failures,
++        # make sure we don't leave any consumer work pool
++        # threads behind. MK.
++        @ch.maybe_kill_consumer_work_pool!
++        @logger.error("RabbitMQ connection error: #{e.message}. Will attempt to reconnect in #{n} seconds...")
++
++        sleep n
++        retry
++      end
++    end
++
++    def teardown
++      @consumer.cancel
++      @q.delete unless @durable
++
++      @ch.close   if @ch && @ch.open?
++      @conn.close if @conn && @conn.open?
++
++      finished
++    end
++
++    def setup
++      @conn = Bunny.new(@settings)
++
++      @logger.debug("Connecting to RabbitMQ. Settings: #{@settings.inspect}, queue: #{@queue.inspect}")
++      return if terminating?
++      @conn.start
++
++      @ch = @conn.create_channel.tap do |ch|
++        ch.prefetch(@prefetch_count)
++      end
++      @logger.info("Connected to RabbitMQ at #{@settings[:host]}")
++
++      @arguments_hash = Hash[*@arguments]
++
++      @q = @ch.queue(@queue,
++        :durable     => @durable,
++        :auto_delete => @auto_delete,
++        :exclusive   => @exclusive,
++        :arguments   => @arguments)
++
++      # exchange binding is optional for the input
++      if @exchange
++        @q.bind(@exchange, :routing_key => @key)
++      end
++    end
++
++    def consume(output_queue)
++      # we both need to block the caller in Bunny::Queue#subscribe and have
++      # a reference to the consumer so that we can cancel it, so
++      # a consumer manually. MK.
++      @consumer = Bunny::Consumer.new(@ch, @q)
++      suffix = if @ack
++                 "with message acknowledgements"
++               else
++                 "without message acknowledgements"
++               end
++      @logger.info("Will consume messages from queue #{@q.name} #{suffix}")
++      @q.subscribe(:manual_ack => @ack, :block => true) do |delivery_info, properties, data|
++        begin
++          if e = to_event(data, @connection_url)
++            output_queue << e
++          else
++            @logger.error "Failed to transform a message to event!"
++          end
++
++          @ch.acknowledge(delivery_info.delivery_tag) if @ack
++        rescue Exception => e
++          @logger.error "Exception when handling a delivery: #{e.message}"
++        end
++      end
++    end
++  end # BunnyImpl
++end
+diff --git a/lib/logstash/inputs/rabbitmq/hot_bunnies.rb b/lib/logstash/inputs/rabbitmq/hot_bunnies.rb
+new file mode 100644
+index 00000000000..9c31985a16e
+--- /dev/null
++++ b/lib/logstash/inputs/rabbitmq/hot_bunnies.rb
+@@ -0,0 +1,136 @@
++require "logstash/pipeline"
++
++class LogStash::Inputs::RabbitMQ
++  # HotBunnies-based implementation for JRuby
++  module HotBunniesImpl
++    def register
++      require "hot_bunnies"
++      require "java"
++
++      @vhost       ||= "127.0.0.1"
++      # 5672. Will be switched to 5671 by Bunny if TLS is enabled.
++      @port        ||= 5672
++      @key         ||= "#"
++
++      @settings = {
++        :vhost => @vhost,
++        :host  => @host,
++        :port  => @port,
++        :user  => @user
++      }
++      @settings[:pass]      = @password.value if @password
++      @settings[:tls]       = @ssl if @ssl
++
++      proto                 = if @ssl
++                                "amqp"
++                              else
++                                "amqps"
++                              end
++      @connection_url       = "#{proto}://#{@user}@#{@host}:#{@port}#{vhost}/#{@queue}"
++
++      @logger.info("Registering input #{@connection_url}")
++    end
++
++    def run(output_queue)
++      @output_queue          = output_queue
++      @break_out_of_the_loop = java.util.concurrent.atomic.AtomicBoolean.new(false)
++
++      # HotBunnies does not raise exceptions when connection goes down with a blocking
++      # consumer running (it uses callbacks, as the RabbitMQ Java client does).
++      #
++      # However, HotBunnies::Channel will make sure to unblock all blocking consumers
++      # on any internal shutdown, so #consume will return and another loop iteration
++      # will run.
++      #
++      # This is very similar to how the Bunny implementation works and is sufficient
++      # for our needs: it recovers successfully after RabbitMQ is kill -9ed, the
++      # network device is shut down, etc. MK.
++      until @break_out_of_the_loop.get do
++        begin
++          setup
++          consume(output_queue)
++        rescue HotBunnies::Exception, java.lang.Throwable, com.rabbitmq.client.AlreadyClosedException => e
++          n = 10
++          @logger.error("RabbitMQ connection error: #{e}. Will reconnect in #{n} seconds...")
++
++          sleep n
++          retry
++        rescue LogStash::Pipeline::ShutdownSignal
++          shutdown_consumer
++        end
++
++        n = 10
++        @logger.error("RabbitMQ connection error: #{e}. Will reconnect in #{n} seconds...")
++      end
++    end
++
++    def teardown
++      shutdown_consumer
++      @q.delete unless @durable
++
++      @ch.close         if @ch && @ch.open?
++      @connection.close if @connection && @connection.open?
++
++      finished
++    end
++
++    #
++    # Implementation
++    #
++
++    protected
++
++    def setup
++      return if terminating?
++
++      @conn = HotBunnies.connect(@settings)
++      @logger.info("Connected to RabbitMQ #{@connection_url}")
++
++      @ch          = @conn.create_channel.tap do |ch|
++        ch.prefetch = @prefetch_count
++      end
++
++      @arguments_hash = Hash[*@arguments]
++
++      @q = @ch.queue(@queue,
++        :durable     => @durable,
++        :auto_delete => @auto_delete,
++        :exclusive   => @exclusive,
++        :arguments   => @arguments)
++    end
++
++    def consume(output_queue)
++      return if terminating?
++
++      # we manually build a consumer here to be able to keep a reference to it
++      # in an @ivar even though we use a blocking version of HB::Queue#subscribe
++      @consumer = @q.build_consumer(:block => true) do |metadata, data|
++        begin
++          if e = to_event(data, @connection_url)
++            output_queue << e
++          else
++            @logger.error "Failed to transform a message to event!"
++          end
++
++          @ch.ack(metadata.delivery_tag) if @ack
++        rescue Exception => e
++          @logger.error "Exception when handling a delivery: #{e.message}"
++        end
++      end
++      suffix = if @ack
++                 "with message acknowledgements"
++               else
++                 "without message acknowledgements"
++               end
++      @logger.info("Will consume messages from queue #{@q.name} #{suffix}")
++      @q.subscribe_with(@consumer, :manual_ack => @ack, :block => true)
++    end
++
++    def shutdown_consumer
++      @break_out_of_the_loop.set(true)
++
++      @consumer.cancel
++      @consumer.gracefully_shut_down
++    end
++  end # HotBunniesImpl
++end
+diff --git a/lib/logstash/outputs/rabbitmq.rb b/lib/logstash/outputs/rabbitmq.rb
+index 8cf057f12f7..5d386497ee3 100644
+--- a/lib/logstash/outputs/rabbitmq.rb
++++ b/lib/logstash/outputs/rabbitmq.rb
+@@ -1,158 +1,89 @@
+ require "logstash/outputs/base"
+ require "logstash/namespace"
+ 
+-# Push events to a RabbitMQ exchange.
++# Push events to a RabbitMQ exchange. Requires RabbitMQ 2.x
++# or later version (3.x is recommended).
+ #
+-# This has been tested with Bunny 0.9.x, which supports RabbitMQ 2.x and 3.x. You can
+-# find links to both here:
++# Relevant links:
+ #
+-# * RabbitMQ - <http://www.rabbitmq.com/>
+-# * Bunny - <https://github.com/ruby-amqp/bunny>
++# * RabbitMQ: <http://www.rabbitmq.com/>
++# * HotBunnies: <http://hotbunnies.info>
++# * Bunny: <http://rubybunny.info>
+ class LogStash::Outputs::RabbitMQ < LogStash::Outputs::Base
+-  MQTYPES = [ "fanout", "direct", "topic" ]
++  EXCHANGE_TYPES = ["fanout", "direct", "topic"]
+ 
+   config_name "rabbitmq"
+-  plugin_status "unsupported"
++  plugin_status "beta"
+ 
+-  # Your amqp server address
++
++  #
++  # Connection
++  #
++
++  # RabbitMQ server address
+   config :host, :validate => :string, :required => true
+ 
+-  # The AMQP port to connect on
++  # RabbitMQ port to connect on
+   config :port, :validate => :number, :default => 5672
+ 
+-  # Your amqp username
++  # RabbitMQ username
+   config :user, :validate => :string, :default => "guest"
+ 
+-  # Your amqp password
++  # RabbitMQ password
+   config :password, :validate => :password, :default => "guest"
+ 
+-  # The exchange type (fanout, topic, direct)
+-  config :exchange_type, :validate => [ "fanout", "direct", "topic"], :required => true
++  # The vhost to use. If you don't know what this is, leave the default.
++  config :vhost, :validate => :string, :default => "/"
++
++  # Enable or disable SSL
++  config :ssl, :validate => :boolean, :default => false
++
++  # Validate SSL certificate
++  config :verify_ssl, :validate => :boolean, :default => false
++
++  # Enable or disable logging
++  config :debug, :validate => :boolean, :default => false
++
++
+ 
+-  # The name of the exchange. Depricated due to conflicts with puppet naming convention.
+-  # Replaced by 'exchange' variable. See LOGSTASH-755
+-  config :name, :validate => :string, :deprecated => true
++  #
++  # Exchange
++  #
++
++
++  # The exchange type (fanout, topic, direct)
++  config :exchange_type, :validate => EXCHANGE_TYPES, :required => true
+ 
+   # The name of the exchange
+-  config :exchange, :validate => :string # TODO(sissel): Make it required when 'name' is gone
++  config :exchange, :validate => :string, :required => true
+ 
+   # Key to route to by default. Defaults to 'logstash'
+   #
+   # * Routing keys are ignored on fanout exchanges.
+   config :key, :validate => :string, :default => "logstash"
+ 
+-  # The vhost to use
+-  config :vhost, :validate => :string, :default => "/"
+-
+   # Is this exchange durable? (aka; Should it survive a broker restart?)
+   config :durable, :validate => :boolean, :default => true
+ 
+-  # Should messages persist to disk on the AMQP broker until they are read by a
+-  # consumer?
++  # Should RabbitMQ persist messages to disk?
+   config :persistent, :validate => :boolean, :default => true
+ 
+-  # Enable or disable debugging
+-  config :debug, :validate => :boolean, :default => false
+ 
+-  # Enable or disable SSL
+-  config :ssl, :validate => :boolean, :default => false
+ 
+-  # Validate SSL certificate
+-  config :verify_ssl, :validate => :boolean, :default => false
++  # Use HotBunnies on JRuby to avoid IO#select CPU spikes
++  # (see github.com/ruby-amqp/bunny/issues/95).
++  #
++  # On MRI, use Bunny 0.9.
++  #
++  # See http://rubybunny.info and http://hotbunnies.info
++  # for the docs.
++  if RUBY_ENGINE == "jruby"
++    require "logstash/outputs/rabbitmq/hot_bunnies"
+ 
+-  public
+-  def register
+-    require "bunny" # rubygem 'bunny'
+-
+-    if @name
+-      if @exchange
+-        @logger.error("'name' and 'exchange' are the same setting, but 'name' is deprecated. Please use only 'exchange'")
+-      end
+-      @exchange = @name
+-    end
+-
+-    @logger.info("Registering output", :plugin => self)
+-    connect
+-  end # def register
+-
+-  public
+-  def connect
+-    amqpsettings = {
+-      :vhost => @vhost,
+-      :host => @host,
+-      :port => @port,
+-      :logging => @debug,
+-    }
+-    amqpsettings[:user] = @user if @user
+-    amqpsettings[:pass] = @password.value if @password
+-    amqpsettings[:ssl] = @ssl if @ssl
+-    amqpsettings[:verify_ssl] = @verify_ssl if @verify_ssl
+-
+-    begin
+-      @logger.debug("Connecting to AMQP", :settings => amqpsettings,
+-                    :exchange_type => @exchange_type, :name => @exchange)
+-      @bunny = Bunny.new(amqpsettings)
+-      @bunny.start
+-    rescue => e
+-      if terminating?
+-        return
+-      else
+-        @logger.error("AMQP connection error (during connect), will reconnect",
+-                      :exception => e, :backtrace => e.backtrace)
+-        sleep(1)
+-        retry
+-      end
+-    end
+-
+-    @logger.debug("Declaring exchange", :name => @exchange, :type => @exchange_type,
+-                  :durable => @durable)
+-    @bunnyexchange = @bunny.exchange(@exchange, :type => @exchange_type.to_sym, :durable => @durable)
+-
+-    @logger.debug("Binding exchange", :name => @exchange, :key => @key)
+-  end # def connect
+-
+-  public
+-  def receive(event)
+-    return unless output?(event)
+-
+-    @logger.debug("Sending event", :destination => to_s, :event => event,
+-                  :key => key)
+-    key = event.sprintf(@key) if @key
+-    begin
+-      receive_raw(event.to_json, key)
+-    rescue JSON::GeneratorError => e
+-      @logger.warn("Trouble converting event to JSON", :exception => e,
+-                   :event => event)
+-      return
+-    end
+-  end # def receive
+-
+-  public
+-  def receive_raw(message, key=@key)
+-    begin
+-      if @bunnyexchange
+-        @logger.debug(["Publishing message", { :destination => to_s, :message => message, :key => key }])
+-        @bunnyexchange.publish(message, :persistent => @persistent, :key => key)
+-      else
+-        @logger.warn("Tried to send message, but not connected to amqp yet.")
+-      end
+-    rescue *[Bunny::ServerDownError, Errno::ECONNRESET] => e
+-      @logger.error("AMQP connection error (during publish), will reconnect: #{e}")
+-      connect
+-      retry
+-    end
+-  end
++    include HotBunniesImpl
++  else
++    require "logstash/outputs/rabbitmq/bunny"
+ 
+-  public
+-  def to_s
+-    return "amqp://#{@user}@#{@host}:#{@port}#{@vhost}/#{@exchange_type}/#{@exchange}\##{@key}"
++    include BunnyImpl
+   end
+-
+-  public
+-  def teardown
+-    @bunny.close rescue nil
+-    @bunny = nil
+-    @bunnyexchange = nil
+-    finished
+-  end # def teardown
+ end # class LogStash::Outputs::RabbitMQ
+diff --git a/lib/logstash/outputs/rabbitmq/bunny.rb b/lib/logstash/outputs/rabbitmq/bunny.rb
+new file mode 100644
+index 00000000000..1ed242e83fb
+--- /dev/null
++++ b/lib/logstash/outputs/rabbitmq/bunny.rb
+@@ -0,0 +1,134 @@
++class LogStash::Outputs::RabbitMQ
++  module BunnyImpl
++
++    #
++    # API
++    #
++
++    def register
++      require "bunny"
++
++      @logger.info("Registering output", :plugin => self)
++
++      connect
++      declare_exchange
++    end # def register
++
++
++    def receive(event)
++      return unless output?(event)
++
++      @logger.debug("Sending event", :destination => to_s, :event => event, :key => key)
++      key = event.sprintf(@key) if @key
++
++      begin
++        publish_serialized(event.to_json, key)
++      rescue JSON::GeneratorError => e
++        @logger.warn("Trouble converting event to JSON", :exception => e,
++                     :event => event)
++      end
++    end
++
++    def publish_serialized(message, key = @key)
++      begin
++        if @x
++          @x.publish(message, :persistent => @persistent, :routing_key => key)
++        else
++          @logger.warn("Tried to send a message, but not connected to RabbitMQ yet.")
++        end
++      rescue Bunny::NetworkFailure, Bunny::ConnectionClosedError, Bunny::ConnectionLevelException, Bunny::TCPConnectionFailed => e
++        n = Bunny::Session::DEFAULT_NETWORK_RECOVERY_INTERVAL * 2
++
++        @logger.error("RabbitMQ connection error: #{e.message}. Will attempt to reconnect in #{n} seconds...",
++                      :exception => e,
++                      :backtrace => e.backtrace)
++        return if terminating?
++
++        sleep n
++        connect
++        declare_exchange
++        retry
++      end
++    end
++
++    def to_s
++      return "amqp://#{@user}@#{@host}:#{@port}#{@vhost}/#{@exchange_type}/#{@exchange}\##{@key}"
++    end
++
++    def teardown
++      @conn.close if @conn && @conn.open?
++      @conn = nil
++
++      finished
++    end
++
++
++
++    #
++    # Implementation
++    #
++
++    def connect
++      @vhost       ||= Bunny::DEFAULT_HOST
++      # 5672. Will be switched to 5671 by Bunny if TLS is enabled.
++      @port        ||= AMQ::Protocol::DEFAULT_PORT
++      @routing_key ||= "#"
++
++      @settings = {
++        :vhost => @vhost,
++        :host  => @host,
++        :port  => @port,
++        :automatically_recover => false
++      }
++      @settings[:user]      = @user || Bunny::DEFAULT_USER
++      @settings[:pass]      = if @password
++                                @password.value
++                              else
++                                Bunny::DEFAULT_PASSWORD
++                              end
++
++      @settings[:log_level] = if @debug
++                                :debug
++                              else
++                                :error
++                              end
++
++      @settings[:tls]        = @ssl if @ssl
++      @settings[:verify_ssl] = @verify_ssl if @verify_ssl
++
++      proto                  = if @ssl
++                                 "amqp"
++                               else
++                                 "amqps"
++                               end
++      @connection_url        = "#{proto}://#{@user}@#{@host}:#{@port}#{vhost}/#{@queue}"
++
++      begin
++        @conn = Bunny.new(@settings)
++
++        @logger.debug("Connecting to RabbitMQ. Settings: #{@settings.inspect}, queue: #{@queue.inspect}")
++        return if terminating?
++        @conn.start
++
++        @ch = @conn.create_channel
++        @logger.info("Connected to RabbitMQ at #{@settings[:host]}")
++      rescue Bunny::NetworkFailure, Bunny::ConnectionClosedError, Bunny::ConnectionLevelException, Bunny::TCPConnectionFailed => e
++        n = Bunny::Session::DEFAULT_NETWORK_RECOVERY_INTERVAL * 2
++
++        @logger.error("RabbitMQ connection error: #{e.message}. Will attempt to reconnect in #{n} seconds...",
++                      :exception => e,
++                      :backtrace => e.backtrace)
++        return if terminating?
++
++        sleep n
++        retry
++      end
++    end
++
++    def declare_exchange
++      @logger.debug("Declaring an exchange", :name => @exchange, :type => @exchange_type,
++                    :durable => @durable)
++      @x = @ch.exchange(@exchange, :type => @exchange_type.to_sym, :durable => @durable)
++    end
++  end # BunnyImpl
++end # LogStash::Outputs::RabbitMQ
+diff --git a/lib/logstash/outputs/rabbitmq/hot_bunnies.rb b/lib/logstash/outputs/rabbitmq/hot_bunnies.rb
+new file mode 100644
+index 00000000000..95192e4c4d3
+--- /dev/null
++++ b/lib/logstash/outputs/rabbitmq/hot_bunnies.rb
+@@ -0,0 +1,141 @@
++class LogStash::Outputs::RabbitMQ
++  module HotBunniesImpl
++
++
++    #
++    # API
++    #
++
++    def register
++      require "hot_bunnies"
++      require "java"
++
++      @logger.info("Registering output", :plugin => self)
++
++      @connected = java.util.concurrent.atomic.AtomicBoolean.new
++
++      connect
++      declare_exchange
++
++      @connected.set(true)
++    end
++
++
++    def receive(event)
++      return unless output?(event)
++
++      key = event.sprintf(@key) if @key
++
++      begin
++        publish_serialized(event.to_json, key)
++      rescue JSON::GeneratorError => e
++        @logger.warn("Trouble converting event to JSON", :exception => e,
++                     :event => event)
++      end
++    end
++
++    def publish_serialized(message, key = @key)
++      begin
++        if @connected.get
++          @x.publish(message, :routing_key => key, :properties => {
++            :persistent => @persistent
++          })
++        else
++          @logger.warn("Tried to send a message, but not connected to RabbitMQ.")
++        end
++      rescue HotBunnies::Exception, com.rabbitmq.client.AlreadyClosedException => e
++        @connected.set(false)
++        n = 10
++
++        @logger.error("RabbitMQ connection error: #{e.message}. Will attempt to reconnect in #{n} seconds...",
++                      :exception => e,
++                      :backtrace => e.backtrace)
++        return if terminating?
++
++        sleep n
++
++        connect
++        declare_exchange
++        retry
++      end
++    end
++
++    def to_s
++      return "amqp://#{@user}@#{@host}:#{@port}#{@vhost}/#{@exchange_type}/#{@exchange}\##{@key}"
++    end
++
++    def teardown
++      @connected.set(false)
++      @conn.close if @conn && @conn.open?
++      @conn = nil
++
++      finished
++    end
++
++
++
++    #
++    # Implementation
++    #
++
++    def connect
++      return if terminating?
++
++      @vhost       ||= "127.0.0.1"
++      # 5672. Will be switched to 5671 by Bunny if TLS is enabled.
++      @port        ||= 5672
++
++      @settings = {
++        :vhost => @vhost,
++        :host  => @host,
++        :port  => @port,
++        :user  => @user
++      }
++      @settings[:pass]      = if @password
++                                @password.value
++                              else
++                                "guest"
++                              end
++
++      @settings[:tls]        = @ssl if @ssl
++      proto                  = if @ssl
++                                 "amqp"
++                               else
++                                 "amqps"
++                               end
++      @connection_url        = "#{proto}://#{@user}@#{@host}:#{@port}#{vhost}/#{@queue}"
++
++      begin
++        @conn = HotBunnies.connect(@settings)
++
++        @logger.debug("Connecting to RabbitMQ. Settings: #{@settings.inspect}, queue: #{@queue.inspect}")
++
++        @ch = @conn.create_channel
++        @logger.info("Connected to RabbitMQ at #{@settings[:host]}")
++      rescue HotBunnies::Exception => e
++        @connected.set(false)
++        n = 10
++
++        @logger.error("RabbitMQ connection error: #{e.message}. Will attempt to reconnect in #{n} seconds...",
++                      :exception => e,
++                      :backtrace => e.backtrace)
++        return if terminating?
++
++        sleep n
++        retry
++      end
++    end
++
++    def declare_exchange
++      @logger.debug("Declaring an exchange", :name => @exchange, :type => @exchange_type,
++                    :durable => @durable)
++      @x = @ch.exchange(@exchange, :type => @exchange_type.to_sym, :durable => @durable)
++
++      # sets @connected to true during recovery. MK.
++      @connected.set(true)
++
++      @x
++    end
++
++  end # HotBunniesImpl
++end
+diff --git a/logstash.gemspec b/logstash.gemspec
+index 4f3c1dbb73a..0097e2f310a 100644
+--- a/logstash.gemspec
++++ b/logstash.gemspec
+@@ -38,7 +38,6 @@ Gem::Specification.new do |gem|
+   gem.add_runtime_dependency "aws-sdk"                          #{Apache 2.0 license}
+   gem.add_runtime_dependency "heroku"                           #(MIT license)
+   gem.add_runtime_dependency "addressable"                      #(Apache 2.0 license)
+-  gem.add_runtime_dependency "bunny", ["0.8.0"]                 #(MIT license)
+   gem.add_runtime_dependency "ffi"                              #(LGPL-3 license)
+   gem.add_runtime_dependency "ffi-rzmq", ["1.0.0"]              #(MIT license)
+   gem.add_runtime_dependency "filewatch", ["0.5.1"]             #(BSD license)
+@@ -84,6 +83,12 @@ Gem::Specification.new do |gem|
+     gem.add_runtime_dependency "msgpack"  #(Apache 2.0 license)
+   end
+ 
++  if RUBY_PLATFORM != 'java'
++    gem.add_runtime_dependency "bunny",       ["~> 0.9.8"]  #(MIT license)
++  else
++    gem.add_runtime_dependency "hot_bunnies", ["~> 2.0.0.pre9"] #(MIT license)
++  end
++
+   if RUBY_VERSION >= '1.9.1'
+     gem.add_runtime_dependency "cinch" # cinch requires 1.9.1+ #(MIT license)
+   end

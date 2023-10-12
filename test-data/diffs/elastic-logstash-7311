@@ -1,0 +1,178 @@
+diff --git a/tools/ingest-converter/src/main/java/org/logstash/ingest/Gsub.java b/tools/ingest-converter/src/main/java/org/logstash/ingest/Gsub.java
+new file mode 100644
+index 00000000000..63b9dfded06
+--- /dev/null
++++ b/tools/ingest-converter/src/main/java/org/logstash/ingest/Gsub.java
+@@ -0,0 +1,30 @@
++package org.logstash.ingest;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Paths;
++import javax.script.Invocable;
++import javax.script.ScriptEngine;
++import javax.script.ScriptException;
++
++public final class Gsub {
++
++    private Gsub() {
++        // Utility Wrapper for JS Script.
++    }
++    
++    public static void main(final String... args) throws ScriptException, NoSuchMethodException {
++        try {
++            final ScriptEngine engine = JsUtil.engine();
++            Files.write(Paths.get(args[1]), ((String) ((Invocable) engine).invokeFunction(
++                "ingest_to_logstash_gsub",
++                new String(
++                    Files.readAllBytes(Paths.get(args[0])), StandardCharsets.UTF_8
++                )
++            )).getBytes(StandardCharsets.UTF_8));
++        } catch (final IOException ex) {
++            throw new IllegalStateException(ex);
++        }
++    }
++}
+diff --git a/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java b/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java
+index 8cd410ab92f..1b9c21043a6 100644
+--- a/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java
++++ b/tools/ingest-converter/src/main/java/org/logstash/ingest/JsUtil.java
+@@ -12,7 +12,9 @@ final class JsUtil {
+     /**
+      * Script names used by the converter in correct load order.
+      */
+-    private static final String[] SCRIPTS = {"shared", "date", "grok", "geoip", "pipeline", "convert"};
++
++    private static final String[] SCRIPTS =
++        {"shared", "date", "grok", "geoip", "gsub", "pipeline", "convert"};
+ 
+     private JsUtil() {
+         // Utility Class
+diff --git a/tools/ingest-converter/src/main/resources/ingest-gsub.js b/tools/ingest-converter/src/main/resources/ingest-gsub.js
+new file mode 100644
+index 00000000000..d060d5ec6cc
+--- /dev/null
++++ b/tools/ingest-converter/src/main/resources/ingest-gsub.js
+@@ -0,0 +1,29 @@
++var IngestGsub = {
++    has_gsub: function (processor) {
++        return !!processor["gsub"];
++    },
++    gsub_hash: function (processor) {
++        var gsub_data = processor["gsub"];
++        return IngestConverter.create_field(
++            "gsub",
++            "[\n" + [IngestConverter.dots_to_square_brackets(gsub_data["field"]),
++                gsub_data["pattern"], gsub_data["replacement"]].map(IngestConverter.quote_string)
++                .join(", ") + "\n]"
++        );
++    }
++};
++
++/**
++ * Converts Ingest JSON to LS Grok.
++ */
++function ingest_to_logstash_gsub(json) {
++
++    function map_processor(processor) {
++
++        return IngestConverter.filter_hash(
++            IngestConverter.create_hash("mutate", IngestGsub.gsub_hash(processor))
++        )
++    }
++
++    return IngestConverter.filters_to_file(JSON.parse(json)["processors"].map(map_processor));
++}
+diff --git a/tools/ingest-converter/src/main/resources/ingest-pipeline.js b/tools/ingest-converter/src/main/resources/ingest-pipeline.js
+index 1f639b14fdd..311c33f8611 100644
+--- a/tools/ingest-converter/src/main/resources/ingest-pipeline.js
++++ b/tools/ingest-converter/src/main/resources/ingest-pipeline.js
+@@ -24,7 +24,12 @@ function ingest_pipeline_to_logstash(json) {
+         if (IngestConvert.has_convert(processor)) {
+             filter_blocks.push(
+                 IngestConverter.create_hash("mutate", IngestConvert.convert_hash(processor))
+-            )
++            );
++        }
++        if (IngestGsub.has_gsub(processor)) {
++            filter_blocks.push(
++                IngestConverter.create_hash("mutate", IngestGsub.gsub_hash(processor))
++            );
+         }
+         return IngestConverter.join_hash_fields(filter_blocks);
+     }
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/GsubTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/GsubTest.java
+new file mode 100644
+index 00000000000..c3b92c1e397
+--- /dev/null
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/GsubTest.java
+@@ -0,0 +1,25 @@
++package org.logstash.ingest;
++
++import java.util.Collections;
++import org.junit.Test;
++
++import static org.hamcrest.CoreMatchers.is;
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.junit.runners.Parameterized.Parameters;
++
++public final class GsubTest extends IngestTest {
++
++    @Parameters
++    public static Iterable<String> data() {
++        return Collections.singletonList("GsubSimple");
++    }
++
++    @Test
++    public void convertsGsubCorrectly() throws Exception {
++        final String date = getResultPath(temp);
++        Gsub.main(resourcePath(String.format("ingest%s.json", testCase)), date);
++        assertThat(
++            utf8File(date), is(utf8File(resourcePath(String.format("logstash%s.conf", testCase))))
++        );
++    }
++}
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/PipelineTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/PipelineTest.java
+index c269062895c..358e9af913e 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/PipelineTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/PipelineTest.java
+@@ -19,6 +19,7 @@ public static Iterable<String> data() {
+         DateTest.data().forEach(cases::add);
+         GrokTest.data().forEach(cases::add);
+         ConvertTest.data().forEach(cases::add);
++        GsubTest.data().forEach(cases::add);
+         return cases;
+     }
+ 
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestGsubSimple.json b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestGsubSimple.json
+new file mode 100644
+index 00000000000..14835baa028
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestGsubSimple.json
+@@ -0,0 +1,12 @@
++{
++  "description": "ExampleGsub",
++  "processors": [
++    {
++      "gsub": {
++        "field": "field1",
++        "pattern": "\\.",
++        "replacement": "_"
++      }
++    }
++  ]
++}
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashGsubSimple.conf b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashGsubSimple.conf
+new file mode 100644
+index 00000000000..d62c6c25957
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/logstashGsubSimple.conf
+@@ -0,0 +1,7 @@
++filter {
++   mutate {
++      gsub => [
++         "field1", "\.", "_"
++      ]
++   }
++}

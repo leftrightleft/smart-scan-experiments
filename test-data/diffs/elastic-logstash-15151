@@ -1,0 +1,569 @@
+diff --git a/config/jvm.options b/config/jvm.options
+index 9b1b6616765..826f630fd43 100644
+--- a/config/jvm.options
++++ b/config/jvm.options
+@@ -3,8 +3,8 @@
+ # Xms represents the initial size of total heap space
+ # Xmx represents the maximum size of total heap space
+ 
+--Xms1g
+--Xmx1g
++-Xms4g
++-Xmx4g
+ 
+ ################################################################
+ ## Expert settings
+@@ -69,4 +69,14 @@
+ -Djava.security.egd=file:/dev/urandom
+ 
+ # Copy the logging context from parent threads to children
+--Dlog4j2.isThreadContextMapInheritable=true
+\ No newline at end of file
++-Dlog4j2.isThreadContextMapInheritable=true
++
++#-Dio.netty.eventLoopThreads=48
++#-Dio.netty.allocator.numHeapArenas=0
++#-Dio.netty.allocator.numDirectArenas=1
++#-Dio.netty.noPreferDirect=false
++
++-XX:NativeMemoryTracking=summary
++#-XX:MaxDirectMemorySize=64m
++-XX:MaxDirectMemorySize=128m
++-XX:-MaxFDLimit
+\ No newline at end of file
+diff --git a/config/log4j2.properties b/config/log4j2.properties
+index 234b23db45e..a5bc0600e45 100644
+--- a/config/log4j2.properties
++++ b/config/log4j2.properties
+@@ -145,3 +145,15 @@ logger.deprecation_root.name = deprecation
+ logger.deprecation_root.level = WARN
+ logger.deprecation_root.appenderRef.deprecation_rolling.ref = deprecation_plain_rolling
+ logger.deprecation_root.additivity = false
++
++
++#logger.netty.name = io.netty.util.internal
++logger.beats_input.name = org.logstash.beats.BeatsParser
++logger.beats_input.level = warn
++logger.netty.name = io.netty.buffer
++logger.netty.level = debug
++logger.netty_channel.name = io.netty.channel
++logger.netty_channel.level = debug
++logger.netty_ssl_handler.name = io.netty.handler.ssl
++logger.netty_ssl_handler.level = info
++
+diff --git a/ingest_all_hands/README.md b/ingest_all_hands/README.md
+new file mode 100644
+index 00000000000..2f9d6a1d3e8
+--- /dev/null
++++ b/ingest_all_hands/README.md
+@@ -0,0 +1,33 @@
++Add the following to `jvm.options`
++
++```
++-XX:MaxDirectMemorySize=64m
++-XX:-MaxFDLimit
++```
++
++MaxDirectMemorySize : limits the direct memory used by JVM
++-MaxFDLimit : on Mac avoid the JVM limiting the number of file descriptors
++
++
++# Launching LS
++
++```
++ulimit -S -n 1048576 && bin/logstash -f /Users/andrea/workspace/logstash_andsel/ingest_all_hands/ssl_tcp_pipeline.conf
++```
++
++## Launching the TCP benchmark tool
++
++```
++ruby -J-Xmx16g -J-XX:-MaxFDLimit benchmark_client.rb
++```
++
++- `-MaxFDLimit` is used to avoid the FD limit imposed by the JVM
++
++## Launching the Beats benchmark tool
++Provide at least 128Mb for direct memory (MaxDirectMemorySize)
++
++```
++ruby -J-Xmx16g -J-XX:-MaxFDLimit benchmark_client.rb --test=beats -a yes -f 3
++```
++- `-a` is used to consumes the ACK messages
++-  `-f 3` define the speed of ACKs reads per seconds.
+\ No newline at end of file
+diff --git a/ingest_all_hands/benchmark_client.rb b/ingest_all_hands/benchmark_client.rb
+new file mode 100644
+index 00000000000..37bd3f5a5c2
+--- /dev/null
++++ b/ingest_all_hands/benchmark_client.rb
+@@ -0,0 +1,244 @@
++# encoding: utf-8
++
++require "socket"
++require "thread"
++require "zlib"
++require "json"
++require "openssl"
++require 'optparse'
++
++Thread.abort_on_exception = true
++HOST="127.0.0.1"
++PORT=3333
++CLIENT_CERT="/Users/andrea/workspace/certificates/client_from_root.crt"
++CLIENT_KEY="/Users/andrea/workspace/certificates/client_from_root.key.pkcs8"
++
++module Lumberjack
++  SEQUENCE_MAX = (2**32-1).freeze
++
++  class Client
++    def initialize
++      @sequence = 0
++      @socket = connect
++    end
++
++    private
++    def connect
++      socket = TCPSocket.new(HOST, PORT)
++      ctx = OpenSSL::SSL::SSLContext.new
++      ctx.cert = OpenSSL::X509::Certificate.new(File.read(CLIENT_CERT))
++      ctx.key = OpenSSL::PKey::RSA.new(File.read(CLIENT_KEY))
++      ctx.ssl_version = :TLSv1_2
++      # Wrap the socket with SSL/TLS
++      ssl_socket = OpenSSL::SSL::SSLSocket.new(socket, ctx)
++      ssl_socket.sync_close = true
++      ssl_socket.connect
++      ssl_socket
++    end
++
++    public
++    def write(elements, opts={})
++      elements = [elements] if elements.is_a?(Hash)
++      send_window_size(elements.size)
++
++      payload = elements.map { |element| JsonEncoder.to_frame(element, inc) }.join
++      send_payload(payload)
++    end
++
++    public
++    def read_ack
++      ack = @socket.sysread(6)
++      if ack.size > 2
++        # ACK os size 2 are "2A" messages which are keep alive
++        unpacked = ack.unpack('AAN')
++        if unpacked[0] == "2" && unpacked[1] == "A"
++          sequence_num = unpacked[2]
++          #puts "Received ACK #{sequence_num}"
++        end
++      end
++    end
++
++    private
++    def inc
++      @sequence = 0 if @sequence + 1 > Lumberjack::SEQUENCE_MAX
++      @sequence = @sequence + 1
++    end
++
++    private
++    def send_window_size(size)
++      @socket.syswrite(["2", "W", size].pack("AAN"))
++    end
++
++    private
++    def send_payload(payload)
++      payload_size = payload.size
++      written = 0
++      while written < payload_size
++        written += @socket.syswrite(payload[written..-1])
++      end
++    end
++
++    public 
++    def send_raw(payload)
++      send_payload(payload)
++    end
++
++    public
++    def close
++      @socket.close
++    end
++  end
++
++  module JsonEncoder
++    def self.to_frame(hash, sequence)
++      json = hash.to_json
++      json_length = json.bytesize
++      pack = "AANNA#{json_length}"
++      frame = ["2", "J", sequence, json_length, json]
++      frame.pack(pack)
++    end
++  end
++
++end
++
++class Benchmark
++  MB = 1024 * 1024
++  KB = 1024
++
++  attr_reader :client_count
++
++  def initialize(traffic_type = :tcp, beats_ack = true, acks_per_second = nil)
++    @client_count = 12
++    @total_traffic_per_connection = 1024 * MB
++    # keep message size above 16k, requiring two TLS records
++    @message_sizes = [8 * KB, 16 * KB, 64 * KB, 128 * KB, 512 * KB]
++    @traffic_type = traffic_type
++    @beats_ack = beats_ack
++    @acks_per_second = acks_per_second
++  end
++
++  def run
++    puts "Using #{client_count} clients, starting at: #{Time.now()}"
++    @message_sizes.each do |message_size|
++      puts "\n\n"
++      message = 'a' * message_size + "\n"
++      test_iterations = 3
++      repetitions = @total_traffic_per_connection / message_size
++      puts "Expected to send #{repetitions * client_count * test_iterations} total messages, repetitions #{repetitions} for client of #{message_size}KB size"
++      puts "Writing approximately #{(client_count * repetitions * message.size)/1024.0/1024.0}Mib across #{@client_count} clients (message size: #{message_size} Kb)"
++
++      speeds = []
++      test_iterations.times do
++        speeds << execute_message_benchmark(message, repetitions)
++      end
++
++      puts "Terminated  at: #{Time.now()}"
++      puts "Average evts(#{message_size}bytes)/sec (mean): #{speeds.sum / test_iterations} values: #{speeds}"
++    end
++  end
++
++  private
++  def execute_message_benchmark(message, repetitions)
++    start = Time.now()
++    sent_messages = java.util.concurrent.atomic.AtomicLong.new(0)
++
++    if @traffic_type == :tcp
++      tcp_traffic_load(client_count, message, repetitions, sent_messages)
++    elsif @traffic_type == :beats
++      beats_traffic_load(client_count, message, repetitions, sent_messages)
++    else
++      raise "Unrecognized traffic type: #{@traffic_type}"
++    end
++
++    puts "Done in #{Time.now() - start} seconds"
++
++    sent_messages.get / (Time.now() - start)
++  end
++
++  private
++  def tcp_traffic_load(client_count, message, repetitions, sent_messages)
++    clients = @client_count.times.map { Lumberjack::Client.new }
++
++    threads = client_count.times.map do |i|
++      Thread.new(i) do |i|
++        client = clients[i]
++        # keep message size above 16k, requiring two TLS records
++        repetitions.times do
++          client.send_raw(message)
++          sent_messages.incrementAndGet
++        end
++        client.close
++      end
++    end
++
++    threads.each(&:join)
++  end
++
++  private
++  def beats_traffic_load(client_count, message, repetitions, sent_messages)
++    clients = @client_count.times.map { Lumberjack::Client.new }
++
++    writer_threads = client_count.times.map do |i|
++      Thread.new(i) do |i|
++        client = clients[i]
++        # keep message size above 16k, requiring two TLS records
++        data = [ { "message" => message } ]
++        repetitions.times do
++          client.write(data) # this convert JSON to bytes
++          sent_messages.incrementAndGet
++        end
++        client.close
++      end
++    end
++
++    if @beats_ack
++      puts "Starting ACK reading thread"
++      reader_threads = client_count.times.map do |i|
++        Thread.new(i) do |i|
++          client = clients[i]
++          exit = false
++          acks_counter = 0;
++          while (!exit)
++            if acks_counter == @acks_per_second
++              sleep 1
++              acks_counter = 0
++            end
++            begin
++              client.read_ack
++              acks_counter = acks_counter + 1
++            rescue
++              #puts "Closing reader thread for client #{i}"
++              exit = true
++            end
++          end
++        end
++      end
++    end
++
++    writer_threads.each(&:join)
++    reader_threads.each(&:join) if @beats_ack
++  end
++end
++
++options = {}
++option_parser = OptionParser.new do |opts|
++  opts.banner = "Usage: ruby tcp_client.rb benchmark_client.rb --test=beats|tcp -ack [yes|no] --acks_per_second 1000"
++  opts.on '-tKIND', '--test=KIND', 'Select to benchmark the TCP or Beats input'
++  opts.on '-a' '--[no-]ack [FLAG]', TrueClass, 'In beats determine if read ACKs flow or not' do |v|
++    options[:ack] = v.nil? ? true : v
++  end
++  opts.on("-fACKS", "--acks_per_second ACKS", Integer, "Rate ACKs per second")
++end
++option_parser.parse!(into: options)
++
++puts "Parsed options: #{options}"
++
++ack = options[:ack]
++
++kind = :tcp
++kind = options[:test].downcase.to_sym if options[:test]
++acks_per_second = nil
++acks_per_second = options[:acks_per_second] if options[:acks_per_second]
++
++benchmark = Benchmark.new(kind, ack, acks_per_second)
++benchmark.run
+\ No newline at end of file
+diff --git a/ingest_all_hands/filebeat/multiple_filebeats.rb b/ingest_all_hands/filebeat/multiple_filebeats.rb
+new file mode 100644
+index 00000000000..ce061ac0454
+--- /dev/null
++++ b/ingest_all_hands/filebeat/multiple_filebeats.rb
+@@ -0,0 +1,107 @@
++# encoding: utf-8
++
++require "open3"
++require 'fileutils'
++require 'open-uri'
++
++def generate_sample_file(filename, size, line_length)
++  file = File.open(filename, "w")
++  words = %w(Lorem ipsum dolor sit amet consectetur adipiscing elit Ut ornare erat purus in condimentum quam accumsan ut 
++  Maecenas et iaculis erat quis tempus odio Etiam ut malesuada est Nam tristique tincidunt dictum Morbi purus ipsum maximus ut risus eu 
++  ultrices scelerisque est Ut bibendum augue ac nisl gravida pretium Quisque eu quam dignissim porttitor nunc non venenatis ipsum 
++  Aenean vel lacinia arcu Etiam risus ex suscipit vel dui at pellentesque eleifend est Interdum et malesuada fames ac ante ipsum primis 
++  in faucibus Etiam luctus nibh nulla Vivamus ante ex tempor eget sapien in finibus laoreet est In sagittis rhoncus aliquet 
++  Praesent lobortis arcu efficitur purus viverra vitae fermentum nisi condimentum Nunc ornare eros nec augue consequat pulvinar Nunc convallis 
++  malesuada ultrices Mauris mi ligula gravida eget dui id vehicula posuere purus Etiam ac tincidunt mauris Nulla semper eros nulla ac 
++  viverra nulla pellentesque at Vivamus tincidunt consectetur purus Vivamus congue libero vel lobortis lacinia Donec consectetur sagittis leo sit 
++  amet dapibus lorem faucibus ut Phasellus rhoncus risus vitae aliquam malesuada Fusce blandit dictum leo ut sodales Nunc fringilla lectus ut 
++  feugiat vehicula Aliquam erat volutpat)
++  sample_line = ""
++  while (sample_line.size < line_length)
++   sample_line = sample_line + words.sample
++  end
++  sample_line = sample_line + "\n"
++  puts "dictionary size: #{words.size} sample_line size: #{sample_line.size}"
++
++  iterations = size / sample_line.size
++  (1..iterations).each { file.write(sample_line) }
++  file.close
++end
++
++def generate_filebeat_config_file(sample_file)
++  sample_file = Dir.pwd + "/#{sample_file}"
++  config_string = <<-CONFIG
++  filebeat.inputs:
++  - type: filestream
++    enabled: true
++
++    # Paths that should be crawled and fetched. Glob based paths.
++    paths:
++      - #{sample_file}
++
++  output.logstash:
++    hosts: ["127.0.0.1:5044"]
++    slow_start: true
++  CONFIG
++  File.write("filebeat.yml", config_string, mode: "w")
++end
++
++# return the name of the filebeat folder
++def download_and_unpack_beats(version)
++  os = RbConfig::CONFIG['host_os']
++  arch = RbConfig::CONFIG['host_cpu']
++  arch = 'aarch64' if RbConfig::CONFIG['host_cpu'] == "arm64"
++  filebeat_archive = "filebeat-#{version}-#{os}-#{arch}.tar.gz"
++  unless File.exists?(filebeat_archive)
++    puts "Filebeat distribution not present for version: #{version}, OS: {os}, arch: #{arch}"
++    open(filebeat_archive, 'wb') do |file|
++      file << open("https://artifacts.elastic.co/downloads/beats/filebeat/#{filebeat_archive}").read
++    end
++    puts "Downloded."
++  end
++
++  filebeat_folder = "filebeat-#{version}-#{os}-#{arch}"
++  unless File.exists?(filebeat_folder)
++     puts "Filebeat distribution not unpacked, unpacking"
++     system("tar zxf #{filebeat_archive}")
++     puts "Filebeat distribution ready"
++  end
++  filebeat_folder
++end
++
++filebeat_folder = download_and_unpack_beats('8.8.2')
++puts "Generating sample data"
++generate_sample_file("input_sample.txt", 800 * 1024 * 1024, 1024)
++puts "Ok."
++puts "Setting up filebeat configuration file"
++generate_filebeat_config_file("input_sample.txt")
++puts "Ok."
++
++beats_instances = 20
++# beats_instances = 1
++wait_threads = []
++pwd = Dir.pwd
++(1..beats_instances).each do |id|
++  data_dir = pwd + "/data_#{id}"
++  logs_dir = pwd + "/logs_#{id}"
++
++  stdin, stdout, stderr, wait_thr = Open3.popen3("#{filebeat_folder}/filebeat --path.data #{data_dir} --path.logs #{logs_dir} --path.config #{pwd}")
++  wait_threads << wait_thr
++  puts "Started #{id} beats process"
++end
++
++sleep 2 * 60
++
++# shutting down all beats
++wait_threads.each { |wait_thr| Process.kill("KILL", wait_thr.pid) }
++
++puts "Killed all beats processes"
++
++puts "cleaning data and logs folders for all the beats"
++(1..beats_instances).each do |id|
++  FileUtils.remove_dir(pwd + "/data_#{id}")
++  FileUtils.remove_dir(pwd + "/logs_#{id}")
++end
++
++puts "Done."
++
+diff --git a/ingest_all_hands/plain_tcp_pipeline.conf b/ingest_all_hands/plain_tcp_pipeline.conf
+new file mode 100644
+index 00000000000..29736434733
+--- /dev/null
++++ b/ingest_all_hands/plain_tcp_pipeline.conf
+@@ -0,0 +1,26 @@
++input{
++  tcp {
++    port => 3333
++    codec => line
++  }
++} 
++
++#filter{
++#  sleep{time => "0.1"}
++#} 
++
++#filter {
++#  ruby {
++#    init => "Thread.new { loop { puts Java::io.netty.buffer.ByteBufAllocator::DEFAULT.metric.toString(); puts Java::io.netty.buffer.ByteBufAllocator::DEFAULT.dump_stats;sleep 5 } }" 
++#    code => ""
++#  }
++#}
++
++output{
++  sink {}
++
++  #stdout {
++  #  codec=>dots
++  #  #codec => rubydebug
++  #}
++}
+\ No newline at end of file
+diff --git a/ingest_all_hands/ssl_beats_pipeline.conf b/ingest_all_hands/ssl_beats_pipeline.conf
+new file mode 100644
+index 00000000000..b7b3f3c6ee1
+--- /dev/null
++++ b/ingest_all_hands/ssl_beats_pipeline.conf
+@@ -0,0 +1,34 @@
++input{
++  beats {
++    port => 3333
++    ssl_enabled => true 
++    ssl_key => "/Users/andrea/workspace/certificates/server_from_root.key"
++    ssl_certificate => "/Users/andrea/workspace/certificates/server_from_root.crt"
++    ssl_client_authentication => "none"
++  }
++
++  beats {
++    port => 5044
++  }
++} 
++
++#filter{
++#  sleep{time => "0.1"}
++#} 
++
++filter {
++  ruby {
++#    init => "Thread.new { loop { puts Java::io.netty.buffer.ByteBufAllocator::DEFAULT.metric.toString(); puts Java::io.netty.buffer.ByteBufAllocator::DEFAULT.dump_stats;sleep 5 } }"
++    init => "Thread.new { loop { puts 'Direct mem: ' + Java::io.netty.buffer.ByteBufAllocator::DEFAULT.metric.used_direct_memory.to_s + ' pinned: ' + Java::io.netty.buffer.ByteBufAllocator::DEFAULT.pinned_direct_memory.to_s; sleep 5 } }"
++    code => ""
++  }
++}
++
++output{
++  sink {}
++
++#  stdout {
++##    codec=>dots
++#    codec => rubydebug
++#  }
++}
+\ No newline at end of file
+diff --git a/ingest_all_hands/ssl_tcp_pipeline.conf b/ingest_all_hands/ssl_tcp_pipeline.conf
+new file mode 100644
+index 00000000000..8a87ba7d203
+--- /dev/null
++++ b/ingest_all_hands/ssl_tcp_pipeline.conf
+@@ -0,0 +1,31 @@
++input{
++  tcp {
++    port => 3333
++    ssl_enable => true 
++    ssl_key => "/Users/andrea/workspace/certificates/server_from_root.key"
++    ssl_cert => "/Users/andrea/workspace/certificates/server_from_root.crt"
++    ssl_verify => false
++    codec => line
++  }
++} 
++
++#filter{
++#  sleep{time => "0.1"}
++#} 
++
++filter {
++  ruby {
++#    init => "Thread.new { loop { puts Java::io.netty.buffer.ByteBufAllocator::DEFAULT.metric.toString(); puts Java::io.netty.buffer.ByteBufAllocator::DEFAULT.dump_stats;sleep 5 } }"
++    init => "Thread.new { loop { puts 'Direct mem: ' + Java::io.netty.buffer.ByteBufAllocator::DEFAULT.metric.used_direct_memory.to_s;sleep 5 } }"
++    code => ""
++  }
++}
++
++output{
++  sink {}
++
++  #stdout {
++  #  codec=>dots
++  #  #codec => rubydebug
++  #}
++}
+\ No newline at end of file

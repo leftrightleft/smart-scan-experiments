@@ -1,0 +1,235 @@
+diff --git a/logstash-core/lib/logstash/util/wrapped_acked_queue.rb b/logstash-core/lib/logstash/util/wrapped_acked_queue.rb
+index e5af8512be1..7eb17475109 100644
+--- a/logstash-core/lib/logstash/util/wrapped_acked_queue.rb
++++ b/logstash-core/lib/logstash/util/wrapped_acked_queue.rb
+@@ -100,6 +100,10 @@ def check_closed(action)
+       end
+     end
+ 
++    def is_empty?
++      @queue.is_empty?
++    end
++
+     def close
+       @queue.close
+       @closed.make_true
+@@ -129,7 +133,7 @@ def close
+       def empty?
+         @mutex.lock
+         begin
+-          @queue.queue.is_fully_acked?
++          @queue.is_empty?
+         ensure
+           @mutex.unlock
+         end
+diff --git a/logstash-core/spec/logstash/util/wrapped_acked_queue_spec.rb b/logstash-core/spec/logstash/util/wrapped_acked_queue_spec.rb
+new file mode 100644
+index 00000000000..6d2d2794674
+--- /dev/null
++++ b/logstash-core/spec/logstash/util/wrapped_acked_queue_spec.rb
+@@ -0,0 +1,63 @@
++# encoding: utf-8
++require "spec_helper"
++require "logstash/util/wrapped_acked_queue"
++
++describe LogStash::Util::WrappedAckedQueue do
++  shared_examples "queue tests" do
++    it "is_empty? on creation" do
++      expect(queue.is_empty?).to be_truthy
++    end
++
++    it "not is_empty? after pushing an element" do
++      queue.push(LogStash::Event.new)
++      expect(queue.is_empty?).to be_falsey
++    end
++
++    it "not is_empty? when all elements are not acked" do
++      queue.push(LogStash::Event.new)
++      batch = queue.read_batch(1, 250)
++      expect(batch.get_elements.size).to eq(1)
++      expect(queue.is_empty?).to be_falsey
++    end
++
++    it "is_empty? when all elements are acked" do
++      queue.push(LogStash::Event.new)
++      batch = queue.read_batch(1, 250)
++      expect(batch.get_elements.size).to eq(1)
++      expect(queue.is_empty?).to be_falsey
++      batch.close
++      expect(queue.is_empty?).to be_truthy
++    end
++  end
++
++  context "memory" do
++    let(:page_capacity) { 1024 }
++    let(:max_events) { 0 }
++    let(:max_bytes) { 0 }
++    let(:path) { Stud::Temporary.directory }
++    let(:queue) { LogStash::Util::WrappedAckedQueue.create_memory_based(path, page_capacity, max_events, max_bytes) }
++
++    after do
++      queue.close
++    end
++
++    include_examples "queue tests"
++  end
++
++  context "persisted" do
++    let(:page_capacity) { 1024 }
++    let(:max_events) { 0 }
++    let(:max_bytes) { 0 }
++    let(:checkpoint_acks) { 1024 }
++    let(:checkpoint_writes) { 1024 }
++    let(:checkpoint_interval) { 0 }
++    let(:path) { Stud::Temporary.directory }
++    let(:queue) { LogStash::Util::WrappedAckedQueue.create_file_based(path, page_capacity, max_events, checkpoint_acks, checkpoint_writes, checkpoint_interval, max_bytes) }
++
++    after do
++      queue.close
++    end
++
++    include_examples "queue tests"
++  end
++end
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/Page.java b/logstash-core/src/main/java/org/logstash/ackedqueue/Page.java
+index af25752edf0..555fc15a776 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/Page.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/Page.java
+@@ -67,6 +67,17 @@ public Batch readBatch(int limit) throws IOException {
+         return new Batch(deserialized, serialized.getSeqNums(), this.queue);
+     }
+ 
++    /**
++     * Page is considered empty if it does not contain any element or if all elements are acked.
++     *
++     * TODO: note that this should be the same as isFullyAcked once fixed per https://github.com/elastic/logstash/issues/7570
++     *
++     * @return true if the page has no element or if all elements are acked.
++     */
++    public boolean isEmpty() {
++        return this.elementCount == 0 || isFullyAcked();
++    }
++
+     public boolean isFullyRead() {
+         return unreadCount() <= 0;
+ //        return this.elementCount <= 0 || this.firstUnreadSeqNum > maxSeqNum();
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java b/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java
+index 76284b89c6f..9a122d3d402 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java
+@@ -398,6 +398,24 @@ public boolean isFull() {
+         }
+     }
+ 
++    /**
++     * Queue is considered empty if it does not contain any tail page and the headpage has no element or all
++     * elements are acked
++     *
++     * TODO: note that this should be the same as isFullyAcked once fixed per https://github.com/elastic/logstash/issues/7570
++     *
++     * @return true if the queue has no tail page and the head page is empty.
++     */
++    public boolean isEmpty() {
++        lock.lock();
++        try {
++            return this.tailPages.isEmpty() && this.headPage.isEmpty();
++        } finally {
++            lock.unlock();
++        }
++
++    }
++
+     // @return true if the queue is fully acked, which implies that it is fully read which works as an "empty" state.
+     public boolean isFullyAcked() {
+         lock.lock();
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueExtLibrary.java b/logstash-core/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueExtLibrary.java
+index 6e17f2fdf91..923e2176bc2 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueExtLibrary.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueExtLibrary.java
+@@ -174,6 +174,12 @@ public IRubyObject ruby_is_fully_acked(ThreadContext context)
+             return RubyBoolean.newBoolean(context.runtime, this.queue.isFullyAcked());
+         }
+ 
++        @JRubyMethod(name = "is_empty?")
++        public IRubyObject ruby_is_empty(ThreadContext context)
++        {
++            return RubyBoolean.newBoolean(context.runtime, this.queue.isEmpty());
++        }
++
+         @JRubyMethod(name = "close")
+         public IRubyObject ruby_close(ThreadContext context)
+         {
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueMemoryExtLibrary.java b/logstash-core/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueMemoryExtLibrary.java
+index 8306813336d..436f9673dfd 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueMemoryExtLibrary.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/ext/JrubyAckedQueueMemoryExtLibrary.java
+@@ -171,6 +171,12 @@ public IRubyObject ruby_is_fully_acked(ThreadContext context)
+             return RubyBoolean.newBoolean(context.runtime, this.queue.isFullyAcked());
+         }
+ 
++        @JRubyMethod(name = "is_empty?")
++        public IRubyObject ruby_is_empty(ThreadContext context)
++        {
++            return RubyBoolean.newBoolean(context.runtime, this.queue.isEmpty());
++        }
++
+         @JRubyMethod(name = "close")
+         public IRubyObject ruby_close(ThreadContext context)
+         {
+diff --git a/logstash-core/src/test/java/org/logstash/ackedqueue/HeadPageTest.java b/logstash-core/src/test/java/org/logstash/ackedqueue/HeadPageTest.java
+index 9c69a1b5541..3b0653e8d6a 100644
+--- a/logstash-core/src/test/java/org/logstash/ackedqueue/HeadPageTest.java
++++ b/logstash-core/src/test/java/org/logstash/ackedqueue/HeadPageTest.java
+@@ -72,6 +72,25 @@ public void pageWriteAndReadSingle() throws IOException {
+         }
+     }
+ 
++    @Test
++    public void inEmpty() throws IOException {
++        Queueable element = new StringElement("foobarbaz");
++
++        Settings s = TestSettings.volatileQueueSettings(1000);
++        try(Queue q = new Queue(s)) {
++            q.open();
++            HeadPage p = q.headPage;
++
++            assertThat(p.isEmpty(), is(true));
++            p.write(element.serialize(), 1, 1);
++            assertThat(p.isEmpty(), is(false));
++            Batch b = q.readBatch(1);
++            assertThat(p.isEmpty(), is(false));
++            b.close();
++            assertThat(p.isEmpty(), is(true));
++        }
++    }
++
+     @Test
+     public void pageWriteAndReadMulti() throws IOException {
+         long seqNum = 1L;
+diff --git a/logstash-core/src/test/java/org/logstash/ackedqueue/QueueTest.java b/logstash-core/src/test/java/org/logstash/ackedqueue/QueueTest.java
+index 860275480ff..6bd4bb987dd 100644
+--- a/logstash-core/src/test/java/org/logstash/ackedqueue/QueueTest.java
++++ b/logstash-core/src/test/java/org/logstash/ackedqueue/QueueTest.java
+@@ -764,4 +764,22 @@ private void stableUnderStress(final int capacity) throws IOException {
+             );
+         }
+     }
++
++    @Test
++    public void inEmpty() throws IOException {
++        try(Queue q = new Queue(TestSettings.volatileQueueSettings(1000))) {
++            q.open();
++            assertThat(q.isEmpty(), is(true));
++
++            q.write(new StringElement("foobarbaz"));
++            assertThat(q.isEmpty(), is(false));
++
++            Batch b = q.readBatch(1);
++            assertThat(q.isEmpty(), is(false));
++
++            b.close();
++            assertThat(q.isEmpty(), is(true));
++        }
++    }
++
+ }

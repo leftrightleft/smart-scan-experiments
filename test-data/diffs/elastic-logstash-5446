@@ -1,0 +1,938 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index 8bb3649e9ca..21fa2196e03 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -45,15 +45,16 @@ def initialize(settings = LogStash::SETTINGS)
+     @upgrade_mutex = Mutex.new
+ 
+     @collect_metric = setting("metric.collect")
+-    @metric = create_metric_collector
+-    @periodic_pollers = LogStash::Instrument::PeriodicPollers.new(create_metric_collector)
++
++
++    # Create the collectors and configured it with the library
++    configure_metrics_collectors
+   end
+ 
+   def execute
+     @thread = Thread.current # this var is implicilty used by Stud.stop?
+     @logger.info("starting agent")
+ 
+-    start_background_services
+     start_pipelines
+     start_webserver
+ 
+@@ -112,8 +113,13 @@ def uptime
+     ((Time.now.to_f - STARTED_AT.to_f) * 1000.0).to_i
+   end
+ 
++  def stop_collecting_metrics
++    @collector.stop
++    @periodic_pollers.stop
++  end
++
+   def shutdown
+-    stop_background_services
++    stop_collecting_metrics
+     stop_webserver
+     shutdown_pipelines
+   end
+@@ -131,7 +137,7 @@ def running_pipelines?
+   private
+   def start_webserver
+     options = {:http_host => @http_host, :http_port => @http_port, :http_environment => @http_environment }
+-    @webserver = LogStash::WebServer.new(@logger, options)
++    @webserver = LogStash::WebServer.new(@logger, self, options)
+     Thread.new(@webserver) do |webserver|
+       LogStash::Util.set_thread_name("Api Webserver")
+       webserver.run
+@@ -142,28 +148,24 @@ def stop_webserver
+     @webserver.stop if @webserver
+   end
+ 
+-  def start_background_services
+-    if collect_metrics?
+-      @logger.debug("Agent: Starting metric periodic pollers")
+-      @periodic_pollers.start
+-    end
+-  end
++  def configure_metrics_collectors
++    @collector = LogStash::Instrument::Collector.new
+ 
+-  def stop_background_services
+-    if collect_metrics?
+-      @logger.debug("Agent: Stopping metric periodic pollers")
+-      @periodic_pollers.stop
+-    end
++    @metric = if collect_metrics?
++                @logger.debug("Agent: Configuring metric collection")
++                LogStash::Instrument::Metric.new(@collector)
++              else
++                LogStash::Instrument::NullMetric.new
++              end
++
++
++    @periodic_pollers = LogStash::Instrument::PeriodicPollers.new(@metric)
++    @periodic_pollers.start
+   end
+ 
+-  def create_metric_collector
+-    if collect_metrics?
+-      @logger.debug("Agent: Configuring metric collection")
+-      LogStash::Instrument::Collector.instance.agent = self
+-      LogStash::Instrument::Metric.new
+-    else
+-      LogStash::Instrument::NullMetric.new
+-    end
++  def reset_metrics_collectors
++    stop_collecting_metrics
++    configure_metrics_collectors
+   end
+ 
+   def collect_metrics?
+@@ -171,7 +173,6 @@ def collect_metrics?
+   end
+ 
+   def create_pipeline(settings, config=nil)
+-
+     if config.nil?
+       begin
+         config = fetch_config(settings)
+@@ -182,7 +183,7 @@ def create_pipeline(settings, config=nil)
+     end
+ 
+     begin
+-      LogStash::Pipeline.new(config, settings)
++      LogStash::Pipeline.new(config, settings, metric)
+     rescue => e
+       @logger.error("fetched an invalid config", :config => config, :reason => e.message)
+       return
+@@ -204,6 +205,11 @@ def reload_pipeline!(id)
+       return
+     end
+ 
++    # Reset the current collected stats,
++    # starting a pipeline with a new configuration should be the same as restarting
++    # logstash.
++    reset_metrics_collectors
++
+     new_pipeline = create_pipeline(old_pipeline.settings, new_config)
+ 
+     return if new_pipeline.nil?
+@@ -225,12 +231,6 @@ def start_pipeline(id)
+     return unless pipeline.is_a?(LogStash::Pipeline)
+     return if pipeline.ready?
+     @logger.info("starting pipeline", :id => id)
+-
+-    # Reset the current collected stats,
+-    # starting a pipeline with a new configuration should be the same as restarting
+-    # logstash.
+-    reset_collector
+-
+     Thread.new do
+       LogStash::Util.set_thread_name("pipeline.#{id}")
+       begin
+@@ -273,10 +273,6 @@ def clean_state?
+     @pipelines.empty?
+   end
+ 
+-  def reset_collector
+-    LogStash::Instrument::Collector.instance.clear
+-  end
+-
+   def setting(key)
+     @settings.get(key)
+   end
+diff --git a/logstash-core/lib/logstash/api/modules/base.rb b/logstash-core/lib/logstash/api/modules/base.rb
+index 7a750d02f32..e7a4fd9ddea 100644
+--- a/logstash-core/lib/logstash/api/modules/base.rb
++++ b/logstash-core/lib/logstash/api/modules/base.rb
+@@ -21,9 +21,9 @@ class Base < ::Sinatra::Base
+ 
+         helpers AppHelpers
+ 
+-        def initialize(app=nil)
++        def initialize(app=nil, agent)
+           super(app)
+-          @factory = ::LogStash::Api::CommandFactory.new(LogStash::Api::Service.instance)
++          @factory = ::LogStash::Api::CommandFactory.new(LogStash::Api::Service.new(agent))
+         end
+ 
+         not_found do
+diff --git a/logstash-core/lib/logstash/api/modules/node.rb b/logstash-core/lib/logstash/api/modules/node.rb
+index 38ae44f7b7c..b5139a027ea 100644
+--- a/logstash-core/lib/logstash/api/modules/node.rb
++++ b/logstash-core/lib/logstash/api/modules/node.rb
+@@ -19,7 +19,6 @@ class Node < ::LogStash::Api::Modules::Base
+           as    = options[:human] ? :string : :json
+           respond_with(stats.hot_threads(options), {:as => as})
+         end
+-
+       end
+     end
+   end
+diff --git a/logstash-core/lib/logstash/api/rack_app.rb b/logstash-core/lib/logstash/api/rack_app.rb
+index 861e26d0697..6c551b3277c 100644
+--- a/logstash-core/lib/logstash/api/rack_app.rb
++++ b/logstash-core/lib/logstash/api/rack_app.rb
+@@ -73,8 +73,9 @@ def call(env)
+         end
+       end
+       
+-      def self.app(logger, environment)
+-        namespaces = rack_namespaces 
++      def self.app(logger, agent, environment)
++        namespaces = rack_namespaces(agent)
++
+         Rack::Builder.new do
+           # Custom logger object. Rack CommonLogger does not work with cabin
+           use ApiLogger, logger
+@@ -87,16 +88,18 @@ def self.app(logger, environment)
+             use ApiErrorHandler, logger
+           end
+           
+-          run LogStash::Api::Modules::Root
++          run LogStash::Api::Modules::Root.new(nil, agent)
+           namespaces.each_pair do |namespace, app|
+             map(namespace) do
+-              run app
++              # Pass down a reference to the current agent
++              # This allow the API to have direct access to the collector
++              run app.new(nil, agent)
+             end
+           end
+         end
+       end
+ 
+-      def self.rack_namespaces
++      def self.rack_namespaces(agent)
+         {
+           "/_node" => LogStash::Api::Modules::Node,
+           "/_stats" => LogStash::Api::Modules::Stats,
+diff --git a/logstash-core/lib/logstash/api/service.rb b/logstash-core/lib/logstash/api/service.rb
+index 3eaeb2535ef..d286f8f0ca0 100644
+--- a/logstash-core/lib/logstash/api/service.rb
++++ b/logstash-core/lib/logstash/api/service.rb
+@@ -5,40 +5,21 @@
+ module LogStash
+   module Api
+     class Service
+-
+-      include Singleton
+       include LogStash::Util::Loggable
+ 
+-      def initialize
+-        @snapshot_rotation_mutex = Mutex.new
+-        @snapshot = nil
+-        logger.debug("[api-service] start") if logger.debug?
+-        LogStash::Instrument::Collector.instance.add_observer(self)
+-      end
+-
+-      def stop
+-        logger.debug("[api-service] stop") if logger.debug?
+-        LogStash::Instrument::Collector.instance.delete_observer(self)
+-      end
++      attr_reader :agent
+ 
+-      def agent
+-        LogStash::Instrument::Collector.instance.agent
++      def initialize(agent)
++        @agent = agent
++        logger.debug("[api-service] start") if logger.debug?
+       end
+ 
+       def started?
+-        !@snapshot.nil? && has_counters?        
+-      end
+-
+-      def update(snapshot)
+-        logger.debug("[api-service] snapshot received", :snapshot_time => snapshot.created_at) if logger.debug?
+-
+-        @snapshot_rotation_mutex.synchronize do
+-          @snapshot = snapshot
+-        end
++        true
+       end
+ 
+       def snapshot
+-        @snapshot_rotation_mutex.synchronize { @snapshot }
++        agent.metric.collector.snapshot_metric
+       end
+ 
+       def get_shallow(*path)
+@@ -54,20 +35,6 @@ def get(key)
+         end
+         LogStash::Json.dump(data)
+       end
+-
+-      private
+-
+-      def has_counters?
+-        (["LogStash::Instrument::MetricType::Counter", "LogStash::Instrument::MetricType::Gauge"] - metric_types).empty?
+-      end
+-
+-      def metric_types
+-        types = []
+-        @snapshot_rotation_mutex.synchronize do
+-          types = @snapshot.metric_store.all.map { |t| t.class.to_s }
+-        end
+-        return types
+-      end
+     end
+   end
+ end
+diff --git a/logstash-core/lib/logstash/inputs/metrics.rb b/logstash-core/lib/logstash/inputs/metrics.rb
+index 8a8ce92dcf0..d85bcc4e53c 100644
+--- a/logstash-core/lib/logstash/inputs/metrics.rb
++++ b/logstash-core/lib/logstash/inputs/metrics.rb
+@@ -21,7 +21,7 @@ def run(queue)
+       @queue = queue
+ 
+       # we register to the collector after receiving the pipeline queue
+-      LogStash::Instrument::Collector.instance.add_observer(self)
++      metric.collector.add_observer(self)
+ 
+       # Keep this plugin thread alive,
+       # until we shutdown the metric pipeline
+@@ -30,7 +30,7 @@ def run(queue)
+ 
+     def stop
+       @logger.debug("Metrics input: stopped")
+-      LogStash::Instrument::Collector.instance.delete_observer(self)
++      metric.collector.delete_observer(self)
+     end
+ 
+     def update(snapshot)
+diff --git a/logstash-core/lib/logstash/instrument/collector.rb b/logstash-core/lib/logstash/instrument/collector.rb
+index 302fe4c3ac7..ff4c658bcff 100644
+--- a/logstash-core/lib/logstash/instrument/collector.rb
++++ b/logstash-core/lib/logstash/instrument/collector.rb
+@@ -8,7 +8,7 @@
+ require "thread"
+ 
+ module LogStash module Instrument
+-  # The Collector singleton is the single point of reference for all
++  # The Collector is the single point of reference for all
+   # the metrics collection inside logstash, the metrics library will make
+   # direct calls to this class.
+   #
+@@ -17,7 +17,6 @@ module LogStash module Instrument
+   class Collector
+     include LogStash::Util::Loggable
+     include Observable
+-    include Singleton
+ 
+     SNAPSHOT_ROTATION_TIME_SECS = 1 # seconds
+     SNAPSHOT_ROTATION_TIMEOUT_INTERVAL_SECS = 10 * 60 # seconds
+@@ -59,10 +58,6 @@ def push(namespaces_path, key, type, *metric_type_params)
+       end
+     end
+ 
+-    def clear
+-      @metric_store = MetricStore.new
+-    end
+-
+     # Monitor the `Concurrent::TimerTask` this update is triggered on every successful or not
+     # run of the task, TimerTask implement Observable and the collector acts as
+     # the observer and will keep track if something went wrong in the execution.
+@@ -96,6 +91,10 @@ def start_periodic_snapshotting
+       @snapshot_task.execute
+     end
+ 
++    def stop
++      @snapshot_task.shutdown
++    end
++
+     # Create a snapshot of the MetricStore and send it to to the registered observers
+     # The observer will receive the following signature in the update methode.
+     #
+diff --git a/logstash-core/lib/logstash/instrument/metric.rb b/logstash-core/lib/logstash/instrument/metric.rb
+index 601c7b0ed4b..e6e12262a20 100644
+--- a/logstash-core/lib/logstash/instrument/metric.rb
++++ b/logstash-core/lib/logstash/instrument/metric.rb
+@@ -13,7 +13,7 @@ class MetricNoNamespaceProvided < MetricException; end
+   class Metric
+     attr_reader :collector
+ 
+-    def initialize(collector = LogStash::Instrument::Collector.instance)
++    def initialize(collector)
+       @collector = collector
+     end
+ 
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index a8c1421473f..8c6a6cf221c 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -32,8 +32,8 @@ module LogStash; class Pipeline
+     :started_at,
+     :thread,
+     :config_str,
+-    :settings
+-  attr_accessor :metric
++    :settings,
++    :metric
+ 
+   MAX_INFLIGHT_WARN_THRESHOLD = 10_000
+ 
+@@ -41,7 +41,7 @@ module LogStash; class Pipeline
+     "LogStash::Inputs::Stdin"
+   ]
+ 
+-  def initialize(config_str, settings = LogStash::SETTINGS)
++  def initialize(config_str, settings = LogStash::SETTINGS, namespaced_metric = nil)
+     @config_str = config_str
+     @logger = Cabin::Channel.get(LogStash)
+     @settings = settings
+@@ -56,7 +56,7 @@ def initialize(config_str, settings = LogStash::SETTINGS)
+ 
+     # This needs to be configured before we evaluate the code to make
+     # sure the metric instance is correctly send to the plugins to make the namespace scoping work
+-    @metric = settings.get_value("metric.collect") ? Instrument::Metric.new : Instrument::NullMetric.new 
++    @metric = namespaced_metric.nil? ? LogStash::Instrument::NullMetric.new : namespaced_metric
+ 
+     grammar = LogStashConfigParser.new
+     @config = grammar.parse(config_str)
+diff --git a/logstash-core/lib/logstash/runner.rb b/logstash-core/lib/logstash/runner.rb
+index f0a630a324a..c24a692feb9 100644
+--- a/logstash-core/lib/logstash/runner.rb
++++ b/logstash-core/lib/logstash/runner.rb
+@@ -18,10 +18,10 @@
+ require "logstash/settings"
+ 
+ class LogStash::Runner < Clamp::StrictCommand
+-  # The `path.settings` need to be defined in the runner instead of the `logstash-core/lib/logstash/environment.r`
++  # The `path.settings` need to be defined in the runner instead of the `logstash-core/lib/logstash/environment.rb`
+   # because the `Environment::LOGSTASH_HOME` doesn't exist in the context of the `logstash-core` gem.
+   # 
+-  # See issues https://github.com/elastic/logstash/issues/5361
++  # See issue https://github.com/elastic/logstash/issues/5361
+   LogStash::SETTINGS.register(LogStash::Setting::String.new("path.settings", ::File.join(LogStash::Environment::LOGSTASH_HOME, "config")))
+ 
+   # Node Settings
+diff --git a/logstash-core/lib/logstash/webserver.rb b/logstash-core/lib/logstash/webserver.rb
+index 6cf8366e3ba..1498f380493 100644
+--- a/logstash-core/lib/logstash/webserver.rb
++++ b/logstash-core/lib/logstash/webserver.rb
+@@ -7,7 +7,7 @@ module LogStash
+   class WebServer
+     extend Forwardable
+ 
+-    attr_reader :logger, :status, :config, :options, :cli_options, :runner, :binder, :events, :http_host, :http_port, :http_environment
++    attr_reader :logger, :status, :config, :options, :cli_options, :runner, :binder, :events, :http_host, :http_port, :http_environment, :agent
+ 
+     def_delegator :@runner, :stats
+ 
+@@ -15,12 +15,13 @@ class WebServer
+     DEFAULT_PORT = 9600.freeze
+     DEFAULT_ENVIRONMENT = 'production'.freeze
+ 
+-    def initialize(logger, options={})
+-      @logger      = logger
+-      @http_host    = options[:http_host] || DEFAULT_HOST
+-      @http_port    = options[:http_port] || DEFAULT_PORT
++    def initialize(logger, agent, options={})
++      @logger = logger
++      @agent = agent
++      @http_host = options[:http_host] || DEFAULT_HOST
++      @http_port = options[:http_port] || DEFAULT_PORT
+       @http_environment = options[:http_environment] || DEFAULT_ENVIRONMENT
+-      @options     = {}
++      @options = {}
+       @cli_options = options.merge({ :rackup => ::File.join(::File.dirname(__FILE__), "api", "init.ru"),
+                                      :binds => ["tcp://#{http_host}:#{http_port}"],
+                                      :debug => logger.debug?,
+@@ -37,7 +38,7 @@ def run
+ 
+       stop # Just in case
+ 
+-      app = LogStash::Api::RackApp.app(logger, http_environment)
++      app = LogStash::Api::RackApp.app(logger, agent, http_environment)
+       @server = ::Puma::Server.new(app)
+       @server.add_tcp_listener(http_host, http_port)
+ 
+diff --git a/logstash-core/spec/api/lib/api/node_spec.rb b/logstash-core/spec/api/lib/api/node_spec.rb
+index 3fc6ad97752..ae548337dde 100644
+--- a/logstash-core/spec/api/lib/api/node_spec.rb
++++ b/logstash-core/spec/api/lib/api/node_spec.rb
+@@ -5,12 +5,7 @@
+ require "logstash/json"
+ 
+ describe LogStash::Api::Modules::Node do
+-
+-  include Rack::Test::Methods
+-
+-  def app()
+-    described_class
+-  end
++  include_context "api setup"
+ 
+   describe "#hot threads" do
+ 
+diff --git a/logstash-core/spec/api/lib/api/node_stats_spec.rb b/logstash-core/spec/api/lib/api/node_stats_spec.rb
+index 03bf7fd6152..addb45667e0 100644
+--- a/logstash-core/spec/api/lib/api/node_stats_spec.rb
++++ b/logstash-core/spec/api/lib/api/node_stats_spec.rb
+@@ -5,12 +5,9 @@
+ require "logstash/json"
+ 
+ describe LogStash::Api::Modules::NodeStats do
+-  include Rack::Test::Methods
+-  extend ResourceDSLMethods
++  include_context "api setup"
+ 
+-  def app() # Used by Rack::Test::Methods
+-    described_class
+-  end
++  extend ResourceDSLMethods
+ 
+   # DSL describing response structure
+   root_structure = {
+diff --git a/logstash-core/spec/api/lib/api/plugins_spec.rb b/logstash-core/spec/api/lib/api/plugins_spec.rb
+index 216811d0a9b..aecb6f46542 100644
+--- a/logstash-core/spec/api/lib/api/plugins_spec.rb
++++ b/logstash-core/spec/api/lib/api/plugins_spec.rb
+@@ -5,12 +5,7 @@
+ require "logstash/json"
+ 
+ describe LogStash::Api::Modules::Plugins do
+-
+-  include Rack::Test::Methods
+-
+-  def app()
+-    described_class
+-  end
++  include_context "api setup"
+ 
+   before(:all) do
+     get "/"
+@@ -52,6 +47,5 @@ def app()
+         expect(plugin["version"]).not_to be_empty
+       end
+     end
+-
+   end
+ end
+diff --git a/logstash-core/spec/api/lib/api/root_spec.rb b/logstash-core/spec/api/lib/api/root_spec.rb
+index 2395c9edc5d..8347580a639 100644
+--- a/logstash-core/spec/api/lib/api/root_spec.rb
++++ b/logstash-core/spec/api/lib/api/root_spec.rb
+@@ -5,16 +5,11 @@
+ require "logstash/json"
+ 
+ describe LogStash::Api::Modules::Root do
+-
+-  include Rack::Test::Methods
+-
+-  def app()
+-    described_class
+-  end
++  include_context "api setup"
+ 
+   it "should respond to root resource" do
+     do_request { get "/" }
+     expect(last_response).to be_ok
+   end
+-
+ end
++
+diff --git a/logstash-core/spec/api/spec_helper.rb b/logstash-core/spec/api/spec_helper.rb
+index 041311b9314..ac4b977b6ac 100644
+--- a/logstash-core/spec/api/spec_helper.rb
++++ b/logstash-core/spec/api/spec_helper.rb
+@@ -1,13 +1,10 @@
+ # encoding: utf-8
+ API_ROOT = File.expand_path(File.join(File.dirname(__FILE__), "..", "..", "lib", "logstash", "api"))
+ 
+-
+-
+ require "logstash/devutils/rspec/spec_helper"
+-
+ $LOAD_PATH.unshift(File.expand_path(File.dirname(__FILE__)))
+ require "lib/api/support/resource_dsl_methods"
+-
++require 'rspec/expectations'
+ require "logstash/settings"
+ require 'rack/test'
+ require 'rspec'
+@@ -20,10 +17,6 @@ def read_fixture(name)
+ 
+ module LogStash
+   class DummyAgent < Agent
+-    def fetch_config(settings)
+-      "input { generator {count => 0} } output { }"
+-    end
+-
+     def start_webserver; end
+     def stop_webserver; end
+   end
+@@ -39,7 +32,8 @@ class LogStashRunner
+   attr_reader :config_str, :agent, :pipeline_settings
+ 
+   def initialize
+-    @config_str   = "input { generator {count => 0} } output { }"
++    @config_str   = "input { generator {count => 100 } } output { dummyoutput {} }"
++
+     args = {
+       "config.reload.automatic" => false,
+       "metric.collect" => true,
+@@ -57,31 +51,18 @@ def initialize
+   end
+ 
+   def start
++    # We start a pipeline that will generate a finite number of events
++    # before starting the expectations
+     agent.register_pipeline("main", @settings)
+-    @runner = Thread.new(agent) do |_agent|
+-      _agent.execute
+-    end
+-
+-    wait_until_ready
++    @agent_task = Stud::Task.new { agent.execute }
++    @agent_task.wait
+   end
+ 
+   def stop
+     agent.shutdown
+-    Thread.kill(@runner)
+-    sleep 0.1 while !@runner.stop?
+-  end
+-
+-  private
+-
+-  def wait_until_ready
+-    # Wait until the service and pipeline have started
+-    while !(LogStash::Api::Service.instance.started? && agent.pipelines["main"].running?) do
+-      sleep 0.5
+-    end
+   end
+ end
+ 
+-
+ ##
+ # Method used to wrap up a request in between of a running
+ # pipeline, this makes the whole execution model easier and
+@@ -95,30 +76,6 @@ def do_request(&block)
+   ret_val
+ end
+ 
+-##
+-# Helper module that setups necessary mocks when doing the requests,
+-# this could be just included in the test and the runner will be
+-# started managed for all tests.
+-##
+-module LogStash; module RSpec; module RunnerConfig
+-  def self.included(klass)
+-    klass.before(:all) do
+-      LogStashRunner.instance.start
+-    end
+-
+-    klass.before(:each) do
+-      runner = LogStashRunner.instance
+-      allow(LogStash::Instrument::Collector.instance).to receive(:agent).and_return(runner.agent)
+-    end
+-
+-    klass.after(:all) do
+-      LogStashRunner.instance.stop
+-    end
+-  end
+-end; end; end
+-
+-require 'rspec/expectations'
+-
+ RSpec::Matchers.define :be_available? do
+   match do |plugin|
+     begin
+@@ -129,3 +86,20 @@ def self.included(klass)
+     end
+   end
+ end
++
++shared_context "api setup" do
++  before :all do
++    @runner = LogStashRunner.new
++    @runner.start
++  end
++
++  after :all do
++    @runner.stop
++  end
++
++  include Rack::Test::Methods
++
++  def app()
++    described_class.new(nil, @runner.agent)
++  end
++end
+diff --git a/logstash-core/spec/logstash/agent_spec.rb b/logstash-core/spec/logstash/agent_spec.rb
+index 5a40ee9c0ec..64aa3ee3cfd 100644
+--- a/logstash-core/spec/logstash/agent_spec.rb
++++ b/logstash-core/spec/logstash/agent_spec.rb
+@@ -328,11 +328,11 @@
+     end
+   end
+ 
++
+   context "metrics after config reloading" do
+-    let(:dummy_output) { DummyOutput.new }
+     let(:config) { "input { generator { } } output { dummyoutput { } }" }
+-    let(:new_config_generator_counter) { 50 }
+-    let(:new_config) { "input { generator { count => #{new_config_generator_counter} } } output { dummyoutput {} }" }
++    let(:new_config_generator_counter) { 500 }
++    let(:new_config) { "input { generator { count => #{new_config_generator_counter} } } output { dummyoutput2 {} }" }
+     let(:config_path) do
+       f = Stud::Temporary.file
+       f.write(config)
+@@ -353,11 +353,24 @@
+                     "metric.collect" => true })
+     end 
+ 
++    # We need to create theses dummy classes to know how many
++    # events where actually generated by the pipeline and successfully send to the output.
++    # Theses values are compared with what we store in the metric store.
++    let!(:dummy_output) { DummyOutput.new }
++    let!(:dummy_output2) { DummyOutput.new }
++    class DummyOutput2 < LogStash::Outputs::Base; end
++
+     before :each do
+       allow(DummyOutput).to receive(:new).at_least(:once).with(anything).and_return(dummy_output)
++      allow(DummyOutput2).to receive(:new).at_least(:once).with(anything).and_return(dummy_output2)
++
+       allow(LogStash::Plugin).to receive(:lookup).with("input", "generator").and_return(LogStash::Inputs::Generator)
+       allow(LogStash::Plugin).to receive(:lookup).with("codec", "plain").and_return(LogStash::Codecs::Plain)
+       allow(LogStash::Plugin).to receive(:lookup).with("output", "dummyoutput").and_return(DummyOutput)
++      allow(LogStash::Plugin).to receive(:lookup).with("output", "dummyoutput2").and_return(DummyOutput2)
++
++      @abort_on_exception = Thread.abort_on_exception
++      Thread.abort_on_exception = true
+ 
+       @t = Thread.new do
+         subject.register_pipeline("main",  pipeline_settings)
+@@ -368,28 +381,38 @@
+     end
+ 
+     after :each do
+-      subject.shutdown
+-      Stud.stop!(@t)
+-      @t.join
++      begin
++        subject.shutdown
++        Stud.stop!(@t)
++        @t.join
++      ensure
++        Thread.abort_on_exception = @abort_on_exception
++      end
+     end
+ 
+     it "resets the metric collector" do
+       # We know that the store has more events coming in.
+-      sleep(0.01) while dummy_output.events.size < new_config_generator_counter
+-      snapshot = LogStash::Instrument::Collector.instance.snapshot_metric
++      while dummy_output.events.size <= new_config_generator_counter
++        sleep(0.1)
++      end
++
++      snapshot = subject.metric.collector.snapshot_metric
+       expect(snapshot.metric_store.get_with_path("/stats/events")[:stats][:events][:in].value).to be > new_config_generator_counter
+ 
+       # update the configuration and give some time to logstash to pick it up and do the work
+-      IO.write(config_path, new_config)
++      # Also force a flush to disk to make sure ruby reload it.
++      File.open(config_path, "w") do |f|
++        f.write(new_config)
++        f.fsync
++      end
+ 
+       sleep(interval * 3) # Give time to reload the config
+       
+-      # Since there is multiple threads involved with the configuration reload, 
+-      # It can take some time to the stats be visible in the store but it will
+       # be eventually consistent.
+-      sleep(0.01) while dummy_output.events.size < new_config_generator_counter
++      sleep(0.01) while dummy_output2.events.size < new_config_generator_counter
+ 
+-      value = LogStash::Instrument::Collector.instance.snapshot_metric.metric_store.get_with_path("/stats/events")[:stats][:events][:in].value
++      snapshot = subject.metric.collector.snapshot_metric
++      value = snapshot.metric_store.get_with_path("/stats/events")[:stats][:events][:in].value
+       expect(value).to eq(new_config_generator_counter)
+     end
+   end
+diff --git a/logstash-core/spec/logstash/inputs/metrics_spec.rb b/logstash-core/spec/logstash/inputs/metrics_spec.rb
+index 97a89facda3..436d676f62d 100644
+--- a/logstash-core/spec/logstash/inputs/metrics_spec.rb
++++ b/logstash-core/spec/logstash/inputs/metrics_spec.rb
+@@ -3,15 +3,17 @@
+ require "spec_helper"
+ 
+ describe LogStash::Inputs::Metrics do
++  let(:collector) { LogStash::Instrument::Collector.new }
++  let(:metric) { LogStash::Instrument::Metric.new(collector) }
++  let(:queue) { [] }
++
+   before :each do
+-    LogStash::Instrument::Collector.instance.clear
++    allow(subject).to receive(:metric).and_return(metric)
+   end
+ 
+-  let(:queue) { [] }
+-
+   describe "#run" do
+     it "should register itself to the collector observer" do
+-      expect(LogStash::Instrument::Collector.instance).to receive(:add_observer).with(subject)
++      expect(collector).to receive(:add_observer).with(subject)
+       t = Thread.new { subject.run(queue) }
+       sleep(0.1) # give a bit of time to the thread to start
+       subject.stop
+@@ -19,24 +21,21 @@
+   end
+ 
+   describe "#update" do
+-    let(:namespaces)  { [:root, :base] }
+-    let(:key)        { :foo }
+-    let(:metric_store) { LogStash::Instrument::MetricStore.new }
+-
+     it "should fill up the queue with received events" do
+       Thread.new { subject.run(queue) }
+       sleep(0.1)
+       subject.stop
+ 
+-      metric_store.fetch_or_store(namespaces, key, LogStash::Instrument::MetricType::Counter.new(namespaces, key))
+-      subject.update(LogStash::Instrument::Snapshot.new(metric_store))
++      metric.increment([:root, :test], :plugin)
++
++      subject.update(collector.snapshot_metric)
+       expect(queue.count).to eq(1)
+     end
+   end
+ 
+   describe "#stop" do
+     it "should remove itself from the the collector observer" do
+-      expect(LogStash::Instrument::Collector.instance).to receive(:delete_observer).with(subject)
++      expect(collector).to receive(:delete_observer).with(subject)
+       t = Thread.new { subject.run(queue) }
+       sleep(0.1) # give a bit of time to the thread to start
+       subject.stop
+diff --git a/logstash-core/spec/logstash/instrument/collector_spec.rb b/logstash-core/spec/logstash/instrument/collector_spec.rb
+index b96be4a5ede..2a9979d0caa 100644
+--- a/logstash-core/spec/logstash/instrument/collector_spec.rb
++++ b/logstash-core/spec/logstash/instrument/collector_spec.rb
+@@ -3,7 +3,7 @@
+ require "spec_helper"
+ 
+ describe LogStash::Instrument::Collector do
+-  subject { LogStash::Instrument::Collector.instance }
++  subject { LogStash::Instrument::Collector.new }
+   describe "#push" do
+     let(:namespaces_path) { [:root, :pipelines, :pipelines01] }
+     let(:key) { :my_key }
+diff --git a/logstash-core/spec/logstash/instrument/periodic_poller/jvm_spec.rb b/logstash-core/spec/logstash/instrument/periodic_poller/jvm_spec.rb
+index 649e711d119..7506d3516aa 100644
+--- a/logstash-core/spec/logstash/instrument/periodic_poller/jvm_spec.rb
++++ b/logstash-core/spec/logstash/instrument/periodic_poller/jvm_spec.rb
+@@ -1,8 +1,10 @@
+-require 'spec_helper'
+-require 'logstash/instrument/periodic_poller/jvm'
++# encoding: utf-8
++require "spec_helper"
++require "logstash/instrument/periodic_poller/jvm"
++require "logstash/instrument/collector"
+ 
+ describe LogStash::Instrument::PeriodicPoller::JVM do
+-  let(:metric) { LogStash::Instrument::Metric.new }
++  let(:metric) { LogStash::Instrument::Metric.new(LogStash::Instrument::Collector.new) }
+   let(:options) { {} }
+   subject(:jvm) { described_class.new(metric, options) }
+   
+@@ -18,6 +20,7 @@
+     end
+ 
+     describe "metrics" do
++      before(:each) { jvm.collect }
+       let(:snapshot_store) { metric.collector.snapshot_metric.metric_store }
+       subject(:jvm_metrics) { snapshot_store.get_shallow(:jvm, :process) }
+ 
+diff --git a/logstash-core/spec/logstash/pipeline_spec.rb b/logstash-core/spec/logstash/pipeline_spec.rb
+index 0fb6be8368d..823e2cb5df9 100644
+--- a/logstash-core/spec/logstash/pipeline_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_spec.rb
+@@ -468,8 +468,8 @@ class TestPipeline < LogStash::Pipeline
+       sleep 0.1 while !pipeline.ready?
+       # give us a bit of time to flush the events
+       wait(5).for do
+-        next unless output && output.events && output.events.first
+-        output.events.first.get("message").split("\n").count
++        next unless output && output.events && !(event = output.events.pop).nil?
++        event.get("message").split("\n").count
+       end.to eq(number_of_events)
+       pipeline.shutdown
+     end
+@@ -554,10 +554,12 @@ class TestPipeline < LogStash::Pipeline
+   end
+ 
+   context "when collecting metrics in the pipeline" do
++    let(:metric) { LogStash::Instrument::Metric.new(LogStash::Instrument::Collector.new) }
++
++    subject { described_class.new(config, pipeline_settings_obj, metric) }
++
+     let(:pipeline_settings) { { "pipeline.id" => pipeline_id } }
+-    subject { described_class.new(config, pipeline_settings_obj) }
+     let(:pipeline_id) { "main" }
+-    let(:metric) { LogStash::Instrument::Metric.new }
+     let(:number_of_events) { 1000 }
+     let(:multiline_id) { "my-multiline" }
+     let(:multiline_id_other) { "my-multiline_other" }
+@@ -591,6 +593,7 @@ class TestPipeline < LogStash::Pipeline
+       EOS
+     end
+     let(:dummyoutput) { DummyOutput.new({ "id" => dummy_output_id }) }
++    let(:metric_store) { subject.metric.collector.snapshot_metric.metric_store }
+ 
+     before :each do
+       allow(DummyOutput).to receive(:new).with(any_args).and_return(dummyoutput)
+@@ -599,9 +602,6 @@ class TestPipeline < LogStash::Pipeline
+       allow(LogStash::Plugin).to receive(:lookup).with("filter", "multiline").and_return(LogStash::Filters::Multiline)
+       allow(LogStash::Plugin).to receive(:lookup).with("output", "dummyoutput").and_return(DummyOutput)
+ 
+-      # Reset the metric store
+-      LogStash::Instrument::Collector.instance.clear
+-
+       Thread.new { subject.run }
+       # make sure we have received all the generated events
+       sleep 1 while dummyoutput.events.size < number_of_events
+@@ -612,7 +612,7 @@ class TestPipeline < LogStash::Pipeline
+     end
+ 
+     context "global metric" do
+-      let(:collected_metric) { LogStash::Instrument::Collector.instance.snapshot_metric.metric_store.get_with_path("stats/events") }
++      let(:collected_metric) { metric_store.get_with_path("stats/events") }
+ 
+       it "populates the differents" do
+         expect(collected_metric[:stats][:events][:in].value).to eq(number_of_events)
+@@ -622,7 +622,7 @@ class TestPipeline < LogStash::Pipeline
+     end
+ 
+     context "pipelines" do
+-      let(:collected_metric) { LogStash::Instrument::Collector.instance.snapshot_metric.metric_store.get_with_path("stats/pipelines/") }
++      let(:collected_metric) { metric_store.get_with_path("stats/pipelines/") }
+ 
+       it "populates the pipelines core metrics" do
+         expect(collected_metric[:stats][:pipelines][:main][:events][:in].value).to eq(number_of_events)
+diff --git a/logstash-core/spec/support/mocks_classes.rb b/logstash-core/spec/support/mocks_classes.rb
+index c481e8be21e..3d4ed28f42e 100644
+--- a/logstash-core/spec/support/mocks_classes.rb
++++ b/logstash-core/spec/support/mocks_classes.rb
+@@ -1,5 +1,6 @@
+ # encoding: utf-8
+ require "logstash/outputs/base"
++require "thread"
+ 
+ class DummyOutput < LogStash::Outputs::Base
+   config_name "dummyoutput"
+@@ -10,7 +11,7 @@ class DummyOutput < LogStash::Outputs::Base
+   def initialize(params={})
+     super
+     @num_closes = 0
+-    @events = []
++    @events = Queue.new
+   end
+ 
+   def register

@@ -1,0 +1,430 @@
+diff --git a/logstash-core/lib/logstash/runner.rb b/logstash-core/lib/logstash/runner.rb
+index 7c99afa4631..e10411c9d3a 100644
+--- a/logstash-core/lib/logstash/runner.rb
++++ b/logstash-core/lib/logstash/runner.rb
+@@ -343,7 +343,7 @@ def execute
+     end
+ 
+     # lock path.data before starting the agent
+-    @data_path_lock = FileLockFactory.obtainLock(setting("path.data"), ".lock");
++    @data_path_lock = FileLockFactory.obtainLock(java.nio.file.Paths.get(setting("path.data")).to_absolute_path, ".lock")
+ 
+     @dispatcher.fire(:before_agent)
+     @agent = create_agent(@settings, @source_loader)
+diff --git a/logstash-core/src/main/java/org/logstash/FileLockFactory.java b/logstash-core/src/main/java/org/logstash/FileLockFactory.java
+index c6590e3276e..31da1f38361 100644
+--- a/logstash-core/src/main/java/org/logstash/FileLockFactory.java
++++ b/logstash-core/src/main/java/org/logstash/FileLockFactory.java
+@@ -22,7 +22,6 @@
+ import java.io.IOException;
+ import java.nio.channels.FileChannel;
+ import java.nio.channels.FileLock;
+-import java.nio.file.FileSystems;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.StandardOpenOption;
+@@ -49,13 +48,8 @@ private FileLockFactory() {}
+     private static final Set<String> LOCK_HELD = Collections.synchronizedSet(new HashSet<>());
+     private static final Map<FileLock, String> LOCK_MAP =  Collections.synchronizedMap(new HashMap<>());
+ 
+-    public static FileLock obtainLock(String lockDir, String lockName) throws IOException {
+-        Path dirPath = FileSystems.getDefault().getPath(lockDir);
+-
+-        // Ensure that lockDir exists and is a directory.
+-        // note: this will fail if lockDir is a symlink
++    public static FileLock obtainLock(Path dirPath, String lockName) throws IOException {
+         Files.createDirectories(dirPath);
+-
+         Path lockPath = dirPath.resolve(lockName);
+ 
+         try {
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java b/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java
+index 347b5ef7b06..db467d109d5 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/Queue.java
+@@ -5,7 +5,10 @@
+ import java.lang.reflect.InvocationTargetException;
+ import java.lang.reflect.Method;
+ import java.nio.channels.FileLock;
++import java.nio.file.Files;
+ import java.nio.file.NoSuchFileException;
++import java.nio.file.Path;
++import java.nio.file.Paths;
+ import java.util.ArrayList;
+ import java.util.HashSet;
+ import java.util.List;
+@@ -49,7 +52,7 @@ public final class Queue implements Closeable {
+     private final CheckpointIO checkpointIO;
+     private final int pageCapacity;
+     private final long maxBytes;
+-    private final String dirPath;
++    private final Path dirPath;
+     private final int maxUnread;
+     private final int checkpointMaxAcks;
+     private final int checkpointMaxWrites;
+@@ -72,7 +75,13 @@ public final class Queue implements Closeable {
+     private static final Logger logger = LogManager.getLogger(Queue.class);
+ 
+     public Queue(Settings settings) {
+-        this.dirPath = settings.getDirPath();
++        try {
++            final Path queueDir = Paths.get(settings.getDirPath());
++            Files.createDirectories(queueDir);
++            this.dirPath = queueDir.toRealPath();
++        } catch (final IOException ex) {
++            throw new IllegalStateException(ex);
++        }
+         this.pageCapacity = settings.getCapacity();
+         this.maxBytes = settings.getQueueMaxBytes();
+         this.checkpointIO = new FileCheckpointIO(dirPath);
+@@ -97,7 +106,7 @@ public Queue(Settings settings) {
+     }
+ 
+     public String getDirPath() {
+-        return this.dirPath;
++        return this.dirPath.toString();
+     }
+ 
+     public long getMaxBytes() {
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/io/FileCheckpointIO.java b/logstash-core/src/main/java/org/logstash/ackedqueue/io/FileCheckpointIO.java
+index afceb22f6be..5e51ced1fd1 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/io/FileCheckpointIO.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/io/FileCheckpointIO.java
+@@ -6,7 +6,6 @@
+ import java.nio.channels.FileChannel;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+-import java.nio.file.Paths;
+ import java.nio.file.StandardCopyOption;
+ import java.util.zip.CRC32;
+ import org.logstash.ackedqueue.Checkpoint;
+@@ -39,16 +38,16 @@ public class FileCheckpointIO implements CheckpointIO {
+ 
+     private static final String HEAD_CHECKPOINT = "checkpoint.head";
+     private static final String TAIL_CHECKPOINT = "checkpoint.";
+-    private final String dirPath;
++    private final Path dirPath;
+ 
+-    public FileCheckpointIO(String dirPath) {
++    public FileCheckpointIO(Path dirPath) {
+         this.dirPath = dirPath;
+     }
+ 
+     @Override
+     public Checkpoint read(String fileName) throws IOException {
+         return read(
+-            ByteBuffer.wrap(Files.readAllBytes(Paths.get(dirPath, fileName)))
++            ByteBuffer.wrap(Files.readAllBytes(dirPath.resolve(fileName)))
+         );
+     }
+ 
+@@ -63,17 +62,17 @@ public Checkpoint write(String fileName, int pageNum, int firstUnackedPageNum, l
+     public void write(String fileName, Checkpoint checkpoint) throws IOException {
+         write(checkpoint, buffer);
+         buffer.flip();
+-        final Path tmpPath = Paths.get(dirPath, fileName + ".tmp");
++        final Path tmpPath = dirPath.resolve(fileName + ".tmp");
+         try (FileOutputStream out = new FileOutputStream(tmpPath.toFile())) {
+             out.getChannel().write(buffer);
+             out.getFD().sync();
+         }
+-        Files.move(tmpPath, Paths.get(dirPath, fileName), StandardCopyOption.ATOMIC_MOVE);
++        Files.move(tmpPath, dirPath.resolve(fileName), StandardCopyOption.ATOMIC_MOVE);
+     }
+ 
+     @Override
+     public void purge(String fileName) throws IOException {
+-        Path path = Paths.get(dirPath, fileName);
++        Path path = dirPath.resolve(fileName);
+         Files.delete(path);
+     }
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/io/MmapPageIO.java b/logstash-core/src/main/java/org/logstash/ackedqueue/io/MmapPageIO.java
+index 2034a402979..3a3d8051019 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/io/MmapPageIO.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/io/MmapPageIO.java
+@@ -6,7 +6,7 @@
+ import java.nio.MappedByteBuffer;
+ import java.nio.channels.FileChannel;
+ import java.nio.file.Files;
+-import java.nio.file.Paths;
++import java.nio.file.Path;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.zip.CRC32;
+@@ -48,7 +48,7 @@ public final class MmapPageIO implements PageIO {
+ 
+     private MappedByteBuffer buffer;
+ 
+-    public MmapPageIO(int pageNum, int capacity, String dirPath) {
++    public MmapPageIO(int pageNum, int capacity, Path dirPath) {
+         this.minSeqNum = 0;
+         this.elementCount = 0;
+         this.version = 0;
+@@ -56,7 +56,7 @@ public MmapPageIO(int pageNum, int capacity, String dirPath) {
+         this.capacity = capacity;
+         this.offsetMap = new IntVector();
+         this.checkSummer = new CRC32();
+-        this.file = Paths.get(dirPath, "page." + pageNum).toFile();
++        this.file = dirPath.resolve("page." + pageNum).toFile();
+     }
+ 
+     @Override
+diff --git a/logstash-core/src/main/java/org/logstash/common/FsUtil.java b/logstash-core/src/main/java/org/logstash/common/FsUtil.java
+index a13faabc939..227a47489ae 100644
+--- a/logstash-core/src/main/java/org/logstash/common/FsUtil.java
++++ b/logstash-core/src/main/java/org/logstash/common/FsUtil.java
+@@ -2,6 +2,7 @@
+ 
+ import java.io.File;
+ import java.io.IOException;
++import java.nio.file.Path;
+ import java.util.Arrays;
+ import java.util.HashSet;
+ import java.util.Set;
+@@ -27,13 +28,13 @@ private FsUtil() {
+      * @return True iff the
+      * @throws IOException on failure to determine free space for given path's partition
+      */
+-    public static boolean hasFreeSpace(final String path, final long size)
++    public static boolean hasFreeSpace(final Path path, final long size)
+         throws IOException
+     {
+         final Set<File> partitionRoots = new HashSet<>(Arrays.asList(File.listRoots()));
+ 
+         // crawl up file path until we find a root partition
+-        File location = new File(path).getCanonicalFile();
++        File location = path.toFile().getCanonicalFile();
+         while (!partitionRoots.contains(location)) {
+             location = location.getParentFile();
+             if (location == null) {
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
+index d80804f3731..bc333bc70ee 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
+@@ -58,7 +58,7 @@ public final class DeadLetterQueueWriter implements Closeable {
+     private final AtomicBoolean open = new AtomicBoolean(true);
+ 
+     public DeadLetterQueueWriter(Path queuePath, long maxSegmentSize, long maxQueueSize) throws IOException {
+-        this.lock = FileLockFactory.obtainLock(queuePath.toString(), LOCK_FILE);
++        this.lock = FileLockFactory.obtainLock(queuePath, LOCK_FILE);
+         this.queuePath = queuePath;
+         this.maxSegmentSize = maxSegmentSize;
+         this.maxQueueSize = maxQueueSize;
+diff --git a/logstash-core/src/test/java/org/logstash/FileLockFactoryMain.java b/logstash-core/src/test/java/org/logstash/FileLockFactoryMain.java
+index 5f5a70201d8..84aa5bc2e85 100644
+--- a/logstash-core/src/test/java/org/logstash/FileLockFactoryMain.java
++++ b/logstash-core/src/test/java/org/logstash/FileLockFactoryMain.java
+@@ -1,6 +1,7 @@
+ package org.logstash;
+ 
+ import java.io.IOException;
++import java.nio.file.Paths;
+ 
+ /*
+  * This program is used to test the FileLockFactory in cross-process/JVM.
+@@ -9,7 +10,7 @@ public class FileLockFactoryMain {
+ 
+     public static void main(String[] args) {
+         try {
+-            FileLockFactory.obtainLock(args[0], args[1]);
++            FileLockFactory.obtainLock(Paths.get(args[0]), args[1]);
+             System.out.println("File locked");
+             // Sleep enough time until this process is killed.
+             Thread.sleep(Long.MAX_VALUE);
+diff --git a/logstash-core/src/test/java/org/logstash/FileLockFactoryTest.java b/logstash-core/src/test/java/org/logstash/FileLockFactoryTest.java
+index 86c232aea4b..bf7e88a6ec9 100644
+--- a/logstash-core/src/test/java/org/logstash/FileLockFactoryTest.java
++++ b/logstash-core/src/test/java/org/logstash/FileLockFactoryTest.java
+@@ -1,5 +1,6 @@
+ package org.logstash;
+ 
++import java.nio.file.Path;
+ import org.junit.After;
+ import org.junit.Before;
+ import org.junit.Rule;
+@@ -25,7 +26,7 @@
+ 
+ public class FileLockFactoryTest {
+     @Rule public TemporaryFolder temporaryFolder = new TemporaryFolder();
+-    private String lockDir;
++    private Path lockDir;
+     private final String LOCK_FILE = ".test";
+ 
+     private FileLock lock;
+@@ -34,7 +35,7 @@ public class FileLockFactoryTest {
+ 
+     @Before
+     public void setUp() throws Exception {
+-        lockDir = temporaryFolder.newFolder("lock").getPath();
++        lockDir = temporaryFolder.newFolder("lock").toPath();
+         executor = Executors.newSingleThreadExecutor();
+     }
+ 
+@@ -117,7 +118,7 @@ public void crossJvmObtainLockOnLocked() throws Exception {
+             Paths.get(System.getProperty("java.home"), "bin", "java").toString(),
+             "-cp", System.getProperty("java.class.path"),
+             Class.forName("org.logstash.FileLockFactoryMain").getName(),
+-            lockDir, lockFile
++            lockDir.toString(), lockFile
+         };
+ 
+         try {
+diff --git a/logstash-core/src/test/java/org/logstash/ackedqueue/HeadPageTest.java b/logstash-core/src/test/java/org/logstash/ackedqueue/HeadPageTest.java
+index a5d59262eb6..2af5e3c784a 100644
+--- a/logstash-core/src/test/java/org/logstash/ackedqueue/HeadPageTest.java
++++ b/logstash-core/src/test/java/org/logstash/ackedqueue/HeadPageTest.java
+@@ -1,6 +1,7 @@
+ package org.logstash.ackedqueue;
+ 
+ import java.io.IOException;
++import java.nio.file.Paths;
+ import java.util.concurrent.TimeUnit;
+ import org.junit.Before;
+ import org.junit.Rule;
+@@ -32,7 +33,7 @@ public void newHeadPage() throws IOException {
+         // Close method on Page requires an instance of Queue that has already been opened.
+         try (Queue q = new Queue(s)) {
+             q.open();
+-            PageIO pageIO = new MmapPageIO(0, 100, dataPath);
++            PageIO pageIO = new MmapPageIO(0, 100, Paths.get(dataPath));
+             pageIO.create();
+             try (final Page p = PageFactory.newHeadPage(0, q, pageIO)) {
+                 assertThat(p.getPageNum(), is(equalTo(0)));
+diff --git a/logstash-core/src/test/java/org/logstash/ackedqueue/io/FileCheckpointIOTest.java b/logstash-core/src/test/java/org/logstash/ackedqueue/io/FileCheckpointIOTest.java
+index 9fa3df2f552..7ff54ef20f1 100644
+--- a/logstash-core/src/test/java/org/logstash/ackedqueue/io/FileCheckpointIOTest.java
++++ b/logstash-core/src/test/java/org/logstash/ackedqueue/io/FileCheckpointIOTest.java
+@@ -16,7 +16,7 @@
+ import static org.hamcrest.MatcherAssert.assertThat;
+ 
+ public class FileCheckpointIOTest {
+-    private String checkpointFolder;
++    private Path checkpointFolder;
+     private CheckpointIO io;
+ 
+     @Rule
+@@ -26,15 +26,14 @@ public class FileCheckpointIOTest {
+     public void setUp() throws Exception {
+         checkpointFolder = temporaryFolder
+                 .newFolder("checkpoints")
+-                .getPath();
++                .toPath();
+         io = new FileCheckpointIO(checkpointFolder);
+     }
+ 
+     @Test
+     public void read() throws Exception {
+         URL url = this.getClass().getResource("checkpoint.head");
+-        String dirPath = Paths.get(url.toURI()).getParent().toString();
+-        io = new FileCheckpointIO(dirPath);
++        io = new FileCheckpointIO(Paths.get(url.toURI()).getParent());
+         Checkpoint chk = io.read("checkpoint.head");
+         assertThat(chk.getMinSeqNum(), is(8L));
+     }
+@@ -43,7 +42,7 @@ public void read() throws Exception {
+     public void write() throws Exception {
+         io.write("checkpoint.head", 6, 2, 10L, 8L, 200);
+         io.write("checkpoint.head", 6, 2, 10L, 8L, 200);
+-        Path fullFileName = Paths.get(checkpointFolder, "checkpoint.head");
++        Path fullFileName = checkpointFolder.resolve("checkpoint.head");
+         byte[] contents = Files.readAllBytes(fullFileName);
+         URL url = this.getClass().getResource("checkpoint.head");
+         Path path = Paths.get(url.toURI());
+diff --git a/logstash-core/src/test/java/org/logstash/ackedqueue/io/FileMmapIOTest.java b/logstash-core/src/test/java/org/logstash/ackedqueue/io/FileMmapIOTest.java
+index 493cdcd826a..d8e6d61c197 100644
+--- a/logstash-core/src/test/java/org/logstash/ackedqueue/io/FileMmapIOTest.java
++++ b/logstash-core/src/test/java/org/logstash/ackedqueue/io/FileMmapIOTest.java
+@@ -1,5 +1,6 @@
+ package org.logstash.ackedqueue.io;
+ 
++import java.nio.file.Path;
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+@@ -15,7 +16,7 @@
+ import static org.hamcrest.MatcherAssert.assertThat;
+ 
+ public class FileMmapIOTest {
+-    private String folder;
++    private Path folder;
+     private MmapPageIO writeIo;
+     private MmapPageIO readIo;
+     private int pageNum;
+@@ -28,7 +29,7 @@ public void setUp() throws Exception {
+         pageNum = 0;
+         folder = temporaryFolder
+                 .newFolder("pages")
+-                .getPath();
++                .toPath();
+         writeIo = new MmapPageIO(pageNum, 1024, folder);
+         readIo = new MmapPageIO(pageNum, 1024, folder);
+     }
+diff --git a/logstash-core/src/test/java/org/logstash/ackedqueue/io/MmapPageIOTest.java b/logstash-core/src/test/java/org/logstash/ackedqueue/io/MmapPageIOTest.java
+index 7fc29659ee5..13569a38778 100644
+--- a/logstash-core/src/test/java/org/logstash/ackedqueue/io/MmapPageIOTest.java
++++ b/logstash-core/src/test/java/org/logstash/ackedqueue/io/MmapPageIOTest.java
+@@ -1,11 +1,10 @@
+ package org.logstash.ackedqueue.io;
+ 
++import java.nio.file.Path;
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+ import org.junit.rules.TemporaryFolder;
+-import org.logstash.ackedqueue.io.MmapPageIO;
+-import org.logstash.ackedqueue.io.PageIO;
+ 
+ import java.io.IOException;
+ 
+@@ -18,11 +17,11 @@ public class MmapPageIOTest {
+     @Rule
+     public final TemporaryFolder temporaryFolder = new TemporaryFolder();
+ 
+-    private String dir;
++    private Path dir;
+ 
+     @Before
+     public void setUp() throws Exception {
+-        dir = temporaryFolder.newFolder().getPath();
++        dir = temporaryFolder.newFolder().toPath();
+     }
+ 
+     @Test
+diff --git a/logstash-core/src/test/java/org/logstash/common/FsUtilTest.java b/logstash-core/src/test/java/org/logstash/common/FsUtilTest.java
+index 28d167ceaa8..01338383793 100644
+--- a/logstash-core/src/test/java/org/logstash/common/FsUtilTest.java
++++ b/logstash-core/src/test/java/org/logstash/common/FsUtilTest.java
+@@ -15,26 +15,26 @@ public final class FsUtilTest {
+     public final TemporaryFolder temp = new TemporaryFolder();
+ 
+     /**
+-     * {@link FsUtil#hasFreeSpace(String, long)} should return true when asked for 1kb of free
++     * {@link FsUtil#hasFreeSpace(java.nio.file.Path, long)} should return true when asked for 1kb of free
+      * space in a subfolder of the system's TEMP location.
+      */
+     @Test
+     public void trueIfEnoughSpace() throws Exception {
+         MatcherAssert.assertThat(
+-                FsUtil.hasFreeSpace(temp.newFolder().getAbsolutePath(), 1024L),
++                FsUtil.hasFreeSpace(temp.newFolder().toPath().toAbsolutePath(), 1024L),
+                 CoreMatchers.is(true)
+         );
+     }
+ 
+     /**
+-     * {@link FsUtil#hasFreeSpace(String, long)} should return false when asked for
++     * {@link FsUtil#hasFreeSpace(java.nio.file.Path, long)} should return false when asked for
+      * {@link Long#MAX_VALUE} of free space in a subfolder of the system's TEMP location.
+      */
+     @Test
+     public void falseIfNotEnoughSpace() throws Exception {
+         MatcherAssert.assertThat(
+-                FsUtil.hasFreeSpace(temp.newFolder().getAbsolutePath(), Long.MAX_VALUE),
++                FsUtil.hasFreeSpace(temp.newFolder().toPath().toAbsolutePath(), Long.MAX_VALUE),
+                 CoreMatchers.is(false)
+         );
+     }
+-}
+\ No newline at end of file
++}

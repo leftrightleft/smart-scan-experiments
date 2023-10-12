@@ -1,0 +1,1014 @@
+diff --git a/docs/static/configuration.asciidoc b/docs/static/configuration.asciidoc
+index 9dce5f5a61e..8048c63ae57 100644
+--- a/docs/static/configuration.asciidoc
++++ b/docs/static/configuration.asciidoc
+@@ -377,20 +377,24 @@ output {
+ }
+ ----------------------------------
+ 
+-Similarly, you can convert the timestamp in the `@timestamp` field into a string. Instead of specifying a field name inside the curly braces, use the `+FORMAT` syntax where `FORMAT` is a http://joda-time.sourceforge.net/apidocs/org/joda/time/format/DateTimeFormat.html[time format].
++Similarly, you can convert the timestamp in the `@timestamp` field into a string.
+ 
+-For example, if you want to use the file output to write to logs based on the
+-event's date and hour and the `type` field:
++Instead of specifying a field name inside the curly braces, use the `%{{FORMAT}}` syntax where `FORMAT` is a https://docs.oracle.com/en/java/javase/11/docs/api/java.base/java/time/format/DateTimeFormatter.html#patterns[java time format].
++
++For example, if you want to use the file output to write logs based on the event's date and hour and the `type` field:
+ 
+ [source,js]
+ ----------------------------------
+ output {
+   file {
+-    path => "/var/log/%{type}.%{+yyyy.MM.dd.HH}"
++    path => "/var/log/%{type}.%{{yyyy.MM.dd.HH}}"
+   }
+ }
+ ----------------------------------
+ 
++NOTE: The sprintf format continues to support http://joda-time.sourceforge.net/apidocs/org/joda/time/format/DateTimeFormat.html[deprecated joda time format] strings as well using the `%{+FORMAT}` syntax.
++      These formats are not directly interchangeable, and we advise you to begin using the more modern Java Time format.
++
+ [discrete]
+ [[conditionals]]
+ ==== Conditionals
+diff --git a/logstash-core/build.gradle b/logstash-core/build.gradle
+index c2e24cba7dc..3a4305c08c7 100644
+--- a/logstash-core/build.gradle
++++ b/logstash-core/build.gradle
+@@ -191,6 +191,8 @@ dependencies {
+     }
+     implementation 'org.javassist:javassist:3.26.0-GA'
+     testImplementation "org.apache.logging.log4j:log4j-core:${log4jVersion}:tests"
++    testImplementation 'org.hamcrest:hamcrest:2.2'
++    testImplementation 'org.hamcrest:hamcrest-library:2.2'
+     testImplementation 'junit:junit:4.12'
+     testImplementation 'net.javacrumbs.json-unit:json-unit:2.3.0'
+     testImplementation 'org.elasticsearch:securemock:1.2'
+diff --git a/logstash-core/spec/logstash/legacy_ruby_timestamp_spec.rb b/logstash-core/spec/logstash/legacy_ruby_timestamp_spec.rb
+index 3d2372551d6..71294914751 100644
+--- a/logstash-core/spec/logstash/legacy_ruby_timestamp_spec.rb
++++ b/logstash-core/spec/logstash/legacy_ruby_timestamp_spec.rb
+@@ -28,23 +28,31 @@
+   it "should parse its own iso8601 output" do
+     t = Time.now
+     ts = LogStash::Timestamp.new(t)
+-    expect(LogStash::Timestamp.parse_iso8601(ts.to_iso8601).to_i).to eq(t.to_i)
++    parsed = LogStash::Timestamp.parse_iso8601(ts.to_iso8601)
++    expect(parsed.to_i).to eq(t.to_i)
++    expect(parsed).to eq(ts)
+   end
+ 
+   it "should coerce iso8601 string" do
+     t = DateTime.now.to_time
+     ts = LogStash::Timestamp.new(t)
+-    expect(LogStash::Timestamp.coerce(ts.to_iso8601).to_i).to eq(t.to_i)
++    coerced = LogStash::Timestamp.coerce(ts.to_iso8601)
++    expect(coerced.to_i).to eq(t.to_i)
++    expect(coerced).to eq(ts)
+   end
+ 
+   it "should coerce Time" do
+     t = Time.now
+-    expect(LogStash::Timestamp.coerce(t).to_i).to eq(t.to_i)
++    coerced = LogStash::Timestamp.coerce(t)
++    expect(coerced.to_i).to eq(t.to_i)
++    expect(coerced.time).to eq(t)
+   end
+ 
+   it "should coerce Timestamp" do
+     t = LogStash::Timestamp.now
+-    expect(LogStash::Timestamp.coerce(t).to_i).to eq(t.to_i)
++    coerced = LogStash::Timestamp.coerce(t)
++    expect(coerced.to_i).to eq(t.to_i)
++    expect(coerced).to eq(t)
+   end
+ 
+   it "should raise on invalid string coerce" do
+@@ -55,12 +63,42 @@
+     expect(LogStash::Timestamp.coerce(:foobar)).to be_nil
+   end
+ 
+-  it "should support to_json" do
+-    expect(LogStash::Timestamp.parse_iso8601("2014-09-23T00:00:00-0800").to_json).to eq("\"2014-09-23T08:00:00.000Z\"")
+-  end
++  context '#to_json' do
++    it "should support to_json" do
++      expect(LogStash::Timestamp.parse_iso8601("2014-09-23T00:00:00.123-0800").to_json).to eq("\"2014-09-23T08:00:00.123Z\"")
++    end
++
++    it "should support to_json and ignore arguments" do
++      expect(LogStash::Timestamp.parse_iso8601("2014-09-23T00:00:00.456-0800").to_json(:some => 1, :arguments => "test")).to eq("\"2014-09-23T08:00:00.456Z\"")
++    end
+ 
+-  it "should support to_json and ignore arguments" do
+-    expect(LogStash::Timestamp.parse_iso8601("2014-09-23T00:00:00-0800").to_json(:some => 1, :arguments => "test")).to eq("\"2014-09-23T08:00:00.000Z\"")
++    context 'variable serialization length' do
++      subject(:timestamp) { LogStash::Timestamp.parse_iso8601(time_string) }
++      context 'with whole seconds' do
++        let(:time_string) { "2014-09-23T00:00:00.000-0800" }
++        it 'serializes a 20-byte string' do
++          expect(timestamp.to_json).to eq('"2014-09-23T08:00:00Z"')
++        end
++      end
++      context 'with excess millis' do
++        let(:time_string) { "2014-09-23T00:00:00.123000-0800" }
++        it 'serializes a 24-byte string' do
++          expect(timestamp.to_json).to eq('"2014-09-23T08:00:00.123Z"')
++        end
++      end
++      context 'with excess micros' do
++        let(:time_string) { "2014-09-23T00:00:00.000100-0800" }
++        it 'serializes a 24-byte string' do
++          expect(timestamp.to_json).to eq('"2014-09-23T08:00:00.000100Z"')
++        end
++      end
++      context 'with excess nanos' do
++        let(:time_string) { "2014-09-23T00:00:00.000000010-0800" }
++        it 'serializes a 24-byte string' do
++          expect(timestamp.to_json).to eq('"2014-09-23T08:00:00.000000010Z"')
++        end
++      end
++    end
+   end
+ 
+   it "should support timestamp comparison" do
+@@ -131,7 +169,7 @@
+   context "at" do
+     context "with integer epoch" do
+       it "should convert to correct date" do
+-        expect(LogStash::Timestamp.at(946702800).to_iso8601).to eq("2000-01-01T05:00:00.000Z")
++        expect(LogStash::Timestamp.at(946702800).to_iso8601).to eq("2000-01-01T05:00:00Z")
+       end
+ 
+       it "should return zero usec" do
+@@ -139,29 +177,27 @@
+       end
+ 
+       it "should return prior to epoch date on negative input" do
+-        expect(LogStash::Timestamp.at(-1).to_iso8601).to eq("1969-12-31T23:59:59.000Z")
++        expect(LogStash::Timestamp.at(-1).to_iso8601).to eq("1969-12-31T23:59:59Z")
+       end
+     end
+ 
+     context "with float epoch" do
+       it "should convert to correct date" do
+-        expect(LogStash::Timestamp.at(946702800.123456.to_f).to_iso8601).to eq("2000-01-01T05:00:00.123Z")
++        expect(LogStash::Timestamp.at(946702800.123456).to_f).to be_within(0.000001).of(946702800.123456)
+       end
+ 
+       it "should return usec with a minimum of millisec precision" do
+-        expect(LogStash::Timestamp.at(946702800.123456.to_f).usec).to be_within(1000).of(123456)
++        expect(LogStash::Timestamp.at(946702800.123456789.to_f).usec).to be_within(1000).of(123456)
+       end
+     end
+ 
+     context "with BigDecimal epoch" do
+       it "should convert to correct date" do
+-        expect(LogStash::Timestamp.at(BigDecimal.new("946702800.123456")).to_iso8601).to eq("2000-01-01T05:00:00.123Z")
++        expect(LogStash::Timestamp.at(BigDecimal.new("946702800.123456789")).to_iso8601).to eq("2000-01-01T05:00:00.123456789Z")
+       end
+ 
+       it "should return usec with a minimum of millisec precision" do
+-        # since Java Timestamp relies on JodaTime which supports only milliseconds precision
+-        # the usec method will only be precise up to milliseconds.
+-        expect(LogStash::Timestamp.at(BigDecimal.new("946702800.123456")).usec).to be_within(1000).of(123456)
++        expect(LogStash::Timestamp.at(BigDecimal.new("946702800.123456789")).usec).to be_within(1000).of(123456)
+       end
+     end
+ 
+@@ -181,10 +217,37 @@
+       expect(LogStash::Timestamp.at(946702800.123).usec).to eq(123000)
+     end
+ 
+-    it "should try to preserve and report microseconds precision if possible" do
+-      # since Java Timestamp relies on JodaTime which supports only milliseconds precision
+-      # the usec method will only be precise up to milliseconds.
+-      expect(LogStash::Timestamp.at(946702800.123456).usec).to be_within(1000).of(123456)
++    it "preserves microseconds precision if possible" do
++      expect(LogStash::Timestamp.at(946702800.123456).usec).to eq(123456)
++    end
++
++    it "truncates excess nanos" do
++      expect(LogStash::Timestamp.at(946702800.123456789).usec).to eq(123456)
++    end
++  end
++
++  context "nsec" do
++    # iterate through a list of known edge-cases, plus one random.
++    # if we get a test failure and identify a regression, add its value to the list.
++    [
++      000000000,
++      499999999,
++      500000000,
++      999999999,
++      Random.rand(1_000_000_000)
++    ].each do |excess_nanos|
++      context "with excess_nanos=`#{'%09d'% excess_nanos}`" do
++        let(:epoch_seconds) { Time.now.to_i }
++        let(:excess_nanos) {  }
++
++        let(:rational_time) { epoch_seconds + Rational(excess_nanos, 1_000_000_000) }
++
++        subject(:timestamp) { LogStash::Timestamp.at(rational_time) }
++
++        it "supports nanosecond precision" do
++          expect(timestamp.nsec).to eq(excess_nanos)
++        end
++      end
+     end
+   end
+ end
+diff --git a/logstash-core/src/main/java/org/logstash/StringInterpolation.java b/logstash-core/src/main/java/org/logstash/StringInterpolation.java
+index cec82b4eca6..8209fdc5920 100644
+--- a/logstash-core/src/main/java/org/logstash/StringInterpolation.java
++++ b/logstash-core/src/main/java/org/logstash/StringInterpolation.java
+@@ -21,9 +21,12 @@
+ package org.logstash;
+ 
+ import com.fasterxml.jackson.core.JsonProcessingException;
++import org.joda.time.DateTime;
+ import org.joda.time.DateTimeZone;
+ import org.joda.time.format.DateTimeFormat;
+ 
++import java.time.ZoneOffset;
++import java.time.format.DateTimeFormatter;
+ import java.util.List;
+ import java.util.Map;
+ 
+@@ -66,21 +69,40 @@ public static String evaluate(final Event event, final String template) throws J
+         }
+         final StringBuilder builder = STRING_BUILDER.get();
+         int pos = 0;
++        final int len = template.length();
+         while (open > -1 && close > -1) {
+             if (open > 0) {
+                 builder.append(template, pos, open);
+             }
+             if (template.regionMatches(open + 2, "+%s", 0, close - open - 2)) {
++                // UNIX-style @timestamp formatter:
++                // - `%{+%s}` -> 1234567890
+                 Timestamp t = event.getTimestamp();
+-                builder.append(t == null ? "" : t.getTime().getMillis() / 1000L);
++                builder.append(t == null ? "" : t.toInstant().getEpochSecond());
++            } else if (template.charAt(open+2) == '{' && (close < len) && template.charAt(close+1) == '}') {
++                // JAVA-style @timestamp formatter:
++                // - `%{{yyyy-MM-dd}}` -> `2021-08-11`
++                // - `%{{YYYY-'W'ww}}` -> `2021-W32`
++                close = close + 1; // consume extra closing squiggle
++                final Timestamp t =  event.getTimestamp();
++                if (t != null) {
++                    final String javaTimeFormatPattern = template.substring(open+3, close-1);
++                    final java.time.format.DateTimeFormatter javaDateTimeFormatter = DateTimeFormatter.ofPattern(javaTimeFormatPattern).withZone(ZoneOffset.UTC);
++                    final String formattedTimestamp = javaDateTimeFormatter.format(t.toInstant());
++                    builder.append(formattedTimestamp);
++                }
+             } else if (template.charAt(open + 2) == '+') {
+-                Timestamp t = event.getTimestamp();
+-                builder.append(t != null
+-                        ? event.getTimestamp().getTime().toString(
+-                                DateTimeFormat.forPattern(template.substring(open + 3, close))
+-                                        .withZone(DateTimeZone.UTC))
+-                        : ""
+-                    );
++                // JODA-style @timestamp formatter:
++                // - `%{+YYYY.MM.dd}` -> `2021-08-11`
++                // - `%{+xxxx-'W'ww}  -> `2021-W32`
++                final Timestamp t = event.getTimestamp();
++                if (t != null) {
++                    final String jodaTimeFormatPattern = template.substring(open + 3, close);
++                    final org.joda.time.format.DateTimeFormatter jodaDateTimeFormatter = DateTimeFormat.forPattern(jodaTimeFormatPattern).withZone(DateTimeZone.UTC);
++                    final DateTime jodaTimestamp = new DateTime(t.toInstant().toEpochMilli(), DateTimeZone.UTC);
++                    final String formattedTimestamp = jodaTimestamp.toString(jodaDateTimeFormatter);
++                    builder.append(formattedTimestamp);
++                }
+             } else {
+                 final String found = template.substring(open + 2, close);
+                 final Object value = event.getField(found);
+@@ -100,7 +122,6 @@ public static String evaluate(final Event event, final String template) throws J
+             open = template.indexOf("%{", pos);
+             close = template.indexOf('}', open);
+         }
+-        final int len = template.length();
+         if (pos < len) {
+             builder.append(template, pos, len);
+         }
+diff --git a/logstash-core/src/main/java/org/logstash/Timestamp.java b/logstash-core/src/main/java/org/logstash/Timestamp.java
+index 893dba3f726..384fd1202a9 100644
+--- a/logstash-core/src/main/java/org/logstash/Timestamp.java
++++ b/logstash-core/src/main/java/org/logstash/Timestamp.java
+@@ -22,100 +22,147 @@
+ 
+ import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+ import com.fasterxml.jackson.databind.annotation.JsonSerialize;
++
++import java.time.Clock;
++import java.time.Instant;
++import java.time.ZoneId;
++import java.time.format.DateTimeFormatter;
++import java.time.format.DateTimeFormatterBuilder;
++import java.time.temporal.ChronoField;
+ import java.util.Date;
+-import org.joda.time.Chronology;
+-import org.joda.time.DateTime;
+-import org.joda.time.DateTimeZone;
+-import org.joda.time.Duration;
+-import org.joda.time.LocalDateTime;
+-import org.joda.time.chrono.ISOChronology;
+-import org.joda.time.format.DateTimeFormatter;
+-import org.joda.time.format.ISODateTimeFormat;
++
+ import org.logstash.ackedqueue.Queueable;
+ 
+ /**
+- * Wrapper around a {@link DateTime} with Logstash specific serialization behaviour.
+- * This class is immutable and thread-safe since its only state is held in a final {@link DateTime}
+- * reference and {@link DateTime} which itself is immutable and thread-safe.
++ * Wrapper around a {@link Instant} with Logstash specific serialization behaviour.
++ * This class is immutable and thread-safe since its only state is held in a final {@link Instant}
++ * reference and {@link Instant} which itself is immutable and thread-safe.
+  */
+ @JsonSerialize(using = ObjectMappers.TimestampSerializer.class)
+ @JsonDeserialize(using = ObjectMappers.TimestampDeserializer.class)
+ public final class Timestamp implements Comparable<Timestamp>, Queueable {
+ 
+-    // all methods setting the time object must set it in the UTC timezone
+-    private final DateTime time;
+-
+-    private static final DateTimeFormatter iso8601Formatter = ISODateTimeFormat.dateTime();
++    private transient org.joda.time.DateTime time;
+ 
+-    private static final LocalDateTime JAN_1_1970 = new LocalDateTime(1970, 1, 1, 0, 0);
+-
+-    /**
+-     * {@link Chronology} for UTC timezone, cached here to avoid lookup of it when constructing
+-     * {@link DateTime} instances.
+-     */
+-    private static final Chronology UTC_CHRONOLOGY = ISOChronology.getInstance(DateTimeZone.UTC);
++    private final Instant instant;
+ 
+     public Timestamp() {
+-        this.time = new DateTime(UTC_CHRONOLOGY);
++        this(Clock.systemDefaultZone());
+     }
+ 
+     public Timestamp(String iso8601) {
+-        this.time =
+-            ISODateTimeFormat.dateTimeParser().parseDateTime(iso8601).toDateTime(UTC_CHRONOLOGY);
++        this(iso8601, Clock.systemDefaultZone());
++    }
++
++    Timestamp(final String iso8601, final Clock clock) {
++        this.instant = tryParse(iso8601, clock);
++    }
++
++    Timestamp(final Clock clock) {
++        this(clock.instant());
+     }
+ 
+     public Timestamp(long epoch_milliseconds) {
+-        this.time = new DateTime(epoch_milliseconds, UTC_CHRONOLOGY);
++        this(Instant.ofEpochMilli(epoch_milliseconds));
++    }
++
++    public Timestamp(final Date date) {
++        this(date.toInstant());
+     }
+ 
+-    public Timestamp(Date date) {
+-        this.time = new DateTime(date, UTC_CHRONOLOGY);
++    public Timestamp(final org.joda.time.DateTime date) {
++        this(date.getMillis());
+     }
+ 
+-    public Timestamp(DateTime date) {
+-        this.time = date.toDateTime(UTC_CHRONOLOGY);
++    public Timestamp(final Instant instant) {
++        this.instant = instant;
+     }
+ 
+-    public DateTime getTime() {
++    /**
++     * @deprecated This method returns JodaTime which is deprecated in favor of JDK Instant.
++     *   * <p> Use {@link Timestamp#toInstant()} instead. </p>
++     */
++    @Deprecated
++    public org.joda.time.DateTime getTime() {
++        if (time == null) {
++            time = new org.joda.time.DateTime(instant.toEpochMilli(), org.joda.time.DateTimeZone.UTC);
++        }
+         return time;
+     }
+ 
++    public Instant toInstant() {
++        return instant;
++    }
++
+     public static Timestamp now() {
+         return new Timestamp();
+     }
+ 
+     public String toString() {
+-        return iso8601Formatter.print(this.time);
++        return instant.toString();
+     }
+ 
+     public long toEpochMilli() {
+-        return time.getMillis();
++        return instant.toEpochMilli();
+     }
+ 
+-    // returns the fraction of a second as microseconds, not the number of microseconds since epoch
++    /**
++     * @return the fraction of a second as microseconds from 0 to 999,999; not the number of microseconds since epoch
++     */
+     public long usec() {
+-        // JodaTime only supports milliseconds precision we can only return usec at millisec precision.
+-        // note that getMillis() return millis since epoch
+-        return (new Duration(JAN_1_1970.toDateTime(DateTimeZone.UTC), this.time).getMillis() % 1000) * 1000;
++        return instant.getNano() / 1000;
++    }
++
++    /**
++     * @return the fraction of a second as nanoseconds from 0 to 999,999,999; not the number of nanoseconds since epoch
++     */
++    public long nsec() {
++        return instant.getNano();
+     }
+ 
+     @Override
+     public int compareTo(Timestamp other) {
+-        return time.compareTo(other.time);
++        return instant.compareTo(other.instant);
+     }
+     
+     @Override
+     public boolean equals(final Object other) {
+-        return other instanceof Timestamp && time.equals(((Timestamp) other).time);
++        return other instanceof Timestamp && instant.equals(((Timestamp) other).instant);
+     }
+ 
+     @Override
+     public int hashCode() {
+-        return time.hashCode();
++        return instant.hashCode();
+     }
+ 
+     @Override
+     public byte[] serialize() {
+         return toString().getBytes();
+     }
++
++    // Here we build a DateTimeFormatter that is as forgiving as Joda's ISODateTimeFormat.dateTimeParser()
++    // Required yyyy-MM-dd date
++    // Optional 'T'-prefixed HH:mm:ss.SSS time (defaults to 00:00:00.000)
++    // Optional Zone information, in standard or colons-optional formats (defaults to system zone)
++    private static final DateTimeFormatter LENIENT_ISO_DATE_TIME_FORMATTER = (new DateTimeFormatterBuilder())
++            .parseCaseInsensitive()
++            .append(DateTimeFormatter.ISO_LOCAL_DATE)
++            // Time is optional, but if present will begin with a T
++            .optionalStart().appendLiteral('T').append(DateTimeFormatter.ISO_LOCAL_TIME).optionalEnd()
++            // Timezone is optional, and may land in one of a couple different formats.
++            .optionalStart().appendZoneOrOffsetId().optionalEnd()
++            .optionalStart().appendOffset("+HHmmss", "Z").optionalEnd()
++            .parseDefaulting(ChronoField.HOUR_OF_DAY, 0)
++            .parseDefaulting(ChronoField.MINUTE_OF_HOUR, 0)
++            .parseDefaulting(ChronoField.SECOND_OF_MINUTE, 0)
++            .parseDefaulting(ChronoField.NANO_OF_SECOND, 0)
++            .toFormatter().withZone(ZoneId.systemDefault());
++
++    private static Instant tryParse(final String iso8601, final Clock clock) {
++        try {
++            return LENIENT_ISO_DATE_TIME_FORMATTER.withZone(clock.getZone()).parse(iso8601, Instant::from);
++        } catch (java.time.format.DateTimeParseException e) {
++            throw new IllegalArgumentException(String.format("Invalid ISO8601 input `%s`", iso8601), e);
++        }
++    }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/Valuefier.java b/logstash-core/src/main/java/org/logstash/Valuefier.java
+index e103ba3c1ee..872ee92b466 100644
+--- a/logstash-core/src/main/java/org/logstash/Valuefier.java
++++ b/logstash-core/src/main/java/org/logstash/Valuefier.java
+@@ -155,7 +155,7 @@ private static Map<Class<?>, Valuefier.Converter> initConverters() {
+         );
+         converters.put(
+             RubyTime.class, input -> JrubyTimestampExtLibrary.RubyTimestamp.newRubyTimestamp(
+-                RubyUtil.RUBY, new Timestamp(((RubyTime) input).getDateTime())
++                RubyUtil.RUBY, new Timestamp(((RubyTime) input).toInstant())
+             )
+         );
+         converters.put(
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
+index 54edca12fe9..b1d2e2cea62 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
+@@ -157,7 +157,7 @@ void writeEntry(DLQEntry entry) throws IOException {
+         lock.lock();
+         try {
+             Timestamp entryTimestamp = Timestamp.now();
+-            if (entryTimestamp.getTime().isBefore(lastEntryTimestamp.getTime())) {
++            if (entryTimestamp.compareTo(lastEntryTimestamp) < 0) {
+                 entryTimestamp = lastEntryTimestamp;
+             }
+             innerWriteEntry(entry);
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JrubyTimestampExtLibrary.java b/logstash-core/src/main/java/org/logstash/ext/JrubyTimestampExtLibrary.java
+index 6557746ea33..4c65fd27746 100644
+--- a/logstash-core/src/main/java/org/logstash/ext/JrubyTimestampExtLibrary.java
++++ b/logstash-core/src/main/java/org/logstash/ext/JrubyTimestampExtLibrary.java
+@@ -68,6 +68,10 @@ public void setTimestamp(Timestamp timestamp) {
+             this.timestamp = timestamp;
+         }
+ 
++        public java.time.Instant toInstant() {
++            return this.timestamp.toInstant();
++        }
++
+         // def initialize(time = Time.new)
+         @JRubyMethod(optional = 1)
+         public JrubyTimestampExtLibrary.RubyTimestamp initialize(final ThreadContext context,
+@@ -78,7 +82,7 @@ public JrubyTimestampExtLibrary.RubyTimestamp initialize(final ThreadContext con
+             if (time.isNil()) {
+                 this.timestamp = new Timestamp();
+             } else if (time instanceof RubyTime) {
+-                this.timestamp = new Timestamp(((RubyTime) time).getDateTime());
++                this.timestamp = new Timestamp(((RubyTime) time).toInstant());
+             } else if (time instanceof RubyString) {
+                 try {
+                     this.timestamp = new Timestamp(time.toString());
+@@ -98,19 +102,26 @@ public JrubyTimestampExtLibrary.RubyTimestamp initialize(final ThreadContext con
+         @JRubyMethod(name = "time")
+         public RubyTime ruby_time(ThreadContext context)
+         {
+-            return RubyTime.newTime(context.runtime, this.timestamp.getTime());
++            final org.joda.time.DateTime milliPrecise = org.joda.time.Instant.ofEpochMilli(this.timestamp.toEpochMilli()).toDateTime();
++            final long excessNanos = Math.floorMod(this.timestamp.nsec(), 1_000_000L);
++
++            return RubyTime.newTime(context.runtime, milliPrecise, excessNanos);
+         }
+ 
+         @JRubyMethod(name = "to_i")
+         public IRubyObject ruby_to_i(ThreadContext context)
+         {
+-            return RubyFixnum.newFixnum(context.runtime, this.timestamp.getTime().getMillis() / 1000);
++            return RubyFixnum.newFixnum(context.runtime, this.timestamp.toInstant().getEpochSecond());
+         }
+ 
+         @JRubyMethod(name = "to_f")
+         public IRubyObject ruby_to_f(ThreadContext context)
+         {
+-            return RubyFloat.newFloat(context.runtime, this.timestamp.getTime().getMillis() / 1000.0d);
++            final java.time.Instant instant = this.timestamp.toInstant();
++
++            final double epochSecondsWithNanos = instant.getEpochSecond() + (instant.getNano() / 1_000_000_000d);
++
++            return RubyFloat.newFloat(context.runtime, epochSecondsWithNanos);
+         }
+ 
+         @JRubyMethod(name = "to_s")
+@@ -162,7 +173,7 @@ public static IRubyObject ruby_coerce(ThreadContext context, IRubyObject recv, I
+                 } else if (time instanceof RubyTime) {
+                     return RubyTimestamp.newRubyTimestamp(
+                         context.runtime,
+-                        new Timestamp(((RubyTime) time).getDateTime())
++                        new Timestamp(((RubyTime) time).toInstant())
+                     );
+                 } else if (time instanceof RubyString) {
+                     return fromRString(context.runtime, (RubyString) time);
+@@ -206,7 +217,7 @@ public static JrubyTimestampExtLibrary.RubyTimestamp ruby_at(ThreadContext conte
+             } else {
+                 t = (RubyTime)RubyTime.at(context, context.runtime.getTime(), args[0], args[1]);
+             }
+-            return RubyTimestamp.newRubyTimestamp(context.runtime, new Timestamp(t.getDateTime()));
++            return RubyTimestamp.newRubyTimestamp(context.runtime, new Timestamp(t.toInstant()));
+         }
+ 
+         @JRubyMethod(name = "now", meta = true)
+@@ -233,18 +244,23 @@ public IRubyObject ruby_usec(ThreadContext context)
+             return RubyFixnum.newFixnum(context.runtime, this.timestamp.usec());
+         }
+ 
++        @JRubyMethod(name = {"nsec", "tv_nsec"})
++        public org.jruby.RubyInteger ruby_nsec(final ThreadContext context) {
++            return RubyFixnum.newFixnum(context.runtime, this.timestamp.nsec());
++        }
++
+         @JRubyMethod(name = "year")
+         public IRubyObject ruby_year(ThreadContext context)
+         {
+-            return RubyFixnum.newFixnum(context.runtime, this.timestamp.getTime().getYear());
++            final int year = this.timestamp.toInstant().atOffset(java.time.ZoneOffset.UTC).getYear();
++            return RubyFixnum.newFixnum(context.runtime, year);
+         }
+ 
+         @JRubyMethod(name = "<=>")
+         public IRubyObject op_cmp(final ThreadContext context, final IRubyObject other) {
+             if (other instanceof JrubyTimestampExtLibrary.RubyTimestamp) {
+-                return ruby_time(context).op_cmp(
+-                    context, ((JrubyTimestampExtLibrary.RubyTimestamp) other).ruby_time(context)
+-                );
++                final int cmp = this.timestamp.compareTo(((RubyTimestamp) other).timestamp);
++                return RubyFixnum.newFixnum(context.runtime, cmp);
+             }
+             return context.nil;
+         }
+diff --git a/logstash-core/src/test/java/org/logstash/StringInterpolationTest.java b/logstash-core/src/test/java/org/logstash/StringInterpolationTest.java
+index 536110c6009..7930837f29a 100644
+--- a/logstash-core/src/test/java/org/logstash/StringInterpolationTest.java
++++ b/logstash-core/src/test/java/org/logstash/StringInterpolationTest.java
+@@ -76,6 +76,13 @@ public void TestMixDateAndFields() throws IOException {
+         assertEquals("/full/2015/weeee/foo", StringInterpolation.evaluate(event, path));
+     }
+ 
++    @Test
++    public void TestMixDateAndFieldsJavaSyntax() throws IOException {
++        Event event = getTestEvent();
++        String path = "/full/%{{YYYY-DDD}}/weeee/%{bar}";
++        assertEquals("/full/2015-274/weeee/foo", StringInterpolation.evaluate(event, path));
++    }
++
+     @Test
+     public void testUnclosedTag() throws IOException {
+         Event event = getTestEvent();
+@@ -90,6 +97,13 @@ public void TestStringIsOneDateTag() throws IOException {
+         assertEquals("2015", StringInterpolation.evaluate(event, path));
+     }
+ 
++    @Test
++    public void TestStringIsJavaDateTag() throws IOException {
++        Event event = getTestEvent();
++        String path = "%{{YYYY-'W'ww}}";
++        assertEquals("2015-W40", StringInterpolation.evaluate(event, path));
++    }
++
+     @Test
+     public void TestFieldRef() throws IOException {
+         Event event = getTestEvent();
+@@ -101,6 +115,8 @@ public void TestFieldRef() throws IOException {
+     public void TestEpochSeconds() throws IOException {
+         Event event = getTestEvent();
+         String path = "%{+%ss}";
++        // `+%ss` bypasses the EPOCH syntax and instead matches the JODA syntax.
++        // which produces the literal `%` followed by a two-s seconds value `00`
+         assertEquals("%00", StringInterpolation.evaluate(event, path));
+     }
+ 
+diff --git a/logstash-core/src/test/java/org/logstash/TimestampTest.java b/logstash-core/src/test/java/org/logstash/TimestampTest.java
+index 2cf5889b8bd..e63a86b8f2d 100644
+--- a/logstash-core/src/test/java/org/logstash/TimestampTest.java
++++ b/logstash-core/src/test/java/org/logstash/TimestampTest.java
+@@ -25,42 +25,78 @@
+ import org.junit.Assert;
+ import org.junit.Test;
+ 
++import java.time.Clock;
+ import java.time.Instant;
++import java.time.ZoneId;
+ 
+ import static org.junit.Assert.*;
+ 
+ public class TimestampTest {
+ 
+ 
++    static final Clock OFFSET_CLOCK = Clock.systemUTC().withZone(ZoneId.of("-08:00"));
++
+     @Test
++    @SuppressWarnings({"deprecation"})
+     public void testCircularIso8601() throws Exception {
+         Timestamp t1 = new Timestamp();
+         Timestamp t2 = new Timestamp(t1.toString());
++        //noinspection deprecation
+         assertEquals(t1.getTime(), t2.getTime());
++        assertEquals(t1.toInstant(), t2.toInstant());
++    }
++
++    @Test
++    public void testToString() throws Exception {
++        Timestamp t = new Timestamp("2014-09-23T12:34:56.789012345-0800", OFFSET_CLOCK);
++        assertEquals("2014-09-23T20:34:56.789012345Z", t.toString());
+     }
+ 
+     @Test
+-    public void testToIso8601() throws Exception {
+-        Timestamp t = new Timestamp("2014-09-23T00:00:00-0800");
+-        assertEquals("2014-09-23T08:00:00.000Z", t.toString());
++    public void testParsingDateTimeNoOffset() throws Exception {
++        final Timestamp t = new Timestamp("2014-09-23T12:34:56.789012345", OFFSET_CLOCK);
++        assertEquals("2014-09-23T20:34:56.789012345Z", t.toString());
++    }
++    @Test
++    public void testParsingDateNoOffset() throws Exception {
++        final Timestamp t = new Timestamp("2014-09-23", OFFSET_CLOCK);
++        assertEquals("2014-09-23T08:00:00Z", t.toString());
++    }
++
++    @Test
++    public void testParsingDateWithOffset() throws Exception {
++        final Timestamp t = new Timestamp("2014-09-23-08:00", OFFSET_CLOCK);
++        assertEquals("2014-09-23T08:00:00Z", t.toString());
++    }
++
++    @Test
++    public void testParsingDateTimeWithZOffset() throws Exception {
++        final Timestamp t = new Timestamp("2014-09-23T13:49:52.987654321Z", OFFSET_CLOCK);
++        assertEquals("2014-09-23T13:49:52.987654321Z", t.toString());
+     }
+ 
+     // Timestamp should always be in a UTC representation
++    // TODO: remove spec, since `Instant` is UTC by default.
+     @Test
++    @SuppressWarnings({"deprecation"})
+     public void testUTC() throws Exception {
+         Timestamp t;
+ 
+         t = new Timestamp();
++        //noinspection deprecation
+         assertEquals(DateTimeZone.UTC, t.getTime().getZone());
+ 
+         t = new Timestamp("2014-09-23T00:00:00-0800");
++        //noinspection deprecation
+         assertEquals(DateTimeZone.UTC, t.getTime().getZone());
+ 
+         t = new Timestamp("2014-09-23T08:00:00.000Z");
++        //noinspection deprecation
+         assertEquals(DateTimeZone.UTC, t.getTime().getZone());
+ 
+         long ms = DateTime.now(DateTimeZone.forID("EST")).getMillis();
+         t = new Timestamp(ms);
++        //noinspection deprecation
+         assertEquals(DateTimeZone.UTC, t.getTime().getZone());
+     }
+ 
+@@ -82,4 +118,11 @@ public void testEpochMillis() {
+         Assert.assertEquals(i.toEpochMilli(), millis);
+     }
+ 
++    @Test
++    public void testNanoPrecision() {
++        final String input = "2021-04-02T00:28:17.987654321Z";
++        final Timestamp t1 = new Timestamp(input);
++
++        assertEquals(987654321, t1.toInstant().getNano());
++    }
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
+index 9c04397c0d7..acdfa81a53c 100644
+--- a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
++++ b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
+@@ -33,17 +33,13 @@
+ import java.io.IOException;
+ import java.nio.file.Path;
+ import java.time.Duration;
+-import java.util.Arrays;
+-import java.util.Collections;
+-import java.util.Random;
++import java.util.*;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.TimeUnit;
+ 
+-import static org.hamcrest.CoreMatchers.equalTo;
+-import static org.hamcrest.CoreMatchers.is;
+-import static org.hamcrest.CoreMatchers.nullValue;
+ import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.*;
+ import static org.logstash.common.io.RecordIOWriter.BLOCK_SIZE;
+ import static org.logstash.common.io.RecordIOWriter.VERSION_SIZE;
+ 
+@@ -128,28 +124,34 @@ public void testReadFromTwoSegments() throws Exception {
+     // This test checks that polling after a block has been mostly filled with an event is handled correctly.
+     @Test
+     public void testRereadFinalBlock() throws Exception {
+-        Event event = new Event(Collections.emptyMap());
++        Event event = createEventWithConstantSerializationOverhead(Collections.emptyMap());
+ 
+         // Fill event with not quite enough characters to fill block. Fill event with valid RecordType characters - this
+         // was the cause of https://github.com/elastic/logstash/issues/7868
+-        event.setField("message", generateMessageContent(32500));
++        event.setField("message", generateMessageContent(32495));
+         long startTime = System.currentTimeMillis();
+         int messageSize = 0;
+         try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, 10 * 1024 * 1024, defaultDlqSize, Duration.ofSeconds(1))) {
+             for (int i = 0; i < 2; i++) {
+-                DLQEntry entry = new DLQEntry(event, "", "", "", new Timestamp(startTime++));
+-                messageSize += entry.serialize().length;
++                DLQEntry entry = new DLQEntry(event, "", "", String.valueOf(i), constantSerializationLengthTimestamp(startTime++));
++                final int serializationLength = entry.serialize().length;
++                assertThat("setup: serialized entry size...", serializationLength, is(lessThan(BLOCK_SIZE)));
++                messageSize += serializationLength;
+                 writeManager.writeEntry(entry);
+             }
++            assertThat(messageSize, is(greaterThan(BLOCK_SIZE)));
+         }
+         try (DeadLetterQueueReader readManager = new DeadLetterQueueReader(dir)) {
+-            for (int i = 0; i < 3;i++) {
+-                readManager.pollEntry(100);
++            for (int i = 0; i < 2;i++) {
++                final DLQEntry dlqEntry = readManager.pollEntry(100);
++                assertThat(String.format("read index `%s`", i), dlqEntry, is(notNullValue()));
++                assertThat("", dlqEntry.getReason(), is(String.valueOf(i)));
+             }
++            final DLQEntry entryBeyondEnd = readManager.pollEntry(100);
++            assertThat("read beyond end", entryBeyondEnd, is(nullValue()));
+         }
+     }
+ 
+-
+     @Test
+     public void testSeek() throws Exception {
+         Event event = new Event(Collections.emptyMap());
+@@ -180,14 +182,15 @@ public void testSeekToMiddleOfRemovedLog() throws Exception {
+     }
+ 
+     private void writeSegmentSizeEntries(int count) throws IOException {
+-        Event event = new Event(Collections.emptyMap());
+-        DLQEntry templateEntry = new DLQEntry(event, "1", "1", String.valueOf(0));
++        final Event event = createEventWithConstantSerializationOverhead();
++        long startTime = System.currentTimeMillis();
++        DLQEntry templateEntry = new DLQEntry(event, "1", "1", String.valueOf(0), constantSerializationLengthTimestamp(startTime));
+         int size = templateEntry.serialize().length + RecordIOWriter.RECORD_HEADER_SIZE + VERSION_SIZE;
+         DeadLetterQueueWriter writeManager = null;
+         try {
+             writeManager = new DeadLetterQueueWriter(dir, size, defaultDlqSize, Duration.ofSeconds(1));
+             for (int i = 1; i <= count; i++) {
+-                writeManager.writeEntry(new DLQEntry(event, "1", "1", String.valueOf(i)));
++                writeManager.writeEntry(new DLQEntry(event, "1", "1", String.valueOf(i), constantSerializationLengthTimestamp(startTime++)));
+             }
+         } finally {
+             writeManager.close();
+@@ -218,11 +221,11 @@ private void validateEntries(Path firstLog, int startEntry, int endEntry, int st
+     public void testBlockBoundary() throws Exception {
+ 
+         final int PAD_FOR_BLOCK_SIZE_EVENT = 32490;
+-        Event event = new Event();
++        Event event = createEventWithConstantSerializationOverhead();
+         char[] field = new char[PAD_FOR_BLOCK_SIZE_EVENT];
+         Arrays.fill(field, 'e');
+         event.setField("T", new String(field));
+-        Timestamp timestamp = new Timestamp();
++        Timestamp timestamp = constantSerializationLengthTimestamp();
+ 
+         try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, 10 * 1024 * 1024, defaultDlqSize, Duration.ofSeconds(1))) {
+             for (int i = 0; i < 2; i++) {
+@@ -241,7 +244,7 @@ public void testBlockBoundary() throws Exception {
+     // This test has multiple messages, with a message ending on a block boundary
+     @Test
+     public void testBlockBoundaryMultiple() throws Exception {
+-        Event event = new Event(Collections.emptyMap());
++        Event event = createEventWithConstantSerializationOverhead();
+         char[] field = new char[7929];
+         Arrays.fill(field, 'x');
+         event.setField("message", new String(field));
+@@ -249,7 +252,7 @@ public void testBlockBoundaryMultiple() throws Exception {
+         int messageSize = 0;
+         try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, 10 * 1024 * 1024, defaultDlqSize, Duration.ofSeconds(1))) {
+             for (int i = 1; i <= 5; i++) {
+-                DLQEntry entry = new DLQEntry(event, "", "", "", new Timestamp(startTime++));
++                DLQEntry entry = new DLQEntry(event, "", "", "", constantSerializationLengthTimestamp(startTime++));
+                 messageSize += entry.serialize().length;
+                 writeManager.writeEntry(entry);
+                 if (i == 4){
+@@ -393,9 +396,9 @@ public void testFlushAfterDelay() throws Exception {
+     // This test tests for a single event that ends on a block and segment boundary
+     @Test
+     public void testBlockAndSegmentBoundary() throws Exception {
+-        Event event = new Event();
++        Event event = createEventWithConstantSerializationOverhead();
+         event.setField("T", generateMessageContent(PAD_FOR_BLOCK_SIZE_EVENT));
+-        Timestamp timestamp = new Timestamp();
++        Timestamp timestamp = constantSerializationLengthTimestamp();
+ 
+         try(DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(dir, BLOCK_SIZE, defaultDlqSize, Duration.ofSeconds(1))) {
+             for (int i = 0; i < 2; i++) {
+@@ -516,6 +519,60 @@ public void testConcurrentWriteReadRandomEventSize() throws Exception {
+         }
+     }
+ 
++    /**
++     * Produces a {@link Timestamp} whose epoch milliseconds is _near_ the provided value
++     * such that the result will have a constant serialization length of 24 bytes.
++     *
++     * If the provided epoch millis is exactly a whole second with no remainder, one millisecond
++     * is added to the value to ensure that there are remainder millis.
++     *
++     * @param millis
++     * @return
++     */
++    private Timestamp constantSerializationLengthTimestamp(long millis) {
++        if ( millis % 1000 == 0) { millis += 1; }
++
++        final Timestamp timestamp = new Timestamp(millis);
++        assertThat(String.format("pre-validation: expected timestamp to serialize to exactly 24 bytes, got `%s`", timestamp),
++                   timestamp.serialize().length, is(24));
++        return new Timestamp(millis);
++    }
++
++    private Timestamp constantSerializationLengthTimestamp() {
++        return constantSerializationLengthTimestamp(System.currentTimeMillis());
++    }
++
++    private Timestamp constantSerializationLengthTimestamp(final Timestamp basis) {
++        return constantSerializationLengthTimestamp(basis.toEpochMilli());
++    }
++
++    /**
++     * Because many of the tests here rely on _exact_ alignment of serialization byte size,
++     * and the {@link Timestamp} has a variable-sized serialization length, we need a way to
++     * generated events whose serialization length will not vary depending on the millisecond
++     * in which the test was run.
++     *
++     * This method uses the normal method of creating an event, and ensures that the value of
++     * the timestamp field will serialize to a constant length, truncating precision and
++     * possibly shifting the value to ensure that there is sub-second remainder millis.
++     *
++     * @param data
++     * @return
++     */
++    private Event createEventWithConstantSerializationOverhead(final Map<String, Object> data) {
++        final Event event = new Event(data);
++
++        final Timestamp existingTimestamp = event.getTimestamp();
++        if (existingTimestamp != null) {
++            event.setTimestamp(constantSerializationLengthTimestamp(existingTimestamp));
++        }
++
++        return event;
++    }
++
++    private Event createEventWithConstantSerializationOverhead() {
++        return createEventWithConstantSerializationOverhead(Collections.emptyMap());
++    }
+ 
+     private int randomBetween(int from, int to){
+         Random r = new Random();
+diff --git a/logstash-core/src/test/java/org/logstash/ext/JrubyTimestampExtLibraryTest.java b/logstash-core/src/test/java/org/logstash/ext/JrubyTimestampExtLibraryTest.java
+index a4ccbf3d5d8..4ad121d4bae 100644
+--- a/logstash-core/src/test/java/org/logstash/ext/JrubyTimestampExtLibraryTest.java
++++ b/logstash-core/src/test/java/org/logstash/ext/JrubyTimestampExtLibraryTest.java
+@@ -20,13 +20,18 @@
+ 
+ package org.logstash.ext;
+ 
++import java.time.Instant;
++import java.time.ZonedDateTime;
+ import java.util.concurrent.TimeUnit;
+ import org.assertj.core.api.Assertions;
++import org.jruby.RubyString;
++import org.jruby.RubyTime;
+ import org.jruby.exceptions.RaiseException;
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.junit.Test;
+ import org.logstash.RubyUtil;
++import org.logstash.Timestamp;
+ 
+ /**
+  * Tests for {@link JrubyTimestampExtLibrary}.
+@@ -100,6 +105,49 @@ public void testCompareAnyType() {
+         ).isFalse();
+     }
+ 
++    @Test
++    public void testCoerceInstanceOfRubyTimestamp() {
++        final ThreadContext context = RubyUtil.RUBY.getCurrentContext();
++        final JrubyTimestampExtLibrary.RubyTimestamp source = JrubyTimestampExtLibrary.RubyTimestamp.newRubyTimestamp(context.runtime, Timestamp.now());
++
++        final IRubyObject coerced = JrubyTimestampExtLibrary.RubyTimestamp.ruby_coerce(context, RubyUtil.RUBY_TIMESTAMP_CLASS, source);
++
++        Assertions.assertThat(coerced)
++                .isNotNull()
++                .isInstanceOfSatisfying(JrubyTimestampExtLibrary.RubyTimestamp.class, koerced -> {
++                   Assertions.assertThat(koerced).isEqualTo(source);
++                });
++    }
++
++    @Test
++    public void testCoerceInstanceOfRubyTime() {
++        final ThreadContext context = RubyUtil.RUBY.getCurrentContext();
++        final RubyTime rubyTime = RubyTime.newTimeFromNanoseconds(context.runtime, 1L);
++
++        final IRubyObject coerced = JrubyTimestampExtLibrary.RubyTimestamp.ruby_coerce(context, RubyUtil.RUBY_TIMESTAMP_CLASS, rubyTime);
++
++        Assertions.assertThat(coerced)
++                .isNotNull()
++                .isInstanceOfSatisfying(JrubyTimestampExtLibrary.RubyTimestamp.class, koerced -> {
++                    Assertions.assertThat(koerced.getTimestamp().toInstant()).isEqualTo(rubyTime.toInstant());
++                });
++    }
++
++    @Test
++    public void testCoerceInstanceOfRubyString() {
++        final ThreadContext context = RubyUtil.RUBY.getCurrentContext();
++        final RubyString timestamp = RubyString.newString(context.runtime, "2021-08-30T08:04:57.918273645-08:00");
++        final Instant instant = ZonedDateTime.parse(timestamp).toInstant();
++        final JrubyTimestampExtLibrary.RubyTimestamp source = newRubyTimestamp(context, new IRubyObject[]{ timestamp });
++
++        final IRubyObject coerced = JrubyTimestampExtLibrary.RubyTimestamp.ruby_coerce(context, RubyUtil.RUBY_TIMESTAMP_CLASS, source);
++
++        Assertions.assertThat(coerced)
++                .isNotNull()
++                .isInstanceOfSatisfying(JrubyTimestampExtLibrary.RubyTimestamp.class, koerced -> Assertions.assertThat(koerced.getTimestamp().toInstant()).isEqualTo(instant));
++
++    }
++
+     private static JrubyTimestampExtLibrary.RubyTimestamp newRubyTimestamp(
+         final ThreadContext context, final IRubyObject[] args) {
+         return new JrubyTimestampExtLibrary.RubyTimestamp(

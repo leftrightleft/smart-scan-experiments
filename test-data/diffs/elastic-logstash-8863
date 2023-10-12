@@ -1,0 +1,1317 @@
+diff --git a/logstash-core/lib/logstash/compiler/lscl.rb b/logstash-core/lib/logstash/compiler/lscl.rb
+index 72f6db7b80c..4606da7e092 100644
+--- a/logstash-core/lib/logstash/compiler/lscl.rb
++++ b/logstash-core/lib/logstash/compiler/lscl.rb
+@@ -262,7 +262,10 @@ def javaify_sexpr(sexpr)
+         java_f_branch = f_branch && javaify_sexpr(f_branch)
+ 
+         if java_t_branch || java_f_branch
+-          jdsl.iIf(condition, java_t_branch || jdsl.noop, java_f_branch || jdsl.noop)
++          # We use the condition as the source with metadata because it hashes correctly
++          # It's hard to use the 'real' source due to the re-branching from if / elsif into if/else only
++          # branches. We should come back and improve this at some point if that makes a difference
++          jdsl.iIf(condition.source_with_metadata, condition, java_t_branch || jdsl.noop, java_f_branch || jdsl.noop)
+         else
+           jdsl.noop()
+         end
+@@ -297,7 +300,8 @@ def expr
+ 
+       all_elements = [first_element, *rest_elements]
+ 
+-      if all_elements.size == 1
++
++      res = if all_elements.size == 1
+         elem = all_elements.first
+         if elem.is_a?(Selector)
+           eventValue = elem.recursive_select(SelectorElement).first.expr
+@@ -310,6 +314,7 @@ def expr
+       else
+         join_conditions(all_elements)
+       end
++      res
+     end
+ 
+     def precedence(op)
+@@ -339,13 +344,13 @@ def jconvert(sexpr)
+ 
+       case op
+       when :and
+-        return jdsl.eAnd(left, right);
++        return jdsl.eAnd(source_meta, left, right);
+       when :nand
+-        return jdsl.eNand(left, right);
++        return jdsl.eNand(source_meta, left, right);
+       when :or
+-        return jdsl.eOr(left, right);
++        return jdsl.eOr(source_meta, left, right);
+       when :xor
+-        return jdsl.eXor(left, right);
++        return jdsl.eXor(source_meta, left, right);
+       else
+         raise "Unknown op #{jop}"
+       end
+@@ -394,7 +399,7 @@ def stack_to_expr(stack)
+       while elem = stack.pop
+         if elem.is_a?(::Method)
+           right, left = working_stack.pop, working_stack.pop
+-          working_stack << elem.call(left, right)
++          working_stack << elem.call(source_meta, left, right)
+         else
+           working_stack << elem
+         end
+@@ -472,13 +477,13 @@ def expr
+       # Handle string rvalues, they just get turned into regexps
+       # Maybe we really shouldn't handle these anymore...
+       if regexp.class == org.logstash.config.ir.expression.ValueExpression
+-        regexp = jdsl.eRegex(regexp.get)
++        regexp = jdsl.eRegex(source_meta, regexp.get)
+       end
+       
+       raise "Expected a selector in #{text_value}!" unless selector
+       raise "Expected a regexp in #{text_value}!" unless regexp
+ 
+-      operator_method.call(source_meta, selector, regexp);
++      operator_method.call(source_meta, selector, regexp)
+     end
+   end
+ 
+@@ -512,9 +517,9 @@ module RegExpOperator
+     
+     def expr
+       if self.text_value == '!~'
+-        jdsl.method(:eRegexNeq)
++        jdsl.java_method(:eRegexNeq, [org.logstash.common.SourceWithMetadata, org.logstash.config.ir.expression.Expression, org.logstash.config.ir.expression.ValueExpression])
+       elsif self.text_value == '=~'
+-        jdsl.method(:eRegexEq)
++        jdsl.java_method(:eRegexEq, [org.logstash.common.SourceWithMetadata, org.logstash.config.ir.expression.Expression, org.logstash.config.ir.expression.ValueExpression])
+       else
+         raise "Unknown regex operator #{self.text_value}"
+       end
+diff --git a/logstash-core/lib/logstash/compiler/lscl/helpers.rb b/logstash-core/lib/logstash/compiler/lscl/helpers.rb
+index baac2afcbc1..8cded0a4da0 100644
+--- a/logstash-core/lib/logstash/compiler/lscl/helpers.rb
++++ b/logstash-core/lib/logstash/compiler/lscl/helpers.rb
+@@ -49,9 +49,10 @@ def self.jdsl
+       org.logstash.config.ir.DSL
+     end
+     
+-    AND_METHOD = jdsl.method(:eAnd)
+-    NAND_METHOD = jdsl.method(:eNand)
+-    OR_METHOD = jdsl.method(:eOr)
+-    XOR_METHOD = jdsl.method(:eXor)
++    BOOLEAN_DSL_METHOD_SIGNATURE = [org.logstash.common.SourceWithMetadata, org.logstash.config.ir.expression.Expression, org.logstash.config.ir.expression.Expression]
++    AND_METHOD = jdsl.java_method(:eAnd, BOOLEAN_DSL_METHOD_SIGNATURE)
++    NAND_METHOD = jdsl.java_method(:eNand, BOOLEAN_DSL_METHOD_SIGNATURE)
++    OR_METHOD = jdsl.java_method(:eOr, BOOLEAN_DSL_METHOD_SIGNATURE)
++    XOR_METHOD = jdsl.java_method(:eXor, BOOLEAN_DSL_METHOD_SIGNATURE)
+   end
+ end; end; end; end; end
+diff --git a/logstash-core/spec/logstash/compiler/compiler_spec.rb b/logstash-core/spec/logstash/compiler/compiler_spec.rb
+index b52614a405f..dc9cf9dc379 100644
+--- a/logstash-core/spec/logstash/compiler/compiler_spec.rb
++++ b/logstash-core/spec/logstash/compiler/compiler_spec.rb
+@@ -8,6 +8,10 @@ def j
+     Java::OrgLogstashConfigIr::DSL
+   end
+ 
++  def rand_meta
++    org.logstash.common.SourceWithMetadata.new("test", SecureRandom.uuid, 1, 1, SecureRandom.uuid)
++  end
++
+   let(:source_protocol) { "test_proto" }
+ 
+   let(:settings) { mock_settings({}) }
+@@ -173,7 +177,7 @@ def j
+         let(:plugin_source) { "generator {}" }
+ 
+         it "should contain the plugin" do
+-          expect(c_plugin).to ir_eql(j.iPlugin(INPUT, "generator"))
++          expect(c_plugin).to ir_eql(j.iPlugin(rand_meta, INPUT, "generator"))
+         end
+       end
+ 
+@@ -190,7 +194,7 @@ def j
+         end
+ 
+         it "should contain the plugin" do
+-          expect(c_plugin).to ir_eql(j.iPlugin(INPUT, "generator", expected_plugin_args))
++          expect(c_plugin).to ir_eql(j.iPlugin(rand_meta, INPUT, "generator", expected_plugin_args))
+         end
+       end
+ 
+@@ -203,7 +207,7 @@ def j
+         end
+ 
+         it "should contain the plugin" do
+-          expect(c_plugin).to ir_eql(j.iPlugin(INPUT, "generator", expected_plugin_args))
++          expect(c_plugin).to ir_eql(j.iPlugin(rand_meta, INPUT, "generator", expected_plugin_args))
+         end
+       end
+ 
+@@ -216,7 +220,7 @@ def j
+         end
+ 
+         it "should contain the plugin" do
+-          expect(c_plugin).to ir_eql(j.iPlugin(INPUT, "generator", expected_plugin_args))
++          expect(c_plugin).to ir_eql(j.iPlugin(rand_meta, INPUT, "generator", expected_plugin_args))
+         end
+       end
+ 
+@@ -245,7 +249,7 @@ def j
+         end
+ 
+         it "should merge the contents of the individual directives" do
+-          expect(c_plugin).to ir_eql(j.iPlugin(FILTER, "grok", expected_plugin_args))
++          expect(c_plugin).to ir_eql(j.iPlugin(rand_meta, FILTER, "grok", expected_plugin_args))
+         end
+ 
+         describe "a filter plugin that has nested Hash directives" do
+@@ -300,7 +304,7 @@ def j
+           end
+ 
+           it "should produce a nested ::Hash object" do
+-            expect(c_plugin).to ir_eql(j.iPlugin(FILTER, "matryoshka", expected_plugin_args))
++            expect(c_plugin).to ir_eql(j.iPlugin(rand_meta, FILTER, "matryoshka", expected_plugin_args))
+           end
+         end
+       end
+@@ -313,7 +317,7 @@ def j
+         let(:source) { "input { generator {} }" }
+ 
+         it "should contain the single input" do
+-          expect(input).to ir_eql(j.iPlugin(INPUT, "generator"))
++          expect(input).to ir_eql(j.iPlugin(rand_meta, INPUT, "generator"))
+         end
+ 
+         it_should_behave_like("component source_with_metadata") do
+@@ -326,8 +330,8 @@ def j
+ 
+         it "should contain both inputs" do
+           expect(input).to ir_eql(j.iComposeParallel(
+-                                j.iPlugin(INPUT, "generator", {"count" => 1}),
+-                                j.iPlugin(INPUT, "generator", {"count" => 2})
++                                j.iPlugin(rand_meta, INPUT, "generator", {"count" => 1}),
++                                j.iPlugin(rand_meta, INPUT, "generator", {"count" => 2})
+                               ))
+         end
+       end
+@@ -351,7 +355,7 @@ def j
+       let (:compiled_section) { compiled[section] }
+ 
+       def splugin(*args)
+-        j.iPlugin(section_name_enum, *args)
++        j.iPlugin(rand_meta, section_name_enum, *args)
+       end
+ 
+       def compose(*statements)
+@@ -635,6 +639,7 @@ def compose(*statements)
+ 
+           it "should compile correctly" do
+             expect(compiled_section).to ir_eql(j.iIf(
++                                            rand_meta,
+                                             j.eEq(j.eEventValue("[foo]"), j.eEventValue("[bar]")),
+                                             splugin("grok")
+                                           )
+@@ -647,6 +652,7 @@ def compose(*statements)
+ 
+           it "should compile correctly" do
+             expect(compiled_section).to ir_eql(j.iIf(
++                                          rand_meta,
+                                           j.eEq(j.eEventValue("[foo]"), j.eEventValue("[bar]")),
+                                           j.noop,
+                                           splugin("fplugin"),
+@@ -660,6 +666,7 @@ def compose(*statements)
+ 
+           it "should compile correctly" do
+             expect(compiled_section).to ir_eql(j.iIf(
++                                          rand_meta,
+                                           j.eEq(j.eEventValue("[foo]"), j.eEventValue("[bar]")),
+                                           j.noop,
+                                           j.noop
+@@ -673,6 +680,7 @@ def compose(*statements)
+ 
+           it "should compile correctly" do
+             expect(compiled_section).to ir_eql(j.iIf(
++                                          rand_meta,
+                                           j.eEq(j.eEventValue("[foo]"), j.eEventValue("[bar]")),
+                                           splugin("tplugin"),
+                                           splugin("fplugin")
+@@ -686,9 +694,11 @@ def compose(*statements)
+ 
+           it "should compile correctly" do
+             expect(compiled_section).to ir_eql(j.iIf(
++                                          rand_meta,
+                                           j.eEq(j.eEventValue("[foo]"), j.eEventValue("[bar]")),
+                                           splugin("tplugin"),
+                                           j.iIf(
++                                            rand_meta,
+                                             j.eEq(j.eEventValue("[bar]"), j.eEventValue("[baz]")),
+                                             splugin("eifplugin"),
+                                             splugin("fplugin")
+@@ -712,12 +722,15 @@ def compose(*statements)
+ 
+           it "should compile correctly" do
+             expect(compiled_section).to ir_eql(j.iIf(
++                                          rand_meta,
+                                           j.eEq(j.eEventValue("[foo]"), j.eEventValue("[bar]")),
+                                           splugin("tplugin"),
+                                           j.iIf(
++                                            rand_meta,
+                                             j.eEq(j.eEventValue("[bar]"), j.eEventValue("[baz]")),
+                                             splugin("eifplugin"),
+                                             j.iIf(
++                                              rand_meta,
+                                               j.eEq(j.eEventValue("[baz]"), j.eEventValue("[bot]")),
+                                               splugin("eeifplugin"),
+                                               splugin("fplugin")
+@@ -744,15 +757,18 @@ def compose(*statements)
+ 
+           it "should compile correctly" do
+             expect(compiled_section).to ir_eql(j.iIf(
++                                          rand_meta,
+                                           j.eEq(j.eEventValue("[foo]"), j.eEventValue("[bar]")),
+-                                          j.iIf(j.eEq(j.eEventValue("[bar]"), j.eEventValue("[baz]")),
++                                          j.iIf(rand_meta, j.eEq(j.eEventValue("[bar]"), j.eEventValue("[baz]")),
+                                                    splugin("aplugin"),
+                                                    j.noop
+                                                   ),
+                                           j.iIf(
++                                            rand_meta,
+                                             j.eEq(j.eEventValue("[bar]"), j.eEventValue("[baz]")),
+                                             splugin("bplugin"),
+                                             j.iIf(
++                                              rand_meta,
+                                               j.eEq(j.eEventValue("[baz]"), j.eEventValue("[bot]")),
+                                               splugin("cplugin"),
+                                               splugin("dplugin")
+@@ -773,7 +789,7 @@ def compose(*statements)
+         let(:source) { "input { } filter { grok {} } output { }" }
+ 
+         it "should contain the single filter" do
+-          expect(filter).to ir_eql(j.iPlugin(FILTER, "grok"))
++          expect(filter).to ir_eql(j.iPlugin(rand_meta, FILTER, "grok"))
+         end
+ 
+         it_should_behave_like("component source_with_metadata") do
+@@ -791,7 +807,7 @@ def compose(*statements)
+         let(:source) { "input { } output { stdout {} }" }
+ 
+         it "should contain the single input" do
+-          expect(output).to ir_eql(j.iPlugin(OUTPUT, "stdout"))
++          expect(output).to ir_eql(j.iPlugin(rand_meta, OUTPUT, "stdout"))
+         end
+ 
+         it_should_behave_like("component source_with_metadata") do
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/DSL.java b/logstash-core/src/main/java/org/logstash/config/ir/DSL.java
+index a73d76901a4..d62fdb6e5d6 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/DSL.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/DSL.java
+@@ -3,6 +3,9 @@
+ import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.UUID;
++
++import org.logstash.common.IncompleteSourceWithMetadataException;
+ import org.logstash.common.SourceWithMetadata;
+ import org.logstash.config.ir.expression.BooleanExpression;
+ import org.logstash.config.ir.expression.EventValueExpression;
+@@ -125,8 +128,8 @@ public static And eAnd(Expression left, Expression right) {
+         return new And(null, left, right);
+     }
+ 
+-    public static Not eNand(Expression left, Expression right) throws InvalidIRException {
+-        return eNot(eAnd(left, right));
++    public static Not eNand(SourceWithMetadata meta, Expression left, Expression right) throws InvalidIRException {
++        return eNot(meta, eAnd(left, right));
+     }
+ 
+     public static Or eOr(SourceWithMetadata meta, Expression left, Expression right) {
+@@ -137,8 +140,8 @@ public static Or eOr(Expression left, Expression right) {
+         return new Or(null, left, right);
+     }
+ 
+-    public static Or eXor(Expression left, Expression right) throws InvalidIRException {
+-        return eOr(eAnd(eNot(left), right), eAnd(left, eNot(right)));
++    public static Or eXor(SourceWithMetadata meta, Expression left, Expression right) throws InvalidIRException {
++        return eOr(meta, eAnd(eNot(left), right), eAnd(left, eNot(right)));
+     }
+ 
+     public static RegexEq eRegexEq(SourceWithMetadata meta, Expression left, ValueExpression right) throws InvalidIRException {
+@@ -150,11 +153,11 @@ public static RegexEq eRegexEq(Expression left, ValueExpression right) throws In
+     }
+ 
+     public static Expression eRegexNeq(SourceWithMetadata meta, Expression left, ValueExpression right) throws InvalidIRException {
+-        return eNot(eRegexEq(meta, left, right));
++        return new Not(meta, eRegexEq(meta, left, right));
+     }
+ 
+     public static Expression eRegexNeq(Expression left, ValueExpression right) throws InvalidIRException {
+-        return eNot(eRegexEq(left, right));
++        return new Not(null, eRegexEq(null, left, right));
+     }
+ 
+     public static Neq eNeq(SourceWithMetadata meta, Expression left, Expression right) {
+@@ -221,6 +224,12 @@ public static NoopStatement noop(SourceWithMetadata meta) {
+     }
+ 
+     public static NoopStatement noop() {
++        try {
++            SourceWithMetadata meta = new SourceWithMetadata("internal", "noop", 0, 0, UUID.randomUUID().toString());
++        } catch (IncompleteSourceWithMetadataException e) {
++            // Should never happen
++            throw new RuntimeException("Noop could not instantiate metadata, this should never happen");
++        }
+         return new NoopStatement(null);
+     }
+ 
+@@ -228,20 +237,12 @@ public static PluginStatement iPlugin(SourceWithMetadata meta, PluginDefinition.
+         return new PluginStatement(meta, new PluginDefinition(pluginType, pluginName, pluginArguments));
+     }
+ 
+-    public static PluginStatement iPlugin(PluginDefinition.Type type, String pluginName, Map<String, Object> pluginArguments) {
+-        return iPlugin(null, type, pluginName, pluginArguments);
+-    }
+-
+-    public static PluginStatement iPlugin(PluginDefinition.Type type, String pluginName, MapBuilder<String, Object> argBuilder) {
+-        return iPlugin(type, pluginName, argBuilder.build());
+-    }
+-
+-    public static PluginStatement iPlugin(PluginDefinition.Type type, String pluginName, String id) {
+-        return iPlugin(type, pluginName, argumentBuilder().put("id", id).build());
++    public static PluginStatement iPlugin(SourceWithMetadata meta, PluginDefinition.Type pluginType, String pluginName, String pluginId) {
++        return iPlugin(meta, pluginType, pluginName, pargs().put("id", pluginId).build());
+     }
+ 
+-    public static PluginStatement iPlugin(PluginDefinition.Type type, String pluginName) {
+-        return iPlugin(type, pluginName, pargs());
++    public static PluginStatement iPlugin(SourceWithMetadata meta, PluginDefinition.Type pluginType, String pluginName) {
++        return iPlugin(meta, pluginType, pluginName, pargs().build());
+     }
+ 
+     public static IfStatement iIf(SourceWithMetadata meta,
+@@ -252,15 +253,9 @@ public static IfStatement iIf(SourceWithMetadata meta,
+         return new IfStatement(meta, booleanExpression, ifTrue, ifFalse);
+     }
+ 
+-    public static IfStatement iIf(Expression condition,
+-                                  Statement ifTrue,
+-                                  Statement ifFalse) throws InvalidIRException {
+-        return iIf(null, condition, ifTrue, ifFalse);
+-    }
+-
+-    public static IfStatement iIf(Expression condition,
++    public static IfStatement iIf(SourceWithMetadata meta, Expression condition,
+                                   Statement ifTrue) throws InvalidIRException {
+-        return iIf(null, condition, ifTrue, noop());
++        return iIf(meta, condition, ifTrue, noop());
+     }
+ 
+     public static class MapBuilder<K,V> {
+@@ -300,24 +295,16 @@ public static PluginVertex gPlugin(SourceWithMetadata sourceWithMetadata, Plugin
+        return new PluginVertex(sourceWithMetadata, new PluginDefinition(pluginType, pluginName, pluginArgs));
+     }
+ 
+-    public static PluginVertex gPlugin(PluginDefinition.Type type, String pluginName, Map<String, Object> pluginArgs) {
+-        return gPlugin(null, type, pluginName, pluginArgs);
++    public static PluginVertex gPlugin(SourceWithMetadata meta, PluginDefinition.Type type, String pluginName, String id) {
++        return gPlugin(meta, type, pluginName, argumentBuilder().put("id", id).build());
+     }
+ 
+-    public static PluginVertex gPlugin(PluginDefinition.Type type, String pluginName, String id) {
+-        return gPlugin(type, pluginName, argumentBuilder().put("id", id).build());
+-    }
+-
+-    public static PluginVertex gPlugin(PluginDefinition.Type type, String pluginName) {
+-        return gPlugin(null, type, pluginName, new HashMap<>());
++    public static PluginVertex gPlugin(SourceWithMetadata meta, PluginDefinition.Type type, String pluginName) {
++        return gPlugin(meta, type, pluginName, new HashMap<>());
+     }
+ 
+ 
+     public static IfVertex gIf(SourceWithMetadata meta, BooleanExpression expression) {
+-       return new IfVertex(expression);
+-    }
+-
+-    public static IfVertex gIf(BooleanExpression expression) {
+-       return new IfVertex(expression);
++       return new IfVertex(meta, expression);
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/graph/Graph.java b/logstash-core/src/main/java/org/logstash/config/ir/graph/Graph.java
+index d1a5d9e7441..eab6f857d53 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/graph/Graph.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/graph/Graph.java
+@@ -278,14 +278,14 @@ public void validate() throws InvalidIRException {
+         }
+ 
+         // Check for duplicate IDs in the config
+-        List<String> duplicateIdErrorMessages = this.vertices().parallel()
++        List<String> duplicateIdErrorMessages = this.vertices()
+                 .collect(Collectors.groupingBy(Vertex::getId))
+                 .values()
+                 .stream()
+                 .filter(group -> group.size() > 1)
+                 .map(group -> {
+                     return "ID: " + group.stream().findAny().get().getId() + " " +
+-                            group.stream().map(Object::toString).collect(Collectors.joining(","));
++                            group.stream().map(Object::toString).collect(Collectors.joining("\n"));
+                 })
+                 .collect(Collectors.toList());
+ 
+@@ -415,18 +415,11 @@ public Stream<Edge> edges() {
+     }
+ 
+     public String uniqueHash() {
+-        MessageDigest lineageDigest = Util.defaultMessageDigest();
+-
+-        // We only need to calculate the hashes of the leaves since those hashes are sensitive to changes
+-        // anywhere else on the graph. It would also be OK to use the roots, the decision is arbitrary
+-        List<byte[]> sources = this.leaves().parallel()
+-                .map(Vertex::uniqueHash)
+-                .sorted()
+-                .map(String::getBytes)
+-                .collect(Collectors.toList());
+-        // We don't do this inline with the stream because we need this to be single threaded
+-        // not parallel
+-        sources.forEach(lineageDigest::update);
+-        return Util.bytesToHexString(lineageDigest.digest());
++        return Util.digest(this.vertices().
++                filter(v -> !(v instanceof QueueVertex)). // has no metadata
++                map(Vertex::getSourceWithMetadata).
++                map(SourceWithMetadata::uniqueHash).
++                sorted().
++                collect(Collectors.joining()));
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/graph/IfVertex.java b/logstash-core/src/main/java/org/logstash/config/ir/graph/IfVertex.java
+index 62c4caa115e..85f9db89001 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/graph/IfVertex.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/graph/IfVertex.java
+@@ -20,8 +20,8 @@ public BooleanExpression getBooleanExpression() {
+ 
+     private final BooleanExpression booleanExpression;
+ 
+-    public IfVertex(BooleanExpression booleanExpression) {
+-        super();
++    public IfVertex(SourceWithMetadata meta, BooleanExpression booleanExpression) {
++        super(meta);
+         this.booleanExpression = booleanExpression;
+     }
+ 
+@@ -42,12 +42,6 @@ public boolean sourceComponentEquals(SourceComponent other) {
+         return false;
+     }
+ 
+-    // An IfVertex has no real metadata in and of itself, but its expression does!
+-    @Override
+-    public SourceWithMetadata getSourceWithMetadata() {
+-        return null;
+-    }
+-
+     public boolean hasEdgeType(boolean type) {
+         for (Edge e : getOutgoingEdges()) {
+             BooleanEdge bEdge = (BooleanEdge) e; // There should only  be boolean edges here!
+@@ -89,11 +83,6 @@ public String humanReadableExpression() {
+ 
+     @Override
+     public IfVertex copy() {
+-        return new IfVertex(booleanExpression);
+-    }
+-
+-    @Override
+-    public String calculateIndividualHashSource() {
+-        return this.getClass().getCanonicalName() + "{" + this.booleanExpression.hashSource() + "}";
++        return new IfVertex(this.getSourceWithMetadata(), booleanExpression);
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/graph/PluginVertex.java b/logstash-core/src/main/java/org/logstash/config/ir/graph/PluginVertex.java
+index 3bbc01fc50e..6bd4bff7306 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/graph/PluginVertex.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/graph/PluginVertex.java
+@@ -11,21 +11,16 @@
+  * Created by andrewvc on 9/15/16.
+  */
+ public class PluginVertex extends Vertex {
+-    private final SourceWithMetadata meta;
+     private final PluginDefinition pluginDefinition;
+ 
+     public PluginDefinition getPluginDefinition() {
+         return pluginDefinition;
+     }
+-    @Override
+-    public SourceWithMetadata getSourceWithMetadata() {
+-        return meta;
+-    }
++
+ 
+     public PluginVertex(SourceWithMetadata meta, PluginDefinition pluginDefinition) {
+         // We know that if the ID value exists it will be as a string
+-        super((String) pluginDefinition.getArguments().get("id"));
+-        this.meta = meta;
++        super(meta, (String) pluginDefinition.getArguments().get("id"));
+         this.pluginDefinition = pluginDefinition;
+     }
+ 
+@@ -33,24 +28,9 @@ public String toString() {
+         return "P[" + pluginDefinition + "|" + this.getSourceWithMetadata() + "]";
+     }
+ 
+-    @Override
+-    public String calculateIndividualHashSource() {
+-        try {
+-            return Util.digest(this.getClass().getCanonicalName() + "|" +
+-                    (this.getExplicitId() != null ? this.getExplicitId() : "NOID") + "|" +
+-                    this.pluginDefinition.getName() + "|" +
+-                    this.pluginDefinition.getType().toString() + "|" +
+-                    ObjectMappers.JSON_MAPPER
+-                        .writeValueAsString(this.pluginDefinition.getArguments()));
+-        } catch (JsonProcessingException e) {
+-            // This is basically impossible given the constrained values in the plugin definition
+-            throw new RuntimeException(e);
+-        }
+-    }
+-
+     @Override
+     public PluginVertex copy() {
+-        return new PluginVertex(meta, pluginDefinition);
++        return new PluginVertex(this.getSourceWithMetadata(), pluginDefinition);
+     }
+ 
+     @Override
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/graph/QueueVertex.java b/logstash-core/src/main/java/org/logstash/config/ir/graph/QueueVertex.java
+index a902431a4e6..0f433607273 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/graph/QueueVertex.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/graph/QueueVertex.java
+@@ -1,5 +1,7 @@
+ package org.logstash.config.ir.graph;
+ 
++import org.logstash.common.IncompleteSourceWithMetadataException;
++import org.logstash.common.Util;
+ import org.logstash.config.ir.SourceComponent;
+ import org.logstash.common.SourceWithMetadata;
+ 
+@@ -7,6 +9,9 @@
+  * Created by andrewvc on 9/15/16.
+  */
+ public final class QueueVertex extends Vertex {
++    public QueueVertex() throws IncompleteSourceWithMetadataException {
++        super(new SourceWithMetadata("internal", "queue", 0,0,"queue"));
++    }
+ 
+     @Override
+     public String getId() {
+@@ -14,17 +19,18 @@ public String getId() {
+     }
+ 
+     @Override
+-    public String calculateIndividualHashSource() {
+-        return this.getClass().getCanonicalName();
+-    }
+-
+     public String toString() {
+         return this.getId();
+     }
+ 
+     @Override
+     public QueueVertex copy() {
+-        return new QueueVertex();
++        try {
++            return new QueueVertex();
++        } catch (IncompleteSourceWithMetadataException e) {
++            // Never happens
++            throw new RuntimeException(e);
++        }
+     }
+ 
+     @Override
+@@ -37,4 +43,9 @@ public boolean sourceComponentEquals(SourceComponent other) {
+     public SourceWithMetadata getSourceWithMetadata() {
+         return null;
+     }
++
++    @Override
++    public String uniqueHash() {
++        return Util.digest("QUEUE");
++    }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/graph/Vertex.java b/logstash-core/src/main/java/org/logstash/config/ir/graph/Vertex.java
+index 063a2840110..da600d1a9f6 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/graph/Vertex.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/graph/Vertex.java
+@@ -1,6 +1,8 @@
+ package org.logstash.config.ir.graph;
+ 
+ import java.util.concurrent.atomic.AtomicInteger;
++
++import org.logstash.common.SourceWithMetadata;
+ import org.logstash.common.Util;
+ import org.logstash.config.ir.HashableWithSource;
+ import org.logstash.config.ir.SourceComponent;
+@@ -25,6 +27,8 @@ public abstract class Vertex implements SourceComponent, HashableWithSource {
+ 
+     private final String explicitId;
+ 
++    private final SourceWithMetadata meta;
++
+     private Graph graph;
+ 
+     private volatile String contextualHashCache;
+@@ -32,11 +36,18 @@ public abstract class Vertex implements SourceComponent, HashableWithSource {
+     private volatile String individualHashSourceCache;
+     private volatile String generatedId;
+ 
+-    protected Vertex() {
+-        this(null);
++    protected Vertex(SourceWithMetadata meta) {
++        this(meta,null);
+     }
+ 
+-    protected Vertex(String explicitId) {
++    protected Vertex(SourceWithMetadata meta, String explicitId) {
++        if (meta == null) {
++            throw new IllegalArgumentException(
++                        "No source with metadata declared for " +
++                        this.getClass().getName()
++            );
++        }
++        this.meta = meta;
+         this.explicitId = explicitId;
+     }
+ 
+@@ -148,68 +159,20 @@ public String uniqueHash() {
+             return this.hashCache;
+         }
+ 
+-        // Sort the lineage to ensure consistency. We prepend each item with a lexicographically sortable
+-        // encoding of its rank (using hex notation) so that the sort order is identical to the traversal order.
+-        // This is a required since there may be individually identical components in different locations in the graph.
+-        // It is, however, illegal to have functionally identical vertices, that is to say two vertices with the same
+-        // contents that have the same lineage.
+-
+-        MessageDigest lineageDigest = Util.defaultMessageDigest();
+-
+-        lineageDigest.update(hashPrefix().getBytes(StandardCharsets.UTF_8));
+-
+-        // The lineage can be quite long and we want to avoid the quadratic complexity of string concatenation
+-        // Thus, in this case there's no real way to get the hash source, we just hash as we go.
+-        lineage().map(Vertex::contextualHashSource).forEachOrdered(v -> {
+-                    byte[] bytes = v.getBytes(StandardCharsets.UTF_8);
+-                    lineageDigest.update(bytes);
+-                });
+-
+-        this.hashCache = Util.bytesToHexString(lineageDigest.digest());
+-        return hashCache;
++        if (this.getSourceWithMetadata() != null) {
++            return this.getSourceWithMetadata().uniqueHash();
++        } else {
++            // This should never happen outside of the test suite where we construct pipelines
++            // without source metadata
++            throw new RuntimeException("Attempted to compute unique hash on a vertex with no source metadata!");
++        }
+     }
+ 
+     @Override
+     public String hashSource() {
+-        // In this case the source can be quite large, so we never actually use this function.
+         return this.uniqueHash();
+     }
+ 
+-    public String hashPrefix() {
+-        return String.format("Vertex[%08x]=", this.rank()) + this.individualHashSource() + "|";
+-    }
+-
+-    public String contextualHashSource() {
+-        if (this.contextualHashCache != null) {
+-            return this.contextualHashCache;
+-        }
+-
+-        // This string must be lexicographically sortable hence the ID at the front. It also must have the calculateIndividualHashSource
+-        // repeated at the front for the case of a graph with two nodes at the same rank, same contents, but different lineages
+-        StringBuilder result = new StringBuilder();
+-        result.append(hashPrefix());
+-        result.append(individualHashSource());
+-
+-        result.append("I:");
+-        this.incomingEdges().map(Edge::individualHashSource).sorted().forEachOrdered(result::append);
+-        result.append("O:");
+-        this.outgoingEdges().map(Edge::individualHashSource).sorted().forEachOrdered(result::append);
+-
+-        this.contextualHashCache = result.toString();
+-        return this.contextualHashCache;
+-    }
+-
+-    public final String individualHashSource() {
+-        if (this.individualHashSourceCache != null) {
+-            return this.individualHashSourceCache;
+-        }
+-
+-        this.individualHashSourceCache = calculateIndividualHashSource();
+-        return this.individualHashSourceCache;
+-    }
+-
+-    public abstract String calculateIndividualHashSource();
+-
+     // Can be overriden in subclasses to define multiple
+     // expected Edge classes this Vertex can take.
+     // If any EdgeFactory instances are returned this Vertex is considered
+@@ -260,4 +223,8 @@ public void clearCache() {
+         this.individualHashSourceCache = null;
+     }
+ 
++    @Override
++    public SourceWithMetadata getSourceWithMetadata() {
++        return meta;
++    }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/imperative/IfStatement.java b/logstash-core/src/main/java/org/logstash/config/ir/imperative/IfStatement.java
+index a9ed5b78dbd..a77af33a7b4 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/imperative/IfStatement.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/imperative/IfStatement.java
+@@ -89,7 +89,7 @@ public Graph toGraph() throws InvalidIRException {
+         Collection<Vertex> trueRoots = trueGraph.roots().map(combination.oldToNewVertices::get).collect(Collectors.toList());
+         Collection<Vertex> falseRoots = falseGraph.roots().map(combination.oldToNewVertices::get).collect(Collectors.toList());
+ 
+-        IfVertex ifVertex = new IfVertex(this.booleanExpression);
++        IfVertex ifVertex = new IfVertex(this.getSourceWithMetadata(), this.booleanExpression);
+         newGraph.addVertex(ifVertex);
+ 
+         for (Vertex v : trueRoots) {
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/IRHelpers.java b/logstash-core/src/test/java/org/logstash/config/ir/IRHelpers.java
+index 62b4c707e2e..dfa2e53d670 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/IRHelpers.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/IRHelpers.java
+@@ -10,10 +10,15 @@
+ import org.logstash.config.ir.graph.Graph;
+ import org.logstash.config.ir.graph.Vertex;
+ import org.logstash.config.ir.graph.algorithms.GraphDiff;
++import org.logstash.config.ir.imperative.Statement;
+ 
++import javax.xml.transform.Source;
+ import java.util.HashMap;
+ import java.util.Objects;
++import java.util.Random;
+ import java.util.UUID;
++import java.util.concurrent.Callable;
++import java.util.stream.IntStream;
+ 
+ import static org.logstash.config.ir.DSL.*;
+ import static org.logstash.config.ir.PluginDefinition.Type.*;
+@@ -37,24 +42,24 @@ public static Vertex createTestVertex() {
+     }
+ 
+     public static Vertex createTestVertex(String id) {
+-        return new TestVertex(id);
++        return createTestVertex(randMeta(), id);
++    }
++
++    public static Vertex createTestVertex(SourceWithMetadata meta, String id) {
++        return new TestVertex(meta, id);
+     }
+ 
+     static class TestVertex extends Vertex {
+         private String id;
+ 
+-        public TestVertex(String id) {
++        public TestVertex(SourceWithMetadata meta, String id) {
++            super(meta, id);
+             this.id = id;
+         }
+ 
+         @Override
+         public Vertex copy() {
+-            return new TestVertex(id);
+-        }
+-
+-        @Override
+-        public String calculateIndividualHashSource() {
+-            return "TVertex" + "|" + id;
++            return new TestVertex(this.getSourceWithMetadata(), id);
+         }
+ 
+         @Override
+@@ -74,11 +79,6 @@ public boolean sourceComponentEquals(SourceComponent other) {
+             }
+             return false;
+         }
+-
+-        @Override
+-        public SourceWithMetadata getSourceWithMetadata() {
+-            return null;
+-        }
+     }
+ 
+     public static Edge createTestEdge() throws InvalidIRException {
+@@ -125,17 +125,50 @@ public static PluginDefinition testPluginDefinition() {
+         return new PluginDefinition(PluginDefinition.Type.FILTER, "testDefinition", new HashMap<String, Object>());
+     }
+ 
+-    public static PipelineIR samplePipeline() throws InvalidIRException {
+-        Graph inputSection = iComposeParallel(iPlugin(INPUT, "generator"), iPlugin(INPUT, "stdin")).toGraph();
+-        Graph filterSection = iIf(eEq(eEventValue("[foo]"), eEventValue("[bar]")),
+-                                    iPlugin(FILTER, "grok"),
+-                                    iPlugin(FILTER, "kv")).toGraph();
+-        Graph outputSection = iIf(eGt(eEventValue("[baz]"), eValue(1000)),
++    public static PipelineIR samplePipeline() throws Exception {
++        Random rng = new Random(81892198);
++        Callable<SourceWithMetadata> meta = () -> randMeta(rng);
++
++        Graph inputSection = iComposeParallel(iPlugin(meta.call(), INPUT, "generator"), iPlugin(meta.call(), INPUT, "stdin")).toGraph();
++        Graph filterSection = iIf(meta.call(), eEq(eEventValue("[foo]"), eEventValue("[bar]")),
++                                    iPlugin(meta.call(), FILTER, "grok"),
++                                    iPlugin(meta.call(), FILTER, "kv")).toGraph();
++        Graph outputSection = iIf(meta.call(), eGt(eEventValue("[baz]"), eValue(1000)),
+                                     iComposeParallel(
+-                                            iPlugin(OUTPUT, "s3"),
+-                                            iPlugin(OUTPUT, "elasticsearch")),
+-                                    iPlugin(OUTPUT, "stdout")).toGraph();
++                                            iPlugin(meta.call(), OUTPUT, "s3"),
++                                            iPlugin(meta.call(), OUTPUT, "elasticsearch")),
++                                    iPlugin(meta.call(), OUTPUT, "stdout")).toGraph();
+ 
+         return new PipelineIR(inputSection, filterSection, outputSection);
+     }
++
++    public static SourceWithMetadata randMeta() {
++        try {
++            return randMeta(new Random());
++        } catch (IncompleteSourceWithMetadataException e) {
++            // Never happens, or if it does, the whole test suite is broken anyway
++            throw new RuntimeException(e);
++        }
++    }
++
++    public static SourceWithMetadata randMeta(Random rng) throws IncompleteSourceWithMetadataException {
++        return new SourceWithMetadata(
++                        randomString(rng, 10),
++                        randomString(rng, 10),
++                        rng.nextInt(),
++                        rng.nextInt(),
++                        randomString(rng, 20)
++                    );
++    }
++
++    public static String RANDOM_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
++
++    public static String randomString(Random rng, int length) {
++        StringBuilder out = new StringBuilder();
++        for (int i = 0; i < length; i++) {
++            int pos = Math.abs(rng.nextInt()) % RANDOM_CHARS.length();
++            out.append(RANDOM_CHARS.charAt(pos));
++        }
++        return out.toString();
++    }
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/PipelineIRTest.java b/logstash-core/src/test/java/org/logstash/config/ir/PipelineIRTest.java
+index c2e03edef20..f6a96d14067 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/PipelineIRTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/PipelineIRTest.java
+@@ -7,27 +7,28 @@
+ import static org.junit.Assert.assertEquals;
+ import static org.logstash.config.ir.DSL.*;
+ import static org.logstash.config.ir.PluginDefinition.Type.*;
++import static org.logstash.config.ir.IRHelpers.randMeta;
+ 
+ /**
+  * Created by andrewvc on 9/20/16.
+  */
+ public class PipelineIRTest {
+     public Graph makeInputSection() throws InvalidIRException {
+-        return iComposeParallel(iPlugin(INPUT, "generator"), iPlugin(INPUT, "stdin")).toGraph();
++        return iComposeParallel(iPlugin(randMeta(), INPUT, "generator"), iPlugin(randMeta(), INPUT, "stdin")).toGraph();
+     }
+ 
+     public Graph makeFilterSection() throws InvalidIRException {
+-        return iIf(eEq(eEventValue("[foo]"), eEventValue("[bar]")),
+-                                    iPlugin(FILTER, "grok"),
+-                                    iPlugin(FILTER, "kv")).toGraph();
++        return iIf(randMeta(), eEq(eEventValue("[foo]"), eEventValue("[bar]")),
++                                    iPlugin(randMeta(), FILTER, "grok"),
++                                    iPlugin(randMeta(), FILTER, "kv")).toGraph();
+     }
+ 
+     public Graph makeOutputSection() throws InvalidIRException {
+-        return iIf(eGt(eEventValue("[baz]"), eValue(1000)),
++        return iIf(randMeta(), eGt(eEventValue("[baz]"), eValue(1000)),
+                                     iComposeParallel(
+-                                            iPlugin(OUTPUT, "s3"),
+-                                            iPlugin(OUTPUT, "elasticsearch")),
+-                                    iPlugin(OUTPUT, "stdout")).toGraph();
++                                            iPlugin(randMeta(), OUTPUT, "s3"),
++                                            iPlugin(randMeta(), OUTPUT, "elasticsearch")),
++                                    iPlugin(randMeta(), OUTPUT, "stdout")).toGraph();
+     }
+ 
+     @Test
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/graph/GraphTest.java b/logstash-core/src/test/java/org/logstash/config/ir/graph/GraphTest.java
+index 836eda8d438..0975bc97496 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/graph/GraphTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/graph/GraphTest.java
+@@ -1,6 +1,7 @@
+ package org.logstash.config.ir.graph;
+ 
+ import org.junit.Test;
++import org.logstash.common.SourceWithMetadata;
+ import org.logstash.config.ir.DSL;
+ import org.logstash.config.ir.IRHelpers;
+ import org.logstash.config.ir.InvalidIRException;
+@@ -9,12 +10,14 @@
+ 
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.Random;
+ 
+ import static org.hamcrest.CoreMatchers.instanceOf;
+ import static org.hamcrest.CoreMatchers.is;
+ import static org.junit.Assert.*;
+ import static org.logstash.config.ir.IRHelpers.createTestExpression;
+ import static org.logstash.config.ir.IRHelpers.createTestVertex;
++import static org.logstash.config.ir.IRHelpers.randMeta;
+ 
+ /**
+  * Created by andrewvc on 11/18/16.
+@@ -73,16 +76,18 @@ public void chainingIntoMultipleRoots() throws InvalidIRException {
+ 
+     @Test
+     public void SimpleConsistencyTest() throws InvalidIRException {
++        SourceWithMetadata meta = randMeta();
+         Graph g1 = Graph.empty();
+-        g1.addVertex(createTestVertex("a"));
++        g1.addVertex(createTestVertex(meta, "a"));
+         Graph g2 = Graph.empty();
+-        g2.addVertex(createTestVertex("a"));
++        g2.addVertex(createTestVertex(meta, "a"));
+ 
+         assertEquals(g1.uniqueHash(), g2.uniqueHash());
+     }
+ 
++
+     @Test
+-    public void complexConsistencyTest() throws InvalidIRException {
++    public void complexConsistencyTest() throws Exception {
+         for (int i = 0; i < 10; ++i) {
+             Graph g1 = IRHelpers.samplePipeline().getGraph();
+             Graph g2 = IRHelpers.samplePipeline().getGraph();
+@@ -120,7 +125,7 @@ public void testThreadingMulti() throws InvalidIRException {
+     @Test
+     public void testThreadingTyped() throws InvalidIRException {
+         Graph graph = Graph.empty();
+-        Vertex if1 = new IfVertex(createTestExpression());
++        Vertex if1 = new IfVertex(randMeta(), createTestExpression());
+         Vertex condT = IRHelpers.createTestVertex();
+         Edge tEdge = graph.chainVertices(BooleanEdge.trueFactory, if1, condT).stream().findFirst().get();
+         assertThat(tEdge, instanceOf(BooleanEdge.class));
+@@ -140,27 +145,6 @@ public void copyTest() throws InvalidIRException {
+         assertTrue(rv.sourceComponentEquals(lv));
+     }
+ 
+-    @Test
+-    public void uniqueHashingOfSimilarLeaves() throws InvalidIRException {
+-        // the initial implementation didn't handle this well, so we'll leave it here as a tricky test
+-
+-        IfStatement imperative = DSL.iIf(
+-                DSL.eTruthy(DSL.eValue("1")),
+-                DSL.iPlugin(PluginDefinition.Type.FILTER, "drop"),
+-                DSL.iIf(
+-                        DSL.eTruthy(DSL.eValue("2")),
+-                        DSL.iPlugin(PluginDefinition.Type.FILTER, "drop"),
+-                        DSL.iIf(
+-                                DSL.eTruthy(DSL.eValue("3")),
+-                                DSL.iPlugin(PluginDefinition.Type.FILTER, "drop")
+-                        )
+-                )
+-        );
+-
+-        Graph g = imperative.toGraph();
+-        g.validate();
+-    }
+-
+     private void assertVerticesConnected(Graph graph, String fromId, String toId) {
+         Vertex from = graph.getVertexById(fromId);
+         assertNotNull(from);
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/graph/IfVertexTest.java b/logstash-core/src/test/java/org/logstash/config/ir/graph/IfVertexTest.java
+index e7f742816c0..b337a144690 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/graph/IfVertexTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/graph/IfVertexTest.java
+@@ -60,7 +60,7 @@ public void testEdgeTypeHandling() throws InvalidIRException {
+     }
+ 
+     public IfVertex testIfVertex() throws InvalidIRException {
+-        return new IfVertex(createTestExpression());
++        return new IfVertex(randMeta(), createTestExpression());
+     }
+ 
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/graph/QueueVertexTest.java b/logstash-core/src/test/java/org/logstash/config/ir/graph/QueueVertexTest.java
+index 855791c3891..f446aaa3983 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/graph/QueueVertexTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/graph/QueueVertexTest.java
+@@ -1,6 +1,7 @@
+ package org.logstash.config.ir.graph;
+ 
+ import org.junit.Test;
++import org.logstash.common.IncompleteSourceWithMetadataException;
+ 
+ /**
+  * Created by andrewvc on 11/22/16.
+@@ -8,6 +9,11 @@
+ public class QueueVertexTest {
+     @Test
+     public void testConstruction() {
+-        new QueueVertex();
++        try {
++            new QueueVertex();
++        } catch (IncompleteSourceWithMetadataException e) {
++            // never happens
++            throw new RuntimeException(e);
++        }
+     }
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/imperative/DSLTest.java b/logstash-core/src/test/java/org/logstash/config/ir/imperative/DSLTest.java
+index d6dc03b3ee1..abd2b33ccbe 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/imperative/DSLTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/imperative/DSLTest.java
+@@ -1,20 +1,22 @@
+ package org.logstash.config.ir.imperative;
+ 
+ import org.junit.Test;
++import org.logstash.common.IncompleteSourceWithMetadataException;
+ import org.logstash.config.ir.BaseSourceComponent;
+ import org.logstash.config.ir.InvalidIRException;
+ 
+ import static org.logstash.config.ir.DSL.*;
+ import static org.logstash.config.ir.IRHelpers.assertSyntaxEquals;
+ import static org.logstash.config.ir.PluginDefinition.Type.*;
++import static org.logstash.config.ir.IRHelpers.randMeta;
+ 
+ /**
+  * Created by andrewvc on 9/13/16.
+  */
+ public class DSLTest {
+     @Test
+-    public void testDSLOnePluginEquality() {
+-        assertSyntaxEquals(iPlugin(FILTER, "foo"), iPlugin(FILTER, "foo"));
++    public void testDSLOnePluginEquality() throws IncompleteSourceWithMetadataException {
++        assertSyntaxEquals(iPlugin(randMeta(), FILTER, "foo"), iPlugin(randMeta(), FILTER, "foo"));
+     }
+ 
+     @Test
+@@ -29,27 +31,27 @@ public void testDSLComplexEquality() throws InvalidIRException {
+ 
+     @Test
+     public void testComposeSingle() throws InvalidIRException {
+-        assertSyntaxEquals(iPlugin(FILTER, "grok"), iComposeSequence(iPlugin(FILTER, "grok")));
++        assertSyntaxEquals(iPlugin(randMeta(), FILTER, "grok"), iComposeSequence(iPlugin(randMeta(), FILTER, "grok")));
+     }
+ 
+     @Test
+     public void testComposeMulti() throws InvalidIRException {
+-        Statement composed = iComposeSequence(iPlugin(FILTER, "grok"), iPlugin(FILTER, "foo"));
+-        assertSyntaxEquals(iComposeSequence(iPlugin(FILTER, "grok"), iPlugin(FILTER, "foo")), composed);
++        Statement composed = iComposeSequence(iPlugin(randMeta(), FILTER, "grok"), iPlugin(randMeta(), FILTER, "foo"));
++        assertSyntaxEquals(iComposeSequence(iPlugin(randMeta(), FILTER, "grok"), iPlugin(randMeta(), FILTER, "foo")), composed);
+ }
+ 
+ 
+     public BaseSourceComponent composedPlugins() throws InvalidIRException {
+-        return iComposeSequence(iPlugin(FILTER, "json"), iPlugin(FILTER, "stuff"));
++        return iComposeSequence(iPlugin(randMeta(), FILTER, "json"), iPlugin(randMeta(), FILTER, "stuff"));
+     }
+ 
+     public BaseSourceComponent complexExpression() throws InvalidIRException {
+         return iComposeSequence(
+-                iPlugin(FILTER, "grok"),
+-                iPlugin(FILTER, "kv"),
+-                iIf(eAnd(eTruthy(eValue(5l)), eTruthy(eValue(null))),
+-                        iPlugin(FILTER, "grok"),
+-                        iComposeSequence(iPlugin(FILTER, "json"), iPlugin(FILTER, "stuff"))
++                iPlugin(randMeta(), FILTER, "grok"),
++                iPlugin(randMeta(), FILTER, "kv"),
++                iIf(randMeta(), eAnd(eTruthy(eValue(5l)), eTruthy(eValue(null))),
++                        iPlugin(randMeta(), FILTER, "grok"),
++                        iComposeSequence(iPlugin(randMeta(), FILTER, "json"), iPlugin(randMeta(), FILTER, "stuff"))
+                 )
+         );
+     }
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/imperative/ImperativeToGraphtest.java b/logstash-core/src/test/java/org/logstash/config/ir/imperative/ImperativeToGraphtest.java
+index 36db351c20f..9caea3ef901 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/imperative/ImperativeToGraphtest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/imperative/ImperativeToGraphtest.java
+@@ -8,6 +8,7 @@
+ 
+ import static org.logstash.config.ir.DSL.*;
+ import static org.logstash.config.ir.IRHelpers.assertSyntaxEquals;
++import static org.logstash.config.ir.IRHelpers.randMeta;
+ import static org.logstash.config.ir.PluginDefinition.Type.*;
+ 
+ /**
+@@ -17,22 +18,28 @@ public class ImperativeToGraphtest {
+ 
+     @Test
+     public void convertSimpleExpression() throws InvalidIRException {
+-        Graph imperative =  iComposeSequence(iPlugin(FILTER, "json"), iPlugin(FILTER, "stuff")).toGraph();
++        Graph imperative =  iComposeSequence(randMeta(), iPlugin(randMeta(), FILTER, "json"), iPlugin(randMeta(), FILTER, "stuff")).toGraph();
+         imperative.validate(); // Verify this is a valid graph
+ 
+         Graph regular = Graph.empty();
+-        regular.chainVertices(gPlugin(FILTER, "json"), gPlugin(FILTER, "stuff"));
++        regular.chainVertices(gPlugin(randMeta(), FILTER, "json"), gPlugin(randMeta(), FILTER, "stuff"));
+ 
+         assertSyntaxEquals(imperative, regular);
+     }
+ 
+     @Test
+     public void testIdsDontAffectSourceComponentEquality() throws InvalidIRException {
+-        Graph imperative =  iComposeSequence(iPlugin(FILTER, "json", "oneid"), iPlugin(FILTER, "stuff", "anotherid")).toGraph();
++        Graph imperative =  iComposeSequence(
++                iPlugin(randMeta(), FILTER, "json", "oneid"),
++                iPlugin(randMeta(), FILTER, "stuff", "anotherid")
++        ).toGraph();
+         imperative.validate(); // Verify this is a valid graph
+ 
+         Graph regular = Graph.empty();
+-        regular.chainVertices(gPlugin(FILTER, "json", "someotherid"), gPlugin(FILTER, "stuff", "graphid"));
++        regular.chainVertices(
++                gPlugin(randMeta(), FILTER, "json", "someotherid"),
++                gPlugin(randMeta(), FILTER, "stuff", "graphid")
++        );
+ 
+         assertSyntaxEquals(imperative, regular);
+     }
+@@ -40,21 +47,21 @@ public void testIdsDontAffectSourceComponentEquality() throws InvalidIRException
+     @Test
+     public void convertComplexExpression() throws InvalidIRException {
+         Graph imperative = iComposeSequence(
+-                iPlugin(FILTER, "p1"),
+-                iPlugin(FILTER, "p2"),
+-                iIf(eAnd(eTruthy(eValue(5l)), eTruthy(eValue(null))),
+-                        iPlugin(FILTER, "p3"),
+-                        iComposeSequence(iPlugin(FILTER, "p4"), iPlugin(FILTER, "p5"))
++                iPlugin(randMeta(), FILTER, "p1"),
++                iPlugin(randMeta(), FILTER, "p2"),
++                iIf(randMeta(), eAnd(eTruthy(eValue(5l)), eTruthy(eValue(null))),
++                        iPlugin(randMeta(), FILTER, "p3"),
++                        iComposeSequence(iPlugin(randMeta(), FILTER, "p4"), iPlugin(randMeta(), FILTER, "p5"))
+                 )
+         ).toGraph();
+         imperative.validate(); // Verify this is a valid graph
+ 
+-        PluginVertex p1 = gPlugin(FILTER, "p1");
+-        PluginVertex p2 = gPlugin(FILTER, "p2");
+-        PluginVertex p3 = gPlugin(FILTER, "p3");
+-        PluginVertex p4 = gPlugin(FILTER, "p4");
+-        PluginVertex p5 = gPlugin(FILTER, "p5");
+-        IfVertex testIf = gIf(eAnd(eTruthy(eValue(5l)), eTruthy(eValue(null))));
++        PluginVertex p1 = gPlugin(randMeta(), FILTER, "p1");
++        PluginVertex p2 = gPlugin(randMeta(), FILTER, "p2");
++        PluginVertex p3 = gPlugin(randMeta(), FILTER, "p3");
++        PluginVertex p4 = gPlugin(randMeta(), FILTER, "p4");
++        PluginVertex p5 = gPlugin(randMeta(), FILTER, "p5");
++        IfVertex testIf = gIf(randMeta(), eAnd(eTruthy(eValue(5l)), eTruthy(eValue(null))));
+ 
+         Graph expected = Graph.empty();
+         expected.chainVertices(p1,p2,testIf);
+@@ -69,32 +76,32 @@ public void convertComplexExpression() throws InvalidIRException {
+     // partial leaves. This makes sure they all wire-up right
+     @Test
+     public void deepDanglingPartialLeaves() throws InvalidIRException {
+-         Graph imperative = iComposeSequence(
+-                 iPlugin(FILTER, "p0"),
+-                 iIf(eTruthy(eValue(1)),
+-                         iPlugin(FILTER, "p1"),
+-                         iIf(eTruthy(eValue(3)),
+-                             iPlugin(FILTER, "p5"))
++        Graph imperative = iComposeSequence(
++                 iPlugin(randMeta(), FILTER, "p0"),
++                 iIf(randMeta(), eTruthy(eValue(1)),
++                         iPlugin(randMeta(), FILTER, "p1"),
++                         iIf(randMeta(), eTruthy(eValue(3)),
++                             iPlugin(randMeta(), FILTER, "p5"))
+                  ),
+-                 iIf(eTruthy(eValue(2)),
+-                         iPlugin(FILTER, "p3"),
+-                         iPlugin(FILTER, "p4")
++                 iIf(randMeta(), eTruthy(eValue(2)),
++                         iPlugin(randMeta(), FILTER, "p3"),
++                         iPlugin(randMeta(), FILTER, "p4")
+                  ),
+-                 iPlugin(FILTER, "pLast")
++                 iPlugin(randMeta(), FILTER, "pLast")
+ 
+          ).toGraph();
+         imperative.validate(); // Verify this is a valid graph
+ 
+-        IfVertex if1 = gIf(eTruthy(eValue(1)));
+-        IfVertex if2 = gIf(eTruthy(eValue(2)));
+-        IfVertex if3 = gIf(eTruthy(eValue(3)));
+-        PluginVertex p0 = gPlugin(FILTER, "p0");
+-        PluginVertex p1 = gPlugin(FILTER, "p1");
+-        PluginVertex p2 = gPlugin(FILTER, "p2");
+-        PluginVertex p3 = gPlugin(FILTER, "p3");
+-        PluginVertex p4 = gPlugin(FILTER, "p4");
+-        PluginVertex p5 = gPlugin(FILTER, "p5");
+-        PluginVertex pLast = gPlugin(FILTER, "pLast");
++        IfVertex if1 = gIf(randMeta(), eTruthy(eValue(1)));
++        IfVertex if2 = gIf(randMeta(), eTruthy(eValue(2)));
++        IfVertex if3 = gIf(randMeta(), eTruthy(eValue(3)));
++        PluginVertex p0 = gPlugin(randMeta(), FILTER, "p0");
++        PluginVertex p1 = gPlugin(randMeta(), FILTER, "p1");
++        PluginVertex p2 = gPlugin(randMeta(), FILTER, "p2");
++        PluginVertex p3 = gPlugin(randMeta(), FILTER, "p3");
++        PluginVertex p4 = gPlugin(randMeta(), FILTER, "p4");
++        PluginVertex p5 = gPlugin(randMeta(), FILTER, "p5");
++        PluginVertex pLast = gPlugin(randMeta(), FILTER, "pLast");
+ 
+         Graph expected = Graph.empty();
+         expected.chainVertices(p0, if1);
+@@ -118,32 +125,32 @@ public void deepDanglingPartialLeaves() throws InvalidIRException {
+     @Test
+     public void convertComplexExpressionWithTerminal() throws InvalidIRException {
+         Graph imperative = iComposeSequence(
+-            iPlugin(FILTER, "p1"),
+-            iIf(eTruthy(eValue(1)),
++            iPlugin(randMeta(), FILTER, "p1"),
++            iIf(randMeta(), eTruthy(eValue(1)),
+                 iComposeSequence(
+-                    iIf(eTruthy(eValue(2)), noop(), iPlugin(FILTER, "p2")),
+-                    iIf(eTruthy(eValue(3)), iPlugin(FILTER, "p3"), noop())
++                    iIf(randMeta(), eTruthy(eValue(2)), noop(), iPlugin(randMeta(), FILTER, "p2")),
++                    iIf(randMeta(), eTruthy(eValue(3)), iPlugin(randMeta(), FILTER, "p3"), noop())
+                 ),
+                 iComposeSequence(
+-                    iIf(eTruthy(eValue(4)), iPlugin(FILTER, "p4")),
+-                    iPlugin(FILTER, "p5")
++                    iIf(randMeta(), eTruthy(eValue(4)), iPlugin(randMeta(), FILTER, "p4")),
++                    iPlugin(randMeta(), FILTER, "p5")
+                 )
+             ),
+-            iPlugin(FILTER, "terminal")
++            iPlugin(randMeta(), FILTER, "terminal")
+         ).toGraph();
+         imperative.validate(); // Verify this is a valid graph
+ 
+-        PluginVertex p1 = gPlugin(FILTER,"p1");
+-        PluginVertex p2 = gPlugin(FILTER, "p2");
+-        PluginVertex p3 = gPlugin(FILTER, "p3");
+-        PluginVertex p4 = gPlugin(FILTER, "p4");
+-        PluginVertex p5 = gPlugin(FILTER, "p5");
+-        PluginVertex terminal = gPlugin(FILTER, "terminal");
+-
+-        IfVertex if1 = gIf(eTruthy(eValue(1)));
+-        IfVertex if2 = gIf(eTruthy(eValue(2)));
+-        IfVertex if3 = gIf(eTruthy(eValue(3)));
+-        IfVertex if4 = gIf(eTruthy(eValue(4)));
++        PluginVertex p1 = gPlugin(randMeta(), FILTER,"p1");
++        PluginVertex p2 = gPlugin(randMeta(), FILTER, "p2");
++        PluginVertex p3 = gPlugin(randMeta(), FILTER, "p3");
++        PluginVertex p4 = gPlugin(randMeta(), FILTER, "p4");
++        PluginVertex p5 = gPlugin(randMeta(), FILTER, "p5");
++        PluginVertex terminal = gPlugin(randMeta(), FILTER, "terminal");
++
++        IfVertex if1 = gIf(randMeta(), eTruthy(eValue(1)));
++        IfVertex if2 = gIf(randMeta(), eTruthy(eValue(2)));
++        IfVertex if3 = gIf(randMeta(), eTruthy(eValue(3)));
++        IfVertex if4 = gIf(randMeta(), eTruthy(eValue(4)));
+ 
+         Graph expected = Graph.empty();
+         expected.chainVertices(p1, if1);

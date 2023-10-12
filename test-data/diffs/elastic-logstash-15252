@@ -1,0 +1,256 @@
+diff --git a/.buildkite/serverless_integration_pipeline.yml b/.buildkite/serverless_integration_pipeline.yml
+index 37c06db247f..b2f80cecd01 100644
+--- a/.buildkite/serverless_integration_pipeline.yml
++++ b/.buildkite/serverless_integration_pipeline.yml
+@@ -16,11 +16,15 @@ steps:
+     command: ./.buildkite/scripts/setup_java.sh && ./ci/serverless/elastic_integration_filter_tests.sh
+   - label: "central pipeline management test"
+     command: ./.buildkite/scripts/setup_java.sh && ./ci/serverless/cpm_tests.sh
+-  # Legacy monitoring is disabled. Serverless does not support /_monitoring/bulk, hence the test always fails to ingest metrics.
++    # Legacy monitoring is disabled. Serverless does not support /_monitoring/bulk, hence the test always fails to ingest metrics.
+   - label: "Logstash legacy monitoring test"
+     command: ./.buildkite/scripts/setup_java.sh && ./ci/serverless/monitoring_tests.sh
+     skip: true
++    # Kibana API is disabled as it is not available with the current configuration in QA
+   - label: "Kibana API test"
+     command: ./.buildkite/scripts/setup_java.sh && ./ci/serverless/kibana_api_tests.sh
+-  - label: "metricbeat stack monitoring test"
+-    command: ./.buildkite/scripts/setup_java.sh && ./ci/serverless/metricbeat_monitoring_tests.sh
+\ No newline at end of file
++    skip: true
++    # Metricbeat stack monitoring is disabled
++  - label: "metricbeat test is disabled as metricbeat has not disabled /_ilm yet"
++    command: ./.buildkite/scripts/setup_java.sh && ./ci/serverless/metricbeat_monitoring_tests.sh
++    skip: true
+\ No newline at end of file
+diff --git a/ci/serverless/README.md b/ci/serverless/README.md
+index 5f3383403ce..5e2e2294d68 100644
+--- a/ci/serverless/README.md
++++ b/ci/serverless/README.md
+@@ -7,7 +7,7 @@ The test cases against serverless Elasticsearch covers the following scenarios
+ - DLQ
+ - central pipeline management
+ - Kibana API for pipeline management (CPM)
+-- Metricbeat monitoring 
++- Metricbeat monitoring
+ - ~~Logstash legacy monitoring~~
+ 
+ ### Credentials
+diff --git a/ci/serverless/common.sh b/ci/serverless/common.sh
+index 82eae5ff033..2ad5670f3ba 100755
+--- a/ci/serverless/common.sh
++++ b/ci/serverless/common.sh
+@@ -12,11 +12,10 @@ setup_vault() {
+   vault_path=secret/ci/elastic-logstash/serverless-test
+   set +x
+   export ES_ENDPOINT=$(vault read -field=es_host "${vault_path}")
+-  export ES_USER=$(vault read -field=es_user "${vault_path}")
+-  export ES_PW=$(vault read -field=es_user_pw "${vault_path}")
++  export KB_ENDPOINT=$(vault read -field=kb_host "${vault_path}")
+   export LS_ROLE_API_KEY_ENCODED=$(vault read -field=ls_role_api_key_encoded "${vault_path}")
+   export LS_PLUGIN_API_KEY=$(vault read -field=ls_plugin_api_key "${vault_path}")
+-  export KB_ENDPOINT=$(vault read -field=kb_host "${vault_path}")
++  export MB_API_KEY=$(vault read -field=mb_api_key "${vault_path}")
+   set -x
+ }
+ 
+@@ -25,7 +24,7 @@ build_logstash() {
+ }
+ 
+ index_test_data() {
+-  curl -X POST -u "$ES_USER:$ES_PW" "$ES_ENDPOINT/$INDEX_NAME/_bulk" -H 'Content-Type: application/json' --data-binary @"$CURRENT_DIR/test_data/book.json"
++  curl -X POST -H "Authorization: ApiKey $LS_ROLE_API_KEY_ENCODED" "$ES_ENDPOINT/$INDEX_NAME/_bulk" -H 'Content-Type: application/json' --data-binary @"$CURRENT_DIR/test_data/book.json"
+ }
+ 
+ # $1: check function
+@@ -84,7 +83,7 @@ check_logstash_readiness() {
+   }
+   add_check check_readiness "Failed readiness check."
+ 
+-  [[ "${CHECKS[-1]}" -eq "1" ]] && exit 1
++  [[ "${CHECKS[*]: -1}" -eq "1" ]] && exit 1
+ 
+   echo "Logstash is Up !"
+   return 0
+diff --git a/ci/serverless/cpm_tests.sh b/ci/serverless/cpm_tests.sh
+index 37fc301b454..f610fb6474f 100755
+--- a/ci/serverless/cpm_tests.sh
++++ b/ci/serverless/cpm_tests.sh
+@@ -7,7 +7,7 @@ export PIPELINE_NAME='gen_es'
+ 
+ # update pipeline and check response code
+ index_pipeline() {
+-  RESP_CODE=$(curl -s -w "%{http_code}" -X PUT -u "$ES_USER:$ES_PW" "$ES_ENDPOINT/_logstash/pipeline/$1"  -H 'Content-Type: application/json' -d "$2")
++  RESP_CODE=$(curl -s -w "%{http_code}" -X PUT -H "Authorization: ApiKey $LS_ROLE_API_KEY_ENCODED" "$ES_ENDPOINT/_logstash/pipeline/$1"  -H 'Content-Type: application/json' -d "$2")
+   if [[ $RESP_CODE -ge '400' ]]; then
+     echo "failed to update pipeline for Central Pipeline Management. Got $RESP_CODE from Elasticsearch"
+     exit 1
+@@ -34,7 +34,7 @@ check_plugin() {
+ }
+ 
+ delete_pipeline() {
+-  curl -u "$ES_USER:$ES_PW" -X DELETE "$ES_ENDPOINT/_logstash/pipeline/$PIPELINE_NAME"  -H 'Content-Type: application/json';
++  curl -H "Authorization: ApiKey $LS_ROLE_API_KEY_ENCODED" -X DELETE "$ES_ENDPOINT/_logstash/pipeline/$PIPELINE_NAME"  -H 'Content-Type: application/json';
+ }
+ 
+ cpm_clean_up_and_get_result() {
+diff --git a/ci/serverless/dlq_rspec_tests.sh b/ci/serverless/dlq_rspec_tests.sh
+index afe8a91b87e..54aa9c415a5 100755
+--- a/ci/serverless/dlq_rspec_tests.sh
++++ b/ci/serverless/dlq_rspec_tests.sh
+@@ -1,15 +1,11 @@
+ #!/usr/bin/env bash
+ set -ex
+ 
+-vault_path=secret/ci/elastic-logstash/serverless-test
++source ./$(dirname "$0")/common.sh
+ 
+ export JRUBY_OPTS="-J-Xmx1g"
+ export SERVERLESS=true
+-set +x
+-export ES_ENDPOINT=$(vault read -field=es_host "${vault_path}")
+-export ES_USER=$(vault read -field=es_user "${vault_path}")
+-export ES_PW=$(vault read -field=es_user_pw "${vault_path}")
+-set -x
++setup_vault
+ 
+ ./gradlew clean bootstrap assemble installDefaultGems unpackTarDistribution
+ ./gradlew :logstash-core:copyGemjar
+diff --git a/ci/serverless/elastic_integration_filter_tests.sh b/ci/serverless/elastic_integration_filter_tests.sh
+index 52f61f3361a..0f501e6e89e 100755
+--- a/ci/serverless/elastic_integration_filter_tests.sh
++++ b/ci/serverless/elastic_integration_filter_tests.sh
+@@ -4,11 +4,11 @@ set -ex
+ source ./$(dirname "$0")/common.sh
+ 
+ deploy_ingest_pipeline() {
+-  PIPELINE_RESP_CODE=$(curl -s -w "%{http_code}" -o /dev/null -X PUT -u "$ES_USER:$ES_PW" "$ES_ENDPOINT/_ingest/pipeline/integration-logstash_test.events-default" \
++  PIPELINE_RESP_CODE=$(curl -s -w "%{http_code}" -o /dev/null -X PUT -H "Authorization: ApiKey $LS_ROLE_API_KEY_ENCODED" "$ES_ENDPOINT/_ingest/pipeline/integration-logstash_test.events-default" \
+     -H 'Content-Type: application/json' \
+     --data-binary @"$CURRENT_DIR/test_data/ingest_pipeline.json")
+ 
+-  TEMPLATE_RESP_CODE=$(curl -s -w "%{http_code}" -o /dev/null -X PUT -u "$ES_USER:$ES_PW" "$ES_ENDPOINT/_index_template/logs-serverless-default-template" \
++  TEMPLATE_RESP_CODE=$(curl -s -w "%{http_code}" -o /dev/null -X PUT -H "Authorization: ApiKey $LS_ROLE_API_KEY_ENCODED" "$ES_ENDPOINT/_index_template/logs-serverless-default-template" \
+     -H 'Content-Type: application/json' \
+     --data-binary @"$CURRENT_DIR/test_data/index_template.json")
+ 
+@@ -29,7 +29,7 @@ check_integration_filter() {
+ }
+ 
+ get_doc_msg_length() {
+-  curl -s -u "$ES_USER:$ES_PW" "$ES_ENDPOINT/logs-$INDEX_NAME.004-default/_search?size=1" | jq '.hits.hits[0]._source.message | length'
++  curl -s -H "Authorization: ApiKey $LS_ROLE_API_KEY_ENCODED" "$ES_ENDPOINT/logs-$INDEX_NAME.004-default/_search?size=1" | jq '.hits.hits[0]._source.message | length'
+ }
+ 
+ # ensure no double run of ingest pipeline
+diff --git a/ci/serverless/es_output_tests.sh b/ci/serverless/es_output_tests.sh
+index e2babd14c0b..c23a10c9a1a 100755
+--- a/ci/serverless/es_output_tests.sh
++++ b/ci/serverless/es_output_tests.sh
+@@ -9,7 +9,7 @@ check_named_index() {
+ }
+ 
+ get_data_stream_count() {
+-  curl -s -u "$ES_USER:$ES_PW" "$ES_ENDPOINT/logs-$INDEX_NAME.001-default/_count" | jq '.count'
++  curl -s -H "Authorization: ApiKey $LS_ROLE_API_KEY_ENCODED" "$ES_ENDPOINT/logs-$INDEX_NAME.001-default/_count" | jq '.count'
+ }
+ 
+ compare_data_stream_count() {
+diff --git a/ci/serverless/metricbeat/metricbeat.yml b/ci/serverless/metricbeat/metricbeat.yml
+index 807f19282e9..1d4cf1cf79a 100644
+--- a/ci/serverless/metricbeat/metricbeat.yml
++++ b/ci/serverless/metricbeat/metricbeat.yml
+@@ -6,8 +6,7 @@ metricbeat.config:
+ output.elasticsearch:
+   hosts: ["${ES_ENDPOINT}"]
+   protocol: "https"
+-  username: "${ES_USER}"
+-  password: "${ES_PW}"
++  api_key: "${MB_API_KEY}"
+ 
+ metricbeat.modules:
+   - module: logstash
+diff --git a/ci/serverless/metricbeat_monitoring_tests.sh b/ci/serverless/metricbeat_monitoring_tests.sh
+index 15b48631518..25675534c1a 100755
+--- a/ci/serverless/metricbeat_monitoring_tests.sh
++++ b/ci/serverless/metricbeat_monitoring_tests.sh
+@@ -6,8 +6,8 @@ source ./$(dirname "$0")/common.sh
+ get_cpu_arch() {
+   local arch=$(uname -m)
+ 
+-  if [ "$arch" == "aarch64" ]; then
+-    echo "arm64"
++  if [ "$arch" == "arm64" ]; then
++    echo "aarch64"
+   else
+     echo "$arch"
+   fi
+@@ -40,7 +40,7 @@ stop_metricbeat() {
+ }
+ 
+ get_monitor_count() {
+-  curl -s -u "$ES_USER:$ES_PW" "$ES_ENDPOINT/$INDEX_NAME/_count" | jq '.count'
++  curl -s -H "Authorization: ApiKey $LS_ROLE_API_KEY_ENCODED" "$ES_ENDPOINT/$INDEX_NAME/_count" | jq '.count'
+ }
+ 
+ compare_monitor_count() {
+diff --git a/ci/serverless/monitoring_tests.sh b/ci/serverless/monitoring_tests.sh
+index fee6e757a8e..3113e44734f 100755
+--- a/ci/serverless/monitoring_tests.sh
++++ b/ci/serverless/monitoring_tests.sh
+@@ -6,7 +6,7 @@ set -ex
+ source ./$(dirname "$0")/common.sh
+ 
+ get_monitor_count() {
+-  curl -s -u "$ES_USER:$ES_PW" "$ES_ENDPOINT/.monitoring-logstash-7-*/_count" | jq '.count'
++  curl -s -H "Authorization: ApiKey $LS_ROLE_API_KEY_ENCODED" "$ES_ENDPOINT/.monitoring-logstash-7-*/_count" | jq '.count'
+ }
+ 
+ compare_monitor_count() {
+diff --git a/qa/integration/specs/dlq_spec.rb b/qa/integration/specs/dlq_spec.rb
+index 7583b1739c7..f9b51d1974e 100644
+--- a/qa/integration/specs/dlq_spec.rb
++++ b/qa/integration/specs/dlq_spec.rb
+@@ -25,7 +25,9 @@
+ 
+ describe "Test Dead Letter Queue" do
+   # template with an ip field
+-  let(:template) { { "index_patterns": ["te*"], "mappings": { "properties": { "ip": { "type": "ip" }}}} }
++  let(:template) { serverless? ? { "index_patterns": ["te*"], "template": {"mappings": { "properties": { "ip": { "type": "ip" }}}} } :
++                     { "index_patterns": ["te*"], "mappings": { "properties": { "ip": { "type": "ip" }}}} }
++  let(:template_api) { serverless? ? "_index_template": "_template" }
+   # a message that is incompatible with the template
+   let(:message) { {"message": "hello", "ip": 1}.to_json }
+ 
+@@ -43,7 +45,7 @@
+     IO.write(config_yaml_file, config_yaml)
+     es_client = @fixture.get_service("elasticsearch").get_client
+     clean_es(es_client)
+-    es_client.perform_request("PUT", "_template/ip-template", {}, template)
++    es_client.perform_request("PUT", "#{template_api}/ip-template", {}, template)
+   }
+ 
+   after(:each) do
+@@ -64,7 +66,7 @@
+   let!(:settings_dir) { Stud::Temporary.directory }
+   let(:serverless_es_config) do
+     if serverless?
+-      " hosts => '${ES_ENDPOINT}' user => '${ES_USER}' password => '${ES_PW}' "
++      " hosts => '${ES_ENDPOINT}' api_key => '${LS_PLUGIN_API_KEY}'"
+     else
+       ""
+     end
+diff --git a/qa/integration/specs/spec_helper.rb b/qa/integration/specs/spec_helper.rb
+index 6af6ec6a401..7b51fb29262 100644
+--- a/qa/integration/specs/spec_helper.rb
++++ b/qa/integration/specs/spec_helper.rb
+@@ -20,7 +20,8 @@ def es_allow_wildcard_deletes(es_client)
+ end
+ 
+ def clean_es(es_client)
+-  es_client.indices.delete_template(:name => "*")
++  es_client.indices.delete_template(:name => "*") rescue nil
++  es_client.indices.delete_index_template(:name => "*") rescue nil
+   es_client.indices.delete(:index => "*")
+   es_client.indices.refresh
+ end

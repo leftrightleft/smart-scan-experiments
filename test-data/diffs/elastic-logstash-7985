@@ -1,0 +1,226 @@
+diff --git a/config/jvm.options b/config/jvm.options
+index ca9ccdf7de3..a96961b7484 100644
+--- a/config/jvm.options
++++ b/config/jvm.options
+@@ -52,9 +52,9 @@
+ #-Djna.nosys=true
+ 
+ # Turn on JRuby invokedynamic
+--Djruby.compile.invokedynamic=true
++#-Djruby.compile.invokedynamic=true
+ # Force Compilation
+--Djruby.jit.threshold=0
++#-Djruby.jit.threshold=0
+ 
+ ## heap dumps
+ 
+diff --git a/config/logstash.yml b/config/logstash.yml
+index 74b56f53036..978c397525a 100644
+--- a/config/logstash.yml
++++ b/config/logstash.yml
+@@ -93,7 +93,7 @@
+ # ------------ Module Settings ---------------
+ # Define modules here.  Modules definitions must be defined as an array.
+ # The simple way to see this is to prepend each `name` with a `-`, and keep
+-# all associated variables under the `name` they are associated with, and 
++# all associated variables under the `name` they are associated with, and
+ # above the next, like this:
+ #
+ # modules:
+@@ -103,7 +103,7 @@
+ #     var.PLUGINTYPE2.PLUGINNAME1.KEY1: VALUE
+ #     var.PLUGINTYPE3.PLUGINNAME3.KEY1: VALUE
+ #
+-# Module variable names must be in the format of 
++# Module variable names must be in the format of
+ #
+ # var.PLUGIN_TYPE.PLUGIN_NAME.KEY
+ #
+diff --git a/qa/integration/fixtures/dlq_spec.yml b/qa/integration/fixtures/dlq_spec.yml
+new file mode 100644
+index 00000000000..c1da4b7259d
+--- /dev/null
++++ b/qa/integration/fixtures/dlq_spec.yml
+@@ -0,0 +1,51 @@
++---
++services:
++  - logstash
++  - elasticsearch
++config: |-
++  input {
++      stdin { }
++      dead_letter_queue {
++          path => "<%=options[:dlq_dir]%>"
++          commit_offsets => true
++      }
++  }
++  filter {
++    if ([geoip]) {
++        mutate {
++            remove_field => ["geoip"]
++            add_field => {
++              "mutated" => "true"
++            }
++        }
++    }else{
++      grok {
++          match => {
++            "message" => "%{IPORHOST:clientip} %{USER:ident} %{USER:auth} \[%{HTTPDATE:timestamp}\] \"%{WORD:verb} %{DATA:request} HTTP/%{NUMBER:httpversion}\" %{NUMBER:response:int} (?:-|%{NUMBER:bytes:int}) %{QS:referrer} %{QS:useragent}"
++          }
++        }
++
++      useragent {
++         source => "agent"
++         target => "useragent"
++      }
++
++      date {
++        match => [ "timestamp", "dd/MMM/YYYY:HH:mm:ss Z" ]
++        locale => en
++      }
++
++      mutate {
++        add_field => {
++          "geoip" => "somewhere"
++        }
++      }
++    }
++  }
++
++  output {
++    elasticsearch {}
++  }
++
++input: how_sample.input
++teardown_script:
+diff --git a/qa/integration/services/logstash_service.rb b/qa/integration/services/logstash_service.rb
+index d00252b4e52..45d9afc6433 100644
+--- a/qa/integration/services/logstash_service.rb
++++ b/qa/integration/services/logstash_service.rb
+@@ -77,6 +77,21 @@ def start_with_input(config, input)
+     end
+   end
+ 
++  def start_with_input_with_settings(config, input, settings_file)
++    Bundler.with_clean_env do
++      `cat #{input} | #{@logstash_bin} --path.settings #{settings_file} -e \'#{config}\'`
++    end
++  end
++
++  def start_with_config_string_settings(config, settings_file)
++    spawn_logstash_stdin("-e", "#{config} ", "--path.settings", settings_file)
++  end
++
++  def start_with_config_file_string_settings(config, settings_file)
++    spawn_logstash_stdin("-f", "#{config}", "--path.settings", settings_file)
++  end
++
++
+   def start_with_config_string(config)
+     spawn_logstash("-e", "#{config} ")
+   end
+@@ -116,6 +131,21 @@ def spawn_logstash(*args)
+     end
+   end
+ 
++  # Spawn LS as a child process
++  def spawn_logstash_stdin(*args)
++    Bundler.with_clean_env do
++      out = Tempfile.new("duplex")
++      out.sync = true
++      @process = build_child_process(*args)
++      @env_variables.map { |k, v|  @process.environment[k] = v} unless @env_variables.nil?
++      @process.io.stdout = @process.io.stderr = out
++      @process.duplex = true
++      @process.start
++      wait_for_logstash
++      puts "Logstash started with PID #{@process.pid}" if @process.alive?
++    end
++  end
++
+   def build_child_process(*args)
+     feature_config_dir = @settings.feature_config_dir
+     # if we are using a feature flag and special settings dir to enable it, use it
+diff --git a/qa/integration/specs/dlq_spec.rb b/qa/integration/specs/dlq_spec.rb
+new file mode 100644
+index 00000000000..ac37859c721
+--- /dev/null
++++ b/qa/integration/specs/dlq_spec.rb
+@@ -0,0 +1,77 @@
++require_relative '../framework/fixture'
++require_relative '../framework/settings'
++require_relative '../services/logstash_service'
++require_relative '../framework/helpers'
++require "logstash/devutils/rspec/spec_helper"
++
++describe "Test Dead Letter Queue" do
++
++  before(:all) {
++    @fixture = Fixture.new(__FILE__)
++  }
++
++  after(:all) {
++    es_client = @fixture.get_service("elasticsearch").get_client
++    es_client.indices.delete(index: 'logstash-*')
++    @fixture.teardown
++  }
++
++  let(:dlq_dir) { Stud::Temporary.directory }
++
++  let(:dlq_config) {
++      {
++          "dead_letter_queue.enable" => true,
++          "path.dead_letter_queue" => dlq_dir,
++          "log.level" => "debug"
++      }
++  }
++
++  let!(:settings_dir) { Stud::Temporary.directory }
++  let!(:config_yaml) { dlq_config.to_yaml }
++  let!(:config_yaml_file) { ::File.join(settings_dir, "logstash.yml") }
++  let(:initial_config_file) { config_to_temp_file(@fixture.config("root",{ :dlq_dir => dlq_dir })) }
++
++
++  before(:each) do
++    IO.write(config_yaml_file, config_yaml)
++  end
++
++  it "can ingest 37 log lines of sample apache logs" do
++    logstash_service = @fixture.get_service("logstash")
++
++    logstash_service.start_with_config_file_string_settings(initial_config_file, settings_dir)
++    es_service = @fixture.get_service("elasticsearch")
++
++    es_client = es_service.get_client
++    # now we test if all data was indexed by ES, but first refresh manually
++    es_client.indices.refresh
++    puts "Waiting for logstash"
++    logstash_service.wait_for_logstash
++    puts "Logstash id ready"
++    logstash_service.write_to_stdin(IO.read(@fixture.input))
++    puts "Wrote to stdin"
++    started = false
++
++    try(100) do
++      result = es_client.search(index: 'logstash-*', size: 0, q: '*')
++      puts "Logstash Service alive - #{logstash_service.is_port_open?}"
++      if logstash_service.is_port_open?
++        started = true
++      end
++      if started && !logstash_service.is_port_open?
++        raise "Logstash Service has stopped"
++      end
++      expect(result["hits"]["total"]).to eq(37)
++    end
++
++    # randomly checked for results and structured fields
++    result = es_client.search(index: 'logstash-*', size: 1, q: 'dynamic')
++    s = result["hits"]["hits"][0]["_source"]
++    expect(s["bytes"]).to eq(18848)
++    expect(s["response"]).to eq(200)
++    expect(s["clientip"]).to eq("213.113.233.227")
++    expect(s["geoip"]).to be_nil
++    expect(s["verb"]).to eq("GET")
++    expect(s["mutated"]).to eq("true")
++  end
++end

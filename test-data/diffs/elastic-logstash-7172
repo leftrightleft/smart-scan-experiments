@@ -1,0 +1,472 @@
+diff --git a/config/logstash.yml b/config/logstash.yml
+index c50e6bd614c..4444f155a5e 100644
+--- a/config/logstash.yml
++++ b/config/logstash.yml
+@@ -85,6 +85,25 @@
+ #
+ # config.debug: false
+ #
++# ------------ Module Settings ---------------
++# Define modules here.  Modules definitions must be defined as an array.
++# The simple way to see this is to prepend each `name` with a `-`, and keep
++# all associated variables under the `name` they are associated with, and 
++# above the next, like this:
++#
++# modules:
++#   - name: MODULE_NAME
++#     var.PLUGINTYPE1.PLUGINNAME1.KEY1: VALUE
++#     var.PLUGINTYPE1.PLUGINNAME1.KEY2: VALUE
++#     var.PLUGINTYPE2.PLUGINNAME1.KEY1: VALUE
++#     var.PLUGINTYPE3.PLUGINNAME3.KEY1: VALUE
++#
++# Module variable names must be in the format of 
++#
++# var.PLUGIN_TYPE.PLUGIN_NAME.KEY
++#
++# modules:
++#
+ # ------------ Queuing Settings --------------
+ #
+ # Internal queuing model, "memory" for legacy in-memory based queuing and
+@@ -169,3 +188,4 @@
+ #
+ # Where to find custom plugins
+ # path.plugins: []
++
+diff --git a/logstash-core/lib/logstash/bootstrap_check/default_config.rb b/logstash-core/lib/logstash/bootstrap_check/default_config.rb
+index 8331c861fc7..257e4243189 100644
+--- a/logstash-core/lib/logstash/bootstrap_check/default_config.rb
++++ b/logstash-core/lib/logstash/bootstrap_check/default_config.rb
+@@ -1,21 +1,87 @@
+ # encoding: utf-8
+ require "logstash/errors"
++require "logstash/logging"
+ 
+ module LogStash module BootstrapCheck
+   class DefaultConfig
+-    def self.check(settings)
+-      if settings.get("config.string").nil? && settings.get("path.config").nil?
+-        raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.missing-configuration")
+-      end
++    include LogStash::Util::Loggable
++
++    def initialize(settings)
++      @settings = settings
++    end
++
++    def config_reload?
++      @settings.get("config.reload.automatic")
++    end
++
++    def config_string?
++      @settings.get("config.string")
++    end
+ 
+-      if settings.get("config.string") && settings.get("path.config")
++    def path_config?
++      @settings.get("path.config")
++    end
++
++    def config_modules?
++      # We want it to report true if not empty
++      !@settings.get("modules").empty?
++    end
++
++    def cli_modules?
++      # We want it to report true if not empty
++      !@settings.get("modules.cli").empty?
++    end
++
++    def both_config_flags?
++      config_string? && path_config?
++    end
++
++    def both_module_configs?
++      cli_modules? && config_modules?
++    end
++
++    def config_defined?
++      config_string? || path_config?
++    end
++
++    def modules_defined?
++      cli_modules? || config_modules?
++    end
++
++    def any_config?
++      config_defined? || modules_defined?
++    end
++
++    def check
++      # Check if both -f and -e are present
++      if both_config_flags?
+         raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.config-string-path-exclusive")
+       end
+ 
+-      if settings.get("config.reload.automatic") && settings.get("path.config").nil?
+-        # there's nothing to reload
++      # Make note that if modules are configured in both cli and logstash.yml that cli module  
++      # settings will be used, and logstash.yml modules settings ignored
++      if both_module_configs?
++        logger.info(I18n.t("logstash.runner.cli-module-override"))
++      end
++
++      # Check if both config (-f or -e) and modules are configured
++      if config_defined? && modules_defined?
++        raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.config-module-exclusive")
++      end
++
++      # Check for absence of any configuration
++      if !any_config?
++        raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.missing-configuration")
++      end
++
++      # Check to ensure that if configuration auto-reload is used that -f is specified
++      if config_reload? && !path_config?
+         raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.reload-without-config-path")
+       end
+     end
++
++    def self.check(settings)
++      DefaultConfig.new(settings).check
++    end
+   end
+ end end
+diff --git a/logstash-core/lib/logstash/config/source/modules.rb b/logstash-core/lib/logstash/config/source/modules.rb
+new file mode 100644
+index 00000000000..8f238ec393f
+--- /dev/null
++++ b/logstash-core/lib/logstash/config/source/modules.rb
+@@ -0,0 +1,45 @@
++# encoding: utf-8
++require "logstash/config/source/base"
++require "logstash/config/pipeline_config"
++require "logstash/util/loggable"
++require "logstash/errors"
++
++module LogStash module Config module Source
++  class Modules < Base
++    include LogStash::Util::Loggable
++    def pipeline_configs
++      pipelines = []
++      plugin_modules = LogStash::PLUGIN_REGISTRY.plugins_with_type(:modules)
++
++      modules_array = @settings.get("modules.cli").empty? ? @settings.get("modules") : @settings.get("modules.cli")
++      logger.debug("Configured modules", :modules_array => modules_array.to_s)
++      module_names = []
++      module_names = modules_array.collect {|module_hash| module_hash["name"]}
++      if module_names.length > module_names.uniq.length
++        duplicate_modules = module_names.group_by(&:to_s).select { |_,v| v.size > 1 }.keys
++        raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.modules-must-be-unique", :duplicate_modules => duplicate_modules)
++      end
++      ### Here is where we can force the modules_array to use only [0] for 5.5, and leave
++      ### a warning/error message to that effect.
++      modules_array.each do |module_hash|
++        begin
++          current_module = plugin_modules.find { |allmodules| allmodules.module_name == module_hash["name"] }
++          alt_name = "module-#{module_hash["name"]}"
++          pipeline_id = alt_name
++          config_string = current_module.config_string(module_hash)
++          logger.debug("Config string for module", :config_string => config_string, :module => module_hash["name"])
++          config_part = org.logstash.common.SourceWithMetadata.new("module", alt_name, config_string)
++          pipelines << PipelineConfig.new(self, pipeline_id.to_sym, config_part, @settings)
++        rescue => e
++          raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.parse-failed", :error => e.message)
++        end
++      end
++      pipelines
++    end
++
++    def match?
++      # will fill this later
++      true
++    end
++  end 
++end end end
+\ No newline at end of file
+diff --git a/logstash-core/lib/logstash/config/source_loader.rb b/logstash-core/lib/logstash/config/source_loader.rb
+index 84983c2bd52..abcfd2f5d11 100644
+--- a/logstash-core/lib/logstash/config/source_loader.rb
++++ b/logstash-core/lib/logstash/config/source_loader.rb
+@@ -1,5 +1,6 @@
+ # encoding: utf-8
+ require "logstash/config/source/local"
++require "logstash/config/source/modules"
+ require "logstash/errors"
+ require "thread"
+ require "set"
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 0eb7e34df9e..44da34a3cc8 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -20,6 +20,8 @@ module Environment
+     Setting::NullableString.new("path.config", nil, false),
+  Setting::WritableDirectory.new("path.data", ::File.join(LogStash::Environment::LOGSTASH_HOME, "data")),
+     Setting::NullableString.new("config.string", nil, false),
++                    Setting.new("modules.cli", Array, []),
++                    Setting.new("modules", Array, []),
+            Setting::Boolean.new("config.test_and_exit", false),
+            Setting::Boolean.new("config.reload.automatic", false),
+            Setting::Numeric.new("config.reload.interval", 3), # in seconds
+diff --git a/logstash-core/lib/logstash/modules.rb b/logstash-core/lib/logstash/modules.rb
+new file mode 100644
+index 00000000000..19ef45a10ff
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules.rb
+@@ -0,0 +1,44 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++require "erb"
++
++class LogStash::Modules
++  include LogStash::Util::Loggable
++
++  attr_reader :module_name
++  def initialize(name, directory)
++    @module_name = name
++    @directory = directory  
++  end
++
++  def template
++    ::File.join(@directory, "logstash/#{@module_name}.conf.erb")
++  end
++
++  class ModuleConfig
++
++    def initialize(template, settings)
++      @template = template
++      @settings = settings
++    end
++
++    def setting(value, default)
++      @settings.fetch(value, default)
++    end
++
++    def render
++      # process the template and settings
++      # send back as a string with no newlines (the '>' part)
++      renderer = ERB.new(File.read(@template), 3, '>')
++      renderer.result(binding)
++    end
++  end
++
++  def config_string(settings = {})
++    # settings should be the subset from the YAML file with a structure like
++    # {"name" => "plugin name", "k1" => "v1", "k2" => "v2"}, etc.
++    ModuleConfig.new(template, settings).render
++  end
++
++end # class LogStash::Modules
+\ No newline at end of file
+diff --git a/logstash-core/lib/logstash/modules_cli_parser.rb b/logstash-core/lib/logstash/modules_cli_parser.rb
+new file mode 100644
+index 00000000000..1fdad9b3e18
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules_cli_parser.rb
+@@ -0,0 +1,76 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++require "logstash/errors"
++
++class LogStash::ModulesCLIParser
++  include LogStash::Util::Loggable
++
++  attr_reader :output
++  def initialize(module_names, module_variables)
++    @output = []
++    # The #compact here catches instances when module_variables may be nil or 
++    # [nil] and sets it to []
++    parse_it(module_names, Array(module_variables).compact)
++  end
++
++  def parse_modules(module_list)
++    parsed_modules = []
++    module_list.each do |module_value|
++      # Calling --modules but not filling it results in [nil], so skip that.
++      next if module_value.nil?
++      # Catch if --modules was launched empty but an option/flag (-something) 
++      # follows immediately after
++      if module_value.start_with?('-')
++        raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.modules-empty-value", :modules => module_names)
++      end
++      parsed_modules.concat module_value.split(',')
++    end
++    parsed_modules
++  end
++
++  def get_kv(module_name, unparsed)
++    # Ensure that there is at least 1 equals sign in our variable string
++    if unparsed.split('=').length >= 2
++      # This hackery is to catch the possibility of an equals (`=`) sign 
++      # in a passphrase, which might result in an incomplete key.  The 
++      # portion before the first `=` should always be the key, leaving 
++      # the rest to be the value
++      values = unparsed.split('=')
++      k = values.shift
++      return k,values.join('=')
++    else
++      raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.modules-variables-malformed", :rawvar => (module_name + '.' + unparsed))
++    end
++  end
++
++  def name_splitter(unparsed)
++    # It must have at least `modulename.var.PLUGINTYPE.PLUGINNAME.VARNAME`
++    if unparsed.split('.').length >= 5
++      elements = unparsed.split('.')
++      module_name = elements.shift
++      return module_name,elements.join('.')
++    else
++      raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.modules-variables-malformed", :rawvar => unparsed)
++    end 
++  end
++
++  def parse_vars(module_name, vars_list)
++    module_hash = {"name" => module_name}
++    vars_list.each do |unparsed|
++      extracted_name, modvar = name_splitter(unparsed)
++      next if extracted_name != module_name
++      k, v = get_kv(extracted_name, modvar)
++      module_hash[k] = v 
++    end
++    module_hash
++  end
++  
++  def parse_it(module_list, module_variable_list)
++    if module_list.is_a?(Array)
++      parse_modules(module_list).each do |module_name| 
++        @output << parse_vars(module_name, module_variable_list)
++      end
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/logstash-core/lib/logstash/plugins/registry.rb b/logstash-core/lib/logstash/plugins/registry.rb
+index 7def8c4f3d5..d751c32f8cb 100644
+--- a/logstash-core/lib/logstash/plugins/registry.rb
++++ b/logstash-core/lib/logstash/plugins/registry.rb
+@@ -3,6 +3,7 @@
+ require "logstash/util/loggable"
+ require "logstash/plugin"
+ require "logstash/plugins/hooks_registry"
++require "logstash/modules"
+ 
+ module LogStash module Plugins
+   class Registry
+diff --git a/logstash-core/lib/logstash/runner.rb b/logstash-core/lib/logstash/runner.rb
+index 9f073e30696..b5352f6b01d 100644
+--- a/logstash-core/lib/logstash/runner.rb
++++ b/logstash-core/lib/logstash/runner.rb
+@@ -9,6 +9,7 @@
+ require "logstash/namespace"
+ require "logstash-core/logstash-core"
+ require "logstash/environment"
++require "logstash/modules_cli_parser"
+ 
+ LogStash::Environment.load_locale!
+ 
+@@ -61,6 +62,17 @@ class LogStash::Runner < Clamp::StrictCommand
+     :default => LogStash::SETTINGS.get_default("config.string"),
+     :attribute_name => "config.string"
+ 
++  # Module settings
++  option ["--modules"], "MODULES",
++    I18n.t("logstash.runner.flag.modules"),
++    :multivalued => true,
++    :attribute_name => "modules_list"
++
++  option ["-M", "--modules.variable"], "MODULES_VARIABLE", 
++    I18n.t("logstash.runner.flag.modules_variable"),
++    :multivalued => true,
++    :attribute_name => "modules_variable_list"
++
+   # Pipeline settings
+   option ["-w", "--pipeline.workers"], "COUNT",
+     I18n.t("logstash.runner.flag.pipeline-workers"),
+@@ -175,6 +187,7 @@ def initialize(*args)
+     # Default we check local sources: `-e`, `-f` and the logstash.yml options.
+     @source_loader = LogStash::Config::SourceLoader.new(@settings)
+     @source_loader.add_source(LogStash::Config::Source::Local.new(@settings))
++    @source_loader.add_source(LogStash::Config::Source::Modules.new(@settings))
+ 
+     super(*args)
+   end
+@@ -248,6 +261,10 @@ def execute
+ 
+     return start_shell(setting("interactive"), binding) if setting("interactive")
+ 
++    module_parser = LogStash::ModulesCLIParser.new(@modules_list, @modules_variable_list)
++    # Now populate Setting for modules.list with our parsed array.
++    @settings.set("modules.cli", module_parser.output)
++
+     begin
+       @bootstrap_checks.each { |bootstrap| bootstrap.check(@settings) }
+     rescue LogStash::BootstrapCheckError => e
+diff --git a/logstash-core/locales/en.yml b/logstash-core/locales/en.yml
+index e1ae825c358..6c59bb2247e 100644
+--- a/logstash-core/locales/en.yml
++++ b/logstash-core/locales/en.yml
+@@ -85,10 +85,23 @@ en:
+       logging:
+         unrecognized_option: |-
+           unrecognized option [%{option}]
++    modules:
++      configuration:
++        parse-failed: |-
++          Failed to parse the module configuration: [%{error}]
++        modules-must-be-unique: >-
++          Only a single instance of any module can be run at a time. Duplicate
++          modules: %{duplicate_modules}
++        modules-empty-value: >-
++          Empty value provided for --modules
++        modules-variables-malformed: >-
++          Failed to parse module variable %{rawvar}.  Must be in -M
++          "MODULE_NAME.var.PLUGIN_TYPE.PLUGIN_NAME.VARIABLE_NAME=VALUE" format
+     runner:
+       short-help: |-
+         usage:
+           bin/logstash -f CONFIG_PATH [-t] [-r] [] [-w COUNT] [-l LOG]
++          bin/logstash --modules MODULE_NAME [-M "MODULE_NAME.var.PLUGIN_TYPE.PLUGIN_NAME.VARIABLE_NAME=VALUE"] [-t] [-w COUNT] [-l LOG]
+           bin/logstash -e CONFIG_STR [-t] [--log.level fatal|error|warn|info|debug|trace] [-w COUNT] [-l LOG]
+           bin/logstash -i SHELL [--log.level fatal|error|warn|info|debug|trace]
+           bin/logstash -V [--log.level fatal|error|warn|info|debug|trace]
+@@ -100,6 +113,13 @@ en:
+         the '-f yourlogstash.conf' flag?
+       config-string-path-exclusive:
+         Settings 'path.config' (-f) and 'config.string' (-e) can't be used simultaneously.
++      config-module-exclusive: >-
++        Settings 'path.config' (-f) or 'config.string' (-e) can't be used in conjunction with
++        (--modules) or the "modules:" block in the logstash.yml file.
++      cli-module-override: >-
++        Both command-line and logstash.yml modules configurations detected. 
++        Using command-line module configuration and ignoring logstash.yml module
++        configuration.
+       reload-without-config-path: >-
+         Configuration reloading also requires passing a configuration path with '-f yourlogstash.conf'
+       locked-data-path: >-
+@@ -185,6 +205,24 @@ en:
+           "%{default_output}"
+           If you wish to use both defaults, please use
+           the empty string for the '-e' flag.
++        modules: |+
++          Load Logstash modules.
++          Modules can be defined using multiple instances 
++          '--modules module1 --modules module2', 
++             or comma-separated syntax 
++          '--modules=module1,module2' 
++          Cannot be used in conjunction with '-e' or '-f'
++          Use of '--modules' will override modules declared
++          in the 'logstash.yml' file.
++        modules_variable: |+
++          Load variables for module template.
++          Multiple instances of '-M' or 
++          '--modules.variable' are supported.
++          Ignored if '--modules' flag is not used.
++          Should be in the format of 
++          '-M "MODULE_NAME.var.PLUGIN_TYPE.PLUGIN_NAME.VARIABLE_NAME=VALUE"'
++          as in 
++          '-M "example.var.filter.mutate.fieldname=fieldvalue"'
+         configtest: |+
+           Check configuration for valid syntax and then exit.
+         http_host: Web API binding host

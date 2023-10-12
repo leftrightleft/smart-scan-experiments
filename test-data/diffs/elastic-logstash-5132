@@ -1,0 +1,175 @@
+diff --git a/logstash-core-event-java/src/main/java/com/logstash/Accessors.java b/logstash-core-event-java/src/main/java/com/logstash/Accessors.java
+index 4c1e597ecdc..9a9506f934a 100644
+--- a/logstash-core-event-java/src/main/java/com/logstash/Accessors.java
++++ b/logstash-core-event-java/src/main/java/com/logstash/Accessors.java
+@@ -39,7 +39,7 @@ public Object del(String reference) {
+                 }
+                 return ((List<Object>) target).remove(i);
+             } else {
+-                throw new ClassCastException("expecting List or Map");
++                throw newCollectionException(target);
+             }
+         }
+         return null;
+@@ -67,7 +67,7 @@ private Object findTarget(FieldReference field) {
+         target = this.data;
+         for (String key : field.getPath()) {
+             target = fetch(target, key);
+-            if (target == null) {
++            if (! isCollection(target)) {
+                 return null;
+             }
+         }
+@@ -80,9 +80,13 @@ private Object findTarget(FieldReference field) {
+     private Object findCreateTarget(FieldReference field) {
+         Object target;
+ 
+-        if ((target = this.lut.get(field.getReference())) != null) {
+-            return target;
+-        }
++        // flush the @lut to prevent stale cached fieldref which may point to an old target
++        // which was overwritten with a new value. for example, if "[a][b]" is cached and we
++        // set a new value for "[a]" then reading again "[a][b]" would point in a stale target.
++        // flushing the complete @lut is suboptimal, but a hierarchical lut would be required
++        // to be able to invalidate fieldrefs from a common root.
++        // see https://github.com/elastic/logstash/pull/5132
++        this.lut.clear();
+ 
+         target = this.data;
+         for (String key : field.getPath()) {
+@@ -95,10 +99,8 @@ private Object findCreateTarget(FieldReference field) {
+                     int i = Integer.parseInt(key);
+                     // TODO: what about index out of bound?
+                     ((List<Object>)target).set(i, result);
+-                } else if (target == null) {
+-                    // do nothing
+-                } else {
+-                    throw new ClassCastException("expecting List or Map");
++                } else if (target != null) {
++                    throw newCollectionException(target);
+                 }
+             }
+             target = result;
+@@ -133,8 +135,8 @@ private Object fetch(Object target, String key) {
+             return result;
+         } else if (target == null) {
+             return null;
+-        } {
+-            throw new ClassCastException("expecting List or Map");
++        } else {
++            throw newCollectionException(target);
+         }
+     }
+ 
+@@ -157,8 +159,19 @@ private Object store(Object target, String key, Object value) {
+                 ((List<Object>) target).set(i, value);
+             }
+         } else {
+-            throw new ClassCastException("expecting List or Map");
++            throw newCollectionException(target);
+         }
+         return value;
+     }
++
++    private boolean isCollection(Object target) {
++        if (target == null) {
++            return false;
++        }
++        return (target instanceof Map || target instanceof List);
++    }
++
++    private ClassCastException newCollectionException(Object target) {
++        return new ClassCastException("expecting List or Map, found "  + target.getClass());
++    }
+ }
+diff --git a/logstash-core-event-java/src/test/java/com/logstash/AccessorsTest.java b/logstash-core-event-java/src/test/java/com/logstash/AccessorsTest.java
+index 61855abc34b..4e7192c70b4 100644
+--- a/logstash-core-event-java/src/test/java/com/logstash/AccessorsTest.java
++++ b/logstash-core-event-java/src/test/java/com/logstash/AccessorsTest.java
+@@ -182,4 +182,28 @@ public void testNilInclude() throws Exception {
+ 
+         assertEquals(accessors.includes("nilfield"), true);
+     }
++
++    @Test
++    public void testInvalidPath() throws Exception {
++        Map data = new HashMap();
++        Accessors accessors = new Accessors(data);
++
++        assertEquals(accessors.set("[foo]", 1), 1);
++        assertEquals(accessors.get("[foo][bar]"), null);
++    }
++
++    @Test
++    public void testStaleTargetCache() throws Exception {
++        Map data = new HashMap();
++
++        Accessors accessors = new Accessors(data);
++
++        assertEquals(accessors.get("[foo][bar]"), null);
++        assertEquals(accessors.set("[foo][bar]", "baz"), "baz");
++        assertEquals(accessors.get("[foo][bar]"), "baz");
++
++        assertEquals(accessors.set("[foo]", "boom"), "boom");
++        assertEquals(accessors.get("[foo][bar]"), null);
++        assertEquals(accessors.get("[foo]"), "boom");
++    }
+ }
+diff --git a/logstash-core-event/lib/logstash/util/accessors.rb b/logstash-core-event/lib/logstash/util/accessors.rb
+index 01c16910855..23248f2c3ea 100644
+--- a/logstash-core-event/lib/logstash/util/accessors.rb
++++ b/logstash-core-event/lib/logstash/util/accessors.rb
+@@ -95,7 +95,14 @@ def lookup(field_reference)
+     # @param field_reference [String] the field referece
+     # @return [[Object, String]] the  [target, key] tuple associated with this field reference
+     def lookup_or_create(field_reference)
+-      @lut[field_reference] ||= find_or_create_target(field_reference)
++      # flush the @lut to prevent stale cached fieldref which may point to an old target
++      # which was overwritten with a new value. for example, if "[a][b]" is cached and we
++      # set a new value for "[a]" then reading again "[a][b]" would point in a stale target.
++      # flushing the complete @lut is suboptimal, but a hierarchical lut would be required
++      # to be able to invalidate fieldrefs from a common root.
++      # see https://github.com/elastic/logstash/pull/5132
++      @lut.clear
++      @lut[field_reference] = find_or_create_target(field_reference)
+     end
+ 
+     # find the target container object in store for this field reference
+diff --git a/logstash-core-event/spec/logstash/event_spec.rb b/logstash-core-event/spec/logstash/event_spec.rb
+index b0e4985bc07..0389ffc6d25 100644
+--- a/logstash-core-event/spec/logstash/event_spec.rb
++++ b/logstash-core-event/spec/logstash/event_spec.rb
+@@ -602,4 +602,33 @@
+       expect(event1.to_s).to eq("#{timestamp.to_iso8601} #{event1["host"]} #{event1["message"]}")
+     end
+   end
++
++  describe "Event accessors" do
++    let(:event) { LogStash::Event.new({ "message" => "foo" }) }
++
++    it "should invalidate target caching" do
++      expect(event["[a][0]"]).to be_nil
++
++      expect(event["[a][0]"] = 42).to eq(42)
++      expect(event["[a][0]"]).to eq(42)
++      expect(event["[a]"]).to eq({"0" => 42})
++
++      expect(event["[a]"] = [42, 24]).to eq([42, 24])
++      expect(event["[a]"]).to eq([42, 24])
++
++      expect(event["[a][0]"]).to eq(42)
++
++      expect(event["[a]"] = [24, 42]).to eq([24, 42])
++      expect(event["[a][0]"]).to eq(24)
++
++      expect(event["[a][0]"] = {"a "=> 99, "b" => 98}).to eq({"a "=> 99, "b" => 98})
++      expect(event["[a][0]"]).to eq({"a "=> 99, "b" => 98})
++
++      expect(event["[a]"]).to eq([{"a "=> 99, "b" => 98}, 42])
++      expect(event["[a][0]"]).to eq({"a "=> 99, "b" => 98})
++      expect(event["[a][1]"]).to eq(42)
++      expect(event["[a][0][b]"]).to eq(98)
++    end
++  end
+ end
++

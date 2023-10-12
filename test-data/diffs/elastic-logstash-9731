@@ -1,0 +1,234 @@
+diff --git a/README.md b/README.md
+index c5841ab64c5..a8d2bedd854 100644
+--- a/README.md
++++ b/README.md
+@@ -235,6 +235,17 @@ rake artifact:rpm_oss
+ rake artifact:deb_oss
+ ```
+ 
++## Using a Custom JRuby Distribution
++
++If you want the build to use a custom JRuby you can do so by setting a path to a custom 
++JRuby distribution's source root via the `custom.jruby.path` Gradle property.
++
++E.g.
++
++```sh
++./gradlew clean test -Pcustom.jruby.path="/path/to/jruby"
++```
++
+ ## Project Principles
+ 
+ * Community: If a newbie has a bad time, it's a bug.
+diff --git a/build.gradle b/build.gradle
+index 17fcd70e90f..dcac8a8afeb 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -20,6 +20,8 @@ apply plugin: 'de.undercouch.download'
+ 
+ import de.undercouch.gradle.tasks.download.Download
+ import de.undercouch.gradle.tasks.download.Verify
++import java.nio.file.Files
++import java.nio.file.Paths
+ import org.logstash.gradle.RubyGradleUtils
+ import org.yaml.snakeyaml.Yaml
+ 
+@@ -142,6 +144,10 @@ project(":logstash-core") {
+ 
+ def jrubyTarPath = "${projectDir}/vendor/_/jruby-bin-${jRubyVersion}.tar.gz"
+ 
++def customJRubyDir = project.hasProperty("custom.jruby.path") ? project.property("custom.jruby.path") : ""
++def customJRubyVersion = customJRubyDir == "" ? "" : Files.readAllLines(Paths.get(customJRubyDir, "VERSION")).get(0).trim()
++def customJRubyTar = customJRubyDir == "" ? "" : (customJRubyDir + "/maven/jruby-dist/target/jruby-dist-${customJRubyVersion}-bin.tar.gz")
++
+ task downloadJRuby(type: Download) {
+     description "Download JRuby artifact from this specific URL: ${jRubyURL}"
+     src jRubyURL
+@@ -151,6 +157,8 @@ task downloadJRuby(type: Download) {
+     dest new File("${projectDir}/vendor/_", "jruby-bin-${jRubyVersion}.tar.gz")
+ }
+ 
++downloadJRuby.onlyIf { customJRubyDir == "" }
++
+ task verifyFile(dependsOn: downloadJRuby, type: Verify) {
+     description "Verify the SHA1 of the download JRuby artifact"
+     inputs.file(jrubyTarPath)
+@@ -160,7 +168,37 @@ task verifyFile(dependsOn: downloadJRuby, type: Verify) {
+     checksum jRubySha1
+ }
+ 
+-task downloadAndInstallJRuby(dependsOn: verifyFile, type: Copy) {
++verifyFile.onlyIf { customJRubyDir == "" }
++
++task buildCustomJRuby(type: Exec) {
++  description "Build tar.gz and .jar artifacts from JRuby source directory"
++  workingDir customJRubyDir
++  commandLine './mvnw', 'clean', 'install', '-Pdist', '-Pcomplete'
++  standardOutput = new ByteArrayOutputStream()
++  errorOutput = new ByteArrayOutputStream()
++  ext.output = {
++    standardOutput.toString() + errorOutput.toString()
++  }
++}
++
++buildCustomJRuby.onlyIf { customJRubyDir != "" }
++
++task installCustomJRuby(dependsOn: buildCustomJRuby, type: Copy) {
++  description "Install custom built JRuby in the vendor directory"
++  inputs.file(customJRubyTar)
++  outputs.dir("${projectDir}/vendor/jruby")
++  from tarTree(customJRubyTar == "" ? jrubyTarPath : customJRubyTar)
++  eachFile { f ->
++    f.path = f.path.replaceFirst("^jruby-${customJRubyVersion}", '')
++  }
++  exclude "**/stdlib/rdoc/**"
++  includeEmptyDirs = false
++  into "${projectDir}/vendor/jruby"
++}
++
++installCustomJRuby.onlyIf { customJRubyDir != "" }
++
++task downloadAndInstallJRuby(dependsOn: [verifyFile, installCustomJRuby], type: Copy) {
+     description "Install JRuby in the vendor directory"
+     inputs.file(jrubyTarPath)
+     outputs.dir("${projectDir}/vendor/jruby")
+@@ -173,6 +211,8 @@ task downloadAndInstallJRuby(dependsOn: verifyFile, type: Copy) {
+     into "${projectDir}/vendor/jruby"
+ }
+ 
++downloadAndInstallJRuby.onlyIf { customJRubyDir == "" }
++
+ task installDefaultGems(dependsOn: downloadAndInstallJRuby) {
+   inputs.files file("${projectDir}/Gemfile.template")
+   inputs.files fileTree("${projectDir}/rakelib")
+@@ -186,7 +226,11 @@ task installDefaultGems(dependsOn: downloadAndInstallJRuby) {
+   }
+ }
+ 
+-task installTestGems(dependsOn: downloadAndInstallJRuby) {
++def assemblyDeps = [downloadAndInstallJRuby, assemble] + subprojects.collect {
++  it.tasks.findByName("assemble")
++}
++
++task installTestGems(dependsOn: assemblyDeps) {
+   inputs.files file("${projectDir}/Gemfile.template")
+   inputs.files fileTree("${projectDir}/rakelib")
+   inputs.files file("${projectDir}/versions.yml")
+@@ -199,7 +243,7 @@ task installTestGems(dependsOn: downloadAndInstallJRuby) {
+   }
+ }
+ 
+-task assembleTarDistribution(dependsOn: downloadAndInstallJRuby) {
++task assembleTarDistribution(dependsOn: assemblyDeps) {
+   inputs.files fileTree("${projectDir}/rakelib")
+   inputs.files fileTree("${projectDir}/bin")
+   inputs.files fileTree("${projectDir}/config")
+@@ -215,7 +259,7 @@ task assembleTarDistribution(dependsOn: downloadAndInstallJRuby) {
+   }
+ }
+ 
+-task assembleOssTarDistribution() {
++task assembleOssTarDistribution(dependsOn: assemblyDeps) {
+   inputs.files fileTree("${projectDir}/rakelib")
+   inputs.files fileTree("${projectDir}/bin")
+   inputs.files fileTree("${projectDir}/config")
+@@ -229,7 +273,7 @@ task assembleOssTarDistribution() {
+   }
+ }
+ 
+-task assembleZipDistribution(dependsOn: downloadAndInstallJRuby) {
++task assembleZipDistribution(dependsOn: assemblyDeps) {
+   inputs.files fileTree("${projectDir}/rakelib")
+   inputs.files fileTree("${projectDir}/bin")
+   inputs.files fileTree("${projectDir}/config")
+@@ -245,7 +289,7 @@ task assembleZipDistribution(dependsOn: downloadAndInstallJRuby) {
+   }
+ }
+ 
+-task assembleOssZipDistribution(dependsOn: downloadAndInstallJRuby) {
++task assembleOssZipDistribution(dependsOn: assemblyDeps) {
+   inputs.files fileTree("${projectDir}/rakelib")
+   inputs.files fileTree("${projectDir}/bin")
+   inputs.files fileTree("${projectDir}/config")
+diff --git a/logstash-core/build.gradle b/logstash-core/build.gradle
+index db875198ce4..e3baf6c537c 100644
+--- a/logstash-core/build.gradle
++++ b/logstash-core/build.gradle
+@@ -1,3 +1,5 @@
++import java.nio.file.Files
++import java.nio.file.Paths
+ import org.yaml.snakeyaml.Yaml
+ 
+ // fetch version from Logstash's master versions.yml file
+@@ -53,6 +55,7 @@ task cleanGemjar {
+ 
+ clean.dependsOn(cleanGemjar)
+ jar.finalizedBy(copyGemjar)
++assemble.dependsOn(copyGemjar)
+ 
+ configurations.create('sources')
+ configurations.create('javadoc')
+@@ -111,6 +114,9 @@ idea {
+     }
+ }
+ 
++def customJRubyDir = project.hasProperty("custom.jruby.path") ? project.property("custom.jruby.path") : ""
++def customJRubyVersion = customJRubyDir == "" ? "" : Files.readAllLines(Paths.get(customJRubyDir, "VERSION")).get(0).trim()
++
+ dependencies {
+     compile 'org.apache.logging.log4j:log4j-api:2.9.1'
+     compile 'org.apache.logging.log4j:log4j-core:2.9.1'
+@@ -122,7 +128,11 @@ dependencies {
+     compile "com.fasterxml.jackson.core:jackson-annotations:${jacksonVersion}"
+     compile 'org.codehaus.janino:janino:3.0.8'
+     compile "com.fasterxml.jackson.dataformat:jackson-dataformat-cbor:${jacksonVersion}"
+-    compile "org.jruby:jruby-complete:${jrubyVersion}"
++    if (customJRubyDir == "") {
++        compile "org.jruby:jruby-complete:${jrubyVersion}"
++    } else {
++        compile files(customJRubyDir + "/maven/jruby-complete/target/jruby-complete-${customJRubyVersion}.jar")
++    }
+     compile group: 'com.google.guava', name: 'guava', version: '22.0'
+     // Do not upgrade this, later versions require GPL licensed code in javac-shaded that is
+     // Apache2 incompatible
+diff --git a/rakelib/compile.rake b/rakelib/compile.rake
+index 99c7e320efb..1935f2cba05 100644
+--- a/rakelib/compile.rake
++++ b/rakelib/compile.rake
+@@ -8,9 +8,8 @@ end
+ 
+ namespace "compile" do
+   desc "Compile the config grammar"
+-
+   task "grammar" => "logstash-core/lib/logstash/config/grammar.rb"
+-  
++
+   def safe_system(*args)
+     if !system(*args)
+       status = $?
+@@ -19,8 +18,10 @@ namespace "compile" do
+   end
+ 
+   task "logstash-core-java" do
+-    puts("Building logstash-core using gradle")
+-    safe_system("./gradlew", "assemble")
++    unless File.exists?(File.join("logstash-core", "lib", "jars", "logstash-core.jar"))
++      puts("Building logstash-core using gradle")
++      safe_system("./gradlew", "assemble")
++    end
+   end
+ 
+   desc "Build everything"
+diff --git a/rakelib/vendor.rake b/rakelib/vendor.rake
+index d062dd47124..5c60e4d9b7d 100644
+--- a/rakelib/vendor.rake
++++ b/rakelib/vendor.rake
+@@ -4,7 +4,7 @@ namespace "vendor" do
+   end
+ 
+   task "jruby" do |task, args|
+-    system('./gradlew downloadAndInstallJRuby')
++    system('./gradlew downloadAndInstallJRuby') unless File.exists?(File.join("vendor", "jruby"))
+   end # jruby
+ 
+   task "all" => "jruby"

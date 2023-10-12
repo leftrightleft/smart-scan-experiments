@@ -1,0 +1,130 @@
+diff --git a/logstash-core/lib/logstash/instrument/metric_store.rb b/logstash-core/lib/logstash/instrument/metric_store.rb
+index 8240d899d57..c440e2524d2 100644
+--- a/logstash-core/lib/logstash/instrument/metric_store.rb
++++ b/logstash-core/lib/logstash/instrument/metric_store.rb
+@@ -188,6 +188,10 @@ def prune(path)
+       end
+     end
+ 
++    def size
++      @fast_lookup.size
++    end
++
+     private
+     def get_all
+       @fast_lookup.values
+diff --git a/logstash-core/lib/logstash/util/wrapped_synchronous_queue.rb b/logstash-core/lib/logstash/util/wrapped_synchronous_queue.rb
+index 3c5c2d31d72..f3a60f2c0f8 100644
+--- a/logstash-core/lib/logstash/util/wrapped_synchronous_queue.rb
++++ b/logstash-core/lib/logstash/util/wrapped_synchronous_queue.rb
+@@ -90,9 +90,14 @@ def current_inflight_batch
+       def take_batch
+         @mutex.synchronize do
+           batch = ReadBatch.new(@queue, @batch_size, @wait_for)
+-          add_starting_metrics(batch)
+           set_current_thread_inflight_batch(batch)
+-          start_clock
++
++          # We dont actually have any events to work on so lets
++          # not bother with recording metrics for them
++          if batch.size > 0
++            add_starting_metrics(batch)
++            start_clock
++          end
+           batch
+         end
+       end
+@@ -116,8 +121,10 @@ def start_clock
+       end
+ 
+       def stop_clock
+-        @inflight_clocks[Thread.current].each(&:stop)
+-        @inflight_clocks.delete(Thread.current)
++        unless @inflight_clocks[Thread.current].nil?
++          @inflight_clocks[Thread.current].each(&:stop)
++          @inflight_clocks.delete(Thread.current)
++        end
+       end
+ 
+       def add_starting_metrics(batch)
+diff --git a/logstash-core/spec/logstash/instrument/metric_store_spec.rb b/logstash-core/spec/logstash/instrument/metric_store_spec.rb
+index 3ad08f0fee1..993be7fd4f3 100644
+--- a/logstash-core/spec/logstash/instrument/metric_store_spec.rb
++++ b/logstash-core/spec/logstash/instrument/metric_store_spec.rb
+@@ -203,6 +203,12 @@
+       end
+     end
+ 
++    describe "#size" do
++      it "returns the number of unique metrics" do
++        expect(subject.size).to eq(metric_events.size)
++      end
++    end
++
+     describe "#each" do
+       it "retrieves all the metric" do
+         expect(subject.each.size).to eq(metric_events.size)
+diff --git a/logstash-core/spec/logstash/util/wrapped_synchronous_queue_spec.rb b/logstash-core/spec/logstash/util/wrapped_synchronous_queue_spec.rb
+index e0c5ce26d0c..ca7cb956479 100644
+--- a/logstash-core/spec/logstash/util/wrapped_synchronous_queue_spec.rb
++++ b/logstash-core/spec/logstash/util/wrapped_synchronous_queue_spec.rb
+@@ -1,6 +1,7 @@
+ # encoding: utf-8
+ require "spec_helper"
+ require "logstash/util/wrapped_synchronous_queue"
++require "logstash/instrument/collector"
+ 
+ describe LogStash::Util::WrappedSynchronousQueue do
+   context "#offer" do
+@@ -45,11 +46,47 @@ def poll(*) shift(); end
+     end
+ 
+     describe "WriteClient | ReadClient" do
+-      context "when writing to the queue" do
+-        let(:queue) { DummyQueue.new }
+-        let(:write_client) { LogStash::Util::WrappedSynchronousQueue::WriteClient.new(queue)}
+-        let(:read_client)  { LogStash::Util::WrappedSynchronousQueue::ReadClient.new(queue)}
++      let(:queue) { DummyQueue.new }
++      let(:write_client) { LogStash::Util::WrappedSynchronousQueue::WriteClient.new(queue)}
++      let(:read_client)  { LogStash::Util::WrappedSynchronousQueue::ReadClient.new(queue)}
++
++      context "when reading from the queue" do
++        let(:collector) { LogStash::Instrument::Collector.new }
++
++        before do
++          read_client.set_events_metric(LogStash::Instrument::Metric.new(collector).namespace(:events))
++          read_client.set_pipeline_metric(LogStash::Instrument::Metric.new(collector).namespace(:pipeline))
++        end
++
++        context "when the queue is empty" do
++          it "doesnt record the `duration_in_millis`" do
++            batch = read_client.take_batch
++            read_client.close_batch(batch)
++            store = collector.snapshot_metric.metric_store
++            expect(store.size).to eq(0)
++          end
++        end
+ 
++        context "when we have item in the queue" do
++          it "records the `duration_in_millis`" do
++            batch = write_client.get_new_batch
++            5.times {|i| batch.push("value-#{i}")}
++            write_client.push_batch(batch)
++            read_batch = read_client.take_batch
++            sleep(0.1) # simulate some work?
++            read_client.close_batch(batch)
++            store = collector.snapshot_metric.metric_store
++
++            expect(store.size).to eq(4)
++            expect(store.get_shallow(:events, :in).value).to eq(5)
++            expect(store.get_shallow(:events, :duration_in_millis).value).to be > 0
++            expect(store.get_shallow(:pipeline, :in).value).to eq(5)
++            expect(store.get_shallow(:pipeline, :duration_in_millis).value).to be > 0
++          end
++        end
++      end
++
++      context "when writing to the queue" do
+         before :each do
+           read_client.set_events_metric(LogStash::Instrument::NullMetric.new)
+           read_client.set_pipeline_metric(LogStash::Instrument::NullMetric.new)

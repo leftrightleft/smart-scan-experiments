@@ -1,0 +1,309 @@
+diff --git a/logstash-core/lib/logstash/elasticsearch_client.rb b/logstash-core/lib/logstash/elasticsearch_client.rb
+index 9e3bfa84491..9a9d3ddc25e 100644
+--- a/logstash-core/lib/logstash/elasticsearch_client.rb
++++ b/logstash-core/lib/logstash/elasticsearch_client.rb
+@@ -72,7 +72,7 @@ def client_args
+     end
+ 
+     def unpack_hosts
+-      @settings.fetch("var.output.elasticsearch.host", "logstash:9200").split(',').map(&:strip)
++      @settings.fetch("var.output.elasticsearch.hosts", "localhost:9200").split(',').map(&:strip)
+     end
+   end
+ 
+diff --git a/logstash-core/lib/logstash/modules/kibana_config.rb b/logstash-core/lib/logstash/modules/kibana_config.rb
+index 6b6a17037be..7f3843d0b53 100644
+--- a/logstash-core/lib/logstash/modules/kibana_config.rb
++++ b/logstash-core/lib/logstash/modules/kibana_config.rb
+@@ -28,26 +28,22 @@ def dashboards
+     end
+   end
+ 
+-  def kibana_index_hacks
+-    # Copied from libbeat/dashboards/importer.go
+-    # CreateKibanaIndex creates the kibana index if it doesn't exists and sets
+-    # some index properties which are needed as a workaround for:
+-    # https://github.com/elastic/beats-dashboards/issues/94
+-    # with kibana 5.4.0 this hack failed to be applied.
+-    ha = '{"settings": {"index":{"mapping":{"single_type": false}}}}'
+-    hb = '{"search": {"properties": {"hits": {"type": "integer"}, "version": {"type": "integer"}}}}'
++  def index_pattern
++    pattern_name = "#{@name}-*"
++    default_index_json = '{"defaultIndex": "#{pattern_name}"}'
++    default_index_content_id = @settings.fetch("index_pattern.kibana_version", "5.4.0") # make this 5.5.0
+     [
+-      KibanaBaseResource.new(@index_name, "not-used", "not-used", ha),
+-      KibanaBaseResource.new(@index_name, "not-used", "not-used", hb)
++      KibanaResource.new(@index_name, "index-pattern", dynamic("index_pattern"),nil, pattern_name),
++      KibanaResource.new(@index_name, "config", nil, default_index_json, default_index_content_id)
+     ]
+   end
+ 
+   def resources
+-    list = [] # kibana_index_hacks
++    list = index_pattern
+     dashboards.each do |board|
+       extract_panels_into(board, list)
+     end
+-    list
++    list.concat(extract_saved_searches(list))
+   end
+ 
+   private
+@@ -88,5 +84,20 @@ def extract_panels_into(dashboard, list)
+         logger.warn("panelJSON contained unknown type", :type => panel_type)
+       end
+     end
++
++    def extract_saved_searches(list)
++      result = [] # must not add to list while iterating
++      list.each do |resource|
++        next unless resource.contains?("savedSearchId")
++        content = resource.content_as_object
++        next if content.nil?
++        saved_search = content["savedSearchId"]
++        next if saved_search.nil?
++        ss_resource = KibanaResource.new(@index_name, "search", dynamic("search", saved_search))
++        next if list.member?(ss_resource) || result.member?(ss_resource)
++        result << ss_resource
++      end
++      result
++    end
+   end
+ end end end
+diff --git a/logstash-core/lib/logstash/modules/logstash_config.rb b/logstash-core/lib/logstash/modules/logstash_config.rb
+index 7f77ed61293..e19d2841b34 100644
+--- a/logstash-core/lib/logstash/modules/logstash_config.rb
++++ b/logstash-core/lib/logstash/modules/logstash_config.rb
+@@ -18,7 +18,9 @@ def setting(value, default)
+   end
+ 
+   def elasticsearch_output_config
+-    hosts = "#{setting("var.output.elasticsearch.host", "localhost:9200")}"
++    hosts = setting("var.output.elasticsearch.hosts", "localhost:9200").split(',').map do |s|
++      '"' + s.strip + '"'
++    end.join(',')
+     index = "#{@name}-#{setting("var.output.elasticsearch.index_suffix", "%{+YYYY.MM.dd}")}"
+     password = "#{setting("var.output.elasticsearch.password", "changeme")}"
+     user = "#{setting("var.output.elasticsearch.user", "elasticsearch")}"
+diff --git a/logstash-core/lib/logstash/modules/resource_base.rb b/logstash-core/lib/logstash/modules/resource_base.rb
+index 86e8a21b2b9..f1886b0fee8 100644
+--- a/logstash-core/lib/logstash/modules/resource_base.rb
++++ b/logstash-core/lib/logstash/modules/resource_base.rb
+@@ -5,13 +5,33 @@
+ module LogStash module Modules module ResourceBase
+   attr_reader :base, :content_type, :content_path, :content_id
+ 
+-  def initialize(base, content_type, content_path, content = nil)
++  def initialize(base, content_type, content_path, content = nil, content_id = nil)
+     @base, @content_type, @content_path = base, content_type, content_path
+-    @content_id =  ::File.basename(@content_path, ".*")
++    @content_id =  content_id || ::File.basename(@content_path, ".*")
+     @content = content
+   end
+ 
+   def content
+-    @content || FileReader.read(@content_path)
++    @content ||= FileReader.read(@content_path)
++  end
++
++  def to_s
++    "#{base}, #{content_type}, #{content_path}, #{content_id}"
++  end
++
++  def contains?(text)
++    content.include?(text)
++  end
++
++  def content_as_object
++    LogStash::Json.load(content) rescue nil
++  end
++
++  def <=>(other)
++    to_s <=> other.to_s
++  end
++
++  def ==(other)
++    to_s == other.to_s
+   end
+ end end end
+diff --git a/logstash-core/lib/logstash/modules/scaffold.rb b/logstash-core/lib/logstash/modules/scaffold.rb
+index 242a5f73893..f32b69fc03a 100644
+--- a/logstash-core/lib/logstash/modules/scaffold.rb
++++ b/logstash-core/lib/logstash/modules/scaffold.rb
+@@ -54,26 +54,61 @@ def config_string()
+   var.output.elasticsearch.password: "password"
+   var.input.tcp.port: 5606
+ 
+-File structure
++GEM File structure
+ logstash-module-netflow
+ ├── configuration
+ │   ├── elasticsearch
+ │   │   └── netflow.json
+ │   ├── kibana
+ │   │   ├── dashboard
+-│   │   │   └── netflow.json ("panelJSON" contains references to visualization panels 1,2,3)
++│   │   │   └── netflow.json (contains '["dash1", "dash2"]')
++│   │   │   └── dash1.json ("panelJSON" contains refs to visualization panels 1,2 and search 1)
++│   │   │   └── dash2.json ("panelJSON" contains refs to visualization panel 3  and search 2)
+ │   │   ├── search
+-|   |   |   └── netflow-search1.json
+-|   |   |   └── netflow-search2.json
++|   |   |   └── search1.json
++|   |   |   └── search2.json
+ │   │   └── vizualization
+-|   |   |   └── netflow-panel1.json
+-|   |   |   └── netflow-panel2.json
+-|   |   |   └── netflow-panel3.json
++|   |   |   └── panel1.json
++|   |   |   └── panel2.json
++|   |   |   └── panel3.json
++│   └── logstash
++│       └── netflow.conf.erb
++├── lib
++│   └── logstash_registry.rb
++└── logstash-module-netflow.gemspec
++
++GEM File structure
++logstash-module-netflow
++├── configuration
++│   ├── elasticsearch
++│   │   └── netflow.json
++│   ├── kibana
++│   │   ├── dashboard
++│   │   │   └── netflow.json (contains '{"v5.5.0": ["dash1", "dash2"], "v6.0.4": ["dash1", "dash2"]')
++│   │   │   └── v5.5.0
++│   │   │   |   └── dash1.json ("panelJSON" contains refs to visualization panels 1,2 and search 1)
++│   │   │   |   └── dash2.json ("panelJSON" contains refs to visualization panel 3  and search 2)
++│   │   │   └── v6.0.4
++│   │   │       └── dash1.json ("panelJSON" contains refs to visualization panels 1,2 and search 1)
++│   │   │       └── dash2.json ("panelJSON" contains refs to visualization panel 3  and search 2)
++│   │   ├── search
++│   │   │   └── v5
++|   |   |   |   └── search1.json
++|   |   |   |   └── search2.json
++│   │   │   └── v6
++|   |   |       └── search1.json
++|   |   |       └── search2.json
++│   │   └── vizualization
++│   │   │   └── v5
++|   |   |   |   └── panel1.json
++|   |   |   |   └── panel2.json
++|   |   |   |   └── panel3.json
++│   │   │   └── v6
++|   |   |       └── panel1.json
++|   |   |       └── panel2.json
++|   |   |       └── panel3.json
+ │   └── logstash
+ │       └── netflow.conf.erb
+ ├── lib
+-│   ├── logstash
+-│   │   └── modules
+-│   │       └── netflow.rb
+ │   └── logstash_registry.rb
+ └── logstash-module-netflow.gemspec
+diff --git a/logstash-core/spec/logstash/modules/scaffold_spec.rb b/logstash-core/spec/logstash/modules/scaffold_spec.rb
+index b9e2e042007..fe826390bc1 100644
+--- a/logstash-core/spec/logstash/modules/scaffold_spec.rb
++++ b/logstash-core/spec/logstash/modules/scaffold_spec.rb
+@@ -13,7 +13,7 @@
+   subject(:test_module) { described_class.new(mname, base_dir) }
+   let(:module_settings) do
+     {
+-      "var.output.elasticsearch.host" => "\"es.mycloud.com:9200\"",
++      "var.output.elasticsearch.hosts" => "es.mycloud.com:9200",
+       "var.output.elasticsearch.user" => "foo",
+       "var.output.elasticsearch.password" => "password",
+       "var.input.tcp.port" => 5606,
+@@ -37,7 +37,19 @@
+ }
+ JSON
+   end
+-
++  let(:viz_json) do
++<<-JSON
++{
++"visState": "",
++"description": "",
++"title": "foo-c",
++"uiStateJSON": "",
++"version": 1,
++"savedSearchId": "foo-f",
++"kibanaSavedObjectMeta": {}
++}
++JSON
++  end
+   context "logstash operation" do
+     let(:ls_conf) do
+ <<-ERB
+@@ -85,8 +97,10 @@
+ 
+   context "kibana operation" do
+     before do
++      allow(LogStash::Modules::FileReader).to receive(:read).and_return("{}")
+       allow(LogStash::Modules::FileReader).to receive(:read).with("gem-home/kibana/dashboard/foo.json").and_return("[\"Foo-Dashboard\"]")
+       allow(LogStash::Modules::FileReader).to receive(:read).with("gem-home/kibana/dashboard/Foo-Dashboard.json").and_return(dashboard_json)
++      allow(LogStash::Modules::FileReader).to receive(:read).with("gem-home/kibana/visualization/foo-c.json").and_return(viz_json)
+     end
+ 
+     it "provides a list of importable files" do
+@@ -94,16 +108,24 @@
+       test_module.with_settings(module_settings)
+       expect(test_module.kibana_configuration).not_to be_nil
+       files = test_module.kibana_configuration.resources
+-      expect(files.size).to eq(4)
++      expect(files.size).to eq(7)
+       expect(files.map{|o| o.class.name}.uniq).to eq(["LogStash::Modules::KibanaResource"])
+-      expect(files[0].content_path).to eq("gem-home/kibana/dashboard/Foo-Dashboard.json")
+-      expect(files[0].import_path).to eq(".kibana/dashboard/Foo-Dashboard")
+-      expect(files[1].content_path).to eq("gem-home/kibana/visualization/foo-c.json")
+-      expect(files[1].import_path).to eq(".kibana/visualization/foo-c")
+-      expect(files[2].content_path).to eq("gem-home/kibana/visualization/foo-d.json")
+-      expect(files[2].import_path).to eq(".kibana/visualization/foo-d")
+-      expect(files[3].content_path).to eq("gem-home/kibana/search/foo-e.json") #<- the panels can contain items from other folders
+-      expect(files[3].import_path).to eq(".kibana/search/foo-e")
++      expect(files[0].content_path).to eq("gem-home/kibana/index_pattern/foo.json")
++      expect(files[0].import_path).to eq(".kibana/index-pattern/foo-*")
++
++      expect(files[1].content).to eq("{\"defaultIndex\": \"\#{pattern_name}\"}")
++      expect(files[1].import_path).to eq(".kibana/config/5.4.0")
++
++      expect(files[2].content_path).to eq("gem-home/kibana/dashboard/Foo-Dashboard.json")
++      expect(files[2].import_path).to eq(".kibana/dashboard/Foo-Dashboard")
++      expect(files[3].content_path).to eq("gem-home/kibana/visualization/foo-c.json")
++      expect(files[3].import_path).to eq(".kibana/visualization/foo-c")
++      expect(files[4].content_path).to eq("gem-home/kibana/visualization/foo-d.json")
++      expect(files[4].import_path).to eq(".kibana/visualization/foo-d")
++      expect(files[5].content_path).to eq("gem-home/kibana/search/foo-e.json") #<- the panels can contain items from other folders
++      expect(files[5].import_path).to eq(".kibana/search/foo-e")
++      expect(files[6].content_path).to eq("gem-home/kibana/search/foo-f.json") #<- the visualization can contain items from the search folder
++      expect(files[6].import_path).to eq(".kibana/search/foo-f")
+     end
+ 
+     it "provides the kibana index string" do
+@@ -122,6 +144,8 @@
+     let(:expected_paths) do
+       [
+         "_template/cef",
++        ".kibana/index-pattern/cef-*",
++        ".kibana/config/5.4.0",
+         ".kibana/dashboard/FW-Dashboard",
+         ".kibana/visualization/FW-Metrics",
+         ".kibana/visualization/FW-Last-Update",
+@@ -160,7 +184,7 @@
+     let(:base_dir) { File.expand_path(File.join(File.dirname(__FILE__), "..", "..", "modules_test_files", "#{mname}")) }
+     let(:module_settings) do
+       {
+-        "var.output.elasticsearch.host" => "localhost:9200",
++        "var.output.elasticsearch.hosts" => "localhost:9200",
+         "var.output.elasticsearch.user" => "foo",
+         "var.output.elasticsearch.password" => "password",
+         "var.input.tcp.port" => 5606,
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/index_pattern/cef.json b/logstash-core/spec/modules_test_files/cef/kibana/index_pattern/cef.json
+new file mode 100644
+index 00000000000..877187ca6cc
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/index_pattern/cef.json
+@@ -0,0 +1 @@
++{"title":"cef-*","timeFieldName":"deviceReceiptTime","notExpandable":true,"fieldFormatMap": "{\"bytesIn\":{\"id\":\"bytes\"},\"bytesOut\":{\"id\":\"bytes\"},\"totalBytes\":{\"id\":\"bytes\"}}","fields":"[  {\"name\":\"flexDate1\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"fileName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString3Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"modelConfidence\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categoryObject\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"oldFileSize\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"type\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceLongitude\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceSeverity\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"source.country_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceServiceName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"device.region_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categoryOutcome\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"applicationProtocol\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString2Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceProcessId\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"deviceAction\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categoryBehavior\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"locality\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"priority\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomFloatingPoint1\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"relevance\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"oldFileModificationTime\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"deviceCustomFloatingPoint2\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"tags\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destination.location\",\"type\":\"geo_point\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceAssetId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomFloatingPoint3\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"sourceTranslatedAddress\",\"type\":\"ip\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomFloatingPoint4\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"fileCreateTime\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"device.location\",\"type\":\"geo_point\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"_source\",\"type\":\"_source\",\"count\":0,\"scripted\":false,\"indexed\":false,\"analyzed\":false,\"doc_values\":false,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"deviceFacility\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceUserId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationProcessName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomNumber1\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceDirection\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"source.region_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomNumber3\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomNumber2\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationPort\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"source.city_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceLatitude\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"device.country_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceHostName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"agentType\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationProcessId\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"destinationTimeZone\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString6Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomNumber2Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceOutboundInterface\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceAddress\",\"type\":\"ip\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString5Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destination.region_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"requestUrl\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"transportProtocol\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceProcessName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"startTime\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceProduct\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceProcessId\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"deviceCustomNumber1Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categoryDeviceType\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"bytesOut\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationDnsDomain\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceAddress\",\"type\":\"ip\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationServiceName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceTranslatedPort\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString1\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString3\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString2\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationHostName\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString5\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"flexNumber1\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"devicePayloadId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString4\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"oldFileCreateTime\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"deviceCustomString6\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceEventCategory\",\"type\":\"string\",\"count\":3,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"flexNumber2\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"@timestamp\",\"type\":\"date\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"fileModificationTime\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"destinationTranslatedAddress\",\"type\":\"ip\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categoryDeviceGroup\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"endTime\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destination.city_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationMacAddress\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourcePort\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationAddress\",\"type\":\"ip\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceReceiptTime\",\"type\":\"date\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationTranslatedZoneURI\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomDate2Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categoryTupleDescription\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationTranslatedPort\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceTranslatedAddress\",\"type\":\"ip\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"sourceTranslatedZoneURI\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceInboundInterface\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"source.location\",\"type\":\"geo_point\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"host\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"agentReceiptTime\",\"type\":\"date\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomDate1Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationLatitude\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceHostName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"eventId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"agentAddress\",\"type\":\"ip\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceDnsDomain\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomDate2\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"deviceCustomDate1\",\"type\":\"date\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categorySignificance\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceEventClassId\",\"type\":\"string\",\"count\":3,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"port\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"fileSize\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"name\",\"type\":\"string\",\"count\":3,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"cefVersion\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationNTDomain\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"agentId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"baseEventCount\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceVendor\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"categoryTechnique\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"agentTimeZone\",\"type\":\"string\",\"count\":2,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"managerReceiptTime\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"customerURI\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceExternalId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationUserName\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationAssetId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"@version\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"agentHost\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationUserId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"bytesIn\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"severity\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomNumber3Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceUserName\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"filePath\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"externalId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString1Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceVersion\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"message\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationLongitude\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destination.country_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"device.city_name\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceCustomString4Label\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"agentVersion\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"fileType\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"destinationUserPrivileges\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"fileId\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"originator\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"deviceNtDomain\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceNtDomain\",\"type\":\"string\",\"count\":1,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"sourceProcessName\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"requestMethod\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"amac\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"dvcmac\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":true,\"analyzed\":false,\"doc_values\":true,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"_id\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":false,\"analyzed\":false,\"doc_values\":false,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"_type\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":false,\"analyzed\":false,\"doc_values\":false,\"searchable\":true,\"aggregatable\":true},  {\"name\":\"_index\",\"type\":\"string\",\"count\":0,\"scripted\":false,\"indexed\":false,\"analyzed\":false,\"doc_values\":false,\"searchable\":false,\"aggregatable\":false},  {\"name\":\"_score\",\"type\":\"number\",\"count\":0,\"scripted\":false,\"indexed\":false,\"analyzed\":false,\"doc_values\":false,\"searchable\":false,\"aggregatable\":false}]"}

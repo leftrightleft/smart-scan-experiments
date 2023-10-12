@@ -1,0 +1,160 @@
+diff --git a/docker/Makefile b/docker/Makefile
+index db07dac5b7c..673043f8b4e 100644
+--- a/docker/Makefile
++++ b/docker/Makefile
+@@ -12,7 +12,7 @@ else
+   VERSION_TAG := $(ELASTIC_VERSION)
+ endif
+ 
+-IMAGE_FLAVORS ?= oss full ubi7
++IMAGE_FLAVORS ?= oss full
+ DEFAULT_IMAGE_FLAVOR ?= full
+ 
+ IMAGE_TAG := $(ELASTIC_REGISTRY)/logstash/logstash
+@@ -20,7 +20,7 @@ HTTPD ?= logstash-docker-artifact-server
+ 
+ FIGLET := pyfiglet -w 160 -f puffy
+ 
+-all: build-from-local-artifacts build-from-local-oss-artifacts build-from-local-ubi7-artifacts public-dockerfiles
++all: build-from-local-artifacts build-from-local-oss-artifacts public-dockerfiles
+ 
+ lint: venv
+ 	flake8 tests
+@@ -48,16 +48,6 @@ build-from-local-oss-artifacts: venv dockerfile env2yaml
+ 	  (docker kill $(HTTPD); false);
+ 	-docker kill $(HTTPD)
+ 
+-build-from-local-ubi7-artifacts: venv dockerfile env2yaml
+-	docker run --rm -d --name=$(HTTPD) \
+-	           -p 8000:8000 --expose=8000 -v $(ARTIFACTS_DIR):/mnt \
+-	           python:3 bash -c 'cd /mnt && python3 -m http.server'
+-	timeout 120 bash -c 'until curl -s localhost:8000 > /dev/null; do sleep 1; done'
+-	pyfiglet -f puffy -w 160 "Building: ubi7"; \
+-	docker build --network=host -t $(IMAGE_TAG)-ubi7:$(VERSION_TAG) -f $(ARTIFACTS_DIR)/Dockerfile-ubi7 data/logstash || \
+-	  (docker kill $(HTTPD); false);
+-	-docker kill $(HTTPD)
+-
+ COPY_FILES = $(ARTIFACTS_DIR)/docker/config/pipelines.yml $(ARTIFACTS_DIR)/docker/config/logstash-oss.yml $(ARTIFACTS_DIR)/docker/config/logstash-full.yml $(ARTIFACTS_DIR)/docker/config/log4j2.properties $(ARTIFACTS_DIR)/docker/pipeline/default.conf $(ARTIFACTS_DIR)/docker/bin/docker-entrypoint $(ARTIFACTS_DIR)/docker/env2yaml/env2yaml
+ 
+ $(ARTIFACTS_DIR)/docker/config/pipelines.yml: data/logstash/config/pipelines.yml
+@@ -93,18 +83,9 @@ public-dockerfiles: venv templates/Dockerfile.j2 docker_paths $(COPY_FILES)
+ 	  -D local_artifacts='false' \
+ 	  -D release='$(RELEASE)' \
+ 	  templates/Dockerfile.j2 > $(ARTIFACTS_DIR)/Dockerfile-oss && \
+-	jinja2 \
+-	  -D elastic_version='$(ELASTIC_VERSION)' \
+-	  -D version_tag='$(VERSION_TAG)' \
+-	  -D image_flavor='ubi7' \
+-	  -D local_artifacts='false' \
+-	  -D release='$(RELEASE)' \
+-	  templates/Dockerfile.j2 > $(ARTIFACTS_DIR)/Dockerfile-ubi7 && \
+ 	cd $(ARTIFACTS_DIR)/docker && \
+ 	cp $(ARTIFACTS_DIR)/Dockerfile-full Dockerfile && \
+ 	tar -zcf ../logstash-$(VERSION_TAG)-docker-build-context.tar.gz Dockerfile bin config env2yaml pipeline && \
+-	cp $(ARTIFACTS_DIR)/Dockerfile-ubi7 Dockerfile && \
+-	tar -zcf ../logstash-ubi7-$(VERSION_TAG)-docker-build-context.tar.gz Dockerfile bin config env2yaml pipeline && \
+ 	cp $(ARTIFACTS_DIR)/Dockerfile-oss Dockerfile && \
+ 	tar -zcf ../logstash-oss-$(VERSION_TAG)-docker-build-context.tar.gz Dockerfile bin config env2yaml pipeline
+ 
+diff --git a/docker/templates/Dockerfile.j2 b/docker/templates/Dockerfile.j2
+index 48cb1b44574..44e782d2e2e 100644
+--- a/docker/templates/Dockerfile.j2
++++ b/docker/templates/Dockerfile.j2
+@@ -11,21 +11,13 @@
+   {% set tarball = 'logstash-%s.tar.gz' % elastic_version -%}
+ {% endif -%}
+ 
+-{% if image_flavor == 'ubi7' -%}
+-  {% set base_image = 'registry.access.redhat.com/ubi7/ubi-minimal:7.7' -%}
+-  {% set package_manager = 'microdnf'  -%}
+-{% else -%}
+-  {% set base_image = 'centos:7'  -%}
+-  {% set package_manager = 'yum' -%}
+-{% endif -%}
+-
+ 
+-FROM {{ base_image }}
++FROM centos:7
+ 
+ # Install Java and the "which" command, which is needed by Logstash's shell
+ # scripts.
+-RUN {{ package_manager }} update -y && {{ package_manager }} install -y java-11-openjdk-devel which && \
+-    {{ package_manager }} clean all
++RUN yum update -y && yum install -y java-11-openjdk-devel which && \
++    yum clean all
+ 
+ # Provide a non-root user to run the process.
+ RUN groupadd --gid 1000 logstash && \
+@@ -51,11 +43,7 @@ ENV PATH=/usr/share/logstash/bin:$PATH
+ # Provide a minimal configuration, so that simple invocations will provide
+ # a good experience.
+ ADD config/pipelines.yml config/pipelines.yml
+-{% if image_flavor == 'oss' -%}
+-ADD config/logstash-oss.yml config/logstash.yml
+-{% else -%}
+-ADD config/logstash-full.yml config/logstash.yml
+-{% endif -%}
++ADD config/logstash-{{ image_flavor }}.yml config/logstash.yml
+ ADD config/log4j2.properties config/
+ ADD pipeline/default.conf pipeline/logstash.conf
+ RUN chown --recursive logstash:root config/ pipeline/
+diff --git a/rakelib/artifacts.rake b/rakelib/artifacts.rake
+index eba15c3ad48..46e32ad9cdb 100644
+--- a/rakelib/artifacts.rake
++++ b/rakelib/artifacts.rake
+@@ -181,22 +181,16 @@ namespace "artifact" do
+   desc "Build docker image"
+   task "docker" => ["prepare", "generate_build_metadata", "tar"] do
+     puts("[docker] Building docker image")
+-    build_docker
++    build_docker(false)
+   end
+ 
+   desc "Build OSS docker image"
+   task "docker_oss" => ["prepare", "generate_build_metadata", "tar_oss"] do
+     puts("[docker_oss] Building OSS docker image")
+-    build_docker('oss')
++    build_docker(true)
+   end
+ 
+-  desc "Build UBI7 docker image"
+-  task "docker_ubi7" => ["prepare", "generate_build_metadata", "tar"] do
+-    puts("[docker_ubi7] Building UBI docker image")
+-    build_docker('ubi7')
+-  end
+-
+-  desc "Generate Dockerfile for default, ubi7 and oss images"
++  desc "Generate Dockerfile for default and oss images"
+   task "dockerfiles" => ["prepare", "generate_build_metadata"] do
+     puts("[dockerfiles] Building Dockerfiles")
+     build_dockerfiles
+@@ -216,7 +210,6 @@ namespace "artifact" do
+     unless ENV['SKIP_DOCKER'] == "1"
+       Rake::Task["artifact:docker"].invoke
+       Rake::Task["artifact:docker_oss"].invoke
+-      Rake::Task["artifact:docker_ubi7"].invoke
+       Rake::Task["artifact:dockerfiles"].invoke
+     end
+   end
+@@ -545,15 +538,18 @@ namespace "artifact" do
+     end
+   end # def package
+ 
+-  def build_docker(image = nil)
++  def build_docker(oss = false)
+     env = {
+       "ARTIFACTS_DIR" => ::File.join(Dir.pwd, "build"),
+       "RELEASE" => ENV["RELEASE"],
+       "VERSION_QUALIFIER" => VERSION_QUALIFIER
+     }
+     Dir.chdir("docker") do |dir|
+-      make_job = image.nil? ?  "make build-from-local-artifacts"  : "make build-from-local-#{image}-artifacts"
+-      system(env, make_job)
++      if oss
++        system(env, "make build-from-local-oss-artifacts")
++      else
++        system(env, "make build-from-local-artifacts")
++      end
+     end
+   end
+ 

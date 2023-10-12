@@ -1,0 +1,167 @@
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java b/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
+index 3cdd1d35716..4222a0c80fb 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
+@@ -7,6 +7,7 @@
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.stream.Collectors;
++import java.util.stream.Stream;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ import org.jruby.RubyHash;
+@@ -247,14 +248,14 @@ private Dataset compile() {
+          * Build a {@link Dataset} representing the {@link JrubyEventExtLibrary.RubyEvent}s after
+          * the application of the given filter.
+          * @param vertex Vertex of the filter to create this {@link Dataset} for
+-         * @param datasets All the datasets that pass through this filter
++         * @param datasets All the datasets that have children passing into this filter
+          * @return Filter {@link Dataset}
+          */
+         private Dataset filterDataset(final Vertex vertex, final Collection<Dataset> datasets) {
+             return plugins.computeIfAbsent(
+                 vertex.getId(), v -> {
+                     final ComputeStepSyntaxElement<Dataset> prepared =
+-                        DatasetCompiler.filterDataset(datasets, filters.get(v));
++                        DatasetCompiler.filterDataset(flatten(datasets, vertex), filters.get(v));
+                     LOGGER.debug("Compiled filter\n {} \n into \n {}", vertex, prepared);
+                     return prepared.instantiate();
+                 }
+@@ -265,7 +266,7 @@ private Dataset filterDataset(final Vertex vertex, final Collection<Dataset> dat
+          * Build a {@link Dataset} representing the {@link JrubyEventExtLibrary.RubyEvent}s after
+          * the application of the given output.
+          * @param vertex Vertex of the output to create this {@link Dataset} for
+-         * @param datasets All the datasets that are passed into this output
++         * @param datasets All the datasets that have children passing into this output
+          * @return Output {@link Dataset}
+          */
+         private Dataset outputDataset(final Vertex vertex, final Collection<Dataset> datasets) {
+@@ -273,7 +274,7 @@ private Dataset outputDataset(final Vertex vertex, final Collection<Dataset> dat
+                 vertex.getId(), v -> {
+                     final ComputeStepSyntaxElement<Dataset> prepared =
+                         DatasetCompiler.outputDataset(
+-                            datasets, outputs.get(v), outputs.size() == 1
++                            flatten(datasets, vertex), outputs.get(v), outputs.size() == 1
+                         );
+                     LOGGER.debug("Compiled output\n {} \n into \n {}", vertex, prepared);
+                     return prepared.instantiate();
+@@ -284,7 +285,7 @@ private Dataset outputDataset(final Vertex vertex, final Collection<Dataset> dat
+         /**
+          * Split the given {@link Dataset}s and return the dataset half of their elements that contains
+          * the {@link JrubyEventExtLibrary.RubyEvent} that fulfil the given {@link EventCondition}.
+-         * @param datasets Datasets to split
++         * @param datasets Datasets that are the parents of the datasets to split
+          * @param condition Condition that must be fulfilled
+          * @param vertex Vertex id to cache the resulting {@link Dataset} under
+          * @return The half of the datasets contents that fulfils the condition
+@@ -294,7 +295,7 @@ private SplitDataset split(final Collection<Dataset> datasets,
+             return iffs.computeIfAbsent(
+                 vertex.getId(), v -> {
+                     final ComputeStepSyntaxElement<SplitDataset> prepared =
+-                        DatasetCompiler.splitDataset(datasets, condition);
++                        DatasetCompiler.splitDataset(flatten(datasets, vertex), condition);
+                     LOGGER.debug(
+                         "Compiled conditional\n {} \n into \n {}", vertex, prepared
+                     );
+@@ -314,11 +315,10 @@ private SplitDataset split(final Collection<Dataset> datasets,
+          */
+         private Collection<Dataset> flatten(final Collection<Dataset> datasets,
+             final Vertex start) {
+-            final Collection<Vertex> dependencies = start.incomingVertices()
+-                .filter(v -> isFilter(v) || isOutput(v) || v instanceof IfVertex)
+-                .collect(Collectors.toList());
+-            return dependencies.isEmpty() ? datasets
+-                : compileDependencies(start, datasets, dependencies);
++            final Collection<Dataset> result = compileDependencies(start, datasets,
++                start.incomingVertices().filter(v -> isFilter(v) || isOutput(v) || v instanceof IfVertex)
++            );
++            return result.isEmpty() ? datasets : result;
+         }
+ 
+         /**
+@@ -329,26 +329,25 @@ private Collection<Dataset> flatten(final Collection<Dataset> datasets,
+          * @return Datasets compiled from vertex children
+          */
+         private Collection<Dataset> compileDependencies(final Vertex start,
+-            final Collection<Dataset> datasets, final Collection<Vertex> dependencies) {
+-            return dependencies.stream().map(
++            final Collection<Dataset> datasets, final Stream<Vertex> dependencies) {
++            return dependencies.map(
+                 dependency -> {
+-                    final Collection<Dataset> transientDependencies = flatten(datasets, dependency);
+                     if (isFilter(dependency)) {
+-                        return filterDataset(dependency, transientDependencies);
++                        return filterDataset(dependency, datasets);
+                     } else if (isOutput(dependency)) {
+-                        return outputDataset(dependency, transientDependencies);
++                        return outputDataset(dependency, datasets);
+                     } else {
+                         // We know that it's an if vertex since the the input children are either
+                         // output, filter or if in type.
+                         final IfVertex ifvert = (IfVertex) dependency;
+                         final SplitDataset ifDataset = split(
+-                            transientDependencies,
++                            datasets,
+                             EventCondition.Compiler.buildCondition(ifvert.getBooleanExpression()),
+                             dependency
+                         );
+                         // It is important that we double check that we are actually dealing with the
+                         // positive/left branch of the if condition
+-                        if (ifvert.getOutgoingBooleanEdgesByType(true).stream()
++                        if (ifvert.outgoingBooleanEdgesByType(true)
+                             .anyMatch(edge -> Objects.equals(edge.getTo(), start))) {
+                             return ifDataset;
+                         } else {
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/graph/IfVertex.java b/logstash-core/src/main/java/org/logstash/config/ir/graph/IfVertex.java
+index 85f9db89001..8636b1a99af 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/graph/IfVertex.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/graph/IfVertex.java
+@@ -1,13 +1,12 @@
+ package org.logstash.config.ir.graph;
+ 
+-import org.logstash.config.ir.SourceComponent;
+-import org.logstash.common.SourceWithMetadata;
+-import org.logstash.config.ir.expression.BooleanExpression;
+-
+ import java.util.Collection;
+ import java.util.LinkedList;
+ import java.util.List;
+-import java.util.stream.Collectors;
++import java.util.stream.Stream;
++import org.logstash.common.SourceWithMetadata;
++import org.logstash.config.ir.SourceComponent;
++import org.logstash.config.ir.expression.BooleanExpression;
+ 
+ /**
+  * Created by andrewvc on 9/15/16.
+@@ -61,13 +60,8 @@ public boolean acceptsOutgoingEdge(Edge e) {
+         return (e instanceof BooleanEdge);
+     }
+ 
+-    public Collection<BooleanEdge> getOutgoingBooleanEdges() {
+-        // Wish there was a way to do this as a java a cast without an operation
+-        return getOutgoingEdges().stream().map(e -> (BooleanEdge) e).collect(Collectors.toList());
+-    }
+-
+-    public Collection<BooleanEdge> getOutgoingBooleanEdgesByType(boolean edgeType) {
+-        return getOutgoingBooleanEdges().stream().filter(e -> e.getEdgeType() == edgeType).collect(Collectors.toList());
++    public Stream<BooleanEdge> outgoingBooleanEdgesByType(boolean edgeType) {
++        return outgoingEdges().map(e -> (BooleanEdge) e).filter(e -> e.getEdgeType() == edgeType);
+     }
+ 
+     // The easiest readable version of this for a human.
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/graph/IfVertexTest.java b/logstash-core/src/test/java/org/logstash/config/ir/graph/IfVertexTest.java
+index b337a144690..043248f9574 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/graph/IfVertexTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/graph/IfVertexTest.java
+@@ -53,8 +53,8 @@ public void testEdgeTypeHandling() throws InvalidIRException {
+         assertThat(ifV.getUnusedOutgoingEdgeFactories().isEmpty(), is(true));
+ 
+ 
+-        BooleanEdge trueEdge = ifV.getOutgoingBooleanEdgesByType(true).stream().findAny().get();
+-        BooleanEdge falseEdge = ifV.getOutgoingBooleanEdgesByType(false).stream().findAny().get();
++        BooleanEdge trueEdge = ifV.outgoingBooleanEdgesByType(true).findAny().get();
++        BooleanEdge falseEdge = ifV.outgoingBooleanEdgesByType(false).findAny().get();
+         assertThat(trueEdge.getEdgeType(), is(true));
+         assertThat(falseEdge.getEdgeType(), is(false));
+     }

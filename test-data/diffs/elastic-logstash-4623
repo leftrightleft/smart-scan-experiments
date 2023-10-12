@@ -1,0 +1,94 @@
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index d2cbaf191ea..d29206aa20f 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -72,8 +72,6 @@ def initialize(config_str, settings = {})
+     @ready = Concurrent::AtomicBoolean.new(false)
+     @running = Concurrent::AtomicBoolean.new(false)
+     @flushing = Concurrent::AtomicReference.new(false)
+-
+-    start_flusher
+   end # def initialize
+ 
+   def ready?
+@@ -130,9 +128,10 @@ def run
+     # Block until all inputs have stopped
+     # Generally this happens if SIGINT is sent and `shutdown` is called from an external thread
+ 
+-    @running.make_true
++    transition_to_running
++    start_flusher # Launches a non-blocking thread for flush events
+     wait_inputs
+-    @running.make_false
++    transition_to_stopped
+ 
+     @logger.info("Input plugins stopped! Will shutdown filter/output workers.")
+ 
+@@ -146,6 +145,22 @@ def run
+     return 0
+   end # def run
+ 
++  def transition_to_running
++    @running.make_true
++  end
++
++  def transition_to_stopped
++    @running.make_false
++  end
++
++  def running?
++    @running.true?
++  end
++
++  def stopped?
++    @running.false?
++  end
++
+   def start_workers
+     @inflight_batches = {}
+ 
+@@ -415,10 +430,13 @@ def flush_filters(options = {}, &block)
+   end
+ 
+   def start_flusher
++    # Invariant to help detect improper initialization
++    raise "Attempted to start flusher on a stopped pipeline!" if stopped?
++
+     @flusher_thread = Thread.new do
+-      while Stud.stoppable_sleep(5, 0.1) { @running.false? }
++      while Stud.stoppable_sleep(5, 0.1) { stopped? }
+         flush
+-        break if @running.false?
++        break if stopped?
+       end
+     end
+   end
+diff --git a/logstash-core/spec/logstash/pipeline_spec.rb b/logstash-core/spec/logstash/pipeline_spec.rb
+index 425a04d5872..5b8000cb390 100644
+--- a/logstash-core/spec/logstash/pipeline_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_spec.rb
+@@ -232,6 +232,24 @@ class TestPipeline < LogStash::Pipeline
+   end
+ 
+   context "compiled flush function" do
++    describe "flusher thread" do
++      before(:each) do
++        allow(LogStash::Plugin).to receive(:lookup).with("input", "dummyinput").and_return(DummyInput)
++        allow(LogStash::Plugin).to receive(:lookup).with("codec", "plain").and_return(DummyCodec)
++        allow(LogStash::Plugin).to receive(:lookup).with("output", "dummyoutput").and_return(DummyOutput)
++      end
++
++      let(:config) { "input { dummyinput {} } output { dummyoutput {} }"}
++
++      it "should start the flusher thread only after the pipeline is running" do
++        pipeline = TestPipeline.new(config)
++
++        expect(pipeline).to receive(:transition_to_running).ordered.and_call_original
++        expect(pipeline).to receive(:start_flusher).ordered.and_call_original
++
++        pipeline.run
++      end
++    end
+ 
+     context "cancelled events should not propagate down the filters" do
+       config <<-CONFIG

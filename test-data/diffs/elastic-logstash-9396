@@ -1,0 +1,235 @@
+diff --git a/logstash-core/lib/logstash/config/modules_common.rb b/logstash-core/lib/logstash/config/modules_common.rb
+index cf637a8ba5c..d94a443b679 100644
+--- a/logstash-core/lib/logstash/config/modules_common.rb
++++ b/logstash-core/lib/logstash/config/modules_common.rb
+@@ -1,7 +1,7 @@
+ # encoding: utf-8
+ require "logstash/util/loggable"
+ require "logstash/elasticsearch_client"
+-require "logstash/modules/kibana_client"
++require "logstash/kibana_client"
+ require "logstash/modules/elasticsearch_importer"
+ require "logstash/modules/kibana_importer"
+ require "logstash/modules/settings_merger"
+@@ -72,7 +72,15 @@ def self.pipeline_configs(settings)
+           # Only import data if it's not a config test and --setup is true
+           if !config_test && modul_setup
+             esclient = LogStash::ElasticsearchClient.build(module_hash)
+-            kbnclient = LogStash::Modules::KibanaClient.new(module_hash)
++
++            kbn_settings_hash = Hash.new
++            module_hash.each do | setting_name, setting_value |
++              setting_name.match("var\.kibana\.(.+)") do | match |
++                kbn_settings_hash[match[1]] = setting_value
++              end
++            end
++            kbnclient = LogStash::KibanaClient.new(module_hash)
++
+             esconnected = esclient.can_connect?
+             kbnconnected = kbnclient.can_connect?
+             if esconnected && kbnconnected
+diff --git a/logstash-core/lib/logstash/modules/kibana_client.rb b/logstash-core/lib/logstash/kibana_client.rb
+similarity index 83%
+rename from logstash-core/lib/logstash/modules/kibana_client.rb
+rename to logstash-core/lib/logstash/kibana_client.rb
+index 896820db19e..c9926bf3ab2 100644
+--- a/logstash-core/lib/logstash/modules/kibana_client.rb
++++ b/logstash-core/lib/logstash/kibana_client.rb
+@@ -4,7 +4,7 @@
+ require "logstash/json"
+ require "manticore"
+ 
+-module LogStash module Modules class KibanaClient
++module LogStash class KibanaClient
+   include LogStash::Util::Loggable
+ 
+   class Response
+@@ -43,24 +43,24 @@ def initialize(settings, client = nil) # allow for test mock injection
+ 
+     # boolean settings may be strings if set through the cli
+     # or booleans if set through the yaml file, so we use .to_s
+-    ssl_enabled = @settings["var.kibana.ssl.enabled"].to_s == "true"
++    ssl_enabled = @settings["ssl.enabled"].to_s == "true"
+     if ssl_enabled
+-      ssl_options[:verify] = @settings.fetch("var.kibana.ssl.verification_mode", "strict").to_sym
+-      ssl_options[:ca_file] = @settings.fetch("var.kibana.ssl.certificate_authority", nil)
+-      ssl_options[:client_cert] = @settings.fetch("var.kibana.ssl.certificate", nil)
+-      ssl_options[:client_key] = @settings.fetch("var.kibana.ssl.key", nil)
++      ssl_options[:verify] = @settings.fetch("ssl.verification_mode", "strict").to_sym
++      ssl_options[:ca_file] = @settings.fetch("ssl.certificate_authority", nil)
++      ssl_options[:client_cert] = @settings.fetch("ssl.certificate", nil)
++      ssl_options[:client_key] = @settings.fetch("ssl.key", nil)
+     end
+ 
+     client_options[:ssl] = ssl_options
+ 
+-    @host = @settings.fetch("var.kibana.host", "localhost:5601")
++    @host = @settings.fetch("host", "localhost:5601")
+     implicit_scheme, colon_slash_slash, host = @host.partition("://")
+-    explicit_scheme = @settings["var.kibana.scheme"]
++    explicit_scheme = @settings["scheme"]
+     @scheme = "http"
+     if !colon_slash_slash.empty?
+       if !explicit_scheme.nil? && implicit_scheme != explicit_scheme
+         # both are set and not the same - error
+-        msg = sprintf("Detected differing Kibana host schemes as sourced from var.kibana.host: '%s' and var.kibana.scheme: '%s'", implicit_scheme, explicit_scheme)
++        msg = sprintf("Detected differing Kibana host schemes as sourced from host: '%s' and scheme: '%s'", implicit_scheme, explicit_scheme)
+         raise ArgumentError.new(msg)
+       end
+       @scheme = implicit_scheme
+@@ -82,9 +82,9 @@ def initialize(settings, client = nil) # allow for test mock injection
+ 
+     @client = client || Manticore::Client.new(client_options)
+     @http_options = {:headers => {'Content-Type' => 'application/json'}}
+-    username = @settings["var.kibana.username"]
++    username = @settings["username"]
+     if username
+-      password = @settings["var.kibana.password"]
++      password = @settings["password"]
+       if password.is_a?(LogStash::Util::Password)
+         password = password.value
+       end
+@@ -151,4 +151,4 @@ def safely(method_sym, relative_path, options = {})
+   def full_url(relative)
+     "#{@endpoint}/#{relative}"
+   end
+-end end end
++end end
+diff --git a/logstash-core/spec/logstash/modules/kibana_client_spec.rb b/logstash-core/spec/logstash/kibana_client_spec.rb
+similarity index 78%
+rename from logstash-core/spec/logstash/modules/kibana_client_spec.rb
+rename to logstash-core/spec/logstash/kibana_client_spec.rb
+index 946c2824073..807359e09e4 100644
+--- a/logstash-core/spec/logstash/modules/kibana_client_spec.rb
++++ b/logstash-core/spec/logstash/kibana_client_spec.rb
+@@ -1,7 +1,7 @@
+ # encoding: utf-8
+ require "spec_helper"
+-require "logstash/modules/kibana_client"
+-module LogStash module Modules
++require "logstash/kibana_client"
++module LogStash
+   KibanaTestResponse = Struct.new(:code, :body, :headers)
+   class KibanaTestClient
+     def http(method, endpoint, options)
+@@ -18,9 +18,9 @@ def call
+     subject(:kibana_client) { described_class.new(settings, test_client) }
+ 
+     context "when supplied with conflicting scheme data" do
+-      let(:settings) { {"var.kibana.scheme" => "http", "var.kibana.host" => kibana_host} }
++      let(:settings) { {"scheme" => "http", "host" => kibana_host} }
+       it "a new instance will throw an error" do
+-        expect{described_class.new(settings, test_client)}.to raise_error(ArgumentError, /Detected differing Kibana host schemes as sourced from var\.kibana\.host: 'https' and var\.kibana\.scheme: 'http'/)
++        expect{described_class.new(settings, test_client)}.to raise_error(ArgumentError, /Detected differing Kibana host schemes as sourced from host: 'https' and scheme: 'http'/)
+       end
+     end
+ 
+@@ -28,13 +28,13 @@ def call
+       ["httpd", "ftp", "telnet"].each do |uri_scheme|
+         it "a new instance will throw an error" do
+           re = /Kibana host scheme given is invalid, given value: '#{uri_scheme}' - acceptable values: 'http', 'https'/
+-          expect{described_class.new({"var.kibana.scheme" => uri_scheme}, test_client)}.to raise_error(ArgumentError, re)
++          expect{described_class.new({"scheme" => uri_scheme}, test_client)}.to raise_error(ArgumentError, re)
+         end
+       end
+     end
+ 
+     context "when supplied with the scheme in the host only" do
+-      let(:settings) { {"var.kibana.host" => kibana_host} }
++      let(:settings) { {"host" => kibana_host} }
+       it "has a version and an endpoint" do
+         expect(kibana_client.version).to eq("1.2.3")
+         expect(kibana_client.endpoint).to eq("https://foo.bar:4321")
+@@ -42,7 +42,7 @@ def call
+     end
+ 
+     context "when supplied with the scheme in the scheme setting" do
+-      let(:settings) { {"var.kibana.scheme" => "https", "var.kibana.host" => "foo.bar:4321"} }
++      let(:settings) { {"scheme" => "https", "host" => "foo.bar:4321"} }
+       it "has a version and an endpoint" do
+         expect(kibana_client.version).to eq("1.2.3")
+         expect(kibana_client.endpoint).to eq(kibana_host)
+@@ -50,7 +50,7 @@ def call
+     end
+ 
+     context "when supplied with a no scheme host setting and ssl is enabled" do
+-      let(:settings) { {"var.kibana.ssl.enabled" => "true", "var.kibana.host" => "foo.bar:4321"} }
++      let(:settings) { {"ssl.enabled" => "true", "host" => "foo.bar:4321"} }
+       it "has a version and an endpoint" do
+         expect(kibana_client.version).to eq("1.2.3")
+         expect(kibana_client.endpoint).to eq(kibana_host)
+@@ -60,7 +60,7 @@ def call
+     describe "ssl option handling" do
+       context "when using a string for ssl.enabled" do
+         let(:settings) do
+-          { "var.kibana.ssl.enabled" => "true" }
++          { "ssl.enabled" => "true" }
+         end
+ 
+         it "should set the ssl options" do
+@@ -73,7 +73,7 @@ def call
+ 
+       context "when using a boolean for ssl.enabled" do
+         let(:settings) do
+-          { "var.kibana.ssl.enabled" => true }
++          { "ssl.enabled" => true }
+         end
+ 
+         it "should set the ssl options" do
+@@ -85,4 +85,4 @@ def call
+       end
+     end
+   end
+-end end
++end
+\ No newline at end of file
+diff --git a/logstash-core/spec/logstash/modules/scaffold_spec.rb b/logstash-core/spec/logstash/modules/scaffold_spec.rb
+index a67c3937472..01d08865cd6 100644
+--- a/logstash-core/spec/logstash/modules/scaffold_spec.rb
++++ b/logstash-core/spec/logstash/modules/scaffold_spec.rb
+@@ -2,7 +2,7 @@
+ #
+ require "logstash/namespace"
+ require "logstash/elasticsearch_client"
+-require "logstash/modules/kibana_client"
++require "logstash/kibana_client"
+ require "logstash/modules/kibana_config"
+ require "logstash/modules/scaffold"
+ require "logstash/modules/elasticsearch_importer"
+@@ -197,7 +197,7 @@
+       expect(kbnclient).to receive(:post).twice do |path, content|
+         paths << path
+         contents << content
+-        LogStash::Modules::KibanaClient::Response.new(201, "", {})
++        LogStash::KibanaClient::Response.new(201, "", {})
+       end
+       test_module.with_settings(module_settings)
+       test_module.import(LogStash::Modules::ElasticsearchImporter.new(client), LogStash::Modules::KibanaImporter.new(kbnclient))
+diff --git a/logstash-core/spec/logstash/runner_spec.rb b/logstash-core/spec/logstash/runner_spec.rb
+index 22a9ecb4aa6..5fd72cb9153 100644
+--- a/logstash-core/spec/logstash/runner_spec.rb
++++ b/logstash-core/spec/logstash/runner_spec.rb
+@@ -10,6 +10,7 @@
+ require "logstash/config/modules_common"
+ require "logstash/modules/util"
+ require "logstash/elasticsearch_client"
++require "logstash/kibana_client"
+ require "json"
+ require_relative "../support/helpers"
+ require_relative "../support/matchers"
+@@ -374,13 +375,13 @@
+           allow(kbnclient).to receive(:version_parts).and_return(kbn_version.split('.'))
+           allow(kbnclient).to receive(:can_connect?).and_return(true)
+           allow(LogStash::ElasticsearchClient).to receive(:build).and_return(esclient)
+-          allow(LogStash::Modules::KibanaClient).to receive(:new).and_return(kbnclient)
++          allow(LogStash::KibanaClient).to receive(:new).and_return(kbnclient)
+ 
+           expect(esclient).to receive(:put).once do |path, content|
+             LogStash::ElasticsearchClient::Response.new(201, "", {})
+           end
+           expect(kbnclient).to receive(:post).twice do |path, content|
+-            LogStash::Modules::KibanaClient::Response.new(201, "", {})
++            LogStash::KibanaClient::Response.new(201, "", {})
+           end
+ 
+           expect(LogStash::Agent).to receive(:new) do |settings, source_loader|

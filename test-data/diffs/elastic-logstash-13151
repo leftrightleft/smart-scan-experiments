@@ -1,0 +1,653 @@
+diff --git a/build.gradle b/build.gradle
+index 5dafee69d78..cf8fac22c85 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -26,13 +26,12 @@ buildscript {
+     }
+     dependencies {
+         classpath 'org.yaml:snakeyaml:1.29'
+-        classpath "gradle.plugin.com.github.jk1:gradle-license-report:0.7.1"
+     }
+ }
+ 
+ plugins {
+     id "de.undercouch.download" version "4.0.4"
+-    id "com.dorongold.task-tree" version "1.5"
++    id "com.dorongold.task-tree" version "2.1.0"
+ }
+ 
+ apply plugin: 'de.undercouch.download'
+@@ -41,6 +40,8 @@ apply from: "rubyUtils.gradle"
+ import org.yaml.snakeyaml.Yaml
+ import de.undercouch.gradle.tasks.download.Download
+ import groovy.json.JsonSlurper
++import java.nio.file.Files
++import java.nio.file.Paths
+ 
+ allprojects {
+   group = 'org.logstash'
+@@ -117,15 +118,31 @@ subprojects {
+             url 'https://plugins.gradle.org/m2/'
+         }
+     }
+-    dependencies {
+-        implementation "gradle.plugin.com.github.jk1:gradle-license-report:0.7.1"
+-    }
+ 
+-    apply plugin: 'com.github.jk1.dependency-license-report'
++    tasks.register("generateLicenseReport") {
++        outputs.dir "${buildDir}/reports/dependency-license"
++        doLast {
++            // collect all project's dependencies
++            Set<Dependency> moduleDeps = new HashSet<>()
++            moduleDeps.addAll(project.configurations.implementation.getAllDependencies())
++            moduleDeps.addAll(project.configurations.runtimeClasspath.getAllDependencies())
++            moduleDeps.addAll(project.configurations.runtimeOnly.getAllDependencies())
++
++            def depsInGAV = moduleDeps.collect {dep ->
++                "${dep.group}:${dep.name}:${dep.version}"
++            }
+ 
+-    licenseReport {
+-        renderer = new com.github.jk1.license.render.CsvReportRenderer()
+-        configurations = ['compile', 'runtime']
++            // output in a CSV to be read by dependencies-report tool
++            String reportFolder = "${buildDir}/reports/dependency-license"
++            Files.createDirectories(Paths.get(reportFolder))
++            def licensesFile = new File("${reportFolder}/licenses.csv")
++            licensesFile.withWriter('utf-8') { writer ->
++                writer.writeLine '"artifact","moduleUrl","moduleLicense","moduleLicenseUrl",'
++                depsInGAV.each { s ->
++                    writer.writeLine "\"$s\",,,,"
++                }
++            }
++        }
+     }
+ }
+ 
+@@ -187,20 +204,23 @@ tasks.register("configureArtifactInfo") {
+ 
+ abstract class SignAliasDefinitionsTask extends DefaultTask {
+ 
+-    String registryPath = "logstash-core/src/main/resources/org/logstash/plugins/AliasRegistry.yml"
+-    String hashedFileName = 'plugin_aliases_hashed.yml'
+-
+-    @InputFile
+-    File aliasPath = project.file("${project.projectDir}/${registryPath}")
++    /**
++     * Relative path to the AliasRegistry.yml file to use, relative to project's root
++     * */
++    @Input
++    String registryPath
+ 
++    /**
++     * Full file path to the file containing the marked AliasRegistry file
++     * */
+     @OutputFile
+-    File hashedFile = project.file("${project.buildDir}/${hashedFileName}")
++    File hashedFile
+ 
+     @TaskAction
+     def sign() {
+         String aliases_defs = new File("${project.projectDir}/${registryPath}").text
+         String hash = aliases_defs.digest('SHA-256')
+-        new File(project.buildDir, hashedFileName).withWriter('utf-8') { writer ->
++        hashedFile.withWriter('utf-8') { writer ->
+             writer.writeLine "#CHECKSUM: ${hash}"
+             writer.writeLine "# DON'T EDIT THIS FILE, PLEASE REFER TO ${registryPath}"
+             writer.write aliases_defs
+@@ -210,44 +230,72 @@ abstract class SignAliasDefinitionsTask extends DefaultTask {
+ 
+ tasks.register("markAliasDefinitions", SignAliasDefinitionsTask) {
+     description "Create an hashes aliases file from original aliases yml definition"
++    registryPath = 'logstash-core/src/main/resources/org/logstash/plugins/AliasRegistry.yml'
++    hashedFile = project.file("${project.buildDir}/plugin_aliases_hashed.yml")
+ }
+ 
+ tasks.register("markTestAliasDefinitions", SignAliasDefinitionsTask) {
+     description "Create an hashes aliases file for testing aliases yml definition"
+     registryPath = 'logstash-core/src/test/resources/org/logstash/plugins/AliasRegistry.yml'
+-    hashedFileName = 'plugin_aliases_hashed_test.yml'
++    hashedFile = project.file("${project.buildDir}/plugin_aliases_hashed_test.yml")
+ }
+ 
+ tasks.register("copyPluginAlias", Copy) {
++    description "Copy the marked plugin_aliases.yml file to destination folders"
++    dependsOn = [copyPluginAlias_ruby, copyPluginAlias_java]
++}
++
++tasks.register("copyPluginAlias_ruby", Copy) {
+     description "Copy the marked plugin_aliases.yml file to destination folders"
+     dependsOn "markAliasDefinitions"
+ 
+     inputs.file("${buildDir}/plugin_aliases_hashed.yml")
+-    destinationDir = projectDir
+-    from("${buildDir}/plugin_aliases_hashed.yml") {
+-        into "lib/pluginmanager/"
++
++    from(markAliasDefinitions.hashedFile) {
+         rename "plugin_aliases_hashed.yml", "plugin_aliases.yml"
+     }
+-    from("${buildDir}/plugin_aliases_hashed.yml") {
+-        into "logstash-core/src/main/resources/org/logstash/plugins/"
++    into "lib/pluginmanager/"
++}
++
++tasks.register("copyPluginAlias_java", Copy) {
++    description "Copy the marked plugin_aliases.yml file to destination folders"
++    dependsOn "markAliasDefinitions"
++
++    inputs.file("${buildDir}/plugin_aliases_hashed.yml")
++
++    from(markAliasDefinitions.hashedFile) {
+         rename "plugin_aliases_hashed.yml", "plugin_aliases.yml"
+     }
++    into "logstash-core/src/main/resources/org/logstash/plugins/"
+ }
+ 
+-tasks.register("copyPluginTestAlias", Copy) {
++tasks.register("copyPluginTestAlias") {
+     description "Copy the marked test plugin_aliases.yml file to destination folders"
++    dependsOn = [copyPluginTestAlias_ruby, copyPluginTestAlias_java]
++}
++
++tasks.register("copyPluginTestAlias_ruby", Copy) {
++    description "Copy the marked test plugin_aliases.yml file into Ruby's plugin_manager specs"
+     dependsOn "markTestAliasDefinitions"
+ 
+-    inputs.file("${buildDir}/plugin_aliases_hashed_test.yml")
+-    destinationDir = projectDir
+-    from("${buildDir}/plugin_aliases_hashed_test.yml") {
+-        into "spec/unit/plugin_manager/"
++    inputs.file(markTestAliasDefinitions.hashedFile)
++
++    from(markTestAliasDefinitions.hashedFile) {
+         rename "plugin_aliases_hashed_test.yml", "plugin_aliases.yml"
+     }
+-    from("${buildDir}/plugin_aliases_hashed_test.yml") {
+-        into "logstash-core/src/test/resources/org/logstash/plugins/"
++    into "spec/unit/plugin_manager/"
++}
++
++tasks.register("copyPluginTestAlias_java", Copy) {
++    description "Copy the marked test plugin_aliases.yml file into logstash-core's test resources"
++    dependsOn "markTestAliasDefinitions"
++
++    inputs.file("${buildDir}/plugin_aliases_hashed_test.yml")
++
++    from(markTestAliasDefinitions.hashedFile) {
+         rename "plugin_aliases_hashed_test.yml", "plugin_aliases.yml"
+     }
++    into "logstash-core/src/test/resources/org/logstash/plugins/"
+ }
+ 
+ tasks.findByPath(':logstash-core:processResources').dependsOn(copyPluginAlias)
+@@ -576,11 +624,11 @@ project(":logstash-integration-tests") {
+         systemProperty 'org.logstash.integration.specs', rubyIntegrationSpecs
+         environment "FEATURE_FLAG", System.getenv('FEATURE_FLAG')
+         workingDir integrationTestPwd
+-        dependsOn installIntegrationTestGems
++        dependsOn = [installIntegrationTestGems, copyProductionLog4jConfiguration]
+     }
+ }
+ 
+-tasks.register("runIntegrationTests"){
++tasks.register("runIntegrationTests") {
+     dependsOn tasks.getByPath(":logstash-integration-tests:integrationTests")
+     dependsOn copyEs
+     dependsOn copyFilebeat
+@@ -609,22 +657,24 @@ tasks.register("generateLicenseReport", JavaExec) {
+ tasks.register("generateLicenseReportInputs") {
+     dependsOn subprojects.generateLicenseReport
+ 
+-    // write location of all license reports for subprojects containing artifacts that are distributed to single file
+-    StringBuilder licenseReportFolders = new StringBuilder()
+-    subprojects.findAll { s1 -> !s1.hasProperty("isDistributedArtifact") || s1.property("isDistributedArtifact") == 'true'}.each { s ->
+-        s.tasks.findAll { t2 -> t2.getName() == "generateLicenseReport" }.each { t3 ->
+-            licenseReportFolders.append(t3.outputs.files.asPath + "\n")
++    doLast {
++        // write location of all license reports for subprojects containing artifacts that are distributed to single file
++        StringBuilder licenseReportFolders = new StringBuilder()
++        subprojects.findAll { s1 -> !s1.hasProperty("isDistributedArtifact") || s1.property("isDistributedArtifact") == 'true' }.each { s ->
++            s.tasks.findAll { t2 -> t2.getName() == "generateLicenseReport" }.each { t3 ->
++                licenseReportFolders.append(t3.outputs.files.asPath + "\n")
++            }
+         }
+-    }
+ 
+-    if (gradle.startParameter.taskNames.contains("generateLicenseReport")) {
+-        def licenseReportPath = project.getBuildDir().toString() + "/licenseReportFolders.txt"
+-        def licenseReportFolder = new File(licenseReportPath)
+-        licenseReportFolder.delete()
+-        licenseReportFolder = new File(licenseReportPath)
+-        licenseReportFolder.createNewFile()
+-        if (licenseReportFolder.canWrite()) {
+-            licenseReportFolder.text = licenseReportFolders.toString()
++        if (gradle.startParameter.taskNames.contains("generateLicenseReport")) {
++            def licenseReportPath = project.getBuildDir().toString() + "/licenseReportFolders.txt"
++            def licenseReportFolder = new File(licenseReportPath)
++            licenseReportFolder.delete()
++            licenseReportFolder = new File(licenseReportPath)
++            licenseReportFolder.createNewFile()
++            if (licenseReportFolder.canWrite()) {
++                licenseReportFolder.text = licenseReportFolders.toString()
++            }
+         }
+     }
+ }
+diff --git a/gradle/wrapper/gradle-wrapper.properties b/gradle/wrapper/gradle-wrapper.properties
+index bb8b2fc26b2..05679dc3c18 100644
+--- a/gradle/wrapper/gradle-wrapper.properties
++++ b/gradle/wrapper/gradle-wrapper.properties
+@@ -1,5 +1,5 @@
+ distributionBase=GRADLE_USER_HOME
+ distributionPath=wrapper/dists
+-distributionUrl=https\://services.gradle.org/distributions/gradle-6.5.1-bin.zip
++distributionUrl=https\://services.gradle.org/distributions/gradle-7.1.1-bin.zip
+ zipStoreBase=GRADLE_USER_HOME
+ zipStorePath=wrapper/dists
+diff --git a/logstash-core/benchmarks/build.gradle b/logstash-core/benchmarks/build.gradle
+index 0a9e884b3e1..884a601b128 100644
+--- a/logstash-core/benchmarks/build.gradle
++++ b/logstash-core/benchmarks/build.gradle
+@@ -28,17 +28,16 @@ String jrubyVersion = versionMap['jruby']['version']
+ 
+ repositories {
+   mavenCentral()
+-  jcenter()
+ }
+ 
+ buildscript {
+   repositories {
+     mavenCentral()
+-    jcenter()
++    gradlePluginPortal()
+   }
+   dependencies {
+     classpath 'org.yaml:snakeyaml:1.29'
+-    classpath 'com.github.jengelman.gradle.plugins:shadow:4.0.4'
++    classpath 'gradle.plugin.com.github.jengelman.gradle.plugins:shadow:7.0.0'
+   }
+ }
+ 
+diff --git a/qa/integration/build.gradle b/qa/integration/build.gradle
+index fc94f05be91..91c29d757a7 100644
+--- a/qa/integration/build.gradle
++++ b/qa/integration/build.gradle
+@@ -61,7 +61,7 @@ clean {
+ }
+ 
+ tasks.register("integrationTests", Test) {
+-  dependsOn "copyProductionLog4jConfiguration"
++  dependsOn copyProductionLog4jConfiguration
+ 
+   inputs.files fileTree("${projectDir}/services")
+   inputs.files fileTree("${projectDir}/framework")
+diff --git a/tools/benchmark-cli/build.gradle b/tools/benchmark-cli/build.gradle
+index 0b342706820..7a40357ad73 100644
+--- a/tools/benchmark-cli/build.gradle
++++ b/tools/benchmark-cli/build.gradle
+@@ -29,17 +29,19 @@ String jacksonDatabindVersion = versionMap['jackson-databind']
+ 
+ repositories {
+   mavenCentral()
+-  jcenter()
++//  jcenter()
+ }
+ 
+ buildscript {
+   repositories {
+     mavenCentral()
+-    jcenter()
++//    jcenter()
++    gradlePluginPortal()
+   }
+   dependencies {
+     classpath 'org.yaml:snakeyaml:1.29'
+-    classpath 'com.github.jengelman.gradle.plugins:shadow:4.0.4'
++//    classpath 'com.github.jengelman.gradle.plugins:shadow:4.0.4'
++    classpath 'gradle.plugin.com.github.jengelman.gradle.plugins:shadow:7.0.0'
+   }
+ }
+ 
+diff --git a/tools/dependencies-report/build.gradle b/tools/dependencies-report/build.gradle
+index 5ca847709f2..5e4d8aec951 100644
+--- a/tools/dependencies-report/build.gradle
++++ b/tools/dependencies-report/build.gradle
+@@ -28,17 +28,16 @@ String jacksonVersion = versionMap['jackson']
+ 
+ repositories {
+   mavenCentral()
+-  jcenter()
+ }
+ 
+ buildscript {
+   repositories {
+     mavenCentral()
+-    jcenter()
++    gradlePluginPortal()
+   }
+   dependencies {
+     classpath 'org.yaml:snakeyaml:1.29'
+-    classpath 'com.github.jengelman.gradle.plugins:shadow:4.0.4'
++    classpath 'gradle.plugin.com.github.jengelman.gradle.plugins:shadow:7.0.0'
+   }
+ }
+ 
+diff --git a/tools/dependencies-report/src/main/resources/licenseMapping.csv b/tools/dependencies-report/src/main/resources/licenseMapping.csv
+index e58f7862f98..10a7b1252a9 100644
+--- a/tools/dependencies-report/src/main/resources/licenseMapping.csv
++++ b/tools/dependencies-report/src/main/resources/licenseMapping.csv
+@@ -23,6 +23,7 @@ dependency,dependencyUrl,licenseOverride,copyright,sourceURL
+ "com.fasterxml.jackson.core:jackson-databind:",https://github.com/FasterXML/jackson-databind,Apache-2.0
+ "com.fasterxml.jackson.core:jackson-core:",https://github.com/FasterXML/jackson-core,Apache-2.0
+ "com.fasterxml.jackson.dataformat:jackson-dataformat-cbor:",https://github.com/FasterXML/jackson-dataformats-binary,Apache-2.0
++"com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:",https://github.com/FasterXML/jackson-dataformats-binary,Apache-2.0
+ "com.fasterxml.jackson.module:jackson-module-afterburner:",https://github.com/FasterXML/jackson-modules-base,Apache-2.0
+ "com.google.code.findbugs:jsr305:",http://findbugs.sourceforge.net,Apache-2.0
+ "com.google.errorprone:error_prone_annotations:",https://github.com/google/error-prone,Apache-2.0
+@@ -95,8 +96,10 @@ dependency,dependencyUrl,licenseOverride,copyright,sourceURL
+ "nio4r:","https://github.com/socketry/nio4r",MIT
+ "nokogiri:","http://nokogiri.org/",MIT
+ "openssl_pkcs8_pure:",http://github.com/cielavenir/openssl_pkcs8_pure,Ruby
++"org.apache.logging.log4j:log4j-1.2-api:",https://logging.apache.org/log4j/2.x/index.html,Apache-2.0
+ "org.apache.logging.log4j:log4j-api:",https://logging.apache.org/log4j/2.x/index.html,Apache-2.0
+ "org.apache.logging.log4j:log4j-core:",https://logging.apache.org/log4j/2.x/index.html,Apache-2.0
++"org.apache.logging.log4j:log4j-jcl:",https://logging.apache.org/log4j/2.x/index.html,Apache-2.0
+ "org.apache.logging.log4j:log4j-slf4j-impl:",https://logging.apache.org/log4j/2.x/index.html,Apache-2.0
+ "org.codehaus.janino:commons-compiler:",https://github.com/janino-compiler/janino,BSD-3-Clause
+ "org.codehaus.janino:janino:",https://github.com/janino-compiler/janino,BSD-3-Clause
+diff --git a/tools/dependencies-report/src/main/resources/notices/com.fasterxml.jackson.dataformat!jackson-dataformat-yaml-NOTICE.txt b/tools/dependencies-report/src/main/resources/notices/com.fasterxml.jackson.dataformat!jackson-dataformat-yaml-NOTICE.txt
+new file mode 100644
+index 00000000000..b078e964352
+--- /dev/null
++++ b/tools/dependencies-report/src/main/resources/notices/com.fasterxml.jackson.dataformat!jackson-dataformat-yaml-NOTICE.txt
+@@ -0,0 +1,211 @@
++This copy of Jackson JSON processor databind module is licensed under the
++Apache (Software) License, version 2.0 ("the License").
++See the License for details about distribution rights, and the
++specific rights regarding derivate works.
++
++You may obtain a copy of the License at:
++
++http://www.apache.org/licenses/LICENSE-2.0
++
++
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
++
++   APPENDIX: How to apply the Apache License to your work.
++
++      To apply the Apache License to your work, attach the following
++      boilerplate notice, with the fields enclosed by brackets "[]"
++      replaced with your own identifying information. (Don't include
++      the brackets!)  The text should be enclosed in the appropriate
++      comment syntax for the file format. We also recommend that a
++      file or class name and description of purpose be included on the
++      same "printed page" as the copyright notice for easier
++      identification within third-party archives.
++
++   Copyright [yyyy] [name of copyright owner]
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
+\ No newline at end of file
+diff --git a/tools/dependencies-report/src/main/resources/notices/org.apache.logging.log4j!log4j-1.2-api-NOTICE.txt b/tools/dependencies-report/src/main/resources/notices/org.apache.logging.log4j!log4j-1.2-api-NOTICE.txt
+new file mode 100644
+index 00000000000..4ef04743a60
+--- /dev/null
++++ b/tools/dependencies-report/src/main/resources/notices/org.apache.logging.log4j!log4j-1.2-api-NOTICE.txt
+@@ -0,0 +1,19 @@
++source: https://github.com/apache/logging-log4j2/blob/rel/2.14.0/NOTICE.txt
++
++Apache Log4j
++Copyright 1999-2017 Apache Software Foundation
++
++This product includes software developed at
++The Apache Software Foundation (http://www.apache.org/).
++
++ResolverUtil.java
++Copyright 2005-2006 Tim Fennell
++
++Dumbster SMTP test server
++Copyright 2004 Jason Paul Kitchen
++
++TypeUtil.java
++Copyright 2002-2012 Ramnivas Laddad, Juergen Hoeller, Chris Beams
++
++picocli (http://picocli.info)
++Copyright 2017 Remko Popma
+\ No newline at end of file
+diff --git a/tools/dependencies-report/src/main/resources/notices/org.apache.logging.log4j!log4j-jcl-NOTICE.txt b/tools/dependencies-report/src/main/resources/notices/org.apache.logging.log4j!log4j-jcl-NOTICE.txt
+new file mode 100644
+index 00000000000..4ef04743a60
+--- /dev/null
++++ b/tools/dependencies-report/src/main/resources/notices/org.apache.logging.log4j!log4j-jcl-NOTICE.txt
+@@ -0,0 +1,19 @@
++source: https://github.com/apache/logging-log4j2/blob/rel/2.14.0/NOTICE.txt
++
++Apache Log4j
++Copyright 1999-2017 Apache Software Foundation
++
++This product includes software developed at
++The Apache Software Foundation (http://www.apache.org/).
++
++ResolverUtil.java
++Copyright 2005-2006 Tim Fennell
++
++Dumbster SMTP test server
++Copyright 2004 Jason Paul Kitchen
++
++TypeUtil.java
++Copyright 2002-2012 Ramnivas Laddad, Juergen Hoeller, Chris Beams
++
++picocli (http://picocli.info)
++Copyright 2017 Remko Popma
+\ No newline at end of file
+diff --git a/tools/ingest-converter/build.gradle b/tools/ingest-converter/build.gradle
+index 8664a909313..e3a1729be70 100644
+--- a/tools/ingest-converter/build.gradle
++++ b/tools/ingest-converter/build.gradle
+@@ -27,17 +27,16 @@ version = versionMap['logstash-core']
+ 
+ repositories {
+   mavenCentral()
+-  jcenter()
+ }
+ 
+ buildscript {
+   repositories {
+     mavenCentral()
+-    jcenter()
++    gradlePluginPortal()
+   }
+   dependencies {
+     classpath 'org.yaml:snakeyaml:1.29'
+-    classpath 'com.github.jengelman.gradle.plugins:shadow:4.0.4'
++    classpath 'gradle.plugin.com.github.jengelman.gradle.plugins:shadow:7.0.0'
+   }
+ }
+ 

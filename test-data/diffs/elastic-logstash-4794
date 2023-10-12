@@ -1,0 +1,295 @@
+diff --git a/docs/static/monitoring-apis.asciidoc b/docs/static/monitoring-apis.asciidoc
+index e984382b80c..846896370a8 100644
+--- a/docs/static/monitoring-apis.asciidoc
++++ b/docs/static/monitoring-apis.asciidoc
+@@ -7,8 +7,7 @@ about Logstash:
+ * <<root-resource-api>>
+ * <<stats-info-api>>
+ * <<hot-threads-api>>
+-
+-//NOTE: Need to add this to the doc after Alpha 1: * <<plugins-api>>
++* <<plugins-api>>
+ 
+ [float]
+ [[monitoring-common-options]]
+@@ -40,11 +39,6 @@ being consumed by a monitoring tool, rather than intended for human
+ consumption.  The default for the `human` flag is
+ `false`.
+ 
+-
+-/////
+-COMMENTED OUT because this API was moved to Alpha 2. Feel free to add review
+-comments, tho, if you notice inaccuracies.
+-
+ [[plugins-api]]
+ === Plugins API
+ 
+@@ -77,7 +71,6 @@ Example response:
+ ....
+ ] 
+ --------------------------------------------------
+-/////
+ 
+ [[root-resource-api]]
+ === Root Resource API
+diff --git a/logstash-core/lib/logstash/api/init.ru b/logstash-core/lib/logstash/api/init.ru
+index 550092f1d0e..7fc0c93e9b9 100644
+--- a/logstash-core/lib/logstash/api/init.ru
++++ b/logstash-core/lib/logstash/api/init.ru
+@@ -7,6 +7,7 @@ require 'app/root'
+ require 'app/modules/stats'
+ require 'app/modules/node'
+ require 'app/modules/node_stats'
++require 'app/modules/plugins'
+ 
+ env = ENV["RACK_ENV"].to_sym
+ set :environment, env
+@@ -20,7 +21,8 @@ run LogStash::Api::Root
+ 
+ namespaces = { "/_node" => LogStash::Api::Node,
+                "/_node/stats" => LogStash::Api::NodeStats,
+-               "/_stats" => LogStash::Api::Stats }
++               "/_stats" => LogStash::Api::Stats,
++               "/_plugins" => LogStash::Api::Plugins }
+ 
+ namespaces.each_pair do |namespace, app|
+   map(namespace) do
+diff --git a/logstash-core/lib/logstash/api/lib/app/command_factory.rb b/logstash-core/lib/logstash/api/lib/app/command_factory.rb
+index 7de93384649..29e71e6c4f7 100644
+--- a/logstash-core/lib/logstash/api/lib/app/command_factory.rb
++++ b/logstash-core/lib/logstash/api/lib/app/command_factory.rb
+@@ -4,6 +4,7 @@
+ require "app/commands/stats/events_command"
+ require "app/commands/stats/hotthreads_command"
+ require "app/commands/stats/memory_command"
++require "app/commands/system/plugins_command"
+ 
+ module LogStash::Api
+   class CommandFactory
+@@ -16,7 +17,8 @@ def initialize(service)
+         :system_basic_info => SystemBasicInfoCommand,
+         :events_command => StatsEventsCommand,
+         :hot_threads_command => HotThreadsCommand,
+-        :memory_command => JvmMemoryCommand
++        :memory_command => JvmMemoryCommand,
++        :plugins_command => PluginsCommand
+       )
+     end
+ 
+diff --git a/logstash-core/lib/logstash/api/lib/app/commands/system/plugins_command.rb b/logstash-core/lib/logstash/api/lib/app/commands/system/plugins_command.rb
+new file mode 100644
+index 00000000000..07623283ecc
+--- /dev/null
++++ b/logstash-core/lib/logstash/api/lib/app/commands/system/plugins_command.rb
+@@ -0,0 +1,28 @@
++# encoding: utf-8
++require "app/command"
++
++class LogStash::Api::PluginsCommand < LogStash::Api::Command
++
++  def run
++    { :total => plugins.count, :plugins => plugins }
++  end
++
++  private
++
++  def plugins
++    @plugins ||= find_plugins_gem_specs.map do |spec|
++      { :name => spec.name, :version => spec.version.to_s }
++    end.sort_by do |spec|
++      spec[:name]
++    end
++  end
++
++  def find_plugins_gem_specs
++    @specs ||= Gem::Specification.find_all.select{|spec| logstash_plugin_gem_spec?(spec)}
++  end
++
++  def logstash_plugin_gem_spec?(spec)
++    spec.metadata && spec.metadata["logstash_plugin"] == "true"
++  end
++
++end
+diff --git a/logstash-core/lib/logstash/api/lib/app/modules/plugins.rb b/logstash-core/lib/logstash/api/lib/app/modules/plugins.rb
+new file mode 100644
+index 00000000000..93a94bf76c3
+--- /dev/null
++++ b/logstash-core/lib/logstash/api/lib/app/modules/plugins.rb
+@@ -0,0 +1,15 @@
++# encoding: utf-8
++require "app"
++
++module LogStash::Api
++  class Plugins < BaseApp
++
++    helpers AppHelpers
++
++    get "/" do
++      command = factory.build(:plugins_command)
++      respond_with(command.run())
++    end
++
++  end
++end
+diff --git a/logstash-core/spec/api/lib/api/node_spec.rb b/logstash-core/spec/api/lib/api/node_spec.rb
+index becde036405..4655ec38116 100644
+--- a/logstash-core/spec/api/lib/api/node_spec.rb
++++ b/logstash-core/spec/api/lib/api/node_spec.rb
+@@ -2,6 +2,7 @@
+ require_relative "../../spec_helper"
+ require "sinatra"
+ require "app/modules/node"
++require "logstash/json"
+ 
+ describe LogStash::Api::Node do
+ 
+@@ -22,7 +23,7 @@ def app()
+     end
+ 
+     it "should return a JSON object" do
+-      expect{ JSON.parse(last_response.body) }.not_to raise_error
++      expect{ LogStash::Json.load(last_response.body) }.not_to raise_error
+     end
+ 
+     context "#threads count" do
+@@ -31,7 +32,7 @@ def app()
+         do_request { get "/hot_threads?threads=5" }
+       end
+ 
+-      let(:payload) { JSON.parse(last_response.body) }
++      let(:payload) { LogStash::Json.load(last_response.body) }
+ 
+       it "should return a json payload content type" do
+         expect(last_response.content_type).to eq("application/json")
+@@ -65,7 +66,7 @@ def app()
+         do_request { get "/hot_threads?ignore_idle_threads=false&threads=10" }
+       end
+ 
+-      let(:payload) { JSON.parse(last_response.body) }
++      let(:payload) { LogStash::Json.load(last_response.body) }
+ 
+       it "should return JIT threads" do
+         thread_names = payload["threads"].map { |thread_info| thread_info["name"] }
+diff --git a/logstash-core/spec/api/lib/api/node_stats_spec.rb b/logstash-core/spec/api/lib/api/node_stats_spec.rb
+index 71845620bd0..c90d167e3a7 100644
+--- a/logstash-core/spec/api/lib/api/node_stats_spec.rb
++++ b/logstash-core/spec/api/lib/api/node_stats_spec.rb
+@@ -2,6 +2,7 @@
+ require_relative "../../spec_helper"
+ require "sinatra"
+ require "app/modules/node_stats"
++require "logstash/json"
+ 
+ describe LogStash::Api::NodeStats do
+ 
+@@ -11,7 +12,7 @@ def app()
+     described_class
+   end
+ 
+-  let(:payload) { JSON.parse(last_response.body) }
++  let(:payload) { LogStash::Json.load(last_response.body) }
+ 
+   context "#root" do
+ 
+@@ -32,7 +33,7 @@ def app()
+ 
+   context "#events" do
+ 
+-    let(:payload) { JSON.parse(last_response.body) }
++    let(:payload) { LogStash::Json.load(last_response.body) }
+ 
+     before(:all) do
+       do_request { get "/events" }
+@@ -49,7 +50,7 @@ def app()
+ 
+   context "#jvm" do
+ 
+-    let(:payload) { JSON.parse(last_response.body) }
++    let(:payload) { LogStash::Json.load(last_response.body) }
+ 
+     before(:all) do
+       do_request { get "/jvm" }
+diff --git a/logstash-core/spec/api/lib/api/plugins_spec.rb b/logstash-core/spec/api/lib/api/plugins_spec.rb
+new file mode 100644
+index 00000000000..4e0aa66b48b
+--- /dev/null
++++ b/logstash-core/spec/api/lib/api/plugins_spec.rb
+@@ -0,0 +1,57 @@
++# encoding: utf-8
++require_relative "../../spec_helper"
++require "sinatra"
++require "app/modules/plugins"
++require "logstash/json"
++
++describe LogStash::Api::Plugins do
++
++  include Rack::Test::Methods
++
++  def app()
++    described_class
++  end
++
++  before(:all) do
++    get "/"
++  end
++
++  let(:payload) { LogStash::Json.load(last_response.body) }
++
++  it "respond to plugins resource" do
++    expect(last_response).to be_ok
++  end
++
++  it "return valid json content type" do
++    expect(last_response.content_type).to eq("application/json")
++  end
++
++  context "#schema" do
++    it "return the expected schema" do
++      expect(payload.keys).to include("plugins", "total")
++      payload["plugins"].each do |plugin|
++        expect(plugin.keys).to include("name", "version")
++      end
++    end
++  end
++
++  context "#values" do
++
++    it "return totals of plugins" do
++      expect(payload["total"]).to eq(payload["plugins"].count)
++    end
++
++    it "return a list of available plugins" do
++      payload["plugins"].each do |plugin|
++        expect(plugin).to be_available?
++      end
++    end
++
++    it "return non empty version values" do
++      payload["plugins"].each do |plugin|
++        expect(plugin["version"]).not_to be_empty
++      end
++    end
++
++  end
++end
+diff --git a/logstash-core/spec/api/spec_helper.rb b/logstash-core/spec/api/spec_helper.rb
+index 3e5184897b8..90a1bb1e378 100644
+--- a/logstash-core/spec/api/spec_helper.rb
++++ b/logstash-core/spec/api/spec_helper.rb
+@@ -113,3 +113,16 @@ def self.included(klass)
+     end
+   end
+ end; end; end
++
++require 'rspec/expectations'
++
++RSpec::Matchers.define :be_available? do
++  match do |plugin|
++    begin
++      Gem::Specification.find_by_name(plugin["name"])
++      true
++    rescue
++      false
++    end
++  end
++end

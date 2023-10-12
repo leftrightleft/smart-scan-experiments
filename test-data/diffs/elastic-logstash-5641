@@ -1,0 +1,314 @@
+diff --git a/config/logstash.yml b/config/logstash.yml
+index 08d0ecf9dd5..32f7bcc8e6e 100644
+--- a/config/logstash.yml
++++ b/config/logstash.yml
+@@ -57,6 +57,20 @@
+ #
+ # pipeline.unsafe_shutdown: false
+ #
++# By default, logstash will immediately exit when presented with an unexcepted
++# exception. This is due to the fact that an unknown exception can have an
++# unpredictable effect on filter/output state and data flow.
++#
++# Disabling abort_on_error makes Logstash catch all unexpected errors in the
++# pipeline without terminating logstash.
++# Logstash will do all of the following: drop the erroring event,
++# log an error-level message, and continue processing. This will also increment
++# the 'errored' count in the pipeline stats API at /_node/pipeline/events.
++#
++#
++# pipeline.abort_on_error: true
++#
++#
+ # ------------ Pipeline Configuration Settings --------------
+ #
+ # Where to fetch the pipeline configuration for the main pipeline
+diff --git a/logstash-core/lib/logstash/api/commands/stats.rb b/logstash-core/lib/logstash/api/commands/stats.rb
+index d89770090fe..c63697f527a 100644
+--- a/logstash-core/lib/logstash/api/commands/stats.rb
++++ b/logstash-core/lib/logstash/api/commands/stats.rb
+@@ -32,7 +32,7 @@ def process
+         def events
+           extract_metrics(
+             [:stats, :events],
+-            :in, :filtered, :out
++            :in, :filtered, :out, :errored
+           )
+         end
+ 
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 3ea629623fd..4afabef5bd7 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -21,6 +21,7 @@ module LogStash
+            Setting::Numeric.new("pipeline.batch.size", 125),
+            Setting::Numeric.new("pipeline.batch.delay", 5), # in milliseconds
+            Setting::Boolean.new("pipeline.unsafe_shutdown", false),
++           Setting::Boolean.new("pipeline.abort_on_error", true),
+                     Setting.new("path.plugins", Array, []),
+             Setting::String.new("interactive", nil, false),
+            Setting::Boolean.new("config.debug", false),
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index 4ba7d2675a8..4ac967d63e5 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -33,7 +33,9 @@ module LogStash; class Pipeline
+     :thread,
+     :config_str,
+     :settings,
+-    :metric
++    :metric,
++    :namespace_events,
++    :namespace_pipeline
+ 
+   MAX_INFLIGHT_WARN_THRESHOLD = 10_000
+ 
+@@ -47,6 +49,7 @@ def initialize(config_str, settings = LogStash::SETTINGS, namespaced_metric = ni
+     @settings = settings
+     @pipeline_id = @settings.get_value("pipeline.id") || self.object_id
+     @reporter = LogStash::PipelineReporter.new(@logger, self)
++    @abort_on_error = LogStash::SETTINGS.get("pipeline.abort_on_error")
+ 
+     @inputs = nil
+     @filters = nil
+@@ -58,6 +61,15 @@ def initialize(config_str, settings = LogStash::SETTINGS, namespaced_metric = ni
+     # sure the metric instance is correctly send to the plugins to make the namespace scoping work
+     @metric = namespaced_metric.nil? ? LogStash::Instrument::NullMetric.new : namespaced_metric
+ 
++    @namespace_events = metric.namespace([:stats, :events])
++    @namespace_pipeline = metric.namespace([:stats, :pipelines, pipeline_id.to_s.to_sym, :events])
++
++    # Zero out these counters
++    [:in, :filtered, :out, :errored].each do |name|
++      @namespace_events.increment(name, 0)
++      @namespace_pipeline.increment(name, 0)
++    end
++    
+     grammar = LogStashConfigParser.new
+     @config = grammar.parse(config_str)
+     if @config.nil?
+@@ -221,10 +233,7 @@ def start_workers
+   # Repeatedly takes batches off the queue, filters, then outputs them
+   def worker_loop(batch_size, batch_delay)
+     running = true
+-
+-    namespace_events = metric.namespace([:stats, :events])
+-    namespace_pipeline = metric.namespace([:stats, :pipelines, pipeline_id.to_s.to_sym, :events])
+-
++    
+     while running
+       # To understand the purpose behind this synchronize please read the body of take_batch
+       input_batch, signal = @input_queue_pop_mutex.synchronize { take_batch(batch_size, batch_delay) }
+@@ -284,21 +293,11 @@ def take_batch(batch_size, batch_delay)
+   def filter_batch(batch)
+     batch.reduce([]) do |acc,e|
+       if e.is_a?(LogStash::Event)
+-        filtered = filter_func(e)
++        filtered = with_pipeline_rescue(e) { filter_func(e) }
+         filtered.each {|fe| acc << fe unless fe.cancelled?}
+       end
+       acc
+     end
+-  rescue Exception => e
+-    # Plugins authors should manage their own exceptions in the plugin code
+-    # but if an exception is raised up to the worker thread they are considered
+-    # fatal and logstash will not recover from this situation.
+-    #
+-    # Users need to check their configuration or see if there is a bug in the
+-    # plugin.
+-    @logger.error("Exception in pipelineworker, the pipeline stopped processing new events, please check your filter configuration and restart Logstash.",
+-                  "exception" => e, "backtrace" => e.backtrace)
+-    raise
+   end
+ 
+   # Take an array of events and send them to the correct output
+@@ -307,18 +306,37 @@ def output_batch(batch)
+     outputs_events = batch.reduce(Hash.new { |h, k| h[k] = [] }) do |acc, event|
+       # We ask the AST to tell us which outputs to send each event to
+       # Then, we stick it in the correct bin
+-
+-      # output_func should never return anything other than an Array but we have lots of legacy specs
+-      # that monkeypatch it and return nil. We can deprecate  "|| []" after fixing these specs
+-      outputs_for_event = output_func(event) || []
+-
++      outputs_for_event = with_pipeline_rescue(event) { output_func(event) }
+       outputs_for_event.each { |output| acc[output] << event }
+       acc
+     end
+ 
+     # Now that we have our output to event mapping we can just invoke each output
+     # once with its list of events
+-    outputs_events.each { |output, events| output.multi_receive(events) }
++    outputs_events.each do |output, events|
++      with_pipeline_rescue(events) do
++        output.multi_receive(events)
++      end
++    end
++  end
++
++  def with_pipeline_rescue(event_or_events)
++    yield
++  rescue Exception => e
++    events = Array(event_or_events)
++    namespace_events.increment(:errored, events.size)
++    namespace_pipeline.increment(:errored, events.size)
++
++    # if @abort_on_error is disabled this exception is handled
++    # and logged by the pipeline higher in the stack.
++    raise if @abort_on_error
++
++    logger_opts = {:exception_message => e.message, :class => e.class.name}
++    logger_opts[:events] = events.map(&:to_hash) if @logger.info?
++    logger_opts[:backtrace] = e.backtrace if @logger.debug?
++
++    @logger.error("Exception in pipelineworker!", logger_opts)
++    []
+   end
+ 
+   def set_current_thread_inflight_batch(batch)
+diff --git a/logstash-core/spec/api/lib/api/node_stats_spec.rb b/logstash-core/spec/api/lib/api/node_stats_spec.rb
+index ea406980f88..211b08fd882 100644
+--- a/logstash-core/spec/api/lib/api/node_stats_spec.rb
++++ b/logstash-core/spec/api/lib/api/node_stats_spec.rb
+@@ -11,8 +11,8 @@
+ 
+   # DSL describing response structure
+   root_structure = {
+-    "jvm"=>{
+-      "threads"=>{
++    "jvm"=> {
++      "threads"=> {
+         "count"=>Numeric,
+         "peak_count"=>Numeric
+       },
+@@ -45,26 +45,26 @@
+         }
+       }
+     },
+-    "process"=>{
++    "process"=> {
+       "peak_open_file_descriptors"=>Numeric,
+       "max_file_descriptors"=>Numeric,
+       "open_file_descriptors"=>Numeric,
+-      "mem"=>{
++      "mem"=> {
+         "total_virtual_in_bytes"=>Numeric
+       },
+-      "cpu"=>{
++      "cpu"=> {
+         "total_in_millis"=>Numeric,
+         "percent"=>Numeric
+       }
+     },
+-   "pipeline" => {
+-     "events" => {
++    "pipeline" => {
++      "events" => {
+         "in" => Numeric,
+         "filtered" => Numeric,
+-        "out" => Numeric
+-     } 
+-    } 
++        "out" => Numeric,
++        "errored"=>Numeric
++      }
++    }
+   }
+-  
+   test_api_and_resources(root_structure)
+ end
+diff --git a/logstash-core/spec/logstash/pipeline_spec.rb b/logstash-core/spec/logstash/pipeline_spec.rb
+index 823e2cb5df9..44cc8ec0a20 100644
+--- a/logstash-core/spec/logstash/pipeline_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_spec.rb
+@@ -100,6 +100,90 @@ class TestPipeline < LogStash::Pipeline
+     pipeline_settings_obj.reset
+   end
+ 
++  describe "rescuing pipeline exceptions" do
++    before(:each) do
++      allow(LogStash::Plugin).to receive(:lookup).with("input", "dummyinput").and_return(DummyInput)
++      allow(LogStash::Plugin).to receive(:lookup).with("codec", "plain").and_return(DummyCodec)
++      allow(LogStash::Plugin).to receive(:lookup).with("output", "dummyoutput").and_return(DummyOutput)
++      allow(LogStash::Plugin).to receive(:lookup).with("filter", "dummyfilter").and_return(DummyFilter)
++      allow(LogStash::Plugin).to receive(:lookup).with("filter", "dummysafefilter").and_return(DummySafeFilter)
++    end
++
++    let(:config) do
++      <<-eos
++        input {
++          dummyinput {}
++        }
++
++        filter {
++          if [foo] > 2 { # Intentionally omit nil check
++            dummyfilter {}
++          }
++        }
++
++        output {
++          if [foo] > 2 {
++             dummyoutput {}
++          }
++        }
++        eos
++    end
++
++    let(:pipeline) { TestPipeline.new(config, pipeline_settings_obj) }
++
++    context "when pipeline.abort_on_error is true" do
++      before(:each) do
++        pipeline_settings_obj.set("pipeline.abort_on_error", true)
++      end
++
++      it "should raise an exception when filtering bad events" do
++        expect do
++          pipeline.filter_batch([LogStash::Event.new])
++        end.to raise_error(NoMethodError)
++      end
++
++      it "should raise an exception when outputting bad events" do
++        expect do
++          pipeline.output_batch([LogStash::Event.new])
++        end.to raise_error(NoMethodError)
++      end
++    end
++
++    context "when pipeline.abort_on_error is false" do
++      before(:each) do
++        pipeline_settings_obj.set("pipeline.abort_on_error", false)
++      end
++
++      it "should raise an exception when filtering bad events" do
++        expect do
++          pipeline.filter_batch([LogStash::Event.new])
++        end.not_to raise_error
++      end
++
++      it "should raise an exception when outputting bad events" do
++        expect do
++          pipeline.output_batch([LogStash::Event.new])
++        end.not_to raise_error
++      end
++
++      describe "metrics" do
++        before(:each) do
++          allow(pipeline.namespace_events).to receive(:increment).with(any_args)
++          allow(pipeline.namespace_pipeline).to receive(:increment).with(any_args)
++          pipeline.output_batch([LogStash::Event.new])
++        end
++        
++        it "should increment the global errored count for metrics" do
++          expect(pipeline.namespace_events).to have_received(:increment).with(:errored, 1)
++        end
++
++        it "should increment the pipeline specific errored count for metrics" do
++          expect(pipeline.namespace_pipeline).to have_received(:increment).with(:errored, 1)
++        end
++      end
++    end
++  end
++
+   describe "defaulting the pipeline workers based on thread safety" do
+     before(:each) do
+       allow(LogStash::Plugin).to receive(:lookup).with("input", "dummyinput").and_return(DummyInput)

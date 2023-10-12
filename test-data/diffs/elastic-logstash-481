@@ -1,0 +1,1200 @@
+diff --git a/lib/logstash/filters/anonymize.rb b/lib/logstash/filters/anonymize.rb
+index 97062037165..f3144fde9d0 100644
+--- a/lib/logstash/filters/anonymize.rb
++++ b/lib/logstash/filters/anonymize.rb
+@@ -37,7 +37,11 @@ class << self; alias_method :anonymize, :anonymize_openssl; end
+   def filter(event)
+     return unless filter?(event)
+     @fields.each do |field|
+-      event[field] = anonymize(event[field])
++      if event[field].is_a?(Array)
++        event[field] = event[field].collect { |v| anonymize(v) }
++      else
++        event[field] = anonymize(event[field])
++      end
+     end
+   end # def filter
+ 
+diff --git a/lib/logstash/filters/csv.rb b/lib/logstash/filters/csv.rb
+index db27437a49e..85fc50d7092 100644
+--- a/lib/logstash/filters/csv.rb
++++ b/lib/logstash/filters/csv.rb
+@@ -9,24 +9,9 @@ class LogStash::Filters::CSV < LogStash::Filters::Base
+   config_name "csv"
+   plugin_status "beta"
+ 
+-  # Config for csv is:
+-  #   "source => dest".
+-  # The CSV data in the value of the source field will be expanded into a
+-  # datastructure in the "dest" field.  Note: if the "dest" field
+-  # already exists, it will be overridden.
+-  config /[A-Za-z0-9_-]+/, :validate => :string, :deprecated => true
+-
+-  # Define a list of field names (in the order they appear in the CSV,
+-  # as if it were a header line). If this is not specified or there
+-  # are not enough fields specified, the default field name is "fieldN"
+-  # (where N is the field number, starting from 1).
+-  # Optional.
+-  config :fields, :validate => :array, :deprecated => true
+-
+   # The CSV data in the value of the source field will be expanded into a
+   # datastructure.
+-  # This deprecates the regexp `[A-Za-z0-9_-]` variable.
+-  config :source, :validate => :string
++  config :source, :validate => :string, :default => '@message'
+ 
+   # Define a list of column names (in the order they appear in the CSV,
+   # as if it were a header line). If this is not specified or there
+@@ -49,32 +34,8 @@ class LogStash::Filters::CSV < LogStash::Filters::Base
+   public
+   def register
+ 
+-    #TODO(electrical): At some point 'fields' and the regexp parts need to be removed.
+-    if @fields
+-      if @columns
+-        @logger.error("'fields' and 'columns' are the same setting, but 'fields' is deprecated. Please use only 'columns'")
+-      end
+-      @columns = @fields
+-    end
+-
+-    @csv = {}
+-    #TODO(electrical): At some point this can be removed
+-    @config.each do |field, dest|
+-      next if (RESERVED + ["fields", "separator", "source", "columns", "target"]).member?(field)
+-      @logger.warn("#{self.class.config_name}: You used a deprecated setting '#{field} => #{dest}'. You should use 'source => \"#{field}\"' and 'target => \"#{dest}\"'")
+-      @csv[field] = dest
+-    end
+-
+-    #TODO(electrical): Will we make @source required or not?
+-    if @source
+-      #Add the source field to the list.
+-      @csv[@source] = @target
+-    end
+-
+-    # Default to parsing @message and dumping into @target
+-    if @csv.empty?
+-      @csv["@message"] = @target
+-    end
++    # Nothing to do here
++
+   end # def register
+ 
+   public
+@@ -84,42 +45,45 @@ def filter(event)
+     @logger.debug("Running csv filter", :event => event)
+ 
+     matches = 0
+-    #TODO(electrical): When old stuff can be removed. this block will need to be changed also
+-    @csv.each do |key, dest|
+-      if event[key]
+-        if event[key].is_a?(String)
+-          event[key] = [event[key]]
+-        end
+ 
+-        if event[key].length > 1
+-          @logger.warn("csv filter only works on fields of length 1",
+-                       :key => key, :value => event[key],
+-                       :event => event)
+-          next
++    key = @source
++    dest = @target
++
++    if event[key]
++      if event[key].is_a?(String)
++        event[key] = [event[key]]
++      end
++
++      if event[key].length > 1
++        @logger.warn("csv filter only works on fields of length 1",
++                     :key => key, :value => event[key],
++                     :event => event)
++        next
++      end
++
++      raw = event[key].first
++      begin
++        values = CSV.parse_line(raw, {:col_sep => @separator})
++        data = {}
++        values.each_index do |i|
++          field_name = @columns[i] || "column#{i+1}"
++          data[field_name] = values[i]
+         end
+ 
+-        raw = event[key].first
+-        begin
+-          values = CSV.parse_line(raw, {:col_sep => @separator})
+-          data = {}
+-          values.each_index do |i|
+-            field_name = @columns[i] || "column#{i+1}"
+-            data[field_name] = values[i]
+-          end
+-
+-          event[dest] = data
+-
+-          filter_matched(event)
+-        rescue => e
+-          event.tags << "_csvparsefailure"
+-          @logger.warn("Trouble parsing csv", :key => key, :raw => raw,
+-                        :exception => e, :backtrace => e.backtrace)
+-          next
+-        end # begin
+-      end # @csv.each
+-    end # def filter
++        event[dest] = data
++
++        filter_matched(event)
++      rescue => e
++        event.tags << "_csvparsefailure"
++        @logger.warn("Trouble parsing csv", :key => key, :raw => raw,
++                      :exception => e, :backtrace => e.backtrace)
++        next
++      end # begin
++    end # if event
+ 
+     @logger.debug("Event after csv filter", :event => event)
++
+   end # def filter
++
+ end # class LogStash::Filters::Csv
+ 
+diff --git a/lib/logstash/filters/date.rb b/lib/logstash/filters/date.rb
+index 75c89cd3184..55b12db1bfc 100644
+--- a/lib/logstash/filters/date.rb
++++ b/lib/logstash/filters/date.rb
+@@ -33,11 +33,6 @@ class LogStash::Filters::Date < LogStash::Filters::Base
+   #
+   config :locale, :validate => :string
+ 
+-  # This is short-hand for `match => [ "fieldname", "dateformat" ]`
+-  #
+-  # It is deprecated. Please use 'match' instead.
+-  config /[A-Za-z0-9_-]+/, :validate => :array, :deprecated => true
+-
+   # The date formats allowed are anything allowed by Joda-Time (java time
+   # library): You can see the docs for this format here:
+   #
+@@ -118,14 +113,6 @@ def register
+     # TODO(sissel): Need a way of capturing regexp configs better.
+     locale = parseLocale(@config["locale"][0]) if @config["locale"] != nil and @config["locale"][0] != nil
+     missing = []
+-    @config.each do |field, value|
+-      next if (RESERVED + ["locale", "match"]).include?(field)
+-
+-      recommended_setting = value.map { |v| "\"#{v}\"" }.join(", ")
+-      @logger.warn("#{self.class.config_name}: You used a deprecated setting '#{field} => #{value}'. You should use 'match => [ \"#{field}\", #{recommended_setting} ]'")
+-      # values here are an array of format strings for the given field.
+-      setupMatcher(field, locale, missing, value) # value.each
+-    end # @config.each
+     setupMatcher(@config["match"].shift, locale, missing, @config["match"] )
+   end
+ 
+diff --git a/lib/logstash/filters/geoip.rb b/lib/logstash/filters/geoip.rb
+index 44f4165ef48..dd5bcb45923 100644
+--- a/lib/logstash/filters/geoip.rb
++++ b/lib/logstash/filters/geoip.rb
+@@ -22,10 +22,6 @@ class LogStash::Filters::GeoIP < LogStash::Filters::Base
+   # with logstash.
+   config :database, :validate => :path
+ 
+-  # The field containing IP address, hostname is also OK. If this field is an
+-  # array, only the first value will be used.
+-  config :field, :validate => :string, :deprecated => true
+-
+   # The field containing IP address, hostname is also OK. If this field is an
+   # array, only the first value will be used.
+   config :source, :validate => :string
+@@ -79,14 +75,6 @@ def register
+       raise RuntimeException.new "This GeoIP database is not currently supported"
+     end
+ 
+-    #TODO(electrical): Remove this when removing the field variable
+-    if @field
+-      if @source
+-        logger.error("'field' and 'source' are the same setting, but 'field' is deprecated. Please use only 'source'")
+-      end
+-      @source = @field
+-    end
+-
+   end # def register
+ 
+   public
+diff --git a/lib/logstash/filters/grep.rb b/lib/logstash/filters/grep.rb
+index 1d01cf5c28d..282a72c053f 100644
+--- a/lib/logstash/filters/grep.rb
++++ b/lib/logstash/filters/grep.rb
+@@ -41,28 +41,12 @@ class LogStash::Filters::Grep < LogStash::Filters::Base
+   # a regular expression.
+   config :match, :validate => :hash, :default => {}
+ 
+-  # Short-hand for matching
+-  #
+-  #     filter {
+-  #       grep {
+-  #         # This 'match' usage
+-  #         match => [ "fieldname", "pattern" ]
+-  #
+-  #         # is the same as this:
+-  #         fieldname => "pattern"
+-  #       }
+-  #     }
+-  #
+-  # It is recommended to use 'match' instead of this.
+-  config /[A-Za-z0-9_-]+/, :validate => :string, :deprecated => true
+-
+   public
+   def register
+     @patterns = Hash.new { |h,k| h[k] = [] }
++
+       # TODO(sissel): 
+-    @match.merge(@config).each do |field, pattern|
+-      # Skip known config names
+-      next if (RESERVED + ["negate", "match", "drop"]).include?(field)
++    @match.each do |field, pattern|
+ 
+       re = Regexp.new(pattern)
+       @patterns[field] << re
+diff --git a/lib/logstash/filters/grok.rb b/lib/logstash/filters/grok.rb
+index aa603187561..fc58ae08ae0 100644
+--- a/lib/logstash/filters/grok.rb
++++ b/lib/logstash/filters/grok.rb
+@@ -152,21 +152,6 @@ class LogStash::Filters::Grok < LogStash::Filters::Base
+   #
+   config :match, :validate => :hash, :default => {}
+ 
+-  # Shorthand for `match`.
+-  #
+-  #     filter {
+-  #       grok {
+-  #         # This configuration
+-  #         match => [ "foo", "some pattern" ]
+-  #
+-  #         # is the same as this:
+-  #         foo => "some pattern"
+-  #       }
+-  #     }
+-  #
+-  # It is preferable to use the `match` setting instead of this.
+-  config /[A-Za-z0-9_-]+/, :validate => :string, :deprecated => true
+-
+   #
+   # logstash ships by default with a bunch of patterns, so you don't
+   # necessarily need to define this yourself unless you are adding additional
+@@ -221,13 +206,6 @@ class LogStash::Filters::Grok < LogStash::Filters::Base
+     @@patterns_path += ["#{File.dirname(__FILE__)}/../../../patterns/*"]
+   end
+ 
+-  # This flag becomes `--grok-patterns-path`
+-  @@deprecated_flag_used = false
+-  flag("--patterns-path PATH", "Colon-delimited path of patterns to load") do |val|
+-    @@deprecated_flag_used = true
+-    @@patterns_path += val.split(":")
+-  end
+-
+   public
+   def initialize(params)
+     super(params)
+@@ -239,12 +217,6 @@ def initialize(params)
+   def register
+     require "grok-pure" # rubygem 'jls-grok'
+ 
+-    if @@deprecated_flag_used
+-      @logger.warn("The --grok-patterns-path flag is deprecated. This flag " \
+-                   "is going away in the next release. Use the " \
+-                   "'patterns_dir' setting in your logstash config instead")
+-    end
+-
+     @patternfiles = []
+ 
+     # Have @@patterns_path show first. Last-in pattern definitions win; this
+@@ -273,22 +245,7 @@ def register
+ 
+     @logger.info? and @logger.info("Match data", :match => @match)
+ 
+-    # TODO(sissel): This can be removed once the 'field => [patterns]' syntax is removed.
+-    @config.each do |field, pattern|
+-      next if (RESERVED + ["match", "patterns_dir",
+-               "drop_if_match", "named_captures_only", "pattern",
+-               "keep_empty_captures", "break_on_match", "singles", "tag_on_failure"]).include?(field)
+-      @logger.warn("#{self.class.config_name}: You used a deprecated setting '#{field} => \"#{pattern}\"'. You should use 'match => [ \"#{field}\", \"#{pattern}\" ]'")
+-    end
+-
+-    # TODO(sissel): Hash.merge  actually overrides, not merges arrays.
+-    # Work around it by implementing our own?
+-    # TODO(sissel): Check if 'match' is empty?
+-    @match.merge(@config).each do |field, patterns|
+-      # Skip known config names
+-      next if (RESERVED + ["match", "patterns_dir",
+-               "drop_if_match", "named_captures_only", "pattern",
+-               "keep_empty_captures", "break_on_match", "singles", "tag_on_failure"]).include?(field)
++    @match.each do |field, patterns|
+       patterns = [patterns] if patterns.is_a?(String)
+ 
+       if !@patterns.include?(field)
+diff --git a/lib/logstash/filters/json.rb b/lib/logstash/filters/json.rb
+index 43af69978d0..bea7e7da741 100644
+--- a/lib/logstash/filters/json.rb
++++ b/lib/logstash/filters/json.rb
+@@ -8,24 +8,6 @@ class LogStash::Filters::Json < LogStash::Filters::Base
+   config_name "json"
+   plugin_status "beta"
+ 
+-  # Config for json is:
+-  # 
+-  # * source => dest
+-  #
+-  # For example, if you have a field named 'foo' that contains your json,
+-  # and you want to store the evaluated json object in 'bar', do this:
+-  #
+-  #     filter {
+-  #       json {
+-  #         foo => bar
+-  #       }
+-  #     }
+-  #
+-  # JSON in the value of the source field will be expanded into a
+-  # datastructure in the "dest" field.  Note: if the "dest" field
+-  # already exists, it will be overridden.
+-  config /[A-Za-z0-9_@-]+/, :validate => :string, :deprecated => true
+-
+   # Config for json is:
+   #
+   #     source => source_field
+@@ -39,7 +21,7 @@ class LogStash::Filters::Json < LogStash::Filters::Base
+   #     }
+   #
+   # The above would parse the xml from the @message field
+-  config :source, :validate => :string
++  config :source, :validate => :string, :required => true
+ 
+   # Define target for placing the data
+   #
+@@ -54,22 +36,12 @@ class LogStash::Filters::Json < LogStash::Filters::Base
+   # json in the value of the source field will be expanded into a
+   # datastructure in the "target" field.
+   # Note: if the "target" field already exists, it will be overridden
+-  # Required
+-  config :target, :validate => :string
++  config :target, :validate => :string, :required => true
+ 
+   public
+   def register
+-    @json = {}
+-
+-    @config.each do |field, dest|
+-      next if (RESERVED + ["source", "target"]).member?(field)
+-      @logger.warn("#{self.class.config_name}: You used a deprecated setting '#{field} => #{dest}'. You should use 'source => \"#{field}\"' and 'target => \"#{dest}\"'")
+-      @json[field] = dest
+-    end
+ 
+-    if @source
+-      @json[@source] = @target
+-    end
++    # Nothing to do here
+ 
+   end # def register
+ 
+@@ -80,30 +52,34 @@ def filter(event)
+     @logger.debug("Running json filter", :event => event)
+ 
+     matches = 0
+-    @json.each do |key, dest|
+-      next unless event[key]
+-      if event[key].is_a?(String)
+-        event[key] = [event[key]]
+-      end
+-
+-      if event[key].length > 1
+-        @logger.warn("JSON filter only works on single fields (not lists)",
+-                     :key => key, :value => event[key])
+-        next
+-      end
+-
+-      raw = event[key].first
+-      begin
+-        event[dest] = JSON.parse(raw)
+-        filter_matched(event)
+-      rescue => e
+-        event.tags << "_jsonparsefailure"
+-        @logger.warn("Trouble parsing json", :key => key, :raw => raw,
+-                      :exception => e)
+-        next
+-      end
++
++    key = @source
++    dest = @target
++
++    next unless event[key]
++    if event[key].is_a?(String)
++      event[key] = [event[key]]
++    end
++
++    if event[key].length > 1
++      @logger.warn("JSON filter only works on single fields (not lists)",
++                   :key => key, :value => event[key])
++      next
++    end
++
++    raw = event[key].first
++    begin
++      event[dest] = JSON.parse(raw)
++      filter_matched(event)
++    rescue => e
++      event.tags << "_jsonparsefailure"
++      @logger.warn("Trouble parsing json", :key => key, :raw => raw,
++                    :exception => e)
++      next
+     end
+ 
+     @logger.debug("Event after json filter", :event => event)
++
+   end # def filter
++
+ end # class LogStash::Filters::Json
+diff --git a/lib/logstash/filters/kv.rb b/lib/logstash/filters/kv.rb
+index a4a806849e8..041f3822a00 100644
+--- a/lib/logstash/filters/kv.rb
++++ b/lib/logstash/filters/kv.rb
+@@ -26,9 +26,6 @@ class LogStash::Filters::KV < LogStash::Filters::Base
+   config_name "kv"
+   plugin_status "beta"
+ 
+-  # The fields to perform 'key=value' searching on
+-  config :fields, :validate => :array
+-
+   # A string of characters to trim from the value. This is useful if your
+   # values are wrapped in brackets or are terminated by comma (like postfix
+   # logs)
+@@ -82,13 +79,6 @@ class LogStash::Filters::KV < LogStash::Filters::Base
+   #     filter { kv { prefix => "arg_" } }
+   config :prefix, :validate => :string, :default => ''
+ 
+-  # The name of the container to put all of the key-value pairs into 
+-  #
+-  # Example, to place all keys into container kv:
+-  #
+-  #     filter { kv { container => "kv" } }
+-  config :container, :validate => :string, :deprecated => true
+-
+   # The fields to perform 'key=value' searching on
+   #
+   # Example, to use the @message field:
+@@ -106,23 +96,6 @@ class LogStash::Filters::KV < LogStash::Filters::Base
+   def register
+     @trim_re = Regexp.new("[#{@trim}]") if !@trim.nil?
+ 
+-    #TODO(electrical): Remove this when removing the container variable
+-    if @container
+-      if @target
+-        logger.error("'container' and 'target' are the same setting, but 'container' is deprecated. Please use only 'target'")
+-      end
+-      @target = @container
+-    end
+-
+-    #TODO(electrical): Remove this when removing the fields variable
+-    if @source
+-      if @fields
+-        logger.error("'fields' and 'source' are the same setting, but 'fields' is deprecated. Please use only 'source'")
+-      end
+-      @fields=Array.new if @fields.nil?
+-      @fields << @source
+-    end
+-
+   end # def register
+ 
+   def filter(event)
+@@ -130,19 +103,17 @@ def filter(event)
+ 
+     kv_keys=Hash.new
+ 
+-    #TODO(electrical): Remove this loop when we remove the fields variable
+-    @fields.each do |fieldname|
+-      value = event[fieldname]
+-
+-      case value
+-        when nil; #Nothing to do
+-        when String; kv_keys = parse(value, event, kv_keys)
+-        when Array; value.each { |v| kv_keys = parse(v, event, kv_keys) }
+-        else 
+-          @logger.warn("kv filter has no support for this type of data",
+-                       :type => value.class, :value => value)
+-      end # case value
+-    end
++    value = event[@source]
++
++    case value
++      when nil; #Nothing to do
++      when String; kv_keys = parse(value, event, kv_keys)
++      when Array; value.each { |v| kv_keys = parse(v, event, kv_keys) }
++      else 
++        @logger.warn("kv filter has no support for this type of data",
++                     :type => value.class, :value => value)
++    end # case value
++
+     # If we have any keys, create/append the hash
+     if kv_keys.length > 0
+       if !event[@target].nil?
+diff --git a/lib/logstash/filters/xml.rb b/lib/logstash/filters/xml.rb
+index 01536f53620..440aeceaf8d 100644
+--- a/lib/logstash/filters/xml.rb
++++ b/lib/logstash/filters/xml.rb
+@@ -8,26 +8,6 @@ class LogStash::Filters::Xml < LogStash::Filters::Base
+   config_name "xml"
+   plugin_status "experimental"
+ 
+-  # Config for xml to hash is:
+-  #
+-  #     source_field => destination_field
+-  #
+-  # XML in the value of the source field will be expanded into a
+-  # datastructure in the "dest" field. Note: if the "dest" field
+-  # already exists, it will be overridden.
+-  #
+-  # For example, if you have the whole xml document in your @message field:
+-  #
+-  #     filter {
+-  #       xml {
+-  #         "@message" => "doc"
+-  #       }
+-  #     }
+-  #
+-  # The above would parse the xml from @message and store the resulting
+-  # document into the 'doc' field.
+-  config /[A-Za-z0-9_-]+/, :validate => :string, :deprecated => true
+-
+   # Config for xml to hash is:
+   #
+   #     source => source_field
+@@ -85,18 +65,6 @@ class LogStash::Filters::Xml < LogStash::Filters::Base
+   def register
+     require "nokogiri"
+     require "xmlsimple"
+-    @xml = {}
+-
+-    #TODO(electrical): Will be removed when its fully deprecated
+-    @config.each do |field, dest|
+-      next if (RESERVED + ["xpath", "store_xml", "source", "target"]).member?(field)
+-      @logger.warn("#{self.class.config_name}: You used a deprecated setting '#{field} => #{dest}'. You should use 'source => \"#{field}\"' and 'target => \"#{dest}\"'")
+-      @xml[field] = dest
+-    end
+-
+-    if @source
+-      @xml[@source] = @target
+-    end
+ 
+   end # def register
+ 
+@@ -108,69 +76,71 @@ def filter(event)
+ 
+     @logger.debug("Running xml filter", :event => event)
+ 
+-    @xml.each do |key, dest|
+-      if event.fields[key]
+-        if event.fields[key].is_a?(String)
+-          event.fields[key] = [event.fields[key]]
++    key = @source
++    dest = @target
++
++    if event.fields[key]
++      if event.fields[key].is_a?(String)
++        event.fields[key] = [event.fields[key]]
++      end
++
++      if event.fields[key].length > 1
++        @logger.warn("XML filter only works on fields of length 1",
++                     :key => key, :value => event.fields[key])
++        next
++      end
++
++      raw = event.fields[key].first
++
++      # for some reason, an empty string is considered valid XML
++      next if raw.strip.length == 0
++
++       if @xpath
++        begin
++          doc = Nokogiri::XML(raw)
++        rescue => e
++          event.tags << "_xmlparsefailure"
++          @logger.warn("Trouble parsing xml", :key => key, :raw => raw,
++                       :exception => e, :backtrace => e.backtrace)
++          next
+         end
+ 
+-        if event.fields[key].length > 1
+-          @logger.warn("XML filter only works on fields of length 1",
+-                       :key => key, :value => event.fields[key])
++        @xpath.each do |xpath_src, xpath_dest|
++          nodeset = doc.xpath(xpath_src)
++
++          # If asking xpath for a String, like "name(/*)", we get back a
++          # String instead of a NodeSet.  We normalize that here.
++          normalized_nodeset = nodeset.kind_of?(Nokogiri::XML::NodeSet) ? nodeset : [nodeset]
++
++          normalized_nodeset.each do |value|
++            # some XPath functions return empty arrays as string
++            if value.is_a?(Array)
++              next if value.length == 0
++            end
++
++            unless value.nil?
++              matched = true
++              event[xpath_dest] ||= []
++              event[xpath_dest] << value.to_s
++            end
++          end # XPath.each
++        end # @xpath.each
++      end # if @xpath
++
++      if @store_xml
++        begin
++          event[dest] = XmlSimple.xml_in(raw)
++          matched = true
++        rescue => e
++          event.tags << "_xmlparsefailure"
++          @logger.warn("Trouble parsing xml with XmlSimple", :key => key, :raw => raw,
++                        :exception => e, :backtrace => e.backtrace)
+           next
+         end
++      end # if @store_xml
++
++      filter_matched(event) if matched
+ 
+-        raw = event.fields[key].first
+-
+-        # for some reason, an empty string is considered valid XML
+-        next if raw.strip.length == 0
+-
+-        if @xpath
+-          begin
+-            doc = Nokogiri::XML(raw)
+-          rescue => e
+-            event.tags << "_xmlparsefailure"
+-            @logger.warn("Trouble parsing xml", :key => key, :raw => raw,
+-                         :exception => e, :backtrace => e.backtrace)
+-            next
+-          end
+-
+-          @xpath.each do |xpath_src, xpath_dest|
+-            nodeset = doc.xpath(xpath_src)
+-
+-            # If asking xpath for a String, like "name(/*)", we get back a
+-            # String instead of a NodeSet.  We normalize that here.
+-            normalized_nodeset = nodeset.kind_of?(Nokogiri::XML::NodeSet) ? nodeset : [nodeset]
+-
+-            normalized_nodeset.each do |value|
+-              # some XPath functions return empty arrays as string
+-              if value.is_a?(Array)
+-                next if value.length == 0
+-              end
+-
+-              unless value.nil?
+-                matched = true
+-                event[xpath_dest] ||= []
+-                event[xpath_dest] << value.to_s
+-              end
+-            end # XPath.each
+-          end # @xpath.each
+-        end # if @xpath
+-
+-        if @store_xml
+-          begin
+-            event[dest] = XmlSimple.xml_in(raw)
+-            matched = true
+-          rescue => e
+-            event.tags << "_xmlparsefailure"
+-            @logger.warn("Trouble parsing xml with XmlSimple", :key => key, :raw => raw,
+-                          :exception => e, :backtrace => e.backtrace)
+-            next
+-          end
+-        end # if @store_xml
+-
+-        filter_matched(event) if matched
+-      end # @xml.each
+     end
+ 
+     @logger.debug("Event after xml filter", :event => event)
+diff --git a/lib/logstash/inputs/eventlog.rb b/lib/logstash/inputs/eventlog.rb
+index fa99959d934..d02405a1928 100644
+--- a/lib/logstash/inputs/eventlog.rb
++++ b/lib/logstash/inputs/eventlog.rb
+@@ -17,15 +17,8 @@ class LogStash::Inputs::EventLog < LogStash::Inputs::Base
+   config_name "eventlog"
+   plugin_status "beta"
+ 
+-  # Event Log Name. Depricated due to conflicts with puppet naming convention.
+-  # Replaced by 'logfile' variable. See LOGSTASH-755
+-  config :name, :validate => :string, :deprecated => true
+-
+   # Event Log Name
+-  config :logfile, :validate => :string
+-  #:required => true, :default => "System"
+-
+-  # TODO(sissel): Make 'logfile' required after :name is gone.
++  config :logfile, :validate => :string, :required => true, :default => "System"
+ 
+   public
+   def initialize(params)
+@@ -36,14 +29,6 @@ def initialize(params)
+   public
+   def register
+ 
+-    if @name
+-      @logger.warn("Please use 'logfile' instead of the 'name' setting")
+-      if @logfile
+-        @logger.error("'name' and 'logfile' are the same setting, but 'name' is deprecated. Please use only 'logfile'")
+-      end
+-      @logfile = @name
+-    end
+-
+     if @logfile.nil?
+       raise ArgumentError, "Missing required parameter 'logfile' for input/eventlog"
+     end
+diff --git a/lib/logstash/inputs/gemfire.rb b/lib/logstash/inputs/gemfire.rb
+index 36b0c037bbc..7253e7b45df 100644
+--- a/lib/logstash/inputs/gemfire.rb
++++ b/lib/logstash/inputs/gemfire.rb
+@@ -16,9 +16,6 @@ class LogStash::Inputs::Gemfire < LogStash::Inputs::Threadable
+   config_name "gemfire"
+   plugin_status "experimental"
+ 
+-  # Your client cache name
+-  config :name, :validate => :string, :deprecated => true
+-
+   # Your client cache name
+   config :cache_name, :validate => :string, :default => "logstash"
+ 
+@@ -54,13 +51,6 @@ class LogStash::Inputs::Gemfire < LogStash::Inputs::Threadable
+   # How the message is serialized in the cache. Can be one of "json" or "plain"; default is plain
+   config :serialization, :validate => :string, :default => nil
+ 
+-  if @name
+-    if @cache_name
+-      @logger.error("'name' and 'cache_name' are the same setting, but 'name' is deprecated. Please use only 'cache_name'")
+-    end
+-    @cache_name = @name
+-  end
+-
+   public
+   def initialize(params)
+     super
+diff --git a/lib/logstash/inputs/rabbitmq.rb b/lib/logstash/inputs/rabbitmq.rb
+index 157c007b7a8..7274890f67a 100644
+--- a/lib/logstash/inputs/rabbitmq.rb
++++ b/lib/logstash/inputs/rabbitmq.rb
+@@ -32,10 +32,6 @@ class LogStash::Inputs::RabbitMQ < LogStash::Inputs::Threadable
+   # Your amqp password
+   config :password, :validate => :password, :default => "guest"
+ 
+-  # The name of the queue. Depricated due to conflicts with puppet naming convention.
+-  # Replaced by 'queue' variable. See LOGSTASH-755
+-  config :name, :validate => :string, :deprecated => true
+-
+   # The name of the queue.
+   config :queue, :validate => :string, :default => ""
+ 
+@@ -93,13 +89,6 @@ def initialize(params)
+   public
+   def register
+ 
+-    if @name
+-      if @queue
+-        @logger.error("'name' and 'queue' are the same setting, but 'name' is deprecated. Please use only 'queue'")
+-      end
+-      @queue = @name
+-    end   
+-
+     @logger.info("Registering input #{@url}")
+     require "bunny" # rubygem 'bunny'
+     @vhost ||= "/"
+diff --git a/lib/logstash/inputs/sqs.rb b/lib/logstash/inputs/sqs.rb
+index 06edeb7706b..cd3c8823fc4 100644
+--- a/lib/logstash/inputs/sqs.rb
++++ b/lib/logstash/inputs/sqs.rb
+@@ -60,12 +60,6 @@ class LogStash::Inputs::SQS < LogStash::Inputs::Threadable
+   config_name "sqs"
+   plugin_status "experimental"
+ 
+-  # The `access_key` option is deprecated, please update your configuration to use `access_key_id` instead
+-  config :access_key, :validate => :string, :deprecated => true
+-
+-  # The `secret_key` option is deprecated, please update your configuration to use `secret_access_key` instead
+-  config :secret_key, :validate => :string, :deprecated => true
+-
+   # Name of the SQS Queue name to pull messages from. Note that this is just the name of the queue, not the URL or ARN.
+   config :queue, :validate => :string, :required => true
+ 
+@@ -86,12 +80,6 @@ def register
+     @logger.info("Registering SQS input", :queue => @queue)
+     require "aws-sdk"
+ 
+-    # This should be removed when the deprecated aws credential options are removed
+-    if (@access_key && @secret_key)
+-      @access_key_id = @access_key
+-      @secret_access_key = @secret_key
+-    end
+-    
+     @sqs = AWS::SQS.new(aws_options_hash)
+ 
+     begin
+diff --git a/lib/logstash/outputs/cloudwatch.rb b/lib/logstash/outputs/cloudwatch.rb
+index 5a6c34df12e..d195d2df64a 100644
+--- a/lib/logstash/outputs/cloudwatch.rb
++++ b/lib/logstash/outputs/cloudwatch.rb
+@@ -79,12 +79,6 @@ class LogStash::Outputs::CloudWatch < LogStash::Outputs::Base
+   COUNT_UNIT = "Count"
+   NONE = "None"
+ 
+-  # The `access_key` option is deprecated, please update your configuration to use `access_key_id` instead
+-  config :access_key, :validate => :string, :deprecated => true
+-
+-  # The `secret_key` option is deprecated, please update your configuration to use `secret_access_key` instead
+-  config :secret_key, :validate => :string, :deprecated => true
+-
+   # How often to send data to CloudWatch   
+   # This does not affect the event timestamps, events will always have their
+   # actual timestamp (to-the-minute) sent to CloudWatch.
+@@ -170,12 +164,6 @@ def register
+     require "rufus/scheduler"
+     require "aws"
+ 
+-    # This should be removed when the deprecated aws credential options are removed
+-    if (@access_key && @secret_key) 
+-      @access_key_id = @access_key
+-      @secret_access_key = @secret_key
+-    end
+-
+     @cw = AWS::CloudWatch.new(aws_options_hash)
+ 
+     @event_queue = SizedQueue.new(@queue_size)
+diff --git a/lib/logstash/outputs/elasticsearch_river.rb b/lib/logstash/outputs/elasticsearch_river.rb
+index c407d4ce194..3925f1e49bb 100644
+--- a/lib/logstash/outputs/elasticsearch_river.rb
++++ b/lib/logstash/outputs/elasticsearch_river.rb
+@@ -86,13 +86,6 @@ class LogStash::Outputs::ElasticSearchRiver < LogStash::Outputs::Base
+   public
+   def register
+ 
+-    if @name
+-      if @queue
+-        @logger.error("'name' and 'queue' are the same setting, but 'name' is deprecated. Please use only 'queue'")
+-      end
+-      @queue = @name
+-    end
+-
+     # TODO(sissel): find a better way of declaring where the elasticsearch
+     # libraries are
+     # TODO(sissel): can skip this step if we're running from a jar.
+diff --git a/lib/logstash/outputs/gemfire.rb b/lib/logstash/outputs/gemfire.rb
+index 708bd5d668b..e6b4b005efe 100644
+--- a/lib/logstash/outputs/gemfire.rb
++++ b/lib/logstash/outputs/gemfire.rb
+@@ -15,9 +15,6 @@ class LogStash::Outputs::Gemfire < LogStash::Outputs::Base
+   config_name "gemfire"
+   plugin_status "experimental"
+ 
+-  # Your client cache name
+-  config :name, :validate => :string, :deprecated => true
+-
+   # Your client cache name
+   config :cache_name, :validate => :string, :default => "logstash"
+ 
+@@ -43,14 +40,6 @@ class LogStash::Outputs::Gemfire < LogStash::Outputs::Base
+   # A sprintf format to use when building keys
+   config :key_format, :validate => :string, :default => "%{@source}-%{@timestamp}"
+ 
+-  if @name
+-    if @cache_name
+-      @logger.error("'name' and 'cache_name' are the same setting, but 'name' is deprecated. Please use only 'cache_name'")
+-    end
+-    @cache_name = @name
+-  end
+-
+-
+   public
+   def register
+     import com.gemstone.gemfire.cache.client.ClientCacheFactory
+diff --git a/lib/logstash/outputs/rabbitmq.rb b/lib/logstash/outputs/rabbitmq.rb
+index 8cf057f12f7..21ee42871fe 100644
+--- a/lib/logstash/outputs/rabbitmq.rb
++++ b/lib/logstash/outputs/rabbitmq.rb
+@@ -29,12 +29,8 @@ class LogStash::Outputs::RabbitMQ < LogStash::Outputs::Base
+   # The exchange type (fanout, topic, direct)
+   config :exchange_type, :validate => [ "fanout", "direct", "topic"], :required => true
+ 
+-  # The name of the exchange. Depricated due to conflicts with puppet naming convention.
+-  # Replaced by 'exchange' variable. See LOGSTASH-755
+-  config :name, :validate => :string, :deprecated => true
+-
+   # The name of the exchange
+-  config :exchange, :validate => :string # TODO(sissel): Make it required when 'name' is gone
++  config :exchange, :validate => :string, :required => true
+ 
+   # Key to route to by default. Defaults to 'logstash'
+   #
+@@ -64,13 +60,6 @@ class LogStash::Outputs::RabbitMQ < LogStash::Outputs::Base
+   def register
+     require "bunny" # rubygem 'bunny'
+ 
+-    if @name
+-      if @exchange
+-        @logger.error("'name' and 'exchange' are the same setting, but 'name' is deprecated. Please use only 'exchange'")
+-      end
+-      @exchange = @name
+-    end
+-
+     @logger.info("Registering output", :plugin => self)
+     connect
+   end # def register
+diff --git a/lib/logstash/outputs/sns.rb b/lib/logstash/outputs/sns.rb
+index 08c5e8c31e9..bdfd5b0eb4e 100644
+--- a/lib/logstash/outputs/sns.rb
++++ b/lib/logstash/outputs/sns.rb
+@@ -32,9 +32,6 @@ class LogStash::Outputs::Sns < LogStash::Outputs::Base
+   config_name "sns"
+   plugin_status "experimental"
+ 
+-  # The `credentials` option is deprecated, please update your config to use `aws_credentials_file` instead
+-  config :credentials, :validate => :string, :deprecated => true
+-
+   # Message format.  Defaults to plain text.
+   config :format, :validate => [ "json", "plain" ], :default => "plain"
+ 
+@@ -60,11 +57,6 @@ def aws_service_endpoint(region)
+   def register
+     require "aws-sdk"
+ 
+-    # This should be removed when the deprecated aws credentials option is removed
+-    if (@credentials)
+-      @aws_credentials_file = @credentials
+-    end
+-
+     @sns = AWS::SNS.new(aws_options_hash)
+ 
+     # Try to publish a "Logstash booted" message to the ARN provided to
+diff --git a/lib/logstash/outputs/sqs.rb b/lib/logstash/outputs/sqs.rb
+index 14b3cf5c87e..4f6f8722609 100644
+--- a/lib/logstash/outputs/sqs.rb
++++ b/lib/logstash/outputs/sqs.rb
+@@ -61,12 +61,6 @@ class LogStash::Outputs::SQS < LogStash::Outputs::Base
+   config_name "sqs"
+   plugin_status "experimental"
+ 
+-  # The `access_key` option is deprecated, please update your configuration to use `access_key_id` instead
+-  config :access_key, :validate => :string, :deprecated => true
+-
+-  # The `secret_key` option is deprecated, please update your configuration to use `secret_access_key` instead
+-  config :secret_key, :validate => :string, :deprecated => true
+-
+   # Name of SQS queue to push messages into. Note that this is just the name of the queue, not the URL or ARN.
+   config :queue, :validate => :string, :required => true
+ 
+@@ -81,12 +75,6 @@ def aws_service_endpoint(region)
+   def register
+     require "aws-sdk"
+ 
+-    # This should be removed when the deprecated aws credential options are removed
+-    if (@access_key && @secret_key)
+-      @access_key_id = @access_key
+-      @secret_access_key = @secret_key
+-    end
+-
+     @sqs = AWS::SQS.new(aws_options_hash)
+ 
+     begin
+diff --git a/spec/filters/anonymize.rb b/spec/filters/anonymize.rb
+index 91022a53e59..a6952e979ea 100644
+--- a/spec/filters/anonymize.rb
++++ b/spec/filters/anonymize.rb
+@@ -166,4 +166,24 @@
+     end
+   end
+ 
++  describe "Test field with multiple values" do
++    # The logstash config goes here.
++    # At this time, only filters are supported.
++    config <<-CONFIG
++      filter {
++        anonymize {
++          fields => ["clientip"]
++          key => "longencryptionkey"
++          algorithm => 'MD5'
++        }
++      }
++    CONFIG
++
++    sample "@fields" => {"clientip" => [ "123.123.123.123", "223.223.223.223" ]} do
++      insist { subject["clientip"]} == [ "9336c879e305c9604a3843fc3e75948f", "7a6c66b8d3f42a7d650e3354af508df3" ]
++    end
++  end
++
++  
++
+ end
+diff --git a/spec/filters/csv.rb b/spec/filters/csv.rb
+index 7e230c706bc..ae4cdc78d52 100644
+--- a/spec/filters/csv.rb
++++ b/spec/filters/csv.rb
+@@ -35,105 +35,6 @@
+     end
+   end
+ 
+-  describe "given fields ( deprecated test )" do
+-    # The logstash config goes here.
+-    # At this time, only filters are supported.
+-    config <<-CONFIG
+-      filter {
+-        csv {
+-          fields => ["first", "last", "address" ]
+-        }
+-      }
+-    CONFIG
+-
+-    sample "big,bird,sesame street" do
+-      insist { subject["first"] } == "big"
+-      insist { subject["last"] } == "bird"
+-      insist { subject["address"] } == "sesame street"
+-    end
+-  end
+-
+-  describe "parse csv with more data than defined field names ( deprecated test )" do
+-    config <<-CONFIG
+-      filter {
+-        csv {
+-          fields => ["custom1", "custom2"]
+-        }
+-      }
+-    CONFIG
+-
+-    sample "val1,val2,val3" do
+-      insist { subject["custom1"] } == "val1"
+-      insist { subject["custom2"] } == "val2"
+-      insist { subject["column3"] } == "val3"
+-    end
+-  end
+-
+-  describe "parse csv from a given field without field names ( deprecated test )" do
+-    config <<-CONFIG
+-      filter {
+-        csv {
+-          raw => "data"
+-        }
+-      }
+-    CONFIG
+-
+-    sample({"@fields" => {"raw" => "val1,val2,val3"}}) do
+-      insist { subject["data"]["column1"] } == "val1"
+-      insist { subject["data"]["column2"] } == "val2"
+-      insist { subject["data"]["column3"] } == "val3"
+-    end
+-  end
+-
+-  describe "parse csv from a given field with field names ( deprecated test )" do
+-    config <<-CONFIG
+-      filter {
+-        csv {
+-          raw => "data"
+-          fields => ["custom1", "custom2", "custom3"]
+-        }
+-      }
+-    CONFIG
+-
+-    sample({"@fields" => {"raw" => "val1,val2,val3"}}) do
+-      insist { subject["data"]["custom1"] } == "val1"
+-      insist { subject["data"]["custom2"] } == "val2"
+-      insist { subject["data"]["custom3"] } == "val3"
+-    end
+-  end
+-
+-  describe "fail to parse any data in a multi-value field ( deprecated test )" do
+-    config <<-CONFIG
+-      filter {
+-        csv {
+-          raw => "data"
+-        }
+-      }
+-    CONFIG
+-
+-    sample({"@fields" => {"raw" => ["val1,val2,val3", "val1,val2,val3"]}}) do
+-      insist { subject["data"] } == nil
+-    end
+-  end
+-
+-
+-  # New tests
+-
+-  describe "fail to parse any data in a multi-value field ( deprecated test )" do
+-    config <<-CONFIG
+-      filter {
+-        csv {
+-          source => "datain"
+-          target => "data"
+-        }
+-      }
+-    CONFIG
+-
+-    sample({"@fields" => {"datain" => ["val1,val2,val3", "val1,val2,val3"]}}) do
+-      insist { subject["data"] } == nil
+-    end
+-  end
+-
+   describe "given columns" do
+     # The logstash config goes here.
+     # At this time, only filters are supported.
+diff --git a/spec/filters/date.rb b/spec/filters/date.rb
+index c708886fea6..bf39a52611d 100644
+--- a/spec/filters/date.rb
++++ b/spec/filters/date.rb
+@@ -8,7 +8,7 @@
+     config <<-CONFIG
+       filter {
+         date {
+-          mydate => "ISO8601"
++          match => [ "mydate", "ISO8601" ]
+         }
+       }
+     CONFIG
+@@ -44,7 +44,7 @@
+     config <<-CONFIG
+       filter {
+         date {
+-          mydate => "MMM dd HH:mm:ss Z"
++          match => [ "mydate", "MMM dd HH:mm:ss Z" ]
+         }
+       }
+     CONFIG
+@@ -69,7 +69,7 @@
+     config <<-CONFIG
+       filter {
+         date {
+-          mydate => "UNIX"
++          match => [ "mydate", "UNIX" ]
+         }
+       }
+     CONFIG
+@@ -95,7 +95,7 @@
+     config <<-CONFIG
+       filter {
+         date {
+-          mydate => "UNIX"
++          match => [ "mydate", "UNIX" ]
+         }
+       }
+     CONFIG
+@@ -109,7 +109,7 @@
+     config <<-CONFIG
+       filter {
+         date {
+-          mydate => "UNIX_MS"
++          match => [ "mydate", "UNIX_MS" ]
+         }
+       }
+     CONFIG
+@@ -148,7 +148,7 @@
+       }
+       filter {
+         date {
+-          mydate => [ "MMM  d HH:mm:ss", "MMM dd HH:mm:ss" ]
++          match => [ "mydate", "MMM  d HH:mm:ss", "MMM dd HH:mm:ss" ]
+         }
+       }
+       output { 

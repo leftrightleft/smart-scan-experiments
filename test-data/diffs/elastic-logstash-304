@@ -1,0 +1,263 @@
+diff --git a/lib/logstash/event.rb b/lib/logstash/event.rb
+index e8246ab1056..614536132e5 100644
+--- a/lib/logstash/event.rb
++++ b/lib/logstash/event.rb
+@@ -133,9 +133,32 @@ def [](key)
+     # If the key isn't in fields and it starts with an "@" sign, get it out of data instead of fields
+     if ! @data["@fields"].has_key?(key) and key.slice(0,1) == "@"
+       return @data[key]
+-    # Exists in @fields (returns value) or doesn't start with "@" (return null)
++    elsif key.index(/(?<!\\)\./)
++      value = nil
++      obj = @data["@fields"]
++      # "." is what ES uses to access structured data, so adopt that
++      # idea here, too.  "foo.bar" will access key "bar" under hash "foo".
++      key.split(/(?<!\\)\./).each do |segment|
++        segment.gsub!(/\\\./, ".")
++        if (obj.is_a?(Array) || (obj.is_a?(Hash) && !obj.member?(segment)) )
++          # try to safely cast segment to integer for the 0 in foo.0.bar
++          begin
++            segment = Integer(segment)
++          rescue Exception
++            #not an int, do nothing, segment remains a string
++          end
++        end
++        if obj
++          value = obj[segment] rescue nil
++          obj = obj[segment] rescue nil
++        else
++          value = nil
++          break
++        end
++      end # key.split.each
++      return value
+     else
+-      return @data["@fields"][key]
++      return @data["@fields"][key.gsub(/\\\./, ".")]
+     end
+   end # def []
+   
+@@ -252,26 +275,7 @@ def sprintf(format)
+         end
+       else
+         # Use an event field.
+-        value = nil
+-        obj = self
+-
+-        # If the top-level value exists, use that and don't try
+-        # to "look" into data structures.
+-        if self[key]
+-          value = self[key]
+-        else
+-          # "." is what ES uses to access structured data, so adopt that
+-          # idea here, too.  "foo.bar" will access key "bar" under hash "foo".
+-          key.split('.').each do |segment|
+-            if obj
+-              value = obj[segment] rescue nil
+-              obj = obj[segment] rescue nil
+-            else
+-              value = nil
+-              break
+-            end
+-          end # key.split.each
+-        end # if self[key]
++        value = self[key]
+ 
+         case value
+         when nil
+diff --git a/lib/logstash/filters/date.rb b/lib/logstash/filters/date.rb
+index 2c7136870d9..87016988daa 100644
+--- a/lib/logstash/filters/date.rb
++++ b/lib/logstash/filters/date.rb
+@@ -182,9 +182,9 @@ def filter(event)
+       @logger.debug("Date filter: type #{event.type}, looking for field #{field.inspect}",
+                     :type => event.type, :field => field)
+       # TODO(sissel): check event.message, too.
+-      next unless event.fields.member?(field)
++      next unless event[field]
+ 
+-      fieldvalues = event.fields[field]
++      fieldvalues = event[field]
+       fieldvalues = [fieldvalues] if !fieldvalues.is_a?(Array)
+       fieldvalues.each do |value|
+         next if value.nil?
+diff --git a/spec/event.rb b/spec/event.rb
+index f7ad1ae2e8d..62c03af5d5f 100644
+--- a/spec/event.rb
++++ b/spec/event.rb
+@@ -9,21 +9,69 @@
+     @event.message = "hello world"
+     @event.tags = [ "tag1" ]
+     @event.source = "/home/foo"
++    @event["@fields"] = { 
++        "a" => "b", 
++        "c" => {
++            "d" => "f",
++            "e.f" => "g"
++        }, 
++        "c.d" => "e",
++        "f.g" => { 
++            "h" => "i" 
++        },
++        "j" => { 
++            "k1" => "v", 
++            "k2" => [
++                "w", 
++                "x" 
++            ],
++            "k3.4" => "m",
++            5 => 6,
++            "5" => 7
++        } 
++    }
+   end
+ 
+   subject { @event }
+ 
+   context "#sprintf" do
++    it "should report a unix timestamp for %{+%s}" do
++      insist { @event.sprintf("%{+%s}") } == "1356998400"
++    end
++    
+     it "should report a time with %{+format} syntax" do
+       insist { @event.sprintf("%{+YYYY}") } == "2013"
+       insist { @event.sprintf("%{+MM}") } == "01"
+       insist { @event.sprintf("%{+HH}") } == "00"
+     end
+-
++  
+     it "should report fields with %{field} syntax" do
+       insist { @event.sprintf("%{@type}") } == "sprintf"
+       insist { @event.sprintf("%{@message}") } == subject["@message"]
+     end
++    
++    it "should print deep fields" do
++      insist { @event.sprintf("%{j.k1}") } == "v"
++      insist { @event.sprintf("%{j.k2.0}") } == "w"
++    end
++  end
++  
++  context "#[]" do
++    it "should fetch data" do
++      insist { @event["@type"] } == "sprintf"
++    end
++    it "should fetch fields" do
++      insist { @event["a"] } == "b"
++      insist { @event['c\.d'] } == "e"
++    end
++    it "should fetch deep fields" do
++      insist { @event["j.k1"] } == "v"
++      insist { @event["c.d"] } == "f"
++      insist { @event['f\.g.h'] } == "i"
++      insist { @event['j.k3\.4'] } == "m"
++      insist { @event['j.5'] } == 7
++
++    end
+   end
+ 
+   context "#append" do
+@@ -31,12 +79,12 @@
+       subject.append(LogStash::Event.new("@message" => "hello world"))
+       insist { subject.message } == "hello world\nhello world"
+     end
+-
++  
+     it "should concatenate tags" do
+       subject.append(LogStash::Event.new("@tags" => [ "tag2" ]))
+       insist { subject.tags } == [ "tag1", "tag2" ]
+     end
+-
++  
+     context "when event field is nil" do
+       it "should add single value as string" do
+         subject.append(LogStash::Event.new("@fields" => {"field1" => "append1"}))
+@@ -47,10 +95,10 @@
+         insist { subject[ "field1" ] } == [ "append1","append2" ]
+       end
+     end
+-
++  
+     context "when event field is a string" do
+       before { subject[ "field1" ] = "original1" }
+-
++  
+       it "should append string to values, if different from current" do
+         subject.append(LogStash::Event.new("@fields" => {"field1" => "append1"}))
+         insist { subject[ "field1" ] } == [ "original1", "append1" ]
+@@ -70,7 +118,7 @@
+     end
+     context "when event field is an array" do
+       before { subject[ "field1" ] = [ "original1", "original2" ] }
+-
++  
+       it "should append string values to array, if not present in array" do
+         subject.append(LogStash::Event.new("@fields" => {"field1" => "append1"}))
+         insist { subject[ "field1" ] } == [ "original1", "original2", "append1" ]
+diff --git a/spec/filters/date.rb b/spec/filters/date.rb
+index a4dd2a82758..071c49afad3 100644
+--- a/spec/filters/date.rb
++++ b/spec/filters/date.rb
+@@ -199,5 +199,32 @@
+       insist { subject["@timestamp"] } == time
+     end
+   end
+-end
++  
++  describe "support deep field access" do
++    config <<-CONFIG
++      filter { 
++        date {
++          match => [ "data.deep", "ISO8601" ]
++        }
++      }
++    CONFIG
++    
++    sample({ "@fields" => { "data" => { "deep" => "2013-01-01T00:00:00.000Z" } } }) do
++      insist { subject["@timestamp"] } == "2013-01-01T00:00:00.000Z"
++    end
++  end
+ 
++  describe "support deep field access" do
++    config <<-CONFIG
++      filter { 
++        date {
++          match => [ "data\\.deep", "ISO8601" ]
++        }
++      }
++    CONFIG
++
++    sample({ "@fields" => { "data.deep" => "2013-01-01T00:00:00.000Z" } }) do
++      insist { subject["@timestamp"] } == "2013-01-01T00:00:00.000Z"
++    end
++  end
++end
+diff --git a/spec/filters/json.rb b/spec/filters/json.rb
+index 491f53593e7..afb74b98cf4 100644
+--- a/spec/filters/json.rb
++++ b/spec/filters/json.rb
+@@ -18,6 +18,9 @@
+       insist { subject["hello"] } == "world"
+       insist { subject["list" ] } == [1,2,3]
+       insist { subject["hash"] } == { "k" => "v" }
++
++      insist { subject["list.0" ] } == 1
++      insist { subject["hash.k"] } == "v"
+     end
+   end
+ 
+@@ -33,8 +36,14 @@
+ 
+     sample '{ "hello": "world", "list": [ 1, 2, 3 ], "hash": { "k": "v" } }' do
+       insist { subject["data"]["hello"] } == "world"
+-      insist { subject["data"]["list" ] } == [1,2,3]
++      insist { subject["data"]["list"] } == [1,2,3]
+       insist { subject["data"]["hash"] } == { "k" => "v" }
++      
++      insist { subject["data.hello"] } == "world"
++      insist { subject["data.list" ] } == [1,2,3]
++      insist { subject["data.list.0" ] } == 1
++      insist { subject["data.hash"] } == { "k" => "v" }
++      insist { subject["data.hash.k"] } ==  "v"
+     end
+   end
+ 

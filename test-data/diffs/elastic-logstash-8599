@@ -1,0 +1,179 @@
+diff --git a/README.md b/README.md
+index b1732a638ce..71095f7ce7d 100644
+--- a/README.md
++++ b/README.md
+@@ -143,6 +143,10 @@ Most of the unit tests in Logstash are written using [rspec](http://rspec.info/)
+     
+     ./gradlew javaTests
+ 
++3- To execute the complete test-suite including the integration tests run:
++
++    ./gradlew check
++
+ ### Plugins tests
+ 
+ To run the tests of all currently installed plugins:
+diff --git a/build.gradle b/build.gradle
+index e65f53c4db8..793f878806c 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -73,6 +73,7 @@ allprojects {
+ 
+ // fetch version from Logstash's master versions.yml file
+ def versionMap = (Map) (new Yaml()).load(new File("${projectDir}/versions.yml").text)
++version = versionMap['logstash-core']
+ 
+ String jRubyURL
+ String jRubyVersion
+@@ -136,9 +137,11 @@ task downloadAndInstallJRuby(dependsOn: verifyFile, type: Copy) {
+     into "${projectDir}/vendor/jruby"
+ }
+ 
+-def jrubyBin = './vendor/jruby/bin/jruby' +
++def jrubyBin = "${projectDir}/vendor/jruby/bin/jruby" +
+   (System.getProperty("os.name").startsWith("Windows") ? '.bat' : '')
+ 
++def rakeBin = "${projectDir}/vendor/jruby/bin/rake"
++
+ task installTestGems(dependsOn: downloadAndInstallJRuby, type: Exec) {
+   workingDir projectDir
+   inputs.files file("${projectDir}/Gemfile.template")
+@@ -153,9 +156,68 @@ task installTestGems(dependsOn: downloadAndInstallJRuby, type: Exec) {
+   environment "USE_RUBY", "1"
+   standardOutput = new ExecLogOutputStream(System.out)
+   errorOutput =  new ExecLogOutputStream(System.err)
+-  commandLine jrubyBin, "${projectDir}/vendor/jruby/bin/rake", "test:install-core"
++  commandLine jrubyBin, rakeBin, "test:install-core"
++}
++
++task assembleTarDistribution(dependsOn: installTestGems, type: Exec) {
++  workingDir projectDir
++  inputs.files fileTree("${projectDir}/rakelib")
++  inputs.files fileTree("${projectDir}/logstash-core/lib")
++  inputs.files fileTree("${projectDir}/logstash-core/src")
++  outputs.files file("${buildDir}/logstash-${project.version}.tar.gz")
++  standardOutput = new ExecLogOutputStream(System.out)
++  errorOutput =  new ExecLogOutputStream(System.err)
++  commandLine jrubyBin, rakeBin, "artifact:tar"
++}
++
++task unpackTarDistribution(dependsOn: assembleTarDistribution, type: Copy) {
++  def tar = file("${buildDir}/logstash-${project.version}-SNAPSHOT.tar.gz")
++  inputs.files tar
++  outputs.files fileTree("${buildDir}/logstash-${project.version}-SNAPSHOT")
++  from tarTree(tar)
++  into {buildDir}
++}
++
++def bundleBin = "${projectDir}/vendor/bundle/jruby/2.3.0/bin/bundle"
++def gemPath = "${buildDir}/qa/integration/gems"
++
++task installIntegrationTestBundler(dependsOn: unpackTarDistribution, type: Exec) {
++  outputs.files fileTree("${gemPath}/gems/bundler-1.16.0")
++  environment "GEM_PATH", gemPath
++  environment "GEM_HOME", gemPath
++  standardOutput = new ExecLogOutputStream(System.out)
++  errorOutput =  new ExecLogOutputStream(System.err)
++  commandLine jrubyBin, "${projectDir}/vendor/jruby/bin/gem", "install", "bundler", "-v", "1.16.0"
++}
++
++task installIntegrationTestGems(dependsOn: installIntegrationTestBundler, type: Exec) {
++  workingDir "${projectDir}/qa/integration"
++  environment "GEM_PATH", gemPath
++  environment "GEM_HOME", gemPath
++  inputs.files file("${projectDir}/qa/integration/Gemfile")
++  inputs.files file("${projectDir}/qa/integration/integration_tests.gemspec")
++  outputs.files fileTree("${gemPath}/gems")
++  outputs.files file("${projectDir}/qa/integration/Gemfile.lock")
++  standardOutput = new ExecLogOutputStream(System.out)
++  errorOutput =  new ExecLogOutputStream(System.err)
++  commandLine jrubyBin, bundleBin, "install"
++}
++
++def rubyIntegrationSpecs = project.hasProperty("rubyIntegrationSpecs") ? ((String) project.property("rubyIntegrationSpecs")).split(/\s+/) : []
++
++task runIntegrationTests(dependsOn: installIntegrationTestGems, type: Exec) {
++  workingDir "${projectDir}/qa/integration"
++  environment "JAVA_OPTS", ""
++  environment "GEM_PATH", gemPath
++  environment "GEM_HOME", gemPath
++  standardOutput = new ExecLogOutputStream(System.out)
++  errorOutput =  new ExecLogOutputStream(System.err)
++  commandLine([jrubyBin, bundleBin, "exec", "rspec"].plus((Collection<String>)rubyIntegrationSpecs))
+ }
+ 
+ // If you are running a JRuby snapshot we will skip the integrity check.
+ verifyFile.onlyIf { doChecksum }
+ bootstrap.dependsOn installTestGems
++
++runIntegrationTests.shouldRunAfter tasks.getByPath(":logstash-core:test")
++check.dependsOn runIntegrationTests
+diff --git a/ci/integration_tests.sh b/ci/integration_tests.sh
+index e26c9aa0681..8503f57ff11 100755
+--- a/ci/integration_tests.sh
++++ b/ci/integration_tests.sh
+@@ -9,35 +9,25 @@ export JRUBY_OPTS="-J-Xmx1g"
+ export SPEC_OPTS="--order rand --format documentation"
+ export CI=true
+ 
+-rm -rf build && mkdir build
+-
+-echo "Building tar"
+-rake artifact:tar
+-cd build
+-tar xf *.tar.gz
+-
+-cd ../qa/integration
+-echo "Installing test dependencies"
+-bundle install
+-
+ if [[ $1 = "setup" ]]; then
+  echo "Setup only, no tests will be run"
+  exit 0
+ 
+ elif [[ $1 == "split" ]]; then
++    cd qa/integration 
+     glob1=(specs/*spec.rb)
+     glob2=(specs/**/*spec.rb)
+     all_specs=("${glob1[@]}" "${glob2[@]}")
+ 
+     specs0=${all_specs[@]::$((${#all_specs[@]} / 2 ))}
+     specs1=${all_specs[@]:$((${#all_specs[@]} / 2 ))}
+-
++    cd ../..
+     if [[ $2 == 0 ]]; then
+        echo "Running the first half of integration specs: $specs0"
+-       bundle exec rspec $specs0
++       ./gradlew runIntegrationTests -PrubyIntegrationSpecs="$specs0"
+     elif [[ $2 == 1 ]]; then
+        echo "Running the second half of integration specs: $specs1"
+-       bundle exec rspec $specs1
++       ./gradlew runIntegrationTests -PrubyIntegrationSpecs="$specs1"
+     else
+        echo "Error, must specify 0 or 1 after the split. For example ci/integration_tests.sh split 0"
+        exit 1
+@@ -45,9 +35,9 @@ elif [[ $1 == "split" ]]; then
+ 
+ elif [[ !  -z  $@  ]]; then
+     echo "Running integration tests 'rspec $@'"
+-    bundle exec rspec $@
++    ./gradlew runIntegrationTests -PrubyIntegrationSpecs="$@"
+ 
+ else
+     echo "Running all integration tests"
+-    bundle exec rspec
++    ./gradlew runIntegrationTests
+ fi
+diff --git a/qa/integration/services/logstash_service.rb b/qa/integration/services/logstash_service.rb
+index 0453795f98e..c8b53a7ef93 100644
+--- a/qa/integration/services/logstash_service.rb
++++ b/qa/integration/services/logstash_service.rb
+@@ -180,7 +180,7 @@ def reload_config(initial_config_file, reload_config_file)
+   end  
+   
+   def get_version
+-    `#{@logstash_bin} --version`
++    `#{@logstash_bin} --version`.split("\n").last
+   end
+   
+   def get_version_yml

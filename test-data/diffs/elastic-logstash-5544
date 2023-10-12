@@ -1,0 +1,198 @@
+diff --git a/logstash-core/lib/logstash/instrument/null_metric.rb b/logstash-core/lib/logstash/instrument/null_metric.rb
+new file mode 100644
+index 00000000000..02b8a6304ef
+--- /dev/null
++++ b/logstash-core/lib/logstash/instrument/null_metric.rb
+@@ -0,0 +1,45 @@
++# encoding: utf-8
++
++module LogStash module Instrument
++ # This class is used in the context when we disable the metric collection
++ # for specific plugin to replace the `NamespacedMetric` class with this one
++ # which doesn't produce any metric to the collector.
++ class NullMetric
++   attr_reader :namespace_name, :collector
++
++   def increment(key, value = 1)
++   end
++
++   def decrement(key, value = 1)
++   end
++
++   def gauge(key, value)
++   end
++
++   def report_time(key, duration)
++   end
++
++   # We have to manually redefine this method since it can return an
++   # object this object also has to be implemented as a NullObject
++   def time(key, &block)
++     if block_given?
++       yield
++     else
++       NullTimedExecution
++     end
++   end
++
++   def namespace(name)
++     self.class.new
++   end
++
++   private
++   # Null implementation of the internal timer class
++   #
++   # @see LogStash::Instrument::TimedExecution`
++   class NullTimedExecution
++     def self.stop
++     end
++   end
++ end
++end; end
+diff --git a/logstash-core/lib/logstash/plugin.rb b/logstash-core/lib/logstash/plugin.rb
+index 73431b1b811..c87b757f02a 100644
+--- a/logstash-core/lib/logstash/plugin.rb
++++ b/logstash-core/lib/logstash/plugin.rb
+@@ -2,6 +2,7 @@
+ require "logstash/namespace"
+ require "logstash/logging"
+ require "logstash/config/mixin"
++require "logstash/instrument/null_metric"
+ require "cabin"
+ require "concurrent"
+ 
+@@ -26,6 +27,7 @@ def eql?(other)
+   def initialize(params=nil)
+     @params = LogStash::Util.deep_clone(params)
+     @logger = Cabin::Channel.get(LogStash)
++    @metric_plugin = LogStash::Instrument::NullMetric.new
+   end
+ 
+   # close is called during shutdown, after the plugin worker
+@@ -47,6 +49,14 @@ def to_s
+     return "#{self.class.name}: #{@params}"
+   end
+ 
++  # This is a shim to make sure that plugin
++  # that record metric still work with 2.4
++  #
++  # https://github.com/elastic/logstash/issues/5539
++  def metric
++    @metric_plugin
++  end
++
+   public
+   def inspect
+     if !@params.nil?
+diff --git a/logstash-core/spec/logstash/instrument/null_metric_spec.rb b/logstash-core/spec/logstash/instrument/null_metric_spec.rb
+new file mode 100644
+index 00000000000..01806b4aa4f
+--- /dev/null
++++ b/logstash-core/spec/logstash/instrument/null_metric_spec.rb
+@@ -0,0 +1,63 @@
++# encoding: utf-8
++require "logstash/instrument/null_metric"
++
++describe LogStash::Instrument::NullMetric do
++  let(:key) { "galaxy" }
++
++  describe "#increment" do
++    it "allows to increment a key with no amount" do
++      expect { subject.increment(key, 100) }.not_to raise_error
++    end
++
++    it "allow to increment a key" do
++      expect { subject.increment(key) }.not_to raise_error
++    end
++  end
++
++  describe "#decrement" do
++    it "allows to decrement a key with no amount" do
++      expect { subject.decrement(key, 100) }.not_to raise_error
++    end
++
++    it "allow to decrement a key" do
++      expect { subject.decrement(key) }.not_to raise_error
++    end
++  end
++
++  describe "#gauge" do
++    it "allows to set a value" do
++      expect { subject.gauge(key, "pluto") }.not_to raise_error
++    end
++  end
++
++  describe "#report_time" do
++    it "allow to record time" do
++      expect { subject.report_time(key, 1000) }.not_to raise_error
++    end
++  end
++
++  describe "#time" do
++    it "allow to record time with a block given" do
++      expect do
++        subject.time(key) { 1+1 }
++      end.not_to raise_error
++    end
++
++    it "when using a block it return the generated value" do
++      expect(subject.time(key) { 1+1 }).to eq(2)
++    end
++
++    it "allow to record time with no block given" do
++      expect do
++        clock = subject.time(key)
++        clock.stop
++      end.not_to raise_error
++    end
++  end
++
++  describe "#namespace" do
++    it "return a NullMetric" do
++      expect(subject.namespace(key)).to be_kind_of LogStash::Instrument::NullMetric
++    end
++  end
++end
+diff --git a/logstash-core/spec/logstash/plugin_spec.rb b/logstash-core/spec/logstash/plugin_spec.rb
+index b720fe49d27..559553ebbec 100644
+--- a/logstash-core/spec/logstash/plugin_spec.rb
++++ b/logstash-core/spec/logstash/plugin_spec.rb
+@@ -1,6 +1,9 @@
+ # encoding: utf-8
+-require "spec_helper"
+ require "logstash/plugin"
++require "logstash/inputs/base"
++require "logstash/filters/base"
++require "logstash/outputs/base"
++require "spec_helper"
+ 
+ describe LogStash::Plugin do
+   it "should fail lookup on inexisting type" do
+@@ -166,4 +169,27 @@ def register; end
+ 
+     end
+   end
++  context "Collecting Metric in the plugin" do
++    [LogStash::Inputs::Base, LogStash::Filters::Base, LogStash::Outputs::Base].each do |type|
++      let(:plugin) do
++        Class.new(type) do
++          config_name "goku"
++
++          def register
++            metric.gauge("power-level", 9000)
++          end
++        end
++      end
++
++      subject { plugin.new }
++
++      it "should not raise an exception when recoding a metric" do
++        expect { subject.register }.not_to raise_error
++      end
++
++      it "should use a `NullMetric`" do
++        expect(subject.metric).to be_kind_of(LogStash::Instrument::NullMetric)
++      end
++    end
++  end
+ end

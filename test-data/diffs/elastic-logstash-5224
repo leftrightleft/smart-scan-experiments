@@ -1,0 +1,158 @@
+diff --git a/lib/pluginmanager/gemfile.rb b/lib/pluginmanager/gemfile.rb
+index b1648187764..68bf88334f1 100644
+--- a/lib/pluginmanager/gemfile.rb
++++ b/lib/pluginmanager/gemfile.rb
+@@ -41,13 +41,20 @@ def add(name, *requirements)
+       @gemset.add_gem(Gem.parse(name, *requirements))
+     end
+ 
+-    # update existing or add new
++    # update existing or add new and merge passed options with current gem options if it exists
+     # @param name [String] gem name
+     # @param *requirements params following name use the same notation as the Gemfile gem DSL statement
+     def update(name, *requirements)
+       @gemset.update_gem(Gem.parse(name, *requirements))
+     end
+ 
++    # overwrite existing or add new
++    # @param name [String] gem name
++    # @param *requirements params following name use the same notation as the Gemfile gem DSL statement
++    def overwrite(name, *requirements)
++      @gemset.overwrite_gem(Gem.parse(name, *requirements))
++    end
++
+     # @return [Gem] removed gem or nil if not found
+     def remove(name)
+       @gemset.remove_gem(name)
+@@ -99,6 +106,19 @@ def add_gem(_gem)
+ 
+     # update existing or add new
+     def update_gem(_gem)
++      if old = find_gem(_gem.name)
++        # always overwrite requirements if specified
++        old.requirements = _gem.requirements unless no_constrains?(_gem.requirements)
++        # but merge options
++        old.options = old.options.merge(_gem.options)
++      else
++        @gems << _gem
++        @gems_by_name[_gem.name.downcase] = _gem
++      end
++    end
++
++    # update existing or add new
++    def overwrite_gem(_gem)
+       if old = find_gem(_gem.name)
+         @gems[@gems.index(old)] = _gem
+       else
+@@ -119,8 +139,19 @@ def remove_gem(name)
+     def copy
+       Marshal.load(Marshal.dump(self))
+     end
++
+     private
+ 
++    def no_constrains?(requirements)
++      return true if requirements.nil? || requirements.empty?
++
++      # check for the dummy ">= 0" version constrain or any variations thereof
++      # which is in fact a "no constrain" constrain which we should discard
++      return true if requirements.size == 1 && requirements.first.to_s.gsub(/\s+/, "") == ">=0"
++
++      false
++    end
++
+     def sources_to_s
+       return "" if @sources.empty?
+       @sources.map{|source| "source #{source.inspect}"}.join("\n")
+diff --git a/lib/pluginmanager/install.rb b/lib/pluginmanager/install.rb
+index dae85e3dfc5..0e6383d725b 100644
+--- a/lib/pluginmanager/install.rb
++++ b/lib/pluginmanager/install.rb
+@@ -9,6 +9,7 @@ class LogStash::PluginManager::Install < LogStash::PluginManager::Command
+   parameter "[PLUGIN] ...", "plugin name(s) or file", :attribute_name => :plugins_arg
+   option "--version", "VERSION", "version of the plugin to install"
+   option "--[no-]verify", :flag, "verify plugin validity before installation", :default => true
++  option "--preserve", :flag, "preserve current gem options", :default => false
+   option "--development", :flag, "install all development dependencies of currently installed plugins", :default => false
+   option "--local", :flag, "force local-only plugin installation. see bin/logstash-plugin package|unpack", :default => false
+ 
+@@ -90,7 +91,15 @@ def install_gems_list!(install_list)
+ 
+     # Add plugins/gems to the current gemfile
+     puts("Installing" + (install_list.empty? ? "..." : " " + install_list.collect(&:first).join(", ")))
+-    install_list.each { |plugin, version, options| gemfile.update(plugin, version, options) }
++    install_list.each do |plugin, version, options|
++      if preserve?
++        plugin_gem = gemfile.find(plugin)
++        puts("Preserving Gemfile gem options for plugin #{plugin}") if plugin_gem && !plugin_gem.options.empty?
++        gemfile.update(plugin, version, options)
++      else
++        gemfile.overwrite(plugin, version, options)
++      end
++    end
+ 
+     # Sync gemfiles changes to disk to make them available to the `bundler install`'s API
+     gemfile.save
+diff --git a/rakelib/plugin.rake b/rakelib/plugin.rake
+index dc91d19bcc8..0bc1b708906 100644
+--- a/rakelib/plugin.rake
++++ b/rakelib/plugin.rake
+@@ -10,7 +10,7 @@ namespace "plugin" do
+ 
+   task "install-development-dependencies" do
+     puts("[plugin:install-development-dependencies] Installing development dependencies of all installed plugins")
+-    install_plugins("--development")
++    install_plugins("--development",  "--preserve")
+ 
+     task.reenable # Allow this task to be run again
+   end
+@@ -18,35 +18,35 @@ namespace "plugin" do
+   task "install", :name do |task, args|
+     name = args[:name]
+     puts("[plugin:install] Installing plugin: #{name}")
+-    install_plugins("--no-verify", name)
++    install_plugins("--no-verify", "--preserve", name)
+ 
+     task.reenable # Allow this task to be run again
+   end # task "install"
+ 
+   task "install-default" do
+     puts("[plugin:install-default] Installing default plugins")
+-    install_plugins("--no-verify", *LogStash::RakeLib::DEFAULT_PLUGINS)
++    install_plugins("--no-verify", "--preserve", *LogStash::RakeLib::DEFAULT_PLUGINS)
+ 
+     task.reenable # Allow this task to be run again
+   end
+ 
+   task "install-core" do
+     puts("[plugin:install-core] Installing core plugins")
+-    install_plugins("--no-verify", *LogStash::RakeLib::CORE_SPECS_PLUGINS)
++    install_plugins("--no-verify", "--preserve", *LogStash::RakeLib::CORE_SPECS_PLUGINS)
+ 
+     task.reenable # Allow this task to be run again
+   end
+ 
+   task "install-jar-dependencies" do
+     puts("[plugin:install-jar-dependencies] Installing jar_dependencies plugins for testing")
+-    install_plugins("--no-verify", *LogStash::RakeLib::TEST_JAR_DEPENDENCIES_PLUGINS)
++    install_plugins("--no-verify", "--preserve", *LogStash::RakeLib::TEST_JAR_DEPENDENCIES_PLUGINS)
+ 
+     task.reenable # Allow this task to be run again
+   end
+ 
+   task "install-vendor" do
+     puts("[plugin:install-jar-dependencies] Installing vendor plugins for testing")
+-    install_plugins("--no-verify", *LogStash::RakeLib::TEST_VENDOR_PLUGINS)
++    install_plugins("--no-verify", "--preserve", *LogStash::RakeLib::TEST_VENDOR_PLUGINS)
+ 
+     task.reenable # Allow this task to be run again
+   end
+@@ -59,7 +59,7 @@ namespace "plugin" do
+     # TODO Push this downstream to #install_plugins
+     p.each do |plugin|
+       begin
+-        install_plugins("--no-verify", plugin)
++        install_plugins("--no-verify", "--preserve", plugin)
+       rescue
+         puts "Unable to install #{plugin}. Skipping"
+         next

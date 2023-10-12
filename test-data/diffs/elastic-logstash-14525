@@ -1,0 +1,475 @@
+diff --git a/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java b/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
+index b0fa9ef5b65..be9eeb3101f 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
++++ b/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
+@@ -28,12 +28,13 @@
+ import java.security.NoSuchAlgorithmException;
+ import java.time.temporal.ChronoUnit;
+ import java.time.temporal.TemporalUnit;
+-import java.util.ArrayList;
+ import java.time.Duration;
++import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.LinkedHashSet;
+ import java.util.List;
++import java.util.Set;
+ import java.util.UUID;
+-import java.util.concurrent.TimeUnit;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
+@@ -80,6 +81,8 @@
+ import org.logstash.secret.store.SecretStoreExt;
+ 
+ import static org.logstash.instrument.metrics.MetricKeys.*;
++import static org.logstash.instrument.metrics.UptimeMetric.ScaleUnits.MILLISECONDS;
++import static org.logstash.instrument.metrics.UptimeMetric.ScaleUnits.SECONDS;
+ 
+ /**
+  * JRuby extension to provide ancestor class for Ruby's Pipeline and JavaPipeline classes.
+@@ -430,45 +433,40 @@ public final IRubyObject collectStats(final ThreadContext context) throws IOExce
+         return context.nil;
+     }
+ 
++    @SuppressWarnings("DuplicatedCode") // as much as this is sub-par, refactoring makes it harder to read.
+     @JRubyMethod(name = "initialize_flow_metrics")
+     public final IRubyObject initializeFlowMetrics(final ThreadContext context) {
+         if (metric.collector(context).isNil()) { return context.nil; }
+ 
+-        final UptimeMetric uptimeInMillis = initOrGetUptimeMetric(context, buildNamespace(),
+-                RubyUtil.RUBY.newSymbol(UPTIME_IN_MILLIS_KEY.asJavaString()));
+-        final UptimeMetric uptimeInSeconds = uptimeInMillis.withTimeUnit(UPTIME_IN_SECONDS_KEY.asJavaString(),
+-                TimeUnit.SECONDS);
++        final UptimeMetric uptimeMetric = initOrGetUptimeMetric(context, buildNamespace(), context.runtime.newSymbol("uptime_in_millis"));
++        final Metric<Number> uptimeInPreciseMillis = uptimeMetric.withUnitsPrecise(MILLISECONDS);
++        final Metric<Number> uptimeInPreciseSeconds = uptimeMetric.withUnitsPrecise(SECONDS);
+ 
+         final RubySymbol[] flowNamespace = buildNamespace(FLOW_KEY);
+         final RubySymbol[] eventsNamespace = buildNamespace(EVENTS_KEY);
+ 
+         final LongCounter eventsInCounter = initOrGetCounterMetric(context, eventsNamespace, IN_KEY);
+-        final FlowMetric inputThroughput = new FlowMetric(INPUT_THROUGHPUT_KEY.asJavaString(),
+-                eventsInCounter, uptimeInSeconds);
++        final FlowMetric inputThroughput = createFlowMetric(INPUT_THROUGHPUT_KEY, eventsInCounter, uptimeInPreciseSeconds);
+         this.flowMetrics.add(inputThroughput);
+         storeMetric(context, flowNamespace, inputThroughput);
+ 
+         final LongCounter eventsFilteredCounter = initOrGetCounterMetric(context, eventsNamespace, FILTERED_KEY);
+-        final FlowMetric filterThroughput = new FlowMetric(FILTER_THROUGHPUT_KEY.asJavaString(),
+-                eventsFilteredCounter, uptimeInSeconds);
++        final FlowMetric filterThroughput = createFlowMetric(FILTER_THROUGHPUT_KEY, eventsFilteredCounter, uptimeInPreciseSeconds);
+         this.flowMetrics.add(filterThroughput);
+         storeMetric(context, flowNamespace, filterThroughput);
+ 
+         final LongCounter eventsOutCounter = initOrGetCounterMetric(context, eventsNamespace, OUT_KEY);
+-        final FlowMetric outputThroughput = new FlowMetric(OUTPUT_THROUGHPUT_KEY.asJavaString(),
+-                eventsOutCounter, uptimeInSeconds);
++        final FlowMetric outputThroughput = createFlowMetric(OUTPUT_THROUGHPUT_KEY, eventsOutCounter, uptimeInPreciseSeconds);
+         this.flowMetrics.add(outputThroughput);
+         storeMetric(context, flowNamespace, outputThroughput);
+ 
+         final LongCounter queuePushWaitInMillis = initOrGetCounterMetric(context, eventsNamespace, PUSH_DURATION_KEY);
+-        final FlowMetric backpressureFlow = new FlowMetric(QUEUE_BACKPRESSURE_KEY.asJavaString(),
+-                queuePushWaitInMillis, uptimeInMillis);
++        final FlowMetric backpressureFlow = createFlowMetric(QUEUE_BACKPRESSURE_KEY, queuePushWaitInMillis, uptimeInPreciseMillis);
+         this.flowMetrics.add(backpressureFlow);
+         storeMetric(context, flowNamespace, backpressureFlow);
+ 
+         final LongCounter durationInMillis = initOrGetCounterMetric(context, eventsNamespace, DURATION_IN_MILLIS_KEY);
+-        final FlowMetric concurrencyFlow = new FlowMetric(WORKER_CONCURRENCY_KEY.asJavaString(),
+-                durationInMillis, uptimeInMillis);
++        final FlowMetric concurrencyFlow = createFlowMetric(WORKER_CONCURRENCY_KEY, durationInMillis, uptimeInPreciseMillis);
+         this.flowMetrics.add(concurrencyFlow);
+         storeMetric(context, flowNamespace, concurrencyFlow);
+ 
+@@ -481,6 +479,12 @@ public final IRubyObject collectFlowMetrics(final ThreadContext context) {
+         return context.nil;
+     }
+ 
++    private static FlowMetric createFlowMetric(final RubySymbol name,
++                                               final Metric<? extends Number> numeratorMetric,
++                                               final Metric<? extends Number> denominatorMetric) {
++        return new FlowMetric(name.asJavaString(), numeratorMetric, denominatorMetric);
++    }
++
+     LongCounter initOrGetCounterMetric(final ThreadContext context,
+                                        final RubySymbol[] subPipelineNamespacePath,
+                                        final RubySymbol metricName) {
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/FlowMetric.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/FlowMetric.java
+index dbba3079270..e95d4d9de7a 100644
+--- a/logstash-core/src/main/java/org/logstash/instrument/metrics/FlowMetric.java
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/FlowMetric.java
+@@ -2,10 +2,12 @@
+ 
+ import java.math.BigDecimal;
+ import java.math.RoundingMode;
++import java.time.Duration;
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.concurrent.atomic.AtomicReference;
++import java.util.function.LongSupplier;
+ 
+ public class FlowMetric extends AbstractMetric<Map<String,Double>> {
+ 
+@@ -19,13 +21,23 @@ public class FlowMetric extends AbstractMetric<Map<String,Double>> {
+     private final AtomicReference<Capture> head;
+     private final AtomicReference<Capture> instant = new AtomicReference<>();
+ 
++    private final LongSupplier nanoTimeSupplier;
++
+     static final String LIFETIME_KEY = "lifetime";
+     static final String CURRENT_KEY = "current";
+ 
+     public FlowMetric(final String name,
+                       final Metric<? extends Number> numeratorMetric,
+                       final Metric<? extends Number> denominatorMetric) {
++        this(System::nanoTime, name, numeratorMetric, denominatorMetric);
++    }
++
++    FlowMetric(final LongSupplier nanoTimeSupplier,
++               final String name,
++               final Metric<? extends Number> numeratorMetric,
++               final Metric<? extends Number> denominatorMetric) {
+         super(name);
++        this.nanoTimeSupplier = nanoTimeSupplier;
+         this.numeratorMetric = numeratorMetric;
+         this.denominatorMetric = denominatorMetric;
+ 
+@@ -34,8 +46,15 @@ public FlowMetric(final String name,
+     }
+ 
+     public void capture() {
+-        final Capture previousHead = head.getAndSet(doCapture());
+-        instant.set(previousHead);
++        final Capture newestHead = doCapture();
++        final Capture previousHead = head.getAndSet(newestHead);
++        instant.getAndAccumulate(previousHead, (current, given) -> {
++            // keep our current value if the given one is less than ~100ms older than our newestHead
++            // this is naive and when captures happen too frequently without relief can result in
++            // our "current" window growing indefinitely, but we are shipping with a 5s cadence
++            // and shouldn't hit this edge-case in practice.
++            return (newestHead.calculateCapturePeriod(given).toMillis() > 100) ? given : current;
++        });
+     }
+ 
+     public Map<String, Double> getValue() {
+@@ -62,7 +81,7 @@ public Map<String, Double> getValue() {
+     }
+ 
+     Capture doCapture() {
+-        return new Capture(numeratorMetric.getValue(), denominatorMetric.getValue());
++        return new Capture(numeratorMetric.getValue(), denominatorMetric.getValue(), nanoTimeSupplier.getAsLong());
+     }
+ 
+     @Override
+@@ -74,9 +93,12 @@ private static class Capture {
+         private final Number numerator;
+         private final Number denominator;
+ 
+-        public Capture(final Number numerator, final Number denominator) {
++        private final long nanoTimestamp;
++
++        public Capture(final Number numerator, final Number denominator, final long nanoTimestamp) {
+             this.numerator = numerator;
+             this.denominator = denominator;
++            this.nanoTimestamp = nanoTimestamp;
+         }
+ 
+         Double calculateRate(final Capture baseline) {
+@@ -94,5 +116,9 @@ Double calculateRate(final Capture baseline) {
+                     .divide(BigDecimal.valueOf(deltaDenominator), 3, RoundingMode.HALF_UP)
+                     .doubleValue();
+         }
++
++        Duration calculateCapturePeriod(final Capture baseline) {
++            return Duration.ofNanos(Math.subtractExact(this.nanoTimestamp, baseline.nanoTimestamp));
++        }
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/MetricType.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/MetricType.java
+index 526de72d03c..ad4bd19e37c 100644
+--- a/logstash-core/src/main/java/org/logstash/instrument/metrics/MetricType.java
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/MetricType.java
+@@ -32,6 +32,11 @@ public enum MetricType {
+      * A counter backed by a {@link Long} type
+      */
+     COUNTER_LONG("counter/long"),
++
++    /**
++     * A counter backed by a {@link Number} type that includes decimal precision
++     */
++    COUNTER_DECIMAL("counter/decimal"),
+     /**
+      * A gauge backed by a {@link String} type
+      */
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/UptimeMetric.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/UptimeMetric.java
+index 8f637fdf3de..ff9ec5dfcce 100644
+--- a/logstash-core/src/main/java/org/logstash/instrument/metrics/UptimeMetric.java
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/UptimeMetric.java
+@@ -1,5 +1,6 @@
+ package org.logstash.instrument.metrics;
+ 
++import java.math.BigDecimal;
+ import java.util.Objects;
+ import java.util.concurrent.TimeUnit;
+ import java.util.function.LongSupplier;
+@@ -13,6 +14,19 @@ public class UptimeMetric extends AbstractMetric<Long> {
+     private final LongSupplier nanoTimeSupplier;
+     private final long startNanos;
+ 
++    public enum ScaleUnits {
++        NANOSECONDS(0),
++        MICROSECONDS(3),
++        MILLISECONDS(6),
++        SECONDS(9),
++        ;
++
++        private final int nanoRelativeDecimalShift;
++
++        ScaleUnits(final int nanoRelativeDecimalShift) {
++            this.nanoRelativeDecimalShift = nanoRelativeDecimalShift;
++        }
++    }
+     private final TimeUnit timeUnit;
+ 
+     /**
+@@ -22,24 +36,19 @@ public UptimeMetric() {
+         this(MetricKeys.UPTIME_IN_MILLIS_KEY.asJavaString());
+     }
+ 
+-    public UptimeMetric(final String name) {
+-        this(name, TimeUnit.MILLISECONDS);
+-    }
+-
+     /**
+-     * Constructs an {@link UptimeMetric} with the provided name and units.
++     * Constructs an {@link UptimeMetric} with the provided name.
+      * @param name the name of the metric, which is used by our metric store, API retrieval, etc.
+-     * @param timeUnit the units in which to keep track of uptime (millis, seconds, etc.)
+      */
+-    public UptimeMetric(final String name, final TimeUnit timeUnit) {
+-        this(name, timeUnit, System::nanoTime);
++    public UptimeMetric(final String name) {
++        this(name, System::nanoTime);
+     }
+ 
+-    UptimeMetric(final String name, final TimeUnit timeUnit, final LongSupplier nanoTimeSupplier) {
+-        this(name, timeUnit, nanoTimeSupplier, nanoTimeSupplier.getAsLong());
++    UptimeMetric(final String name, final LongSupplier nanoTimeSupplier) {
++        this(name, nanoTimeSupplier, nanoTimeSupplier.getAsLong(), TimeUnit.MILLISECONDS);
+     }
+ 
+-    UptimeMetric(final String name, final TimeUnit timeUnit, final LongSupplier nanoTimeSupplier, final long startNanos) {
++    private UptimeMetric(final String name, final LongSupplier nanoTimeSupplier, final long startNanos, final TimeUnit timeUnit) {
+         super(Objects.requireNonNull(name, "name"));
+         this.nanoTimeSupplier = Objects.requireNonNull(nanoTimeSupplier, "nanoTimeSupplier");
+         this.timeUnit = Objects.requireNonNull(timeUnit, "timeUnit");
+@@ -52,9 +61,11 @@ public UptimeMetric(final String name, final TimeUnit timeUnit) {
+      */
+     @Override
+     public Long getValue() {
+-        final long elapsedNanos = this.nanoTimeSupplier.getAsLong() - this.startNanos;
++        return this.timeUnit.convert(getElapsedNanos(), TimeUnit.NANOSECONDS);
++    }
+ 
+-        return this.timeUnit.convert(elapsedNanos, TimeUnit.NANOSECONDS);
++    long getElapsedNanos() {
++        return this.nanoTimeSupplier.getAsLong() - this.startNanos;
+     }
+ 
+     /**
+@@ -82,6 +93,59 @@ public TimeUnit getTimeUnit() {
+      * @return a _copy_ of this {@link UptimeMetric}.
+      */
+     public UptimeMetric withTimeUnit(final String name, final TimeUnit timeUnit) {
+-        return new UptimeMetric(name, timeUnit, this.nanoTimeSupplier, this.startNanos);
++        return new UptimeMetric(name, this.nanoTimeSupplier, this.startNanos, timeUnit);
++    }
++
++    /**
++     * Constructs a _view_ into this {@link UptimeMetric} whose value is a decimal number
++     * containing subunit precision.
++     *
++     * @param name the name of the metric
++     * @param scaleUnits the desired scale
++     * @return a {@link BigDecimal} representing the whole-and-fractional number
++     *         of {@link ScaleUnits} that have elapsed.
++     */
++    public ScaledView withUnitsPrecise(final String name, final ScaleUnits scaleUnits) {
++        return new ScaledView(name, this::getElapsedNanos, scaleUnits.nanoRelativeDecimalShift);
++    }
++
++    /**
++     * {@code name} defaults to something vaguely descriptive.
++     * Useful when the caller doesn't need the metric name.
++     *
++     * @see UptimeMetric#withUnitsPrecise(String, ScaleUnits)
++     */
++    public ScaledView withUnitsPrecise(final ScaleUnits scaleUnits) {
++        final String name = String.format("%s_scaled_to_%s", getName(), scaleUnits.name());
++        return this.withUnitsPrecise(name, scaleUnits);
++    }
++
++    static class ScaledView implements Metric<Number> {
++        private final String name;
++        private final int nanoRelativeDecimalShift;
++        private final LongSupplier elapsedNanosSupplier;
++
++        ScaledView(final String name,
++                   final LongSupplier elapsedNanosSupplier,
++                   final int nanoRelativeDecimalShift) {
++            this.name = name;
++            this.nanoRelativeDecimalShift = nanoRelativeDecimalShift;
++            this.elapsedNanosSupplier = elapsedNanosSupplier;
++        }
++
++        @Override
++        public String getName() {
++            return this.name;
++        }
++
++        @Override
++        public MetricType getType() {
++            return MetricType.COUNTER_DECIMAL;
++        }
++
++        @Override
++        public BigDecimal getValue() {
++            return BigDecimal.valueOf(elapsedNanosSupplier.getAsLong(), nanoRelativeDecimalShift);
++        }
+     }
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/instrument/metrics/FlowMetricTest.java b/logstash-core/src/test/java/org/logstash/instrument/metrics/FlowMetricTest.java
+index 1652b943f09..8b3780f8fcb 100644
+--- a/logstash-core/src/test/java/org/logstash/instrument/metrics/FlowMetricTest.java
++++ b/logstash-core/src/test/java/org/logstash/instrument/metrics/FlowMetricTest.java
+@@ -5,10 +5,8 @@
+ 
+ import java.time.Duration;
+ import java.time.Instant;
+-import java.time.temporal.ChronoUnit;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.concurrent.TimeUnit;
+ 
+ import static org.junit.Assert.*;
+ import static org.logstash.instrument.metrics.FlowMetric.CURRENT_KEY;
+@@ -19,8 +17,8 @@ public class FlowMetricTest {
+     public void testBaselineFunctionality() {
+         final ManualAdvanceClock clock = new ManualAdvanceClock(Instant.now());
+         final LongCounter numeratorMetric = new LongCounter(MetricKeys.EVENTS_KEY.asJavaString());
+-        final Metric<Long> denominatorMetric = new UptimeMetric("uptime", TimeUnit.SECONDS, clock::nanoTime);
+-        final FlowMetric instance = new FlowMetric("flow", numeratorMetric, denominatorMetric);
++        final Metric<Number> denominatorMetric = new UptimeMetric("uptime", clock::nanoTime).withUnitsPrecise(UptimeMetric.ScaleUnits.SECONDS);
++        final FlowMetric instance = new FlowMetric(clock::nanoTime, "flow", numeratorMetric, denominatorMetric);
+ 
+         final Map<String, Double> ratesBeforeCaptures = instance.getValue();
+         assertTrue(ratesBeforeCaptures.isEmpty());
+@@ -50,5 +48,16 @@ public void testBaselineFunctionality() {
+         final Map<String, Double> ratesAfterNthCapture = instance.getValue();
+         assertFalse(ratesAfterNthCapture.isEmpty());
+         assertEquals(Map.of(LIFETIME_KEY, 367.5, CURRENT_KEY, 378.4), ratesAfterNthCapture);
++
++        // less than half a second passes, during which 0 events are seen by our numerator.
++        // when our two most recent captures are very close together, we want to make sure that
++        // we continue to provide _meaningful_ metrics, namely that:
++        // (a) our CURRENT_KEY and LIFETIME_KEY account for newest capture, and
++        // (b) our CURRENT_KEY does not report _only_ the delta since the very-recent capture
++        clock.advance(Duration.ofMillis(10));
++        instance.capture();
++        final Map<String, Double> ratesAfterSmallAdvanceCapture = instance.getValue();
++        assertFalse(ratesAfterNthCapture.isEmpty());
++        assertEquals(Map.of(LIFETIME_KEY, 367.408, CURRENT_KEY, 377.645), ratesAfterSmallAdvanceCapture);
+     }
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/instrument/metrics/MetricTypeTest.java b/logstash-core/src/test/java/org/logstash/instrument/metrics/MetricTypeTest.java
+index a4d8d6251d8..d45dd1beffe 100644
+--- a/logstash-core/src/test/java/org/logstash/instrument/metrics/MetricTypeTest.java
++++ b/logstash-core/src/test/java/org/logstash/instrument/metrics/MetricTypeTest.java
+@@ -42,6 +42,7 @@ public class MetricTypeTest {
+     public void ensurePassivity(){
+         Map<MetricType, String> nameMap = new HashMap<>(EnumSet.allOf(MetricType.class).size());
+         nameMap.put(MetricType.COUNTER_LONG, "counter/long");
++        nameMap.put(MetricType.COUNTER_DECIMAL, "counter/decimal");
+         nameMap.put(MetricType.GAUGE_TEXT, "gauge/text");
+         nameMap.put(MetricType.GAUGE_BOOLEAN, "gauge/boolean");
+         nameMap.put(MetricType.GAUGE_NUMBER, "gauge/number");
+diff --git a/logstash-core/src/test/java/org/logstash/instrument/metrics/UptimeMetricTest.java b/logstash-core/src/test/java/org/logstash/instrument/metrics/UptimeMetricTest.java
+index 2378cba16a2..61f700f8385 100644
+--- a/logstash-core/src/test/java/org/logstash/instrument/metrics/UptimeMetricTest.java
++++ b/logstash-core/src/test/java/org/logstash/instrument/metrics/UptimeMetricTest.java
+@@ -2,6 +2,7 @@
+ 
+ import org.junit.Test;
+ 
++import java.math.BigDecimal;
+ import java.time.Duration;
+ import java.time.Instant;
+ import java.util.concurrent.TimeUnit;
+@@ -20,7 +21,7 @@ public void testDefaultConstructor() {
+     @Test
+     public void getNameExplicit() {
+         final String customName = "custom_uptime_name";
+-        assertEquals(customName, new UptimeMetric(customName, TimeUnit.MILLISECONDS).getName());
++        assertEquals(customName, new UptimeMetric(customName).getName());
+     }
+ 
+     @Test
+@@ -31,7 +32,7 @@ public void getType() {
+     @Test
+     public void getValue() {
+         final ManualAdvanceClock clock = new ManualAdvanceClock(Instant.now());
+-        final UptimeMetric uptimeMetric = new UptimeMetric("up", TimeUnit.MILLISECONDS, clock::nanoTime);
++        final UptimeMetric uptimeMetric = new UptimeMetric("up", clock::nanoTime);
+         assertEquals(Long.valueOf(0L), uptimeMetric.getValue());
+ 
+         clock.advance(Duration.ofMillis(123));
+@@ -50,7 +51,7 @@ public void getValue() {
+     @Test
+     public void withTemporalUnit() {
+         final ManualAdvanceClock clock = new ManualAdvanceClock(Instant.now());
+-        final UptimeMetric uptimeMetric = new UptimeMetric("up_millis", TimeUnit.MILLISECONDS, clock::nanoTime);
++        final UptimeMetric uptimeMetric = new UptimeMetric("up_millis", clock::nanoTime);
+         clock.advance(Duration.ofMillis(1_000_000_000));
+ 
+         // set-up: ensure advancing nanos reflects in our milli-based uptime
+@@ -58,6 +59,37 @@ public void withTemporalUnit() {
+ 
+         final UptimeMetric secondsBasedCopy = uptimeMetric.withTimeUnit("up_seconds", TimeUnit.SECONDS);
+         assertEquals(Long.valueOf(1_000_000), secondsBasedCopy.getValue());
++
++        clock.advance(Duration.ofMillis(1_999));
++        assertEquals(Long.valueOf(1_000_001_999), uptimeMetric.getValue());
++        assertEquals(Long.valueOf(1_000_001), secondsBasedCopy.getValue());
++    }
++
++    @Test
++    public void withUnitsPrecise() {
++        final ManualAdvanceClock clock = new ManualAdvanceClock(Instant.now());
++        final UptimeMetric uptimeMetric = new UptimeMetric("up_millis", clock::nanoTime);
++        clock.advance(Duration.ofNanos(123_456_789_987L)); // 123.xx seconds
++
++        // set-up: ensure advancing nanos reflects in our milli-based uptime
++        assertEquals(Long.valueOf(123_456L), uptimeMetric.getValue());
++
++        final UptimeMetric.ScaledView secondsBasedView = uptimeMetric.withUnitsPrecise("up_seconds", UptimeMetric.ScaleUnits.SECONDS);
++        final UptimeMetric.ScaledView millisecondsBasedView = uptimeMetric.withUnitsPrecise("up_millis", UptimeMetric.ScaleUnits.MILLISECONDS);
++        final UptimeMetric.ScaledView microsecondsBasedView = uptimeMetric.withUnitsPrecise("up_micros", UptimeMetric.ScaleUnits.MICROSECONDS);
++        final UptimeMetric.ScaledView nanosecondsBasedView = uptimeMetric.withUnitsPrecise("up_nanos", UptimeMetric.ScaleUnits.NANOSECONDS);
++
++        assertEquals(new BigDecimal("123.456789987"), secondsBasedView.getValue());
++        assertEquals(new BigDecimal("123456.789987"), millisecondsBasedView.getValue());
++        assertEquals(new BigDecimal("123456789.987"), microsecondsBasedView.getValue());
++        assertEquals(new BigDecimal("123456789987"), nanosecondsBasedView.getValue());
++
++        clock.advance(Duration.ofMillis(1_999));
++        assertEquals(Long.valueOf(125_455L), uptimeMetric.getValue());
++        assertEquals(new BigDecimal("125.455789987"), secondsBasedView.getValue());
++        assertEquals(new BigDecimal("125455.789987"), millisecondsBasedView.getValue());
++        assertEquals(new BigDecimal("125455789.987"), microsecondsBasedView.getValue());
++        assertEquals(new BigDecimal("125455789987"), nanosecondsBasedView.getValue());
+     }
+ 
+ }
+\ No newline at end of file

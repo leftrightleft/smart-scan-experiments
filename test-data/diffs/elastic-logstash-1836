@@ -1,0 +1,201 @@
+diff --git a/lib/logstash/codecs/rubydebug.rb b/lib/logstash/codecs/rubydebug.rb
+index fa53a5ec6a4..415344045c2 100644
+--- a/lib/logstash/codecs/rubydebug.rb
++++ b/lib/logstash/codecs/rubydebug.rb
+@@ -8,8 +8,16 @@ class LogStash::Codecs::RubyDebug < LogStash::Codecs::Base
+   config_name "rubydebug"
+   milestone 3
+ 
++  # Should the event's metadata be included?
++  config :metadata, :validate => :boolean, :default => false
++
+   def register
+     require "ap"
++    if @metadata
++      @encoder = method(:encode_with_metadata)
++    else
++      @encoder = method(:encode_default)
++    end
+   end
+ 
+   public
+@@ -19,7 +27,15 @@ def decode(data)
+ 
+   public
+   def encode(event)
++    @encoder.call(event)
++  end
++
++  def encode_default(event)
+     @on_event.call(event.to_hash.awesome_inspect + NL)
+-  end # def encode
++  end # def encode_default
++
++  def encode_with_metadata(event)
++    @on_event.call(event.to_hash_with_metadata.awesome_inspect + NL)
++  end # def encode_with_metadata
+ 
+ end # class LogStash::Codecs::Dots
+diff --git a/lib/logstash/event.rb b/lib/logstash/event.rb
+index 70f68ac9bb2..0dfa7487fb1 100644
+--- a/lib/logstash/event.rb
++++ b/lib/logstash/event.rb
+@@ -61,6 +61,13 @@ def initialize(data = {})
+     @accessors = LogStash::Util::Accessors.new(data)
+     @data[VERSION] ||= VERSION_ONE
+     @data[TIMESTAMP] = init_timestamp(@data[TIMESTAMP])
++
++    @metadata = if @data.include?("@metadata")
++      @data.delete("@metadata")
++    else
++      {}
++    end
++    @metadata_accessors = LogStash::Util::Accessors.new(@metadata)
+   end # def initialize
+ 
+   public
+@@ -114,9 +121,17 @@ def ruby_timestamp
+   end # def unix_timestamp
+ 
+   # field-related access
++  METADATA = "@metadata".freeze
++  METADATA_BRACKETS = "[#{METADATA}]".freeze
+   public
+   def [](fieldref)
+-    @accessors.get(fieldref)
++    if fieldref.start_with?(METADATA_BRACKETS)
++      @metadata_accessors.get(fieldref[METADATA_BRACKETS.length .. -1])
++    elsif fieldref == METADATA
++      @metadata
++    else
++      @accessors.get(fieldref)
++    end
+   end # def []
+ 
+   public
+@@ -126,7 +141,13 @@ def []=(fieldref, value)
+     if fieldref == TIMESTAMP && !value.is_a?(LogStash::Timestamp)
+       raise TypeError, "The field '@timestamp' must be a (LogStash::Timestamp, not a #{value.class} (#{value})"
+     end
+-    @accessors.set(fieldref, value)
++    if fieldref.start_with?(METADATA_BRACKETS)
++      @metadata_accessors.set(fieldref[METADATA_BRACKETS.length .. -1], value)
++    elsif fieldref == METADATA
++      @metadata = value
++    else
++      @accessors.set(fieldref, value)
++    end
+   end # def []=
+ 
+   public
+@@ -265,4 +286,19 @@ def init_timestamp(o)
+ 
+     LogStash::Timestamp.now
+   end
++
++  public
++  def to_hash_with_metadata
++    if @metadata.nil?
++      to_hash
++    else
++      to_hash.merge("@metadata" => @metadata)
++    end
++  end
++
++  public
++  def to_json_with_metadata(*args)
++    # ignore arguments to respect accepted to_json method signature
++    LogStash::Json.dump(to_hash_with_metadata)
++  end # def to_json
+ end # class LogStash::Event
+diff --git a/spec/core/event_spec.rb b/spec/core/event_spec.rb
+index 06d85c7609c..eaf19c08201 100644
+--- a/spec/core/event_spec.rb
++++ b/spec/core/event_spec.rb
+@@ -34,7 +34,7 @@
+ 
+     it "should assign simple fields" do
+       insist { subject["foo"] }.nil?
+-      insist { subject["foo"] = "bar"} == "bar"
++      insist { subject["foo"] = "bar" } == "bar"
+       insist { subject["foo"] } == "bar"
+     end
+ 
+@@ -200,7 +200,7 @@
+ 
+     data = { "@timestamp" => "2013-12-21T07:25:06.605Z" }
+     event = LogStash::Event.new(data)
+-    insist { event["@timestamp"] }.is_a?(Time)
++    insist { event["@timestamp"] }.is_a?(LogStash::Timestamp)
+ 
+     duration = 0
+     [warmup, count].each do |i|
+@@ -317,4 +317,68 @@
+     end
+   end
+ 
++  context "metadata" do
++    context "with existing metadata" do
++      subject { LogStash::Event.new("hello" => "world", "@metadata" => { "fancy" => "pants" }) }
++      it "should not include metadata in to_hash" do
++        reject { subject.to_hash.keys }.include?("@metadata")
++
++        # 'hello', '@timestamp', and '@version'
++        insist { subject.to_hash.keys.count } == 3
++      end
++
++      it "should still allow normal field access" do
++        insist { subject["hello"] } == "world"
++      end
++    end
++
++    context "with set metadata" do
++      let(:fieldref) { "[@metadata][foo][bar]" }
++      let(:value) { "bar" }
++      subject { LogStash::Event.new("normal" => "normal") }
++      before do
++        # Verify the test is configured correctly.
++        insist { fieldref }.start_with?("[@metadata]")
++
++        # Set it.
++        subject[fieldref] = value
++      end
++
++      it "should still allow normal field access" do
++        insist { subject["normal"] } == "normal"
++      end
++
++      it "should allow getting" do
++        insist { subject[fieldref] } == value
++      end
++
++      it "should be hidden from .to_json" do
++        require "json"
++        obj = JSON.parse(subject.to_json)
++        reject { obj }.include?("@metadata")
++      end
++
++      it "should be hidden from .to_hash" do
++        reject { subject.to_hash }.include?("@metadata")
++      end
++
++      it "should be accessible through #to_hash_with_metadata" do
++        obj = subject.to_hash_with_metadata
++        insist { obj }.include?("@metadata")
++        insist { obj["@metadata"]["foo"]["bar"] } == value
++      end
++    end
++    
++    context "with no metadata" do
++      subject { LogStash::Event.new("foo" => "bar") }
++      it "should have no metadata" do
++        insist { subject["@metadata"] }.empty?
++      end
++      it "should still allow normal field access" do
++        insist { subject["foo"] } == "bar"
++      end
++    end
++
++  end
++
+ end

@@ -1,0 +1,177 @@
+diff --git a/lib/logstash/outputs/rabbitmq.rb b/lib/logstash/outputs/rabbitmq.rb
+index 7b52baf2a7a..ae4776fdbcd 100644
+--- a/lib/logstash/outputs/rabbitmq.rb
++++ b/lib/logstash/outputs/rabbitmq.rb
+@@ -22,7 +22,7 @@ class LogStash::Outputs::RabbitMQ < LogStash::Outputs::Base
+   #
+ 
+   # RabbitMQ server address
+-  config :host, :validate => :string, :required => true
++  config :host, :validate => :array, :required => true
+ 
+   # RabbitMQ port to connect on
+   config :port, :validate => :number, :default => 5672
+diff --git a/lib/logstash/outputs/rabbitmq/bunny.rb b/lib/logstash/outputs/rabbitmq/bunny.rb
+index cc83eacc093..a953f6139d3 100644
+--- a/lib/logstash/outputs/rabbitmq/bunny.rb
++++ b/lib/logstash/outputs/rabbitmq/bunny.rb
+@@ -16,6 +16,8 @@ def register
+ 
+       connect
+       declare_exchange
++      
++      @cur_host_index = rand @host.length
+     end # def register
+ 
+ 
+@@ -56,7 +58,7 @@ def publish_serialized(message, key = @key)
+     end
+ 
+     def to_s
+-      return "amqp://#{@user}@#{@host}:#{@port}#{@vhost}/#{@exchange_type}/#{@exchange}\##{@key}"
++      return "amqp://#{@user}@#{@host[0]}:#{@port}#{@vhost}/#{@exchange_type}/#{@exchange}\##{@key}"
+     end
+ 
+     def teardown
+@@ -73,15 +75,18 @@ def teardown
+     #
+ 
+     def connect
++      host, port = @host[@cur_host_index].split(":")
++      @cur_host_index = (@cur_host_index + 1) % @host.length
++    
+       @vhost       ||= Bunny::DEFAULT_HOST
+       # 5672. Will be switched to 5671 by Bunny if TLS is enabled.
+-      @port        ||= AMQ::Protocol::DEFAULT_PORT
++      port        ||= @port || AMQ::Protocol::DEFAULT_PORT
+       @routing_key ||= "#"
+ 
+       @settings = {
+         :vhost => @vhost,
+-        :host  => @host,
+-        :port  => @port,
++        :host  => host,
++        :port  => port,
+         :automatically_recover => false
+       }
+       @settings[:user]      = @user || Bunny::DEFAULT_USER
+@@ -105,7 +110,7 @@ def connect
+                                else
+                                  "amqps"
+                                end
+-      @connection_url        = "#{proto}://#{@user}@#{@host}:#{@port}#{vhost}/#{@queue}"
++      @connection_url        = "#{proto}://#{@user}@#{host}:#{port}#{vhost}/#{@queue}"
+ 
+       begin
+         @conn = Bunny.new(@settings)
+diff --git a/lib/logstash/outputs/rabbitmq/march_hare.rb b/lib/logstash/outputs/rabbitmq/march_hare.rb
+index f7bdd9304db..391bb232b53 100644
+--- a/lib/logstash/outputs/rabbitmq/march_hare.rb
++++ b/lib/logstash/outputs/rabbitmq/march_hare.rb
+@@ -11,6 +11,9 @@ def register
+       require "march_hare"
+       require "java"
+ 
++      @cur_host_index = rand @host.length
++      @backlog = []
++
+       @logger.info("Registering output", :plugin => self)
+ 
+       @connected = java.util.concurrent.atomic.AtomicBoolean.new
+@@ -38,11 +41,14 @@ def receive(event)
+     def publish_serialized(message)
+       begin
+         if @connected.get
++          publish_backlog
++        
+           @x.publish(message, :routing_key => @key, :properties => {
+             :persistent => @persistent
+           })
+         else
+-          @logger.warn("Tried to send a message, but not connected to RabbitMQ.")
++          @logger.warn("Tried to send a message, but not connected to RabbitMQ. Will attempt to send when connected.")
++          @backlog.push message
+         end
+       rescue MarchHare::Exception, IOError, com.rabbitmq.client.AlreadyClosedException => e
+         @connected.set(false)
+@@ -52,17 +58,20 @@ def publish_serialized(message)
+                       :exception => e,
+                       :backtrace => e.backtrace)
+         return if terminating?
+-
+-        sleep n
+-
+-        connect
+-        declare_exchange
+-        retry
++        
++        @backlog.push message
++
++        Thread.new {
++          sleep n if @host.length == 1
++          
++          connect
++          declare_exchange
++        }
+       end
+     end
+ 
+     def to_s
+-      return "amqp://#{@user}@#{@host}:#{@port}#{@vhost}/#{@exchange_type}/#{@exchange}\##{@key}"
++      return "amqp://#{@user}@#{@host[@cur_host_index]}:#{@port}#{@vhost}/#{@exchange_type}/#{@exchange}\##{@key}"
+     end
+ 
+     def teardown
+@@ -82,14 +91,18 @@ def teardown
+     def connect
+       return if terminating?
+ 
++      @cur_host_index = (@cur_host_index + 1) % @host.length
++      host, port = @host[@cur_host_index].split(":")
++      puts "@host is #{@host.inspect}, host is #{host.inspect}:#{port}"
++
+       @vhost       ||= "127.0.0.1"
+       # 5672. Will be switched to 5671 by Bunny if TLS is enabled.
+-      @port        ||= 5672
++      port        ||= @port || 5672
+ 
+       @settings = {
+         :vhost => @vhost,
+-        :host  => @host,
+-        :port  => @port,
++        :host  => host,
++        :port  => port,
+         :user  => @user,
+         :automatic_recovery => false
+       }
+@@ -105,7 +118,7 @@ def connect
+                                else
+                                  "amqps"
+                                end
+-      @connection_url        = "#{proto}://#{@user}@#{@host}:#{@port}#{vhost}/#{@queue}"
++      @connection_url        = "#{proto}://#{@user}@#{host}:#{port}#{vhost}/#{@queue}"
+ 
+       begin
+         @conn = MarchHare.connect(@settings)
+@@ -123,7 +136,7 @@ def connect
+                       :backtrace => e.backtrace)
+         return if terminating?
+ 
+-        sleep n
++        sleep n if @host.length == 1
+         retry
+       end
+     end
+@@ -139,5 +152,12 @@ def declare_exchange
+       @x
+     end
+ 
++    def publish_backlog
++      while !@backlog.empty?
++        @x.publish(@backlog.shift, :routing_key => @key, :properties => {
++          :persistent => @persistent
++        })
++      end
++    end
+   end # MarchHareImpl
+ end

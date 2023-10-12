@@ -1,0 +1,231 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index d59a3127c77..7888182be40 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -39,9 +39,7 @@ def initialize(settings = LogStash::SETTINGS, source_loader = nil)
+     @auto_reload = setting("config.reload.automatic")
+     @ephemeral_id = SecureRandom.uuid
+ 
+-    # Do not use @pipelines directly. Use #with_pipelines which does locking
+-    @pipelines = {}
+-    @pipelines_lock = java.util.concurrent.locks.ReentrantLock.new
++    @pipelines = Concurrent::Hash.new
+ 
+     @name = setting("node.name")
+     @http_host = setting("http.host")
+@@ -133,17 +131,6 @@ def stopped?
+     !@running.value
+   end
+ 
+-  # Safely perform an operation on the pipelines hash
+-  # Using the correct synchronization
+-  def with_pipelines
+-    begin
+-      @pipelines_lock.lock
+-      yield @pipelines
+-    ensure
+-      @pipelines_lock.unlock
+-    end
+-  end
+-
+   def converge_state_and_update
+     results = @source_loader.fetch
+ 
+@@ -156,16 +143,10 @@ def converge_state_and_update
+       end
+     end
+ 
+-    # We Lock any access on the pipelines, since the actions will modify the
+-    # content of it.
+-    converge_result = nil
+-
+-    # we don't use the variable here, but we want the locking
+-    with_pipelines do |pipelines|
+-      pipeline_actions = resolve_actions(results.response)
+-      converge_result = converge_state(pipeline_actions)
+-      update_metrics(converge_result)
+-    end
++    # @pipelines is now a Concurrent::Hash
++    pipeline_actions = resolve_actions(results.response)
++    converge_result = converge_state(pipeline_actions)
++    update_metrics(converge_result)
+ 
+     report_currently_running_pipelines(converge_result)
+     dispatch_events(converge_result)
+@@ -229,21 +210,22 @@ def id_path
+   end
+ 
+   def get_pipeline(pipeline_id)
+-    with_pipelines do |pipelines|
+-      pipelines[pipeline_id]
+-    end
++    # @pipelines is now a Concurrent::Hash
++    @pipelines[pipeline_id]
+   end
+ 
+   def pipelines_count
+-    with_pipelines do |pipelines|
+-      pipelines.size
+-    end
++    @pipelines.size
++  end
++
++  def with_pipelines
++    # expose block based access to @pipelines - used in tests
++    yield @pipelines
+   end
+ 
+   def with_running_pipelines
+-    with_pipelines do |pipelines|
+-      yield pipelines.select {|pipeline_id, _| running_pipeline?(pipeline_id) }
+-    end
++    entries = @pipelines.select {|pipeline_id, _| running_pipeline?(pipeline_id) }
++    yield entries
+   end
+ 
+   def running_pipelines?
+@@ -263,30 +245,23 @@ def running_user_defined_pipelines?
+   end
+ 
+   def with_running_user_defined_pipelines
+-    with_pipelines do |pipelines|
+-      found = pipelines.select do |_, pipeline|
+-        pipeline.running? && !pipeline.system?
+-      end
+-
+-      yield found
++    entries = @pipelines.select do |_, pipeline|
++      pipeline.running? && !pipeline.system?
+     end
++    yield entries
+   end
+ 
+   def close_pipeline(id)
+-    with_pipelines do |pipelines|
+-      pipeline = pipelines[id]
+-      if pipeline
+-        @logger.warn("closing pipeline", :id => id)
+-        pipeline.close
+-      end
++    pipeline = @pipelines[id]
++    if pipeline
++      @logger.warn("closing pipeline", :id => id)
++      pipeline.close
+     end
+   end
+ 
+   def close_pipelines
+-    with_pipelines do |pipelines|
+-      pipelines.each  do |id, _|
+-        close_pipeline(id)
+-      end
++    @pipelines.each  do |id, _|
++      close_pipeline(id)
+     end
+   end
+ 
+@@ -329,23 +304,21 @@ def converge_state(pipeline_actions)
+       #
+       # This give us a bit more extensibility with the current startup/validation model
+       # that we currently have.
+-      with_pipelines do |pipelines|
+-        begin
+-          logger.debug("Executing action", :action => action)
+-            action_result = action.execute(self, pipelines)
+-          converge_result.add(action, action_result)
+-
+-          unless action_result.successful?
+-            logger.error("Failed to execute action", :id => action.pipeline_id,
+-                        :action_type => action_result.class, :message => action_result.message,
+-                        :backtrace => action_result.backtrace)
+-          end
+-        rescue SystemExit => e
+-          converge_result.add(action, e)
+-        rescue Exception => e
+-          logger.error("Failed to execute action", :action => action, :exception => e.class.name, :message => e.message, :backtrace => e.backtrace)
+-          converge_result.add(action, e)
++      begin
++        logger.debug("Executing action", :action => action)
++        action_result = action.execute(self, @pipelines)
++        converge_result.add(action, action_result)
++
++        unless action_result.successful?
++          logger.error("Failed to execute action", :id => action.pipeline_id,
++          :action_type => action_result.class, :message => action_result.message,
++          :backtrace => action_result.backtrace)
+         end
++      rescue SystemExit => e
++        converge_result.add(action, e)
++      rescue Exception => e
++        logger.error("Failed to execute action", :action => action, :exception => e.class.name, :message => e.message, :backtrace => e.backtrace)
++        converge_result.add(action, e)
+       end
+     end
+ 
+@@ -359,9 +332,7 @@ def converge_state(pipeline_actions)
+   end
+ 
+   def resolve_actions(pipeline_configs)
+-    with_pipelines do |pipelines|
+-      @state_resolver.resolve(pipelines, pipeline_configs)
+-    end
++    @state_resolver.resolve(@pipelines, pipeline_configs)
+   end
+ 
+   def report_currently_running_pipelines(converge_result)
+@@ -433,10 +404,8 @@ def shutdown_pipelines
+     # In this context I could just call shutdown, but I've decided to
+     # use the stop action implementation for that so we have the same code.
+     # This also give us some context into why a shutdown is failing
+-    with_pipelines do |pipelines|
+-      pipeline_actions = resolve_actions([]) # We stop all the pipeline, so we converge to a empty state
+-      converge_state(pipeline_actions)
+-    end
++    pipeline_actions = resolve_actions([]) # We stop all the pipeline, so we converge to a empty state
++    converge_state(pipeline_actions)
+   end
+ 
+   def running_pipeline?(pipeline_id)
+@@ -445,9 +414,7 @@ def running_pipeline?(pipeline_id)
+   end
+ 
+   def clean_state?
+-    with_pipelines do |pipelines|
+-      pipelines.empty?
+-    end
++    @pipelines.empty?
+   end
+ 
+   def setting(key)
+diff --git a/logstash-core/spec/logstash/agent/converge_spec.rb b/logstash-core/spec/logstash/agent/converge_spec.rb
+index 137dbcecffd..6b1c881f168 100644
+--- a/logstash-core/spec/logstash/agent/converge_spec.rb
++++ b/logstash-core/spec/logstash/agent/converge_spec.rb
+@@ -48,7 +48,7 @@
+     end
+ 
+     context "system pipeline" do
+-      
++
+       let(:system_pipeline_config) { mock_pipeline_config(:system_pipeline, "input { generator { } } output { null {} }", { "pipeline.system" => true }) }
+ 
+       context "when we have a finite pipeline and a system pipeline running" do
+@@ -81,15 +81,15 @@
+ 
+         describe "#running_user_defined_pipelines" do
+           it "returns the user defined pipelines" do
+-            wait_for do
+-              subject.with_running_user_defined_pipelines {|pipelines| pipelines.keys }
++            wait(30, :delay => 1).for do
++              subject.with_running_user_defined_pipelines{|pipelines| pipelines.keys}
+             end.to eq([:main])
+           end
+         end
+ 
+         describe "#running_user_defined_pipelines?" do
+           it "returns true" do
+-            wait_for do
++            wait(30, :delay => 1).for do
+               subject.running_user_defined_pipelines?
+             end.to be_truthy
+           end

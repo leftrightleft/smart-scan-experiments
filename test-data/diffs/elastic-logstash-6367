@@ -1,0 +1,168 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index ebdefefffb2..f9780445d52 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -52,7 +52,8 @@ def initialize(settings = LogStash::SETTINGS)
+     # Create the collectors and configured it with the library
+     configure_metrics_collectors
+ 
+-    @reload_metric = metric.namespace([:stats, :pipelines])
++    @pipeline_reload_metric = metric.namespace([:stats, :pipelines])
++    @instance_reload_metric = metric.namespace([:stats, :reloads])
+ 
+     @dispatcher = LogStash::EventDispatcher.new(self)
+     LogStash::PLUGIN_REGISTRY.hooks.register_emitter(self.class, dispatcher)
+@@ -109,7 +110,8 @@ def reload_state!
+         begin
+           reload_pipeline!(pipeline_id)
+         rescue => e
+-          @reload_metric.namespace([pipeline_id.to_sym, :reloads]).tap do |n|
++          @instance_reload_metric.increment(:failures)
++          @pipeline_reload_metric.namespace([pipeline_id.to_sym, :reloads]).tap do |n|
+             n.increment(:failures)
+             n.gauge(:last_error, { :message => e.message, :backtrace => e.backtrace})
+             n.gauge(:last_failure_timestamp, LogStash::Timestamp.now)
+@@ -236,7 +238,8 @@ def create_pipeline(settings, config=nil)
+     begin
+       LogStash::Pipeline.new(config, settings, metric)
+     rescue => e
+-      @reload_metric.namespace([settings.get("pipeline.id").to_sym, :reloads]).tap do |n|
++      @instance_reload_metric.increment(:failures)
++      @pipeline_reload_metric.namespace([settings.get("pipeline.id").to_sym, :reloads]).tap do |n|
+         n.increment(:failures)
+         n.gauge(:last_error, { :message => e.message, :backtrace => e.backtrace})
+         n.gauge(:last_failure_timestamp, LogStash::Timestamp.now)
+@@ -291,7 +294,8 @@ def start_pipeline(id)
+       begin
+         pipeline.run
+       rescue => e
+-        @reload_metric.namespace([id.to_sym, :reloads]).tap do |n|
++        @instance_reload_metric.increment(:failures)
++        @pipeline_reload_metric.namespace([id.to_sym, :reloads]).tap do |n|
+           n.increment(:failures)
+           n.gauge(:last_error, { :message => e.message, :backtrace => e.backtrace})
+           n.gauge(:last_failure_timestamp, LogStash::Timestamp.now)
+@@ -319,6 +323,8 @@ def stop_pipeline(id)
+   end
+ 
+   def start_pipelines
++    @instance_reload_metric.increment(:successes, 0)
++    @instance_reload_metric.increment(:failures, 0)
+     @pipelines.each do |id, _|
+       start_pipeline(id)
+       # no reloads yet, initalize all the reload metrics
+@@ -340,10 +346,12 @@ def upgrade_pipeline(pipeline_id, new_pipeline)
+     reset_pipeline_metrics(pipeline_id)
+     @pipelines[pipeline_id] = new_pipeline
+     if start_pipeline(pipeline_id) # pipeline started successfuly
+-      @reload_metric.namespace([pipeline_id.to_sym, :reloads]).tap do |n|
++      @instance_reload_metric.increment(:successes)
++      @pipeline_reload_metric.namespace([pipeline_id.to_sym, :reloads]).tap do |n|
+         n.increment(:successes)
+         n.gauge(:last_success_timestamp, LogStash::Timestamp.now)
+       end
++      
+     end
+   end
+ 
+@@ -356,7 +364,7 @@ def setting(key)
+   end
+ 
+   def init_pipeline_reload_metrics(id)
+-    @reload_metric.namespace([id.to_sym, :reloads]).tap do |n|
++    @pipeline_reload_metric.namespace([id.to_sym, :reloads]).tap do |n|
+       n.increment(:successes, 0)
+       n.increment(:failures, 0)
+       n.gauge(:last_error, nil)
+diff --git a/logstash-core/lib/logstash/api/commands/stats.rb b/logstash-core/lib/logstash/api/commands/stats.rb
+index f5ef39043bc..5f9dc5fa460 100644
+--- a/logstash-core/lib/logstash/api/commands/stats.rb
++++ b/logstash-core/lib/logstash/api/commands/stats.rb
+@@ -16,9 +16,13 @@ def jvm
+             ),
+             :mem => memory,
+             :gc => gc,
+-            :uptime_in_millis => service.get_shallow(:jvm, :uptime_in_millis)
++            :uptime_in_millis => service.get_shallow(:jvm, :uptime_in_millis),
+           }
+         end
++        
++        def reloads
++          service.get_shallow(:stats, :reloads)
++        end  
+ 
+         def process
+           extract_metrics(
+diff --git a/logstash-core/lib/logstash/api/modules/node_stats.rb b/logstash-core/lib/logstash/api/modules/node_stats.rb
+index 239aaa87cd1..355ee6736c2 100644
+--- a/logstash-core/lib/logstash/api/modules/node_stats.rb
++++ b/logstash-core/lib/logstash/api/modules/node_stats.rb
+@@ -13,6 +13,7 @@ class NodeStats < ::LogStash::Api::Modules::Base
+             :jvm => jvm_payload,
+             :process => process_payload,
+             :pipeline => pipeline_payload,
++            :reloads => reloads
+           }
+           respond_with(payload, {:filter => params["filter"]})
+         end
+@@ -26,6 +27,10 @@ def events_payload
+         def jvm_payload
+           @stats.jvm
+         end
++        
++        def reloads
++          @stats.reloads
++        end
+ 
+         def process_payload
+           @stats.process
+diff --git a/logstash-core/spec/api/lib/api/node_stats_spec.rb b/logstash-core/spec/api/lib/api/node_stats_spec.rb
+index 1602599e1ce..bfe695a8d01 100644
+--- a/logstash-core/spec/api/lib/api/node_stats_spec.rb
++++ b/logstash-core/spec/api/lib/api/node_stats_spec.rb
+@@ -80,7 +80,11 @@
+         "filtered" => Numeric,
+         "out" => Numeric
+      }
+-    }
++   },
++   "reloads" => {
++     "successes" => Numeric,
++     "failures" => Numeric
++   }
+   }
+ 
+   test_api_and_resources(root_structure)
+diff --git a/logstash-core/spec/logstash/agent_spec.rb b/logstash-core/spec/logstash/agent_spec.rb
+index 98eafba9d9a..b3d558e1fd6 100644
+--- a/logstash-core/spec/logstash/agent_spec.rb
++++ b/logstash-core/spec/logstash/agent_spec.rb
+@@ -479,7 +479,9 @@ class DummyOutput2 < LogStash::Outputs::DroppingDummyOutput; end
+       it "increases the successful reload count" do
+         snapshot = subject.metric.collector.snapshot_metric
+         value = snapshot.metric_store.get_with_path("/stats/pipelines")[:stats][:pipelines][:main][:reloads][:successes].value
++        instance_value = snapshot.metric_store.get_with_path("/stats")[:stats][:reloads][:successes].value
+         expect(value).to eq(1)
++        expect(instance_value).to eq(1)
+       end
+ 
+       it "does not set the failure reload timestamp" do
+diff --git a/qa/integration/specs/reload_config_spec.rb b/qa/integration/specs/reload_config_spec.rb
+index 530e75a2a7f..24f37aba942 100644
+--- a/qa/integration/specs/reload_config_spec.rb
++++ b/qa/integration/specs/reload_config_spec.rb
+@@ -64,11 +64,14 @@
+     
+     # check reload stats
+     reload_stats = logstash_service.monitoring_api.pipeline_stats["reloads"]
++    instance_reload_stats = logstash_service.monitoring_api.node_stats["reloads"]
+     expect(reload_stats["successes"]).to eq(1)
+     expect(reload_stats["failures"]).to eq(0)
+     expect(reload_stats["last_success_timestamp"].blank?).to be false
+     expect(reload_stats["last_error"]).to eq(nil)
+     
++    expect(instance_reload_stats["successes"]).to eq(1)
++    expect(instance_reload_stats["failures"]).to eq(0)
+     # parse the results and validate
+     re = JSON.load(File.new(output_file2))
+     expect(re["clientip"]).to eq("74.125.176.147")

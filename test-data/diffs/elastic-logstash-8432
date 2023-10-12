@@ -1,0 +1,421 @@
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueReader.java b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueReader.java
+index 8a83ca71809..89376314354 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueReader.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueReader.java
+@@ -18,27 +18,25 @@
+  */
+ package org.logstash.common.io;
+ 
++import com.sun.nio.file.SensitivityWatchEventModifier;
+ import java.io.Closeable;
+-import org.apache.logging.log4j.LogManager;
+-import org.apache.logging.log4j.Logger;
+-import org.logstash.DLQEntry;
+-import org.logstash.Timestamp;
+-
+ import java.io.IOException;
+-import java.nio.file.Files;
+ import java.nio.file.FileSystems;
++import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.StandardWatchEventKinds;
+ import java.nio.file.WatchEvent;
+ import java.nio.file.WatchKey;
+ import java.nio.file.WatchService;
++import java.util.Comparator;
+ import java.util.concurrent.ConcurrentSkipListSet;
+ import java.util.concurrent.TimeUnit;
+-import java.util.function.Function;
+ import java.util.stream.Collectors;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import org.logstash.DLQEntry;
++import org.logstash.Timestamp;
+ 
+-import static java.nio.file.StandardWatchEventKinds.ENTRY_CREATE;
+-import static java.nio.file.StandardWatchEventKinds.ENTRY_DELETE;
+ import static org.logstash.common.io.DeadLetterQueueWriter.getSegmentPaths;
+ 
+ public final class DeadLetterQueueReader implements Closeable {
+@@ -52,23 +50,26 @@ public final class DeadLetterQueueReader implements Closeable {
+     public DeadLetterQueueReader(Path queuePath) throws IOException {
+         this.queuePath = queuePath;
+         this.watchService = FileSystems.getDefault().newWatchService();
+-        this.queuePath.register(watchService, ENTRY_CREATE, ENTRY_DELETE);
+-        this.segments = new ConcurrentSkipListSet<>((p1, p2) -> {
+-            Function<Path, Integer> id = (p) -> Integer.parseInt(p.getFileName().toString().split("\\.")[0]);
+-            return id.apply(p1).compareTo(id.apply(p2));
+-        });
+-
++        this.queuePath.register(
++            watchService, new WatchEvent.Kind[]{
++                StandardWatchEventKinds.ENTRY_CREATE, StandardWatchEventKinds.ENTRY_DELETE
++            },
++            SensitivityWatchEventModifier.HIGH
++        );
++        this.segments = new ConcurrentSkipListSet<>(Comparator.comparing(
++            p -> Integer.parseInt(p.getFileName().toString().split("\\.")[0]))
++        );
+         segments.addAll(getSegmentPaths(queuePath).collect(Collectors.toList()));
+     }
+ 
+     public void seekToNextEvent(Timestamp timestamp) throws IOException {
+         for (Path segment : segments) {
+             currentReader = new RecordIOReader(segment);
+-            byte[] event = currentReader.seekToNextEventPosition(timestamp, (b) -> {
++            byte[] event = currentReader.seekToNextEventPosition(timestamp, bytes -> {
+                 try {
+-                    return DLQEntry.deserialize(b).getEntryTime();
+-                } catch (IOException e) {
+-                    throw new IllegalStateException(e);
++                    return DLQEntry.deserialize(bytes).getEntryTime();
++                } catch (final IOException ex) {
++                    throw new IllegalStateException(ex);
+                 }
+             }, Timestamp::compareTo);
+             if (event != null) {
+@@ -81,14 +82,15 @@ public void seekToNextEvent(Timestamp timestamp) throws IOException {
+ 
+     private long pollNewSegments(long timeout) throws IOException, InterruptedException {
+         long startTime = System.currentTimeMillis();
+-        WatchKey key = watchService.poll(timeout, TimeUnit.MILLISECONDS);
+-        if (key != null) {
+-            for (WatchEvent<?> watchEvent : key.pollEvents()) {
+-                if (watchEvent.kind() == StandardWatchEventKinds.ENTRY_CREATE) {
+-                    segments.addAll(getSegmentPaths(queuePath).collect(Collectors.toList()));
+-                }
++        // We have to actually count on the stream to add all new segments
++        if (getSegmentPaths(queuePath).map(segments::add)
++            .filter(Boolean::booleanValue).count() == 0L) {
++            WatchKey key = watchService.poll(timeout, TimeUnit.MILLISECONDS);
++            if (key != null) {
++                key.pollEvents();
+                 key.reset();
+             }
++            getSegmentPaths(queuePath).forEach(segments::add);
+         }
+         return System.currentTimeMillis() - startTime;
+     }
+@@ -107,8 +109,11 @@ byte[] pollEntryBytes() throws IOException, InterruptedException {
+ 
+     byte[] pollEntryBytes(long timeout) throws IOException, InterruptedException {
+         long timeoutRemaining = timeout;
++        getSegmentPaths(queuePath).forEach(segments::add);
+         if (currentReader == null) {
+-            timeoutRemaining -= pollNewSegments(timeout);
++            if (segments.isEmpty()) {
++                timeoutRemaining -= pollNewSegments(timeout);
++            }
+             // If no new segments are found, exit
+             if (segments.isEmpty()) {
+                 logger.debug("No entries found: no segment files found in dead-letter-queue directory");
+@@ -119,8 +124,12 @@ byte[] pollEntryBytes(long timeout) throws IOException, InterruptedException {
+ 
+         byte[] event = currentReader.readEvent();
+         if (event == null && currentReader.isEndOfStream()) {
+-            if (currentReader.getPath().equals(segments.last())) {
+-                pollNewSegments(timeoutRemaining);
++            final Path currentPath = currentReader.getPath();
++            if (currentPath.equals(segments.last())) {
++                getSegmentPaths(queuePath).forEach(segments::add);
++                if (currentPath.equals(segments.last())) {
++                    pollNewSegments(timeoutRemaining);
++                }
+             } else {
+                 currentReader.close();
+                 currentReader = new RecordIOReader(segments.higher(currentReader.getPath()));
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
+index 131e5b3c3ad..d58b9e106db 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/DeadLetterQueueWriter.java
+@@ -18,15 +18,6 @@
+  */
+ package org.logstash.common.io;
+ 
+-import org.apache.logging.log4j.LogManager;
+-import org.apache.logging.log4j.Logger;
+-import org.logstash.DLQEntry;
+-import org.logstash.Event;
+-import org.logstash.FieldReference;
+-import org.logstash.FileLockFactory;
+-import org.logstash.PathCache;
+-import org.logstash.Timestamp;
+-
+ import java.io.Closeable;
+ import java.io.IOException;
+ import java.nio.channels.FileLock;
+@@ -35,7 +26,16 @@
+ import java.nio.file.Paths;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.LongAdder;
++import java.util.stream.Collectors;
+ import java.util.stream.Stream;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import org.logstash.DLQEntry;
++import org.logstash.Event;
++import org.logstash.FieldReference;
++import org.logstash.FileLockFactory;
++import org.logstash.PathCache;
++import org.logstash.Timestamp;
+ 
+ import static org.logstash.common.io.RecordIOWriter.RECORD_HEADER_SIZE;
+ 
+@@ -102,7 +102,10 @@ private void nextWriter() throws IOException {
+     }
+ 
+     static Stream<Path> getSegmentPaths(Path path) throws IOException {
+-        return Files.list(path).filter((p) -> p.toString().endsWith(".log"));
++        try(final Stream<Path> files = Files.list(path)) {
++            return files.filter(p -> p.toString().endsWith(".log"))
++                .collect(Collectors.toList()).stream();
++        }
+     }
+ 
+     public synchronized void writeEntry(DLQEntry entry) throws IOException {
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/RecordIOReader.java b/logstash-core/src/main/java/org/logstash/common/io/RecordIOReader.java
+index 5e74d3de8e2..48de7db297a 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/RecordIOReader.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/RecordIOReader.java
+@@ -165,7 +165,7 @@ int seekToStartOfEventInBlock() {
+              return -1;
+          }
+          while (true) {
+-             RecordType type = RecordType.fromByte(currentBlock.array()[currentBlock.arrayOffset() + currentBlock.position()]);
++             RecordType type = RecordType.fromByte(currentBlock.get(currentBlock.position()));
+              if (RecordType.COMPLETE.equals(type) || RecordType.START.equals(type)) {
+                  return currentBlock.position();
+              } else if (RecordType.END.equals(type)) {
+diff --git a/logstash-core/src/main/java/org/logstash/common/io/RecordIOWriter.java b/logstash-core/src/main/java/org/logstash/common/io/RecordIOWriter.java
+index d8bbcb562e6..2ee1014ba66 100644
+--- a/logstash-core/src/main/java/org/logstash/common/io/RecordIOWriter.java
++++ b/logstash-core/src/main/java/org/logstash/common/io/RecordIOWriter.java
+@@ -26,7 +26,6 @@
+ import java.nio.file.StandardOpenOption;
+ import java.util.OptionalInt;
+ import java.util.zip.CRC32;
+-import java.util.zip.Checksum;
+ 
+ import static org.logstash.common.io.RecordType.COMPLETE;
+ import static org.logstash.common.io.RecordType.END;
+@@ -67,6 +66,12 @@
+ public final class RecordIOWriter implements Closeable {
+ 
+     private final FileChannel channel;
++
++    private final ByteBuffer writeBuffer =
++        ByteBuffer.allocateDirect(2 * (BLOCK_SIZE + VERSION_SIZE));
++
++    private final CRC32 checksum = new CRC32();
++
+     private int posInBlock;
+     private int currentBlockIdx;
+ 
+@@ -75,6 +80,8 @@ public final class RecordIOWriter implements Closeable {
+     static final int VERSION_SIZE = 1;
+     static final char VERSION = '1';
+ 
++    private static final byte[] PADDING_BYTES = new byte[BLOCK_SIZE]; 
++
+     public RecordIOWriter(Path recordsFile) throws IOException {
+         this.posInBlock = 0;
+         this.currentBlockIdx = 0;
+@@ -87,14 +94,12 @@ private int remainingInBlock() {
+         return BLOCK_SIZE - posInBlock;
+     }
+ 
+-    int writeRecordHeader(RecordHeader header) throws IOException {
+-        ByteBuffer buffer = ByteBuffer.allocate(RECORD_HEADER_SIZE);
+-        buffer.put(header.getType().toByte());
+-        buffer.putInt(header.getSize());
+-        buffer.putInt(header.getTotalEventSize().orElse(-1));
+-        buffer.putInt(header.getChecksum());
+-        buffer.rewind();
+-        return channel.write(buffer);
++    private static void writeRecordHeader(final RecordType type, final int size,
++        final OptionalInt total, final int checksum, final ByteBuffer buffer) {
++        buffer.put(type.toByte());
++        buffer.putInt(size);
++        buffer.putInt(total.orElse(-1));
++        buffer.putInt(checksum);
+     }
+ 
+     private RecordType getNextType(ByteBuffer buffer, RecordType previous) {
+@@ -113,13 +118,14 @@ public long getPosition() throws IOException {
+     }
+ 
+     public long writeEvent(byte[] eventArray) throws IOException {
+-        ByteBuffer eventBuffer = ByteBuffer.wrap(eventArray);
+         RecordType nextType = null;
+-        ByteBuffer slice = eventBuffer.slice();
+-        long startPosition = channel.position();
++        ByteBuffer slice = ByteBuffer.wrap(eventArray);
++        final long startPosition = channel.position();
+         while (slice.hasRemaining()) {
++            writeBuffer.clear();
+             if (posInBlock + RECORD_HEADER_SIZE + 1 > BLOCK_SIZE) {
+-                channel.position((++currentBlockIdx) * BLOCK_SIZE + VERSION_SIZE);
++                final long padding = (++currentBlockIdx) * BLOCK_SIZE + VERSION_SIZE - channel.position();
++                writeBuffer.put(PADDING_BYTES, 0, (int) padding);
+                 posInBlock = 0;
+             }
+             nextType = getNextType(slice, nextType);
+@@ -127,13 +133,15 @@ public long writeEvent(byte[] eventArray) throws IOException {
+             int nextRecordSize = Math.min(remainingInBlock() - RECORD_HEADER_SIZE, slice.remaining());
+             OptionalInt optTotalSize = (nextType == RecordType.START) ? OptionalInt.of(eventArray.length) : OptionalInt.empty();
+             slice.limit(nextRecordSize);
+-
+-            Checksum checksum = new CRC32();
+-            checksum.update(slice.array(), slice.arrayOffset() + slice.position(), nextRecordSize);
+-            posInBlock += writeRecordHeader(
+-                    new RecordHeader(nextType, nextRecordSize, optTotalSize, (int) checksum.getValue()));
+-            posInBlock += channel.write(slice);
+-
++            checksum.reset();
++            checksum.update(slice);
++            writeRecordHeader(
++                nextType, nextRecordSize, optTotalSize, (int) checksum.getValue(), writeBuffer
++            );
++            slice.position(0);
++            writeBuffer.put(slice);
++            writeBuffer.flip();
++            posInBlock += channel.write(writeBuffer);
+             slice.limit(originalLimit);
+             slice = slice.slice();
+         }
+diff --git a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
+index 89ab42d2da5..b67d0876ff9 100644
+--- a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
++++ b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueReaderTest.java
+@@ -19,7 +19,15 @@
+ 
+ package org.logstash.common.io;
+ 
+-
++import java.io.IOException;
++import java.nio.file.Path;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Random;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++import org.junit.Assert;
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+@@ -29,12 +37,6 @@
+ import org.logstash.Timestamp;
+ import org.logstash.ackedqueue.StringElement;
+ 
+-import java.io.IOException;
+-import java.nio.file.Path;
+-import java.util.Arrays;
+-import java.util.Collections;
+-import java.util.Random;
+-
+ import static org.hamcrest.CoreMatchers.equalTo;
+ import static org.hamcrest.CoreMatchers.is;
+ import static org.hamcrest.CoreMatchers.nullValue;
+@@ -302,6 +304,53 @@ public void testWriteReadRandomEventSize() throws Exception {
+         }
+     }
+ 
++    /**
++     * Tests concurrently reading and writing from the DLQ.
++     * @throws Exception On Failure
++     */
++    @Test
++    public void testConcurrentWriteReadRandomEventSize() throws Exception {
++        final ExecutorService exec = Executors.newSingleThreadExecutor();
++        try {
++            final int maxEventSize = BLOCK_SIZE * 2;
++            final int eventCount = 3000;
++            exec.submit(() -> {
++                final Event event = new Event();
++                long startTime = System.currentTimeMillis();
++                try (DeadLetterQueueWriter writeManager = new DeadLetterQueueWriter(
++                    dir, (long) (10 * 1024 * 1024), 1_000_000_000L
++                    )
++                ) {
++                    for (int i = 0; i < eventCount; i++) {
++                        event.setField(
++                            "message",
++                            generateMessageContent((int) (Math.random() * (maxEventSize)))
++                        );
++                        writeManager.writeEntry(
++                            new DLQEntry(
++                                event, "", "", String.valueOf(i),
++                                new Timestamp(startTime++)
++                            )
++                        );
++                    }
++                } catch (final IOException ex) {
++                    throw new IllegalStateException(ex);
++                }
++            });
++            try (DeadLetterQueueReader readManager = new DeadLetterQueueReader(dir)) {
++                for (int i = 0; i < eventCount; i++) {
++                    DLQEntry entry = readManager.pollEntry(30_000L);
++                    assertThat(entry.getReason(), is(String.valueOf(i)));
++                }
++            }
++        } finally {
++            exec.shutdown();
++            if (!exec.awaitTermination(2L, TimeUnit.MINUTES)) {
++                Assert.fail("Failed to shut down record writer");
++            }
++        }
++    }
++
+     @Test
+     public void testWriteStopSmallWriteSeekByTimestamp() throws Exception {
+         int FIRST_WRITE_EVENT_COUNT = 100;
+diff --git a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueWriterTest.java b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueWriterTest.java
+index dc85574105e..61bd9a68197 100644
+--- a/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueWriterTest.java
++++ b/logstash-core/src/test/java/org/logstash/common/io/DeadLetterQueueWriterTest.java
+@@ -19,6 +19,13 @@
+ 
+ package org.logstash.common.io;
+ 
++import java.io.IOException;
++import java.nio.channels.FileChannel;
++import java.nio.channels.OverlappingFileLockException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardOpenOption;
++import java.util.stream.Stream;
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+@@ -27,13 +34,6 @@
+ import org.logstash.Event;
+ import org.logstash.LockException;
+ 
+-import java.io.IOException;
+-import java.nio.channels.FileChannel;
+-import java.nio.channels.OverlappingFileLockException;
+-import java.nio.file.Files;
+-import java.nio.file.Path;
+-import java.nio.file.StandardOpenOption;
+-
+ import static junit.framework.TestCase.assertFalse;
+ import static org.hamcrest.CoreMatchers.is;
+ import static org.hamcrest.CoreMatchers.not;
+@@ -144,9 +144,9 @@ public void testDoesNotWriteBeyondLimit() throws Exception {
+     }
+ 
+     private long dlqLength() throws IOException {
+-        return Files.list(dir)
+-                .filter(p -> p.toString().endsWith(".log"))
+-                .mapToLong(p -> p.toFile().length())
+-                .sum();
++        try(final Stream<Path> files = Files.list(dir)) {
++            return files.filter(p -> p.toString().endsWith(".log"))
++                .mapToLong(p -> p.toFile().length()).sum();
++        }
+     }
+-}
+\ No newline at end of file
++}

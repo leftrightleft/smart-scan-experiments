@@ -1,0 +1,294 @@
+diff --git a/Dockerfile b/Dockerfile
+index bf7ac2fc683..9491ee8c98c 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -45,6 +45,7 @@ ADD spec /opt/logstash/spec
+ ADD qa /opt/logstash/qa
+ ADD lib /opt/logstash/lib
+ ADD pkg /opt/logstash/pkg
++ADD buildSrc /opt/logstash/buildSrc
+ ADD tools /opt/logstash/tools
+ ADD logstash-core /opt/logstash/logstash-core
+ ADD logstash-core-plugin-api /opt/logstash/logstash-core-plugin-api
+diff --git a/build.gradle b/build.gradle
+index 546427c8969..3e2ad2daa3b 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -41,6 +41,7 @@ apply from: "rubyUtils.gradle"
+ import org.yaml.snakeyaml.Yaml
+ import de.undercouch.gradle.tasks.download.Download
+ import groovy.json.JsonSlurper
++import org.logstash.gradle.tooling.StackVersionSelector
+ 
+ allprojects {
+   group = 'org.logstash'
+@@ -163,17 +164,15 @@ tasks.register("configureArtifactInfo") {
+         version = "$version-$versionQualifier"
+     }
+ 
+-    def isReleaseBuild = System.getenv('RELEASE') == "1" || versionQualifier
+-    String apiResponse = artifactVersionsApi.toURL().text
+-
+-    def dlVersions = new JsonSlurper().parseText(apiResponse)
+-    String qualifiedVersion = dlVersions['versions'].grep(isReleaseBuild ? ~/^${version}$/ : ~/^${version}-SNAPSHOT/)[0]
+-    if (qualifiedVersion == null) {
+-        throw new GradleException("could not find the current artifact from the artifact-api ${artifactVersionsApi} for ${version}")
++    def versionSelector = new StackVersionSelector(artifactVersionsApi)
++    String qualifiedVersion = versionSelector.selectClosestVersion(version)
++    if (qualifiedVersion != version) {
++        println "WARN version $version does not yet exist or has not been published, switching to $qualifiedVersion"
+     }
++
+     // find latest reference to last build
+     String buildsListApi = "${artifactVersionsApi}/${qualifiedVersion}/builds/"
+-    apiResponse = buildsListApi.toURL().text
++    def apiResponse = buildsListApi.toURL().text
+     def dlBuilds = new JsonSlurper().parseText(apiResponse)
+     def stackBuildVersion = dlBuilds["builds"][0]
+ 
+diff --git a/buildSrc/build.gradle b/buildSrc/build.gradle
+new file mode 100644
+index 00000000000..c29d6d06a0e
+--- /dev/null
++++ b/buildSrc/build.gradle
+@@ -0,0 +1,8 @@
++repositories {
++    mavenCentral()
++}
++
++dependencies {
++    testImplementation 'junit:junit:4.13'
++}
++
+diff --git a/buildSrc/src/main/groovy/org/logstash/gradle/tooling/StackVersionSelector.groovy b/buildSrc/src/main/groovy/org/logstash/gradle/tooling/StackVersionSelector.groovy
+new file mode 100644
+index 00000000000..79bf8dc62af
+--- /dev/null
++++ b/buildSrc/src/main/groovy/org/logstash/gradle/tooling/StackVersionSelector.groovy
+@@ -0,0 +1,148 @@
++package org.logstash.gradle.tooling
++
++import org.gradle.api.GradleException
++import groovy.json.JsonSlurper
++
++class StackVersionSelector {
++
++    private final String artifactVersionsApi
++
++    public StackVersionSelector(String artifactVersionsApi) {
++        this.artifactVersionsApi = artifactVersionsApi
++    }
++
++    def selectClosestVersion(String version) {
++        String apiResponse = artifactVersionsApi.toURL().text
++        def dlVersions = new JsonSlurper().parseText(apiResponse)
++        List<StackVersion> versions = dlVersions['versions'].collect {s -> StackVersion.asVersion(s)}
++
++        def versionQualifier = System.getenv('VERSION_QUALIFIER')
++        def isReleaseBuild = System.getenv('RELEASE') == "1" || versionQualifier
++
++        String qualifiedVersion = selectClosestInList(StackVersion.asVersion(isReleaseBuild ? version : "${version}-SNAPSHOT"), versions)
++        if (qualifiedVersion == null) {
++            throw new GradleException("Could not find Elastic Stack version ($version) in the artifact api (${artifactVersionsApi})")
++        }
++        qualifiedVersion
++    }
++
++    /**
++     * Suppose availableVersions is sorted in such a way that the SNAPSHOT version is before the release version,
++     * following the natural order of versions:
++     *  7.10.1-SNAPSHOT
++     *  7.10.1
++     *  7.11.0-SNAPSHOT
++     *  7.11.0
++     *  8.0.0-SNAPSHOT
++     *  8.0.0-alpha1
++     *  8.0.0-alpha2
++     *  8.0.0-rc1
++     *  8.0.0-rc2
++     *  8.0.0
++     * */
++    protected def selectClosestInList(StackVersion version, List<StackVersion> availableVersions) {
++        for (int index = 0; index < availableVersions.size(); index++) {
++            StackVersion currentVersion = availableVersions[index]
++            if (currentVersion == version) {
++                return currentVersion
++            }
++            if (index == availableVersions.size() - 1) {
++                // last version
++                return currentVersion
++            }
++            if (currentVersion < version && version < availableVersions[index + 1]) {
++                // 7.14.0 < 7.15.0 < 8.0.0-SNAPSHOT and 7.15.0 is not yet released
++                return currentVersion
++            }
++        }
++        throw new IllegalStateException("Never reach this point")
++    }
++
++    static class Version implements Comparable<Version> {
++
++        final int major
++        final int minor
++        final int patch
++        private final String original
++
++        Version(String v) {
++            original = v
++            def splits = v.split("\\.")
++            major = splits[0] as int
++            minor = splits[1] as int
++            patch = splits[2] as int
++        }
++
++        @Override
++        int compareTo(Version version) {
++            if (major != version.major) {
++                return major <=> version.major
++            }
++            if (minor != version.minor) {
++                return minor <=> version.minor
++            }
++            return patch <=> version.patch
++        }
++
++        @Override
++        String toString() {
++            original
++        }
++    }
++
++    static class StackVersion implements Comparable<StackVersion> {
++        final Version version
++        final String suffix
++        final def comparator = comparator()
++
++        StackVersion(String fullVersion) {
++            def splits = fullVersion.split("-")
++            version = new Version(splits[0])
++            if (splits.length == 2) {
++                suffix = splits[1]
++            }
++        }
++
++        def static asVersion(String v) {
++            new StackVersion(v)
++        }
++
++        @Override
++        String toString() {
++            suffix != null ? "$version-$suffix" : version
++        }
++
++        static Comparator<StackVersion> comparator() {
++            Comparator.comparing({sv -> sv.version})
++                    .thenComparing({sv -> sv.suffix}, new SuffixComparator())
++        }
++
++        @Override
++        int compareTo(StackVersion other) {
++            comparator.compare(this, other)
++        }
++    }
++
++    static class SuffixComparator implements Comparator<String> {
++
++        private static final List<String> VERSION_SUFFIX_ORDER = ["SNAPSHOT", "alpha1", "alpha2", "rc1", "rc2", "<GA>"]
++
++        @Override
++        int compare(String s, String t) {
++            if (s == null)
++                s = "<GA>"
++            if (t == null)
++                t = "<GA>"
++
++            //for example 8.0.0-SNAPSHOT vs 8.0.0-alpha1
++            int sSuffixOrder = VERSION_SUFFIX_ORDER.indexOf(s)
++            int tSuffixOrder = VERSION_SUFFIX_ORDER.indexOf(t)
++            if (sSuffixOrder < 0)
++                throw new IllegalArgumentException("Found illegal version suffix: [$s]")
++            if (tSuffixOrder < 0)
++                throw new IllegalArgumentException("Found illegal version suffix: [$t]")
++
++            return sSuffixOrder <=> tSuffixOrder
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/buildSrc/src/test/groovy/org/logstash/gradle/tooling/StackVersionSelectorTest.groovy b/buildSrc/src/test/groovy/org/logstash/gradle/tooling/StackVersionSelectorTest.groovy
+new file mode 100644
+index 00000000000..aeda5377a00
+--- /dev/null
++++ b/buildSrc/src/test/groovy/org/logstash/gradle/tooling/StackVersionSelectorTest.groovy
+@@ -0,0 +1,70 @@
++package org.logstash.gradle.tooling
++
++import org.junit.Test
++import org.junit.Before
++
++import static org.logstash.gradle.tooling.StackVersionSelector.*
++import static org.logstash.gradle.tooling.StackVersionSelector.StackVersion.*
++
++class StackVersionSelectorTest {
++
++    def versionsFixture = [
++            asVersion("6.8.17-SNAPSHOT"),
++            asVersion("6.8.17"),
++            asVersion("7.13.2-SNAPSHOT"),
++            asVersion("7.13.2"),
++            asVersion("7.13.3-SNAPSHOT"),
++            asVersion("7.13.3"),
++            asVersion("7.14.0-SNAPSHOT"),
++            asVersion("7.14.0"),
++            asVersion("8.0.0-SNAPSHOT")
++    ]
++
++    def sut
++
++    @Before
++    void setUp() {
++        sut = new StackVersionSelector("")
++    }
++
++    @Test
++    void "selectClosestInList should return the exact match when present"() {
++        assert "7.14.0" == sut.selectClosestInList(asVersion("7.14.0"), versionsFixture).toString()
++    }
++
++    @Test
++    void "selectClosestInList should return the previous closest version when exact match is not present"() {
++        assert "7.14.0" == sut.selectClosestInList(asVersion("7.15.0"), versionsFixture).toString()
++    }
++
++    @Test
++    void "selectClosestInList should return the greatest version when the version is greater than the max"() {
++        assert "8.0.0-SNAPSHOT" == sut.selectClosestInList(asVersion("8.0.0"), versionsFixture).toString()
++    }
++
++    @Test
++    void "compare StackVersion tests"() {
++        assert asVersion("7.1.0") < asVersion("7.2.1")
++        assert asVersion("7.2.1") > asVersion("7.1.0")
++
++        assert asVersion("7.1.0") > asVersion("7.1.0-SNAPSHOT")
++
++        assert asVersion("7.9.0") < asVersion("7.10.0")
++
++        assert asVersion("7.2.1-SNAPSHOT") > asVersion("7.1.0-SNAPSHOT")
++
++        assert asVersion("7.2.1-SNAPSHOT") > asVersion("7.1.0")
++
++        assert asVersion("7.2.1") > asVersion("7.1.0-SNAPSHOT")
++
++        assert asVersion("8.0.0-alpha1") > asVersion("7.1.0-SNAPSHOT")
++
++        assert asVersion("8.0.0-alpha1") > asVersion("8.0.0-SNAPSHOT")
++
++        assert asVersion("8.0.0-rc1") > asVersion("8.0.0-alpha2")
++
++        assert asVersion("8.0.0") > asVersion("8.0.0-alpha2")
++
++        assert asVersion("8.0.0") > asVersion("8.0.0-SNAPSHOT")
++    }
++}
+\ No newline at end of file

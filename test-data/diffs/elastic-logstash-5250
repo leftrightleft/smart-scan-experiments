@@ -1,0 +1,210 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index d8212acf618..09f2d21cb76 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -165,12 +165,15 @@ def collect_metrics?
+     @collect_metric
+   end
+ 
+-  def create_pipeline(settings)
+-    begin
+-      config = fetch_config(settings)
+-    rescue => e
+-      @logger.error("failed to fetch pipeline configuration", :message => e.message)
+-      return
++  def create_pipeline(settings, config=nil)
++
++    if config.nil?
++      begin
++        config = fetch_config(settings)
++      rescue => e
++        @logger.error("failed to fetch pipeline configuration", :message => e.message)
++        return
++      end
+     end
+ 
+     begin
+@@ -189,16 +192,21 @@ def fetch_config(settings)
+   # wrapped in @upgrade_mutex in the parent call `reload_state!`
+   def reload_pipeline!(id)
+     old_pipeline = @pipelines[id]
+-    new_pipeline = create_pipeline(old_pipeline.original_settings)
++    new_config = fetch_config(old_pipeline.original_settings)
++    if old_pipeline.config_str == new_config
++      @logger.debug("no configuration change for pipeline",
++                    :pipeline => id, :config => new_config)
++      return
++    end
++
++    new_pipeline = create_pipeline(old_pipeline.original_settings, new_config)
+     return if new_pipeline.nil?
+ 
+-    if old_pipeline.config_str == new_pipeline.config_str
+-      @logger.debug("no configuration change for pipeline",
+-                    :pipeline => id, :config => old_pipeline.config_str)
+-    elsif new_pipeline.non_reloadable_plugins.any?
++    if new_pipeline.non_reloadable_plugins.any?
+       @logger.error(I18n.t("logstash.agent.non_reloadable_config_reload"),
+                     :pipeline_id => id,
+                     :plugins => new_pipeline.non_reloadable_plugins.map(&:class))
++      return
+     else
+       @logger.warn("fetched new config for pipeline. upgrading..",
+                    :pipeline => id, :config => new_pipeline.config_str)
+diff --git a/logstash-core/lib/logstash/config/config_ast.rb b/logstash-core/lib/logstash/config/config_ast.rb
+index 96a7ee46a85..b235dded4ed 100644
+--- a/logstash-core/lib/logstash/config/config_ast.rb
++++ b/logstash-core/lib/logstash/config/config_ast.rb
+@@ -94,6 +94,7 @@ def compile
+         @outputs = []
+         @periodic_flushers = []
+         @shutdown_flushers = []
++        @generated_objects = {}
+       CODE
+ 
+       sections = recursive_select(LogStash::Config::AST::PluginSection)
+@@ -137,7 +138,10 @@ class Whitespace < Node; end
+   class PluginSection < Node
+     # Global plugin numbering for the janky instance variable naming we use
+     # like @filter_<name>_1
+-    @@i = 0
++    def initialize(*args)
++      super(*args)
++      @i = 0
++    end
+ 
+     # Generate ruby code to initialize all the plugins.
+     def compile_initializer
+@@ -147,31 +151,31 @@ def compile_initializer
+ 
+ 
+         code << <<-CODE
+-          #{name} = #{plugin.compile_initializer}
+-          @#{plugin.plugin_type}s << #{name}
++          @generated_objects[:#{name}] = #{plugin.compile_initializer}
++          @#{plugin.plugin_type}s << @generated_objects[:#{name}]
+         CODE
+ 
+         # The flush method for this filter.
+         if plugin.plugin_type == "filter"
+ 
+           code << <<-CODE
+-            #{name}_flush = lambda do |options, &block|
+-              @logger.debug? && @logger.debug(\"Flushing\", :plugin => #{name})
++            @generated_objects[:#{name}_flush] = lambda do |options, &block|
++              @logger.debug? && @logger.debug(\"Flushing\", :plugin => @generated_objects[:#{name}])
+ 
+-              events = #{name}.flush(options)
++              events = @generated_objects[:#{name}].flush(options)
+ 
+               return if events.nil? || events.empty?
+ 
+-              @logger.debug? && @logger.debug(\"Flushing\", :plugin => #{name}, :events => events)
++              @logger.debug? && @logger.debug(\"Flushing\", :plugin => @generated_objects[:#{name}], :events => events)
+ 
+               #{plugin.compile_starting_here.gsub(/^/, "  ")}
+ 
+               events.each{|e| block.call(e)}
+             end
+ 
+-            if #{name}.respond_to?(:flush)
+-              @periodic_flushers << #{name}_flush if #{name}.periodic_flush
+-              @shutdown_flushers << #{name}_flush
++            if @generated_objects[:#{name}].respond_to?(:flush)
++              @periodic_flushers << @generated_objects[:#{name}_flush] if @generated_objects[:#{name}].periodic_flush
++              @shutdown_flushers << @generated_objects[:#{name}_flush]
+             end
+           CODE
+ 
+@@ -192,9 +196,10 @@ def generate_variables
+ 
+       plugins.each do |plugin|
+         # Unique number for every plugin.
+-        @@i += 1
++        @i += 1
+         # store things as ivars, like @filter_grok_3
+-        var = "@#{plugin.plugin_type}_#{plugin.plugin_name}_#{@@i}"
++        var = :"#{plugin.plugin_type}_#{plugin.plugin_name}_#{@i}"
++        # puts("var=#{var.inspect}")
+         @variables[plugin] = var
+       end
+       return @variables
+@@ -236,13 +241,13 @@ def compile_initializer
+     def compile
+       case plugin_type
+       when "input"
+-        return "start_input(#{variable_name})"
++        return "start_input(@generated_objects[:#{variable_name}])"
+       when "filter"
+         return <<-CODE
+-          events = #{variable_name}.multi_filter(events)
++          events = @generated_objects[:#{variable_name}].multi_filter(events)
+         CODE
+       when "output"
+-        return "targeted_outputs << #{variable_name}\n"
++        return "targeted_outputs << @generated_objects[:#{variable_name}]\n"
+       when "codec"
+         settings = attributes.recursive_select(Attribute).collect(&:compile).reject(&:empty?)
+         attributes_code = "LogStash::Util.hash_merge_many(#{settings.map { |c| "{ #{c} }" }.join(", ")})"
+@@ -391,7 +396,7 @@ def compile
+       if type == "filter"
+         i = LogStash::Config::AST.defered_conditionals_index += 1
+         source = <<-CODE
+-          define_singleton_method :cond_func_#{i} do |input_events|
++          @generated_objects[:cond_func_#{i}] = lambda do |input_events|
+             result = []
+             input_events.each do |event|
+               events = [event]
+@@ -405,7 +410,7 @@ def compile
+         LogStash::Config::AST.defered_conditionals << source
+ 
+         <<-CODE
+-          events = cond_func_#{i}(events)
++          events = @generated_objects[:cond_func_#{i}].call(events)
+         CODE
+       else # Output
+         <<-CODE
+diff --git a/logstash-core/spec/logstash/config/config_ast_spec.rb b/logstash-core/spec/logstash/config/config_ast_spec.rb
+index d4ba9af94d9..fcf989fcd0c 100644
+--- a/logstash-core/spec/logstash/config/config_ast_spec.rb
++++ b/logstash-core/spec/logstash/config/config_ast_spec.rb
+@@ -169,10 +169,12 @@ def plugin(*args);end
+     end
+ 
+     describe "generated conditional functionals" do
+-      it "should be defined at instance level" do
++      it "should be created per instance" do
+         instance_1 = pipeline_klass.new(config_string)
+         instance_2 = pipeline_klass.new(config_string)
+-        expect(instance_1.method(:cond_func_1).owner).to_not be(instance_2.method(:cond_func_1).owner)
++        generated_method_1 = instance_1.instance_variable_get("@generated_objects")[:cond_func_1]
++        generated_method_2 = instance_2.instance_variable_get("@generated_objects")[:cond_func_1]
++        expect(generated_method_1).to_not be(generated_method_2)
+       end
+     end
+   end
+diff --git a/logstash-core/spec/logstash/pipeline_spec.rb b/logstash-core/spec/logstash/pipeline_spec.rb
+index e17ddff719c..ea375570486 100644
+--- a/logstash-core/spec/logstash/pipeline_spec.rb
++++ b/logstash-core/spec/logstash/pipeline_spec.rb
+@@ -616,4 +616,20 @@ class TestPipeline < LogStash::Pipeline
+       end
+     end
+   end
++
++  context "Pipeline object" do
++    before do
++      allow(LogStash::Plugin).to receive(:lookup).with("input", "generator").and_return(LogStash::Inputs::Generator)
++      allow(LogStash::Plugin).to receive(:lookup).with("codec", "plain").and_return(DummyCodec)
++      allow(LogStash::Plugin).to receive(:lookup).with("filter", "dummyfilter").and_return(DummyFilter)
++      allow(LogStash::Plugin).to receive(:lookup).with("output", "dummyoutput").and_return(DummyOutput)
++    end
++
++    let(:pipeline1) { LogStash::Pipeline.new("input { generator {} } filter { dummyfilter {} } output { dummyoutput {}}") }
++    let(:pipeline2) { LogStash::Pipeline.new("input { generator {} } filter { dummyfilter {} } output { dummyoutput {}}") }
++
++    it "should not add ivars" do
++       expect(pipeline1.instance_variables).to eq(pipeline2.instance_variables)
++    end
++  end
+ end

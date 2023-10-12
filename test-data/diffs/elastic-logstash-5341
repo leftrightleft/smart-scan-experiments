@@ -1,0 +1,1519 @@
+diff --git a/Gemfile b/Gemfile
+index 79c9f2af4a2..f4aab97ef6c 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -23,3 +23,4 @@ gem "rubyzip", "~> 1.1.7", :group => :build
+ gem "gems", "~> 0.8.3", :group => :build
+ gem "rack-test", :require => "rack/test", :group => :development
+ gem "flores", "~> 0.0.6", :group => :development
++gem "pleaserun"
+diff --git a/bin/logstash b/bin/logstash
+index 978bc8e112b..7ddc8bb568f 100755
+--- a/bin/logstash
++++ b/bin/logstash
+@@ -9,7 +9,7 @@
+ # See 'bin/logstash help' for a list of commands.
+ #
+ # Supported environment variables:
+-#   LS_HEAP_SIZE="xxx" size for the -Xmx${LS_HEAP_SIZE} maximum Java heap size option, default is "1g"
++#   LS_JVM_OPTS="xxx" path to file with JVM options
+ #   LS_JAVA_OPTS="xxx" to append extra options to the defaults JAVA_OPTS provided by logstash
+ #   JAVA_OPTS="xxx" to *completely override* the defauls set of JAVA_OPTS provided by logstash
+ #
+diff --git a/bin/logstash.lib.sh b/bin/logstash.lib.sh
+index c2058e5d5c7..55c4c911824 100755
+--- a/bin/logstash.lib.sh
++++ b/bin/logstash.lib.sh
+@@ -26,8 +26,11 @@ fi
+ LOGSTASH_HOME=$(cd `dirname $SOURCEPATH`/..; pwd)
+ export LOGSTASH_HOME
+ 
+-# Defaults you can override with environment variables
+-LS_HEAP_SIZE="${LS_HEAP_SIZE:=1g}"
++parse_jvm_options() {
++  if [ -f "$1" ]; then
++    echo "$(grep "^-" "$1" | tr '\n' ' ')"
++  fi
++}
+ 
+ setup_java() {
+   if [ -z "$JAVACMD" ] ; then
+@@ -50,21 +53,27 @@ setup_java() {
+ 
+   if [ "$JAVA_OPTS" ] ; then
+     echo "WARNING: Default JAVA_OPTS will be overridden by the JAVA_OPTS defined in the environment. Environment JAVA_OPTS are $JAVA_OPTS"  1>&2
+-  else
+-    # There are no JAVA_OPTS set from the client, we set a predefined
+-    # set of options that think are good in general
+-    JAVA_OPTS="-XX:+UseParNewGC"
+-    JAVA_OPTS="$JAVA_OPTS -XX:+UseConcMarkSweepGC"
+-    JAVA_OPTS="$JAVA_OPTS -Djava.awt.headless=true"
++  fi
++
++  # Set a default GC log file for use by jvm.options _before_ it's called.
++  if [ -z "$LS_GC_LOG_FILE" ] ; then
++    LS_GC_LOG_FILE="./logstash-gc.log"
++  fi
+ 
+-    JAVA_OPTS="$JAVA_OPTS -XX:CMSInitiatingOccupancyFraction=75"
+-    JAVA_OPTS="$JAVA_OPTS -XX:+UseCMSInitiatingOccupancyOnly"
+-    # Causes the JVM to dump its heap on OutOfMemory.
+-    JAVA_OPTS="$JAVA_OPTS -XX:+HeapDumpOnOutOfMemoryError"
+-    # The path to the heap dump location
+-    # This variable needs to be isolated since it may contain spaces
+-    HEAP_DUMP_PATH="-XX:HeapDumpPath=${LOGSTASH_HOME}/heapdump.hprof"
++  # Set the initial JVM options from the jvm.options file.  Look in
++  # /etc/logstash first, and break if that file is found readable there.
++  if [ -z "$LS_JVM_OPTS" ]; then
++      for jvm_options in /etc/logstash/jvm.options \
++                        "$LOGSTASH_HOME"/config/jvm.options;
++                         do
++          if [ -r "$jvm_options" ]; then
++              LS_JVM_OPTS=$jvm_options
++              break
++          fi
++      done
+   fi
++  # use the defaults, first, then override with anything provided
++  LS_JAVA_OPTS="$(parse_jvm_options "$LS_JVM_OPTS") $LS_JAVA_OPTS"
+ 
+   if [ "$LS_JAVA_OPTS" ] ; then
+     # The client set the variable LS_JAVA_OPTS, choosing his own
+@@ -72,23 +81,6 @@ setup_java() {
+     JAVA_OPTS="$JAVA_OPTS $LS_JAVA_OPTS"
+   fi
+ 
+-  if [ "$LS_HEAP_SIZE" ] ; then
+-    JAVA_OPTS="$JAVA_OPTS -Xmx${LS_HEAP_SIZE}"
+-  fi
+-
+-  if [ "$LS_USE_GC_LOGGING" ] ; then
+-    if [ -z "$LS_GC_LOG_FILE" ] ; then
+-      LS_GC_LOG_FILE="./logstash-gc.log"
+-    fi
+-    JAVA_OPTS="$JAVA_OPTS -XX:+PrintGCDetails"
+-    JAVA_OPTS="$JAVA_OPTS -XX:+PrintGCTimeStamps"
+-    JAVA_OPTS="$JAVA_OPTS -XX:+PrintClassHistogram"
+-    JAVA_OPTS="$JAVA_OPTS -XX:+PrintTenuringDistribution"
+-    JAVA_OPTS="$JAVA_OPTS -XX:+PrintGCApplicationStoppedTime"
+-    JAVA_OPTS="$JAVA_OPTS -Xloggc:${LS_GC_LOG_FILE}"
+-    echo "Writing garbage collection logs to ${LS_GC_LOG_FILE}"
+-  fi
+-
+   export JAVACMD
+   export JAVA_OPTS
+ }
+@@ -140,7 +132,9 @@ setup_ruby() {
+ jruby_opts() {
+   printf "%s" "--1.9"
+   for i in $JAVA_OPTS ; do
+-    printf "%s" " -J$i"
++    if [ -z "$i" ]; then
++      printf "%s" " -J$i"
++    fi
+   done
+ }
+ 
+@@ -179,8 +173,8 @@ ruby_exec() {
+     # $VENDORED_JRUBY is non-empty so use the vendored JRuby
+ 
+     if [ "$DEBUG" ] ; then
+-      echo "DEBUG: exec ${JRUBY_BIN} $(jruby_opts) "-J$HEAP_DUMP_PATH" $@"
++      echo "DEBUG: exec ${JRUBY_BIN} $(jruby_opts) $@"
+     fi
+-    exec "${JRUBY_BIN}" $(jruby_opts) "-J$HEAP_DUMP_PATH" "$@"
++    exec "${JRUBY_BIN}" $(jruby_opts) "$@"
+   fi
+ }
+diff --git a/bin/system-install b/bin/system-install
+new file mode 100755
+index 00000000000..5790a5a41e8
+--- /dev/null
++++ b/bin/system-install
+@@ -0,0 +1,41 @@
++#!/bin/bash
++
++unset CDPATH
++. "$(cd `dirname $0`/..; pwd)/bin/logstash.lib.sh"
++setup
++
++if [ -z "$1" ]; then
++  [ -r ${LOGSTASH_HOME}/config/startup.options ] && . ${LOGSTASH_HOME}/config/startup.options
++  [ -r /etc/logstash/startup.options ] && . /etc/logstash/startup.options
++else
++  if [ -r $1 ]; then
++    echo "Using provided startup.options file: ${1}"
++    . $1
++  else
++    echo "$1 is not a file path"
++  fi
++fi
++
++# bin/logstash-plugin is a short lived ruby script thus we can use aggressive "faster starting JRuby options"
++# see https://github.com/jruby/jruby/wiki/Improving-startup-time
++export JRUBY_OPTS="$JRUBY_OPTS -J-XX:+TieredCompilation -J-XX:TieredStopAtLevel=1 -J-noverify -X-C -Xcompile.invokedynamic=false"
++
++tempfile=$(mktemp)
++if [ "x${PRESTART}" == "x" ]; then
++  opts=("--log" "$tempfile" "--overwrite" "--install" "--name" "${SERVICE_NAME}" "--user" "${LS_USER}" "--group" "${LS_GROUP}" "--description" "${SERVICE_DESCRIPTION}" "--nice" "${LS_NICE}" "--limit-open-files" "${LS_OPEN_FILES}")
++else
++  opts=("--log" "$tempfile" "--overwrite" "--install" "--name" "${SERVICE_NAME}" "--user" "${LS_USER}" "--group" "${LS_GROUP}" "--description" "${SERVICE_DESCRIPTION}" "--nice" "${LS_NICE}" "--limit-open-files" "${LS_OPEN_FILES}" "--prestart" "${PRESTART}")
++fi
++
++program="$(cd `dirname $0`/..; pwd)/bin/logstash"
++
++$(ruby_exec "${LOGSTASH_HOME}/lib/systeminstall/pleasewrap.rb" "${opts[@]}" ${program} ${LS_OPTS})
++exit_code=$?
++
++if [ $exit_code -ne 0 ]; then
++  cat $tempfile
++  echo "Unable to install system startup script for Logstash."
++else
++  echo "Successfully created system startup script for Logstash"
++fi
++rm $tempfile
+diff --git a/config/jvm.options b/config/jvm.options
+new file mode 100644
+index 00000000000..b50648b2f85
+--- /dev/null
++++ b/config/jvm.options
+@@ -0,0 +1,74 @@
++## JVM configuration
++
++# Xms represents the initial size of total heap space
++# Xmx represents the maximum size of total heap space
++
++-Xms256m
++-Xmx1g
++
++################################################################
++## Expert settings
++################################################################
++##
++## All settings below this section are considered
++## expert settings. Don't tamper with them unless
++## you understand what you are doing
++##
++################################################################
++
++## GC configuration
++-XX:+UseParNewGC
++-XX:+UseConcMarkSweepGC
++-XX:CMSInitiatingOccupancyFraction=75
++-XX:+UseCMSInitiatingOccupancyOnly
++
++## optimizations
++
++# disable calls to System#gc
++-XX:+DisableExplicitGC
++
++## Locale
++# Set the locale language
++#-Duser.language=en
++
++# Set the locale country
++#-Duser.country=US
++
++# Set the locale variant, if any
++#-Duser.variant=
++
++## basic
++
++# set the I/O temp directory
++-Djava.io.tmpdir=$HOME
++
++# set to headless, just in case
++-Djava.awt.headless=true
++
++# ensure UTF-8 encoding by default (e.g. filenames)
++-Dfile.encoding=UTF-8
++
++# use our provided JNA always versus the system one
++#-Djna.nosys=true
++
++## heap dumps
++
++# generate a heap dump when an allocation from the Java heap fails
++# heap dumps are created in the working directory of the JVM
++-XX:+HeapDumpOnOutOfMemoryError
++
++# specify an alternative path for heap dumps
++# ensure the directory exists and has sufficient space
++#-XX:HeapDumpPath=${LOGSTASH_HOME}/heapdump.hprof
++
++## GC logging
++#-XX:+PrintGCDetails
++#-XX:+PrintGCTimeStamps
++#-XX:+PrintGCDateStamps
++#-XX:+PrintClassHistogram
++#-XX:+PrintTenuringDistribution
++#-XX:+PrintGCApplicationStoppedTime
++
++# log GC status to a file with time stamps
++# ensure the directory exists
++#-Xloggc:${LS_GC_LOG_FILE}
+diff --git a/config/startup.options b/config/startup.options
+new file mode 100644
+index 00000000000..9d35f798dcd
+--- /dev/null
++++ b/config/startup.options
+@@ -0,0 +1,52 @@
++################################################################################
++# These settings are ONLY used by $LS_HOME/bin/system-install to create a custom
++# startup script for Logstash.  It should automagically use the init system
++# (systemd, upstart, sysv, etc.) that your Linux distribution uses.
++#
++# After changing anything here, you need to re-run $LS_HOME/bin/system-install
++# as root to push the changes to the init script.
++################################################################################
++
++# Override Java location
++JAVACMD=/usr/bin/java
++
++# Set a home directory
++LS_HOME=/usr/share/logstash
++
++# logstash settings directory, the path which contains logstash.yml
++LS_SETTINGS_DIR="${LS_HOME}/config"
++
++# Arguments to pass to logstash
++LS_OPTS="--path.settings ${LS_SETTINGS_DIR}"
++
++# Arguments to pass to java
++LS_JAVA_OPTS=""
++
++# pidfiles aren't used the same way for upstart and systemd; this is for sysv users.
++LS_PIDFILE=/var/run/logstash.pid
++
++# user and group id to be invoked as
++LS_USER=logstash
++LS_GROUP=logstash
++
++# Enable GC logging by uncommenting the appropriate lines in the GC logging
++# section in jvm.options
++LS_GC_LOG_FILE=/var/log/logstash/gc.log
++
++# Open file limit
++LS_OPEN_FILES=16384
++
++# Nice level
++LS_NICE=19
++
++# Change these to have the init script named and described differently
++# This is useful when running multiple instances of Logstash on the same
++# physical box or vm
++SERVICE_NAME="logstash"
++SERVICE_DESCRIPTION="logstash"
++
++# If you need to run a command or script before launching Logstash, put it
++# between the lines beginning with `read` and `EOM`, and uncomment those lines.
++###
++## read -r -d '' PRESTART << EOM
++## EOM
+diff --git a/lib/systeminstall/pleasewrap.rb b/lib/systeminstall/pleasewrap.rb
+new file mode 100755
+index 00000000000..f7ee00bd447
+--- /dev/null
++++ b/lib/systeminstall/pleasewrap.rb
+@@ -0,0 +1,12 @@
++# encoding: utf-8
++$LOAD_PATH.unshift(File.expand_path(File.join(__FILE__, "..", "..")))
++
++require "bootstrap/environment"
++
++ENV["GEM_HOME"] = ENV["GEM_PATH"] = LogStash::Environment.logstash_gem_home
++Gem.use_paths(LogStash::Environment.logstash_gem_home)
++
++#libdir = File.expand_path("../lib", File.dirname(__FILE__))
++#$LOAD_PATH << libdir if File.exist?(File.join(libdir, "pleaserun", "cli.rb"))
++require "pleaserun/cli"
++exit(PleaseRun::CLI.run || 0)
+diff --git a/pkg/centos/after-install.sh b/pkg/centos/after-install.sh
+index 224904e4b32..ed62ee57903 100644
+--- a/pkg/centos/after-install.sh
++++ b/pkg/centos/after-install.sh
+@@ -1,6 +1,7 @@
+-/sbin/chkconfig --add logstash
++# /sbin/chkconfig --add logstash
+ 
+-chown -R logstash:logstash /opt/logstash
++chown -R logstash:logstash /usr/share/logstash
+ chown logstash /var/log/logstash
+ chown logstash:logstash /var/lib/logstash
+ chmod 0644 /etc/logrotate.d/logstash
++/usr/share/logstash/bin/system-install /etc/logstash/startup.options
+diff --git a/pkg/centos/before-install.sh b/pkg/centos/before-install.sh
+index 5a852488ff3..78fc0b77d49 100644
+--- a/pkg/centos/before-install.sh
++++ b/pkg/centos/before-install.sh
+@@ -5,6 +5,6 @@ fi
+ 
+ # create logstash user
+ if ! getent passwd logstash >/dev/null; then
+-  useradd -r -g logstash -d /opt/logstash \
++  useradd -r -g logstash -d /usr/share/logstash \
+     -s /sbin/nologin -c "logstash" logstash
+ fi
+diff --git a/pkg/centos/before-remove.sh b/pkg/centos/before-remove.sh
+index 5109888475f..6687ee896e5 100644
+--- a/pkg/centos/before-remove.sh
++++ b/pkg/centos/before-remove.sh
+@@ -1,6 +1,32 @@
++# CentOS/RHEL and SuSE
+ if [ $1 -eq 0 ]; then
+-  /sbin/service logstash stop >/dev/null 2>&1 || true
+-  /sbin/chkconfig --del logstash
++  # Upstart
++  if [ -r "/etc/init/logstash.conf" ]; then
++    if [ -f "/sbin/stop" ]; then
++      /sbin/stop logstash >/dev/null 2>&1 || true
++    else
++      /sbin/service logstash stop >/dev/null 2>&1 || true
++    fi
++    if [ -f "/etc/init/logstash.conf" ]; then
++      rm /etc/init/logstash.conf
++    fi
++  # SYSV
++  elif [ -r "/etc/init.d/logstash" ]; then
++    /sbin/chkconfig --del logstash
++    if [ -f "/etc/init.d/logstash" ]; then
++      rm /etc/init.d/logstash
++    fi
++  # systemd
++  else
++    systemctl stop logstash >/dev/null 2>&1 || true
++    if [ -f "/etc/systemd/system/logstash-prestart.sh" ]; then
++      rm /etc/systemd/system/logstash-prestart.sh
++    fi
++
++    if [ -f "/etc/systemd/system/logstash.service" ]; then
++      rm /etc/systemd/system/logstash.service
++    fi
++  fi
+   if getent passwd logstash >/dev/null ; then
+     userdel logstash
+   fi
+diff --git a/pkg/debian/after-install.sh b/pkg/debian/after-install.sh
+index 18b4ea8c32c..21b69ac7142 100644
+--- a/pkg/debian/after-install.sh
++++ b/pkg/debian/after-install.sh
+@@ -1,7 +1,8 @@
+ #!/bin/sh
+ 
+-chown -R logstash:logstash /opt/logstash
++chown -R logstash:logstash /usr/share/logstash
+ chown logstash /var/log/logstash
+ chown logstash:logstash /var/lib/logstash
+ chmod 755 /etc/logstash
+ chmod 0644 /etc/logrotate.d/logstash
++/usr/share/logstash/bin/system-install /etc/logstash/startup.options
+diff --git a/pkg/debian/before-install.sh b/pkg/debian/before-install.sh
+index 45ef4e40f1f..03cf86125a9 100644
+--- a/pkg/debian/before-install.sh
++++ b/pkg/debian/before-install.sh
+@@ -7,6 +7,6 @@ fi
+ 
+ # create logstash user
+ if ! getent passwd logstash >/dev/null; then
+-  useradd -M -r -g logstash -d /var/lib/logstash \
++  useradd -M -r -g logstash -d /usr/share/logstash \
+     -s /usr/sbin/nologin -c "LogStash Service User" logstash
+ fi
+diff --git a/pkg/debian/before-remove.sh b/pkg/debian/before-remove.sh
+index a3f911e60ea..16347f266fc 100644
+--- a/pkg/debian/before-remove.sh
++++ b/pkg/debian/before-remove.sh
+@@ -1,13 +1,38 @@
+ #!/bin/sh
+-
++# Debian
+ if [ $1 = "remove" ]; then
+-  service logstash stop >/dev/null 2>&1 || true
++  # Upstart
++  if [ -r "/etc/init/logstash.conf" ]; then
++    if [ -f "/sbin/stop" ]; then
++      /sbin/stop logstash >/dev/null 2>&1 || true
++    else
++      /usr/sbin/service logstash stop >/dev/null 2>&1 || true
++    fi
++    if [ -f "/etc/init/logstash.conf" ]; then
++      rm /etc/init/logstash.conf
++    fi
++  # SYSV
++  elif [ -r "/etc/init.d/logstash" ]; then
++    /sbin/chkconfig --del logstash
++    if [ -f "/etc/init.d/logstash" ]; then
++      rm /etc/init.d/logstash
++    fi
++  # systemd
++  else
++    systemctl stop logstash >/dev/null 2>&1 || true
++    if [ -f "/etc/systemd/system/logstash-prestart.sh" ]; then
++      rm /etc/systemd/system/logstash-prestart.sh
++    fi
+ 
++    if [ -f "/etc/systemd/system/logstash.service" ]; then
++      rm /etc/systemd/system/logstash.service
++    fi
++  fi
+   if getent passwd logstash >/dev/null ; then
+     userdel logstash
+   fi
+ 
+-  if getent group logstash >/dev/null ; then
++  if getent group logstash > /dev/null ; then
+     groupdel logstash
+   fi
+ fi
+diff --git a/pkg/jvm.options b/pkg/jvm.options
+new file mode 100644
+index 00000000000..b22cb35ea73
+--- /dev/null
++++ b/pkg/jvm.options
+@@ -0,0 +1,74 @@
++## JVM configuration
++
++# Xms represents the initial size of total heap space
++# Xmx represents the maximum size of total heap space
++
++-Xms256m
++-Xmx1g
++
++################################################################
++## Expert settings
++################################################################
++##
++## All settings below this section are considered
++## expert settings. Don't tamper with them unless
++## you understand what you are doing
++##
++################################################################
++
++## GC configuration
++-XX:+UseParNewGC
++-XX:+UseConcMarkSweepGC
++-XX:CMSInitiatingOccupancyFraction=75
++-XX:+UseCMSInitiatingOccupancyOnly
++
++## optimizations
++
++# disable calls to System#gc
++-XX:+DisableExplicitGC
++
++## locale
++# Set the locale language
++#-Duser.language=en
++
++# Set the locale country
++#-Duser.country=US
++
++# Set the locale variant, if any
++#-Duser.variant=
++
++## basic
++
++# set the I/O temp directory
++-Djava.io.tmpdir=$HOME
++
++# set to headless, just in case
++-Djava.awt.headless=true
++
++# ensure UTF-8 encoding by default (e.g. filenames)
++-Dfile.encoding=UTF-8
++
++# use our provided JNA always versus the system one
++#-Djna.nosys=true
++
++## heap dumps
++
++# generate a heap dump when an allocation from the Java heap fails
++# heap dumps are created in the working directory of the JVM
++-XX:+HeapDumpOnOutOfMemoryError
++
++# specify an alternative path for heap dumps
++# ensure the directory exists and has sufficient space
++#-XX:HeapDumpPath=${LOGSTASH_HOME}/heapdump.hprof
++
++## GC logging
++#-XX:+PrintGCDetails
++#-XX:+PrintGCTimeStamps
++#-XX:+PrintGCDateStamps
++#-XX:+PrintClassHistogram
++#-XX:+PrintTenuringDistribution
++#-XX:+PrintGCApplicationStoppedTime
++
++# log GC status to a file with time stamps
++# ensure the directory exists
++#-Xloggc:${LS_GC_LOG_FILE}
+diff --git a/pkg/logstash.default b/pkg/logstash.default
+deleted file mode 100644
+index a1874d0501c..00000000000
+--- a/pkg/logstash.default
++++ /dev/null
+@@ -1,41 +0,0 @@
+-###############################
+-# Default settings for logstash
+-###############################
+-
+-# Override Java location
+-#JAVACMD=/usr/bin/java
+-
+-# Set a home directory
+-#LS_HOME=/var/lib/logstash
+-
+-# Arguments to pass to logstash
+-#LS_OPTS=""
+-
+-# Arguments to pass to java
+-#LS_HEAP_SIZE="1g"
+-#LS_JAVA_OPTS="-Djava.io.tmpdir=$HOME"
+-
+-# pidfiles aren't used for upstart; this is for sysv users.
+-#LS_PIDFILE=/var/run/logstash.pid
+-
+-# user id to be invoked as; for upstart: edit /etc/init/logstash.conf
+-#LS_USER=logstash
+-
+-# logstash logging
+-#LS_LOG_FILE=/var/log/logstash/logstash.log
+-#LS_USE_GC_LOGGING="true"
+-#LS_GC_LOG_FILE=/var/log/logstash/gc.log
+-
+-# logstash configuration directory
+-#LS_CONF_DIR=/etc/logstash/conf.d
+-
+-# Open file limit; cannot be overridden in upstart
+-#LS_OPEN_FILES=16384
+-
+-# Nice level
+-#LS_NICE=19
+-
+-# If this is set to 1, then when `stop` is called, if the process has
+-# not exited within a reasonable time, SIGKILL will be sent next.
+-# The default behavior is to simply log a message "program stop failed; still running"
+-#KILL_ON_STOP_TIMEOUT=0
+diff --git a/pkg/logstash.sysv b/pkg/logstash.sysv
+deleted file mode 100755
+index 80d13322bd6..00000000000
+--- a/pkg/logstash.sysv
++++ /dev/null
+@@ -1,207 +0,0 @@
+-#!/bin/sh
+-# Init script for logstash
+-# Maintained by Elasticsearch
+-# Generated by pleaserun.
+-# Implemented based on LSB Core 3.1:
+-#   * Sections: 20.2, 20.3
+-#
+-### BEGIN INIT INFO
+-# Provides:          logstash
+-# Required-Start:    $remote_fs $syslog
+-# Required-Stop:     $remote_fs $syslog
+-# Default-Start:     2 3 4 5
+-# Default-Stop:      0 1 6
+-# Short-Description:
+-# Description:        Starts Logstash as a daemon.
+-### END INIT INFO
+-
+-PATH=/sbin:/usr/sbin:/bin:/usr/bin
+-export PATH
+-
+-if [ `id -u` -ne 0 ]; then
+-   echo "You need root privileges to run this script"
+-   exit 1
+-fi
+-
+-name=logstash
+-pidfile="/var/run/$name.pid"
+-
+-LS_USER=logstash
+-LS_GROUP=logstash
+-LS_HOME=/var/lib/logstash
+-LS_HEAP_SIZE="1g"
+-LS_LOG_DIR=/var/log/logstash
+-LS_LOG_FILE="${LS_LOG_DIR}/$name.log"
+-LS_CONF_DIR=/etc/logstash/conf.d
+-LS_OPEN_FILES=16384
+-LS_NICE=19
+-KILL_ON_STOP_TIMEOUT=0
+-LS_OPTS=""
+-
+-
+-[ -r /etc/default/$name ] && . /etc/default/$name
+-[ -r /etc/sysconfig/$name ] && . /etc/sysconfig/$name
+-
+-program=/opt/logstash/bin/logstash
+-args="-f ${LS_CONF_DIR} -l ${LS_LOG_FILE} ${LS_OPTS}"
+-
+-quiet() {
+-  "$@" > /dev/null 2>&1
+-  return $?
+-}
+-
+-start() {
+-
+-  LS_JAVA_OPTS="${LS_JAVA_OPTS} -Djava.io.tmpdir=${LS_HOME}"
+-  HOME=${LS_HOME}
+-  export PATH HOME LS_HEAP_SIZE LS_JAVA_OPTS LS_USE_GC_LOGGING LS_GC_LOG_FILE
+-
+-  # chown doesn't grab the suplimental groups when setting the user:group - so we have to do it for it.
+-  # Boy, I hope we're root here.
+-  SGROUPS=$(id -Gn "$LS_USER" | tr " " "," | sed 's/,$//'; echo '')
+-
+-  if [ ! -z $SGROUPS ]
+-  then
+-	EXTRA_GROUPS="--groups $SGROUPS"
+-  fi
+-
+-  # set ulimit as (root, presumably) first, before we drop privileges
+-  ulimit -n ${LS_OPEN_FILES}
+-
+-  # Run the program!
+-  nice -n ${LS_NICE} chroot --userspec $LS_USER:$LS_GROUP $EXTRA_GROUPS / sh -c "
+-    cd $LS_HOME
+-    ulimit -n ${LS_OPEN_FILES}
+-    exec \"$program\" $args
+-  " > "${LS_LOG_DIR}/$name.stdout" 2> "${LS_LOG_DIR}/$name.err" &
+-
+-  # Generate the pidfile from here. If we instead made the forked process
+-  # generate it there will be a race condition between the pidfile writing
+-  # and a process possibly asking for status.
+-  echo $! > $pidfile
+-
+-  echo "$name started."
+-  return 0
+-}
+-
+-stop() {
+-  # Try a few times to kill TERM the program
+-  if status ; then
+-    pid=`cat "$pidfile"`
+-    echo "Killing $name (pid $pid) with SIGTERM"
+-    kill -TERM $pid
+-    # Wait for it to exit.
+-    for i in 1 2 3 4 5 6 7 8 9 ; do
+-      echo "Waiting $name (pid $pid) to die..."
+-      status || break
+-      sleep 1
+-    done
+-    if status ; then
+-      if [ "$KILL_ON_STOP_TIMEOUT" = 1 ] ; then
+-        echo "Timeout reached. Killing $name (pid $pid) with SIGKILL. This may result in data loss."
+-        kill -KILL $pid
+-        echo "$name killed with SIGKILL."
+-      else
+-        echo "$name stop failed; still running."
+-        return 1 # stop timed out and not forced
+-      fi
+-    else
+-      echo "$name stopped."
+-    fi
+-  fi
+-}
+-
+-status() {
+-  if [ -f "$pidfile" ] ; then
+-    pid=`cat "$pidfile"`
+-    if kill -0 $pid > /dev/null 2> /dev/null ; then
+-      # process by this pid is running.
+-      # It may not be our pid, but that's what you get with just pidfiles.
+-      # TODO(sissel): Check if this process seems to be the same as the one we
+-      # expect. It'd be nice to use flock here, but flock uses fork, not exec,
+-      # so it makes it quite awkward to use in this case.
+-      return 0
+-    else
+-      return 2 # program is dead but pid file exists
+-    fi
+-  else
+-    return 3 # program is not running
+-  fi
+-}
+-
+-reload() {
+-  if status ; then
+-    kill -HUP `cat "$pidfile"`
+-  fi
+-}
+-
+-force_stop() {
+-  if status ; then
+-    stop
+-    status && kill -KILL `cat "$pidfile"`
+-  fi
+-}
+-
+-configtest() {
+-  # Check if a config file exists
+-  if [ ! "$(ls -A ${LS_CONF_DIR}/* 2> /dev/null)" ]; then
+-    echo "There aren't any configuration files in ${LS_CONF_DIR}"
+-    return 1
+-  fi
+-
+-  HOME=${LS_HOME}
+-  export PATH HOME
+-
+-  test_args="--configtest -f ${LS_CONF_DIR} ${LS_OPTS}"
+-  $program ${test_args}
+-  [ $? -eq 0 ] && return 0
+-  # Program not configured
+-  return 6
+-}
+-
+-case "$1" in
+-  start)
+-    status
+-    code=$?
+-    if [ $code -eq 0 ]; then
+-      echo "$name is already running"
+-    else
+-      start
+-      code=$?
+-    fi
+-    exit $code
+-    ;;
+-  stop) stop ;;
+-  force-stop) force_stop ;;
+-  status)
+-    status
+-    code=$?
+-    if [ $code -eq 0 ] ; then
+-      echo "$name is running"
+-    else
+-      echo "$name is not running"
+-    fi
+-    exit $code
+-    ;;
+-  reload) reload ;;
+-  restart)
+-
+-    quiet configtest
+-    RET=$?
+-    if [ ${RET} -ne 0 ]; then
+-      echo "Configuration error. Not restarting. Re-run with configtest parameter for details"
+-      exit ${RET}
+-    fi
+-    stop && start
+-    ;;
+-  configtest)
+-    configtest
+-    exit $?
+-    ;;
+-  *)
+-    echo "Usage: $SCRIPTNAME {start|stop|force-stop|status|reload|restart|configtest}" >&2
+-    exit 3
+-  ;;
+-esac
+-
+-exit $?
+diff --git a/pkg/logstash.sysv.debian b/pkg/logstash.sysv.debian
+deleted file mode 100644
+index ee23acd2c3e..00000000000
+--- a/pkg/logstash.sysv.debian
++++ /dev/null
+@@ -1,181 +0,0 @@
+-#!/bin/bash
+-#
+-# /etc/init.d/logstash -- startup script for LogStash.
+-#
+-### BEGIN INIT INFO
+-# Provides:          logstash
+-# Required-Start:    $all
+-# Required-Stop:     $all
+-# Default-Start:     2 3 4 5
+-# Default-Stop:      0 1 6
+-# Short-Description: Starts logstash
+-# Description:       Starts logstash using start-stop-daemon
+-### END INIT INFO
+-
+-set -e
+-
+-NAME=logstash
+-DESC="Logstash Daemon"
+-DEFAULT=/etc/default/$NAME
+-
+-if [ `id -u` -ne 0 ]; then
+-   echo "You need root privileges to run this script"
+-   exit 1
+-fi
+-
+-. /lib/lsb/init-functions
+-
+-if [ -r /etc/default/rcS ]; then
+-   . /etc/default/rcS
+-fi
+-
+-# The following variables can be overwritten in $DEFAULT
+-PATH=/bin:/usr/bin:/sbin:/usr/sbin
+-
+-# See contents of file named in $DEFAULT for comments
+-LS_USER=logstash
+-LS_GROUP=logstash
+-LS_HOME=/var/lib/logstash
+-LS_HEAP_SIZE="1g"
+-LS_LOG_FILE=/var/log/logstash/$NAME.log
+-LS_CONF_DIR=/etc/logstash/conf.d
+-LS_OPEN_FILES=16384
+-LS_NICE=19
+-LS_OPTS=""
+-LS_PIDFILE=/var/run/$NAME.pid
+-
+-# End of variables that can be overwritten in $DEFAULT
+-
+-# overwrite settings from default file
+-if [ -f "$DEFAULT" ]; then
+-   . "$DEFAULT"
+-fi
+-
+-# Define other required variables
+-PID_FILE=${LS_PIDFILE}
+-DAEMON=/opt/logstash/bin/logstash
+-DAEMON_OPTS="-f ${LS_CONF_DIR} -l ${LS_LOG_FILE} ${LS_OPTS}"
+-
+-# Check DAEMON exists
+-if ! test -e $DAEMON; then
+-   log_failure_msg "Script $DAEMON doesn't exist"
+-   exit 1
+-fi
+-
+-case "$1" in
+-   start)
+-      if [ -z "$DAEMON" ]; then
+-         log_failure_msg "no logstash script found - $DAEMON"
+-         exit 1
+-      fi
+-
+-      # Check if a config file exists
+-      if [ ! "$(ls -A $LS_CONF_DIR/*.conf 2> /dev/null)" ]; then
+-         log_failure_msg "There aren't any configuration files in $LS_CONF_DIR"
+-         exit 1
+-      fi
+-
+-      log_daemon_msg "Starting $DESC"
+-
+-      # Parse the actual JAVACMD from the process' environment, we don't care about errors.
+-      JAVA=$(cat /proc/$(cat "${PID_FILE}" 2>/dev/null)/environ 2>/dev/null | grep -z ^JAVACMD= | cut -d= -f2)
+-      if start-stop-daemon --test --start --pidfile "$PID_FILE" \
+-         --user "$LS_USER" --exec "$JAVA" \
+-      >/dev/null; then
+-         # Prepare environment
+-         HOME="${HOME:-$LS_HOME}"
+-         LS_JAVA_OPTS="${LS_JAVA_OPTS} -Djava.io.tmpdir=${LS_HOME}"
+-         ulimit -n ${LS_OPEN_FILES}
+-	 cd "${LS_HOME}"
+-         export PATH HOME JAVACMD LS_HEAP_SIZE LS_JAVA_OPTS LS_USE_GC_LOGGING LS_GC_LOG_FILE
+-
+-         # Start Daemon
+-         start-stop-daemon --start -b --user "$LS_USER" -c "$LS_USER":"$LS_GROUP" \
+-           -d "$LS_HOME" --nicelevel "$LS_NICE" --pidfile "$PID_FILE" --make-pidfile \
+-           --exec $DAEMON -- $DAEMON_OPTS
+-
+-         sleep 1
+-
+-         # Parse the actual JAVACMD from the process' environment, we don't care about errors.
+-         JAVA=$(cat /proc/$(cat "${PID_FILE}" 2>/dev/null)/environ 2>/dev/null | grep -z ^JAVACMD= | cut -d= -f2)
+-         if start-stop-daemon --test --start --pidfile "$PID_FILE" \
+-             --user "$LS_USER" --exec "$JAVA" \
+-         >/dev/null; then
+-
+-            if [ -f "$PID_FILE" ]; then
+-               rm -f "$PID_FILE"
+-            fi
+-
+-            log_end_msg 1
+-         else
+-            log_end_msg 0
+-         fi
+-      else
+-         log_progress_msg "(already running)"
+-         log_end_msg 0
+-      fi
+-   ;;
+-   stop)
+-      log_daemon_msg "Stopping $DESC"
+-
+-      set +e
+-
+-      if [ -f "$PID_FILE" ]; then
+-         start-stop-daemon --stop --pidfile "$PID_FILE" \
+-            --user "$LS_USER" \
+-            --retry=TERM/20/KILL/5 >/dev/null
+-
+-         if [ $? -eq 1 ]; then
+-            log_progress_msg "$DESC is not running but pid file exists, cleaning up"
+-         elif [ $? -eq 3 ]; then
+-            PID="`cat $PID_FILE`"
+-            log_failure_msg "Failed to stop $DESC (pid $PID)"
+-            exit 1
+-         fi
+-
+-         rm -f "$PID_FILE"
+-      else
+-         log_progress_msg "(not running)"
+-      fi
+-
+-      log_end_msg 0
+-      set -e
+-   ;;
+-   status)
+-      set +e
+-
+-      # Parse the actual JAVACMD from the process' environment, we don't care about errors.
+-      JAVA=$(cat /proc/$(cat "${PID_FILE}" 2>/dev/null)/environ 2>/dev/null | grep -z ^JAVACMD= | cut -d= -f2)
+-      start-stop-daemon --test --start --pidfile "$PID_FILE" \
+-         --user "$LS_USER" --exec "$JAVA" \
+-      >/dev/null 2>&1
+-
+-      if [ "$?" = "0" ]; then
+-         if [ -f "$PID_FILE" ]; then
+-            log_success_msg "$DESC is not running, but pid file exists."
+-            exit 1
+-         else
+-            log_success_msg "$DESC is not running."
+-            exit 3
+-         fi
+-      else
+-         log_success_msg "$DESC is running with pid `cat $PID_FILE`"
+-      fi
+-
+-      set -e
+-   ;;
+-   restart|force-reload)
+-      if [ -f "$PID_FILE" ]; then
+-         $0 stop
+-         sleep 1
+-      fi
+-
+-      $0 start
+-   ;;
+-   *)
+-      log_success_msg "Usage: $0 {start|stop|restart|force-reload|status}"
+-      exit 1
+-   ;;
+-esac
+-
+-exit 0
+diff --git a/pkg/logstash.sysv.redhat b/pkg/logstash.sysv.redhat
+deleted file mode 100755
+index 3f312578253..00000000000
+--- a/pkg/logstash.sysv.redhat
++++ /dev/null
+@@ -1,132 +0,0 @@
+-#! /bin/sh
+-#
+-#       /etc/rc.d/init.d/logstash
+-#
+-#       Starts Logstash as a daemon
+-#
+-# chkconfig: 2345 90 10
+-# description: Starts Logstash as a daemon.
+-
+-### BEGIN INIT INFO
+-# Provides: logstash
+-# Required-Start: $local_fs $remote_fs
+-# Required-Stop: $local_fs $remote_fs
+-# Default-Start: 2 3 4 5
+-# Default-Stop: S 0 1 6
+-# Short-Description: Logstash
+-# Description: Starts Logstash as a daemon.
+-### END INIT INFO
+-
+-. /etc/rc.d/init.d/functions
+-
+-NAME=logstash
+-DESC="Logstash Daemon"
+-DEFAULT=/etc/sysconfig/$NAME
+-
+-if [ `id -u` -ne 0 ]; then
+-   echo "You need root privileges to run this script"
+-   exit 1
+-fi
+-
+-# The following variables can be overwritten in $DEFAULT
+-PATH=/bin:/usr/bin:/sbin:/usr/sbin
+-
+-# See contents of file named in $DEFAULT for comments
+-LS_USER=logstash
+-LS_GROUP=logstash
+-LS_HOME=/var/lib/logstash
+-LS_HEAP_SIZE="1g"
+-LS_LOG_FILE=/var/log/logstash/$NAME.log
+-LS_CONF_DIR=/etc/logstash/conf.d
+-LS_OPEN_FILES=16384
+-LS_NICE=19
+-LS_OPTS=""
+-LS_PIDFILE=/var/run/$NAME/$NAME.pid
+-
+-# End of variables that can be overwritten in $DEFAULT
+-
+-if [ -f "$DEFAULT" ]; then
+-  . "$DEFAULT"
+-fi
+-
+-# Define other required variables
+-PID_FILE=${LS_PIDFILE}
+-
+-DAEMON="/opt/logstash/bin/logstash"
+-DAEMON_OPTS="-f ${LS_CONF_DIR} -l ${LS_LOG_FILE} ${LS_OPTS}"
+-
+-#
+-# Function that starts the daemon/service
+-#
+-do_start()
+-{
+-
+-  if [ -z "$DAEMON" ]; then
+-    echo "not found - $DAEMON"
+-    exit 1
+-  fi
+-
+-  if pidofproc -p "$PID_FILE" >/dev/null; then
+-    exit 0
+-  fi
+-
+-  # Prepare environment
+-  HOME="${HOME:-$LS_HOME}"
+-  LS_JAVA_OPTS="${LS_JAVA_OPTS} -Djava.io.tmpdir=${LS_HOME}"
+-  ulimit -n ${LS_OPEN_FILES}
+-  cd "${LS_HOME}"
+-  export PATH HOME LS_HEAP_SIZE LS_JAVA_OPTS LS_USE_GC_LOGGING LS_GC_LOG_FILE
+-  test -n "${JAVACMD}" && export JAVACMD
+-
+-  nice -n ${LS_NICE} runuser -s /bin/sh -c "exec $DAEMON $DAEMON_OPTS" ${LS_USER} >> $LS_LOG_FILE 2>&1 < /dev/null &
+-
+-  RETVAL=$?
+-  local PID=$!
+-  # runuser forks rather than execing our process.
+-  usleep 500000
+-  JAVA_PID=$(ps axo ppid,pid | awk -v "ppid=$PID" '$1==ppid {print $2}')
+-  PID=${JAVA_PID:-$PID}
+-  echo $PID > $PID_FILE
+-  [ "$PID" = "$JAVA_PID" ] && success
+-}
+-
+-#
+-# Function that stops the daemon/service
+-#
+-do_stop()
+-{
+-    killproc -p $PID_FILE $DAEMON
+-    RETVAL=$?
+-    echo
+-    [ $RETVAL = 0 ] && rm -f ${PID_FILE}
+-}
+-
+-case "$1" in
+-  start)
+-    echo -n "Starting $DESC: "
+-    do_start
+-    touch /var/run/logstash/$NAME
+-    ;;
+-  stop)
+-    echo -n "Stopping $DESC: "
+-    do_stop
+-    rm /var/run/logstash/$NAME
+-    ;;
+-  restart|reload)
+-    echo -n "Restarting $DESC: "
+-    do_stop
+-    do_start
+-    ;;
+-  status)
+-    echo -n "$DESC"
+-    status -p $PID_FILE
+-    exit $?
+-    ;;
+-  *)
+-    echo "Usage: $SCRIPTNAME {start|stop|status|restart}" >&2
+-    exit 3
+-    ;;
+-esac
+-
+-echo
+-exit 0
+diff --git a/pkg/logstash.upstart.ubuntu b/pkg/logstash.upstart.ubuntu
+deleted file mode 100644
+index a734901fa59..00000000000
+--- a/pkg/logstash.upstart.ubuntu
++++ /dev/null
+@@ -1,48 +0,0 @@
+-# logstash instance
+-#
+-
+-description     "logstash"
+-
+-start on virtual-filesystems
+-stop on runlevel [06]
+-
+-# Respawn it if the process exits
+-respawn
+-
+-# We're setting high here, we'll re-limit below.
+-limit nofile 65550 65550
+-
+-setuid logstash
+-setgid logstash
+-
+-# You need to chdir somewhere writable because logstash needs to unpack a few
+-# temporary files on startup.
+-console log
+-script
+-  # Defaults
+-  PATH=/bin:/usr/bin
+-  LS_HOME=/var/lib/logstash
+-  LS_HEAP_SIZE="1g"
+-  LS_LOG_FILE=/var/log/logstash/logstash.log
+-  LS_USE_GC_LOGGING=""
+-  LS_GC_LOG_FILE=""
+-  LS_CONF_DIR=/etc/logstash/conf.d
+-  LS_OPEN_FILES=16384
+-  LS_NICE=19
+-  LS_OPTS=""
+-
+-  # Override our defaults with user defaults:
+-  [ -f /etc/default/logstash ] && . /etc/default/logstash
+-
+-  HOME="${HOME:-$LS_HOME}"
+-  LS_JAVA_OPTS="${LS_JAVA_OPTS} -Djava.io.tmpdir=${LS_HOME}"
+-  # Reset filehandle limit
+-  ulimit -n ${LS_OPEN_FILES}
+-  cd "${LS_HOME}"
+-
+-  # Export variables
+-  export PATH HOME LS_HEAP_SIZE LS_JAVA_OPTS LS_USE_GC_LOGGING LS_GC_LOG_FILE
+-  test -n "${JAVACMD}" && export JAVACMD
+-
+-  exec nice -n ${LS_NICE} /opt/logstash/bin/logstash -f "${LS_CONF_DIR}" -l "${LS_LOG_FILE}" ${LS_OPTS}
+-end script
+diff --git a/pkg/logstash.yml b/pkg/logstash.yml
+new file mode 100644
+index 00000000000..a04760246a6
+--- /dev/null
++++ b/pkg/logstash.yml
+@@ -0,0 +1,106 @@
++# Settings file in YAML
++#
++# Settings can be specified either in hierarchical form, e.g.:
++#
++#   pipeline:
++#     batch:
++#       size: 125
++#       delay: 5
++#
++# Or as flat keys:
++#
++#   pipeline.batch.size: 125
++#   pipeline.batch.delay: 5
++#
++# ------------  Node identity ------------
++#
++# Use a descriptive name for the node:
++#
++# node.name: test
++#
++# If omitted the node name will default to the machine's host name
++#
++# ------------ Pipeline Settings --------------
++#
++# Set the number of workers that will, in parallel, execute the filters+outputs
++# stage of the pipeline.
++#
++# This defaults to half the number of the host's CPU cores.
++#
++# pipeline.workers: 2
++#
++# How many workers should be used per output plugin instance
++#
++# pipeline.output.workers: 1
++#
++# How many events to retrieve from inputs before sending to filters+workers
++#
++# pipeline.batch.size: 125
++#
++# How long to wait before dispatching an undersized batch to filters+workers
++# Value is in seconds.
++#
++# pipeline.batch.delay: 5
++#
++# Force Logstash to exit during shutdown even if there are still inflight
++# events in memory. By default, logstash will refuse to quit until all
++# received events have been pushed to the outputs.
++#
++# WARNING: enabling this can lead to data loss during shutdown
++#
++# pipeline.unsafe_shutdown: false
++#
++# ------------ Pipeline Configuration Settings --------------
++#
++# Where to fetch the pipeline configuration for the main pipeline
++#
++# path.config:
++#
++# Pipeline configuration string for the main pipeline
++#
++# config.string:
++#
++# At startup, test if the configuration is valid and exit (dry run)
++#
++# config.test_and_exit: false
++#
++# Periodically check if the configuration has changed and reload the pipeline
++# This can also be triggered manually through the SIGHUP signal
++#
++# config.reload.automatic: false
++#
++# How often to check if the pipeline configuration has changed (in seconds)
++#
++# config.reload.interval: 3
++#
++# Show fully compiled configuration as debug log message
++# NOTE: --log.level must be 'debug'
++#
++# config.debug: false
++#
++# ------------ Metrics Settings --------------
++#
++# Bind address for the metrics REST endpoint
++#
++# http.host: "127.0.0.1"
++#
++# Bind port for the metrics REST endpoint
++#
++# http.port: 9600
++#
++# ------------ Debugging Settings --------------
++#
++# Options for log.level:
++#   * warn => warn (default)
++#   * quiet => error
++#   * verbose => info
++#   * debug => debug
++#
++# log.level: warn
++# log.format: plain (or 'json')
++# path.log:
++#
++# ------------ Other Settings --------------
++#
++# Where to find custom plugins
++# path.plugins: []
+diff --git a/pkg/startup.options b/pkg/startup.options
+new file mode 100644
+index 00000000000..dcb850e66df
+--- /dev/null
++++ b/pkg/startup.options
+@@ -0,0 +1,52 @@
++################################################################################
++# These settings are ONLY used by $LS_HOME/bin/system-install to create a custom
++# startup script for Logstash.  It should automagically use the init system
++# (systemd, upstart, sysv, etc.) that your Linux distribution uses.
++#
++# After changing anything here, you need to re-run $LS_HOME/bin/system-install
++# as root to push the changes to the init script.
++################################################################################
++
++# Override Java location
++JAVACMD=/usr/bin/java
++
++# Set a home directory
++LS_HOME=/usr/share/logstash
++
++# logstash settings directory, the path which contains logstash.yml
++LS_SETTINGS_DIR=/etc/logstash
++
++# Arguments to pass to logstash
++LS_OPTS="--path.settings ${LS_SETTINGS_DIR}"
++
++# Arguments to pass to java
++LS_JAVA_OPTS=""
++
++# pidfiles aren't used the same way for upstart and systemd; this is for sysv users.
++LS_PIDFILE=/var/run/logstash.pid
++
++# user and group id to be invoked as
++LS_USER=logstash
++LS_GROUP=logstash
++
++# Enable GC logging by uncommenting the appropriate lines in the GC logging
++# section in jvm.options
++LS_GC_LOG_FILE=/var/log/logstash/gc.log
++
++# Open file limit
++LS_OPEN_FILES=16384
++
++# Nice level
++LS_NICE=19
++
++# Change these to have the init script named and described differently
++# This is useful when running multiple instances of Logstash on the same
++# physical box or vm
++SERVICE_NAME="logstash"
++SERVICE_DESCRIPTION="logstash"
++
++# If you need to run a command or script before launching Logstash, put it
++# between the lines beginning with `read` and `EOM`, and uncomment those lines.
++###
++## read -r -d '' PRESTART << EOM
++## EOM
+diff --git a/pkg/ubuntu/after-install.sh b/pkg/ubuntu/after-install.sh
+index bcecadf8af7..794bb4d2cdc 100644
+--- a/pkg/ubuntu/after-install.sh
++++ b/pkg/ubuntu/after-install.sh
+@@ -1,6 +1,7 @@
+ #!/bin/sh
+ 
+-chown -R logstash:logstash /opt/logstash
++chown -R logstash:logstash /usr/share/logstash
+ chown logstash /var/log/logstash
+ chown logstash:logstash /var/lib/logstash
+ chmod 0644 /etc/logrotate.d/logstash
++/usr/share/logstash/bin/system-install /etc/logstash/startup.options
+diff --git a/pkg/ubuntu/before-install.sh b/pkg/ubuntu/before-install.sh
+index 45ef4e40f1f..03cf86125a9 100644
+--- a/pkg/ubuntu/before-install.sh
++++ b/pkg/ubuntu/before-install.sh
+@@ -7,6 +7,6 @@ fi
+ 
+ # create logstash user
+ if ! getent passwd logstash >/dev/null; then
+-  useradd -M -r -g logstash -d /var/lib/logstash \
++  useradd -M -r -g logstash -d /usr/share/logstash \
+     -s /usr/sbin/nologin -c "LogStash Service User" logstash
+ fi
+diff --git a/pkg/ubuntu/before-remove.sh b/pkg/ubuntu/before-remove.sh
+index a3f911e60ea..0384e74ffca 100644
+--- a/pkg/ubuntu/before-remove.sh
++++ b/pkg/ubuntu/before-remove.sh
+@@ -1,13 +1,38 @@
+ #!/bin/sh
+-
++# Ubuntu
+ if [ $1 = "remove" ]; then
+-  service logstash stop >/dev/null 2>&1 || true
++  # Upstart
++  if [ -r "/etc/init/logstash.conf" ]; then
++    if [ -f "/sbin/stop" ]; then
++      /sbin/stop logstash >/dev/null 2>&1 || true
++    else
++      /usr/sbin/service logstash stop >/dev/null 2>&1 || true
++    fi
++    if [ -f "/etc/init/logstash.conf" ]; then
++      rm /etc/init/logstash.conf
++    fi
++  # SYSV
++  elif [ -r "/etc/init.d/logstash" ]; then
++    /sbin/chkconfig --del logstash
++    if [ -f "/etc/init.d/logstash" ]; then
++      rm /etc/init.d/logstash
++    fi
++  # systemd
++  else
++    systemctl stop logstash >/dev/null 2>&1 || true
++    if [ -f "/etc/systemd/system/logstash-prestart.sh" ]; then
++      rm /etc/systemd/system/logstash-prestart.sh
++    fi
+ 
++    if [ -f "/etc/systemd/system/logstash.service" ]; then
++      rm /etc/systemd/system/logstash.service
++    fi
++  fi
+   if getent passwd logstash >/dev/null ; then
+     userdel logstash
+   fi
+ 
+-  if getent group logstash >/dev/null ; then
++  if getent group logstash > /dev/null ; then
+     groupdel logstash
+   fi
+ fi
+diff --git a/rakelib/artifacts.rake b/rakelib/artifacts.rake
+index b400940e185..1655302e4ac 100644
+--- a/rakelib/artifacts.rake
++++ b/rakelib/artifacts.rake
+@@ -9,11 +9,12 @@ namespace "artifact" do
+       "NOTICE.TXT",
+       "CONTRIBUTORS",
+       "bin/**/*",
++      "config/**/*",
+       "lib/bootstrap/**/*",
+       "lib/pluginmanager/**/*",
++      "lib/systeminstall/**/*",
+       "patterns/**/*",
+       "vendor/??*/**/*",
+-      "config/logstash.yml",
+       # To include ruby-maven's hidden ".mvn" directory, we need to
+       # do add the line below. This directory contains a file called
+       # "extensions.xml", which loads the ruby DSL for POMs.
+@@ -207,7 +208,10 @@ namespace "artifact" do
+ 
+     files.each do |path|
+       next if File.directory?(path)
+-      dir.input("#{path}=/opt/logstash/#{path}")
++      # Omit any config dir from /usr/share/logstash for packages, since we're
++      # using /etc/logstash below
++      next if path.start_with?("config/")
++      dir.input("#{path}=/usr/share/logstash/#{path}")
+     end
+ 
+     basedir = File.join(File.dirname(__FILE__), "..")
+@@ -231,15 +235,17 @@ namespace "artifact" do
+ 
+     case platform
+       when "redhat", "centos"
+-
+         File.join(basedir, "pkg", "logrotate.conf").tap do |path|
+           dir.input("#{path}=/etc/logrotate.d/logstash")
+         end
+-        File.join(basedir, "pkg", "logstash.default").tap do |path|
+-          dir.input("#{path}=/etc/sysconfig/logstash")
++        File.join(basedir, "pkg", "startup.options").tap do |path|
++          dir.input("#{path}=/etc/logstash")
++        end
++        File.join(basedir, "pkg", "jvm.options").tap do |path|
++          dir.input("#{path}=/etc/logstash")
+         end
+-        File.join(basedir, "pkg", "logstash.sysv").tap do |path|
+-          dir.input("#{path}=/etc/init.d/logstash")
++        File.join(basedir, "pkg", "logstash.yml").tap do |path|
++          dir.input("#{path}=/etc/logstash")
+         end
+         require "fpm/package/rpm"
+         out = dir.convert(FPM::Package::RPM)
+@@ -248,15 +254,19 @@ namespace "artifact" do
+         out.attributes[:rpm_user] = "root"
+         out.attributes[:rpm_group] = "root"
+         out.attributes[:rpm_os] = "linux"
+-        out.config_files << "etc/sysconfig/logstash"
+         out.config_files << "etc/logrotate.d/logstash"
+-        out.config_files << "/etc/init.d/logstash"
++        out.config_files << "/etc/logstash/startup.options"
++        out.config_files << "/etc/logstash/jvm.options"
++        out.config_files << "/etc/logstash/logstash.yml"
+       when "debian", "ubuntu"
+-        File.join(basedir, "pkg", "logstash.default").tap do |path|
+-          dir.input("#{path}=/etc/default/logstash")
++        File.join(basedir, "pkg", "startup.options").tap do |path|
++          dir.input("#{path}=/etc/logstash")
++        end
++        File.join(basedir, "pkg", "jvm.options").tap do |path|
++          dir.input("#{path}=/etc/logstash")
+         end
+-        File.join(basedir, "pkg", "logstash.sysv").tap do |path|
+-          dir.input("#{path}=/etc/init.d/logstash")
++        File.join(basedir, "pkg", "logstash.yml").tap do |path|
++          dir.input("#{path}=/etc/logstash")
+         end
+         require "fpm/package/deb"
+         out = dir.convert(FPM::Package::Deb)
+@@ -264,9 +274,10 @@ namespace "artifact" do
+         out.attributes[:deb_user] = "root"
+         out.attributes[:deb_group] = "root"
+         out.attributes[:deb_suggests] = "java8-runtime-headless"
+-        out.config_files << "/etc/default/logstash"
+         out.config_files << "/etc/logrotate.d/logstash"
+-        out.config_files << "/etc/init.d/logstash"
++        out.config_files << "/etc/logstash/startup.options"
++        out.config_files << "/etc/logstash/jvm.options"
++        out.config_files << "/etc/logstash/logstash.yml"
+     end
+ 
+     # Packaging install/removal scripts

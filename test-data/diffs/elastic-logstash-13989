@@ -1,0 +1,493 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index b184feac177..bdf716d8501 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -26,6 +26,7 @@
+ require "logstash/pipeline_action"
+ require "logstash/state_resolver"
+ require "logstash/pipelines_registry"
++require "logstash/persisted_queue_config_validator"
+ require "stud/trap"
+ require "uri"
+ require "socket"
+@@ -100,6 +101,8 @@ def initialize(settings = LogStash::SETTINGS, source_loader = nil)
+     initialize_agent_metrics
+ 
+     initialize_geoip_database_metrics(metric)
++    
++    @pq_config_validator = LogStash::PersistedQueueConfigValidator.new
+ 
+     @dispatcher = LogStash::EventDispatcher.new(self)
+     LogStash::PLUGIN_REGISTRY.hooks.register_emitter(self.class, dispatcher)
+@@ -190,6 +193,8 @@ def converge_state_and_update
+       end
+     end
+ 
++    @pq_config_validator.check(@pipelines_registry.running_user_defined_pipelines, results.response)
++
+     converge_result = resolve_actions_and_converge_state(results.response)
+     update_metrics(converge_result)
+ 
+diff --git a/logstash-core/lib/logstash/bootstrap_check/persisted_queue_config.rb b/logstash-core/lib/logstash/bootstrap_check/persisted_queue_config.rb
+deleted file mode 100644
+index f227bb11716..00000000000
+--- a/logstash-core/lib/logstash/bootstrap_check/persisted_queue_config.rb
++++ /dev/null
+@@ -1,29 +0,0 @@
+-# Licensed to Elasticsearch B.V. under one or more contributor
+-# license agreements. See the NOTICE file distributed with
+-# this work for additional information regarding copyright
+-# ownership. Elasticsearch B.V. licenses this file to you under
+-# the Apache License, Version 2.0 (the "License"); you may
+-# not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#  http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing,
+-# software distributed under the License is distributed on an
+-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-# KIND, either express or implied.  See the License for the
+-# specific language governing permissions and limitations
+-# under the License.
+-
+-module LogStash
+-  module BootstrapCheck
+-    class PersistedQueueConfig
+-      def self.check(settings)
+-        return unless settings.get('queue.type') == 'persisted'
+-        if settings.get('queue.page_capacity') > settings.get('queue.max_bytes')
+-          raise(LogStash::BootstrapCheckError, I18n.t("logstash.bootstrap_check.persisted_queue_config.page-capacity"))
+-        end
+-      end
+-    end
+-  end
+-end
+diff --git a/logstash-core/lib/logstash/persisted_queue_config_validator.rb b/logstash-core/lib/logstash/persisted_queue_config_validator.rb
+new file mode 100644
+index 00000000000..c61ecb66f2a
+--- /dev/null
++++ b/logstash-core/lib/logstash/persisted_queue_config_validator.rb
+@@ -0,0 +1,129 @@
++# Licensed to Elasticsearch B.V. under one or more contributor
++# license agreements. See the NOTICE file distributed with
++# this work for additional information regarding copyright
++# ownership. Elasticsearch B.V. licenses this file to you under
++# the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#  http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++
++java_import 'org.logstash.common.FsUtil'
++java_import 'java.nio.file.Paths'
++java_import "java.nio.file.FileStore"
++java_import "java.nio.file.Files"
++
++module LogStash
++  class PersistedQueueConfigValidator
++
++    def initialize
++      @last_check_pipeline_configs = Array.new
++      @last_check_pass = false
++    end
++
++    # Check the config of persistent queue. Raise BootstrapCheckError if fail
++    # @param running_pipelines [Hash pipeline_id (sym) => JavaPipeline]
++    # @param pipeline_configs [Array PipelineConfig]
++    def check(running_pipelines, pipeline_configs)
++      # Compare value of new pipeline config and pipeline registry and cache
++      has_update = queue_configs_update?(running_pipelines, pipeline_configs) && cache_check_fail?(pipeline_configs)
++      @last_check_pipeline_configs = pipeline_configs
++      return unless has_update
++
++      err_msg = []
++      queue_path_file_system = Hash.new # (String: queue path, String: file system)
++      required_free_bytes  = Hash.new # (String: file system, Integer: size)
++
++      pipeline_configs.select { |config| config.settings.get('queue.type') == 'persisted'}
++                      .select { |config| config.settings.get('queue.max_bytes').to_i != 0 }
++                      .each do |config|
++        max_bytes = config.settings.get("queue.max_bytes").to_i
++        page_capacity = config.settings.get("queue.page_capacity").to_i
++        pipeline_id = config.settings.get("pipeline.id")
++        queue_path = config.settings.get("path.queue")
++        pq_page_glob = ::File.join(queue_path, pipeline_id, "page.*")
++        used_bytes = get_page_size(pq_page_glob)
++        file_system = get_file_system(queue_path)
++
++        check_page_capacity(err_msg, pipeline_id, max_bytes, page_capacity)
++        check_queue_usage(err_msg, pipeline_id, max_bytes, used_bytes)
++
++        queue_path_file_system[queue_path] = file_system
++        if used_bytes < max_bytes
++          required_free_bytes[file_system] = required_free_bytes.fetch(file_system, 0) + max_bytes - used_bytes
++        end
++      end
++
++      check_disk_space(err_msg, queue_path_file_system, required_free_bytes)
++
++      @last_check_pass = err_msg.empty?
++
++      raise(LogStash::BootstrapCheckError, err_msg.flatten.join(" ")) unless err_msg.empty?
++    end
++
++    def check_page_capacity(err_msg, pipeline_id, max_bytes, page_capacity)
++      if page_capacity > max_bytes
++        err_msg << "Pipeline #{pipeline_id} 'queue.page_capacity' must be less than or equal to 'queue.max_bytes'."
++      end
++    end
++
++    def check_queue_usage(err_msg, pipeline_id, max_bytes, used_bytes)
++      if used_bytes > max_bytes
++        err_msg << "Pipeline #{pipeline_id} current queue size (#{used_bytes}) is greater than 'queue.max_bytes' (#{max_bytes})."
++      end
++    end
++
++    # Check disk has sufficient space for all queues reach their max bytes. Queues may config with different paths/ devices.
++    # It uses the filesystem of the path and count the required bytes by filesystem
++    def check_disk_space(err_msg, queue_path_file_system, required_free_bytes)
++      disk_err_msg =
++        queue_path_file_system
++          .select { |queue_path, file_system| !FsUtil.hasFreeSpace(Paths.get(queue_path), required_free_bytes.fetch(file_system, 0)) }
++          .map { |queue_path, file_system| "Persistent queue path #{queue_path} is unable to allocate #{required_free_bytes.fetch(file_system, 0)} more bytes on top of its current usage." }
++
++      err_msg << disk_err_msg unless disk_err_msg.empty?
++    end
++
++    def get_file_system(queue_path)
++      fs = Files.getFileStore(Paths.get(queue_path));
++      fs.name
++    end
++
++    # PQ pages size in bytes
++    def get_page_size(page_glob)
++      ::Dir.glob(page_glob).sum { |f| ::File.size(f) }
++    end
++
++    # Compare value in pipeline registry / cache and new pipeline config
++    # return true if new pipeline is added or reloadable PQ config has changed
++    # @param pipeline_hash [Hash pipeline_id (sym) => JavaPipeline / PipelineConfig]
++    # @param new_pipeline_configs [Array PipelineConfig]
++    def queue_configs_update?(pipeline_hash, new_pipeline_configs)
++      new_pipeline_configs.each do |new_pipeline_config|
++        return true unless pipeline_hash.has_key?(new_pipeline_config.pipeline_id.to_sym)
++
++        settings = pipeline_hash.fetch(new_pipeline_config.pipeline_id.to_sym).settings
++        return true unless settings.get("queue.type") == new_pipeline_config.settings.get("queue.type") &&
++          settings.get("queue.max_bytes") == new_pipeline_config.settings.get("queue.max_bytes") &&
++          settings.get("queue.page_capacity") == new_pipeline_config.settings.get("queue.page_capacity") &&
++          settings.get("path.queue") == new_pipeline_config.settings.get("path.queue")
++      end
++
++      false
++    end
++
++    # cache check is to prevent an invalid new pipeline config trigger the check of valid size config repeatedly
++    def cache_check_fail?(pipeline_configs)
++      last_check_pipeline_configs = @last_check_pipeline_configs.map { |pc| [pc.pipeline_id.to_sym, pc] }.to_h
++      queue_configs_update?(last_check_pipeline_configs, pipeline_configs) || !@last_check_pass
++    end
++
++  end
++end
+\ No newline at end of file
+diff --git a/logstash-core/lib/logstash/runner.rb b/logstash-core/lib/logstash/runner.rb
+index ab5c848fb3b..b65379433c8 100644
+--- a/logstash-core/lib/logstash/runner.rb
++++ b/logstash-core/lib/logstash/runner.rb
+@@ -49,7 +49,6 @@
+ require 'logstash/plugins'
+ require "logstash/modules/util"
+ require "logstash/bootstrap_check/default_config"
+-require "logstash/bootstrap_check/persisted_queue_config"
+ require "set"
+ require 'logstash/deprecation_message'
+ 
+@@ -64,8 +63,7 @@ class LogStash::Runner < Clamp::StrictCommand
+   # Ordered list of check to run before starting logstash
+   # theses checks can be changed by a plugin loaded into memory.
+   DEFAULT_BOOTSTRAP_CHECKS = [
+-      LogStash::BootstrapCheck::DefaultConfig,
+-      LogStash::BootstrapCheck::PersistedQueueConfig
++      LogStash::BootstrapCheck::DefaultConfig
+   ]
+ 
+   # Node Settings
+diff --git a/logstash-core/spec/logstash/bootstrap_check/persisted_queue_config_spec.rb b/logstash-core/spec/logstash/bootstrap_check/persisted_queue_config_spec.rb
+deleted file mode 100644
+index ea614e4a9b2..00000000000
+--- a/logstash-core/spec/logstash/bootstrap_check/persisted_queue_config_spec.rb
++++ /dev/null
+@@ -1,40 +0,0 @@
+-# Licensed to Elasticsearch B.V. under one or more contributor
+-# license agreements. See the NOTICE file distributed with
+-# this work for additional information regarding copyright
+-# ownership. Elasticsearch B.V. licenses this file to you under
+-# the Apache License, Version 2.0 (the "License"); you may
+-# not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#  http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing,
+-# software distributed under the License is distributed on an
+-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-# KIND, either express or implied.  See the License for the
+-# specific language governing permissions and limitations
+-# under the License.
+-
+-require "spec_helper"
+-require "tmpdir"
+-require "logstash/bootstrap_check/persisted_queue_config"
+-
+-describe LogStash::BootstrapCheck::PersistedQueueConfig do
+-
+-  context("when persisted queues are enabled") do
+-    let(:settings) do
+-      settings = LogStash::SETTINGS.dup
+-      settings.set_value("queue.type", "persisted")
+-      settings.set_value("queue.page_capacity", 1024)
+-      settings.set_value("path.queue", ::File.join(Dir.tmpdir, "some/path"))
+-      settings
+-    end
+-
+-    context("and 'queue.max_bytes' is set to a value less than the value of 'queue.page_capacity'") do
+-      it "should throw" do
+-        settings.set_value("queue.max_bytes", 512)
+-        expect { LogStash::BootstrapCheck::PersistedQueueConfig.check(settings) }.to raise_error
+-      end
+-    end
+-  end
+-end
+\ No newline at end of file
+diff --git a/logstash-core/spec/logstash/persisted_queue_config_validator_spec.rb b/logstash-core/spec/logstash/persisted_queue_config_validator_spec.rb
+new file mode 100644
+index 00000000000..306cf034340
+--- /dev/null
++++ b/logstash-core/spec/logstash/persisted_queue_config_validator_spec.rb
+@@ -0,0 +1,216 @@
++# Licensed to Elasticsearch B.V. under one or more contributor
++# license agreements. See the NOTICE file distributed with
++# this work for additional information regarding copyright
++# ownership. Elasticsearch B.V. licenses this file to you under
++# the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#  http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++
++require "spec_helper"
++require "tmpdir"
++require "logstash/persisted_queue_config_validator"
++require 'securerandom'
++require_relative '../support/helpers'
++
++describe LogStash::PersistedQueueConfigValidator do
++
++  context("when persisted queues are enabled") do
++    let(:input_block) { "input { generator {} }" }
++    let(:config_path) { temporary_file(input_block) }
++    let(:queue_path) { Stud::Temporary.directory }
++    let(:settings) do
++      mock_settings(
++        "queue.type" => "persisted",
++        "queue.page_capacity" => 1024,
++        "path.queue" => queue_path,
++        "path.config" => config_path
++      )
++    end
++    let(:pipeline_configs) { LogStash::Config::Source::Local.new(settings).pipeline_configs }
++    let(:pq_config_validator) { LogStash::PersistedQueueConfigValidator.new }
++
++    context("'queue.max_bytes' is less than 'queue.page_capacity'") do
++      it "should throw" do
++        settings.set_value("queue.max_bytes", 512)
++        expect { pq_config_validator.check({}, pipeline_configs) }
++          .to raise_error(LogStash::BootstrapCheckError, /'queue.page_capacity' must be less than or equal to 'queue.max_bytes'/)
++      end
++    end
++
++    context("'queue.max_bytes' = 0 which is less than 'queue.page_capacity'") do
++      it "should not throw" do
++        settings.set_value("queue.max_bytes", 0)
++        expect { pq_config_validator.check({}, pipeline_configs) }
++          .not_to raise_error
++      end
++    end
++
++    context("queue size is greater than 'queue.max_bytes'") do
++      let(:pipeline_id) { "main" }
++      let(:page_file) do
++        FileUtils.mkdir_p(::File.join(queue_path, pipeline_id))
++        ::File.new(::File.join(queue_path, pipeline_id, "page.0"), "w")
++      end
++
++      before do
++        # create a 2MB file
++        ::File.open(page_file, 'wb') do |f|
++          f.write( SecureRandom.random_bytes( 2 ** 21 ) )
++        end
++      end
++
++      it "should throw" do
++        settings.set_value("queue.max_bytes", "1mb")
++        expect { pq_config_validator.check({}, pipeline_configs) }
++          .to raise_error(LogStash::BootstrapCheckError, /greater than 'queue.max_bytes'/)
++      end
++
++      after do
++        page_file.truncate(0)
++        page_file.close
++      end
++    end
++
++    context("disk does not have sufficient space") do
++      # two pq with different paths
++      let(:settings1) { settings.dup.merge("queue.max_bytes" => "1000pb") }
++      let(:settings2) { settings1.dup.merge("path.queue" => Stud::Temporary.directory) }
++
++      let(:pipeline_configs) do
++        LogStash::Config::Source::Local.new(settings1).pipeline_configs +
++          LogStash::Config::Source::Local.new(settings2).pipeline_configs
++      end
++
++      it "should throw" do
++        expect(pq_config_validator).to receive(:check_disk_space) do | _, _, required_free_bytes|
++          expect(required_free_bytes.size).to eq(1)
++          expect(required_free_bytes.values[0]).to eq(1024**5 * 1000 * 2) # require 2000pb
++        end.and_call_original
++
++        expect { pq_config_validator.check({}, pipeline_configs) }
++          .to raise_error(LogStash::BootstrapCheckError, /is unable to allocate/)
++      end
++    end
++
++    context("pipeline registry check queue config") do
++      shared_examples "no update" do
++        it "gives false" do
++          expect(pq_config_validator.queue_configs_update?(running_pipelines, pipeline_configs))
++            .to be_falsey
++        end
++      end
++
++      shared_examples "got update" do
++        it "gives true" do
++          expect(pq_config_validator.queue_configs_update?(running_pipelines, pipeline_configs))
++            .to be_truthy
++        end
++      end
++
++      let(:java_pipeline) { LogStash::JavaPipeline.new(pipeline_configs[0]) }
++      let(:running_pipelines) { {:main => java_pipeline } }
++
++      context("pipeline config is identical") do
++        it_behaves_like "no update"
++      end
++
++      context("add more pipeline") do
++        let(:settings1) { settings.dup.merge("pipeline.id" => "main") }
++        let(:settings2) { settings.dup.merge("pipeline.id" => "second") }
++        let(:pipeline_configs) do
++          LogStash::Config::Source::Local.new(settings1).pipeline_configs +
++            LogStash::Config::Source::Local.new(settings2).pipeline_configs
++        end
++
++        it_behaves_like "got update"
++      end
++
++      context("queue configs has changed") do
++        let(:settings1) { settings.dup.merge("queue.max_bytes" => "1mb") }
++        let(:pipeline_configs1) { LogStash::Config::Source::Local.new(settings1).pipeline_configs }
++        let(:java_pipeline) { LogStash::JavaPipeline.new(pipeline_configs1[0]) }
++
++        it_behaves_like "got update"
++      end
++
++      context("queue configs do not changed") do
++        let(:settings1) { settings.dup.merge("config.debug" => "true") }
++        let(:pipeline_configs) { LogStash::Config::Source::Local.new(settings1).pipeline_configs }
++
++        it_behaves_like "no update"
++      end
++    end
++
++    context("cache check") do
++      context("has update since last check") do
++        let(:settings1) { settings.dup.merge("pipeline.id" => "main") }
++        let(:settings2) { settings.dup.merge("pipeline.id" => "second") }
++        let(:pipeline_configs2) do
++          LogStash::Config::Source::Local.new(settings1).pipeline_configs +
++            LogStash::Config::Source::Local.new(settings2).pipeline_configs
++        end
++        let(:pipeline_configs) do
++          LogStash::Config::Source::Local.new(settings1).pipeline_configs
++        end
++
++        it "gives true when add a new pipeline " do
++          pq_config_validator.instance_variable_set(:@last_check_pass, true)
++          pq_config_validator.instance_variable_set(:@last_check_pipeline_configs, pipeline_configs )
++          expect(pq_config_validator.cache_check_fail?(pipeline_configs2)).to be_truthy
++        end
++
++        it "gives false when remove a old pipeline" do
++          pq_config_validator.instance_variable_set(:@last_check_pass, true)
++          pq_config_validator.instance_variable_set(:@last_check_pipeline_configs, pipeline_configs2 )
++          expect(pq_config_validator.cache_check_fail?(pipeline_configs)).to be_falsey
++        end
++      end
++
++      context("last check fail") do
++        it "gives true" do
++          pq_config_validator.instance_variable_set(:@last_check_pass, false)
++          pq_config_validator.instance_variable_set(:@last_check_pipeline_configs, pipeline_configs )
++          expect(pq_config_validator.cache_check_fail?(pipeline_configs)).to be_truthy
++        end
++      end
++
++      context("no update and last check pass") do
++        it "gives false" do
++          pq_config_validator.instance_variable_set(:@last_check_pass, true)
++          pq_config_validator.instance_variable_set(:@last_check_pipeline_configs, pipeline_configs )
++          expect(pq_config_validator.cache_check_fail?(pipeline_configs)).to be_falsey
++        end
++      end
++    end
++
++    context("check") do
++      context("add more pipeline and cache check pass") do
++        it "does not check PQ size" do
++          pq_config_validator.instance_variable_set(:@last_check_pass, true)
++          pq_config_validator.instance_variable_set(:@last_check_pipeline_configs, pipeline_configs)
++          expect(pq_config_validator).not_to receive(:check_disk_space)
++          pq_config_validator.check({}, pipeline_configs)
++        end
++      end
++
++      context("add more pipeline and cache is different") do
++        it "check PQ size" do
++          pq_config_validator.instance_variable_set(:@last_check_pass, true)
++          pq_config_validator.instance_variable_set(:@last_check_pipeline_configs, [])
++          expect(pq_config_validator).to receive(:check_disk_space).and_call_original
++          pq_config_validator.check({}, pipeline_configs)
++        end
++      end
++    end
++
++  end
++end
+\ No newline at end of file

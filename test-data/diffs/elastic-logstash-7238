@@ -1,0 +1,311 @@
+diff --git a/settings.gradle b/settings.gradle
+index 9c99395cdcd..daa74978ec8 100644
+--- a/settings.gradle
++++ b/settings.gradle
+@@ -1,3 +1,4 @@
+-include ':logstash-core', 'logstash-core-benchmarks'
++include ':logstash-core', 'logstash-core-benchmarks', 'ingest-converter'
+ project(':logstash-core').projectDir = new File('./logstash-core')
+ project(':logstash-core-benchmarks').projectDir = new File('./logstash-core/benchmarks')
++project(':ingest-converter').projectDir = new File('./tools/ingest-converter')
+diff --git a/tools/ingest-converter/build.gradle b/tools/ingest-converter/build.gradle
+new file mode 100644
+index 00000000000..e5b13c67f68
+--- /dev/null
++++ b/tools/ingest-converter/build.gradle
+@@ -0,0 +1,46 @@
++import org.yaml.snakeyaml.Yaml
++
++apply plugin: 'java'
++apply plugin: 'idea'
++
++// fetch version from Logstash's master versions.yml file
++def versionMap = (Map) (new Yaml()).load(new File("$projectDir/../../versions.yml").text)
++
++group = 'org.logstash'
++description = """Ingest JSON to Logstash Grok Config Converter"""
++version = versionMap['logstash-core']
++
++project.sourceCompatibility = JavaVersion.VERSION_1_8
++project.targetCompatibility = JavaVersion.VERSION_1_8
++
++repositories {
++  mavenCentral()
++  jcenter()
++}
++
++buildscript {
++  repositories {
++    mavenCentral()
++    jcenter()
++  }
++  dependencies {
++    classpath 'org.yaml:snakeyaml:1.17'
++    classpath 'com.github.jengelman.gradle.plugins:shadow:1.2.4'
++  }
++}
++
++dependencies {
++  testCompile "junit:junit:4.12"
++}
++
++javadoc {
++  enabled = true
++}
++
++apply plugin: 'com.github.johnrengelman.shadow'
++
++shadowJar {
++  baseName = 'ingest-converter'
++  classifier = null
++  version = null
++}
+diff --git a/tools/ingest-converter/src/main/java/org/logstash/ingest/Grok.java b/tools/ingest-converter/src/main/java/org/logstash/ingest/Grok.java
+new file mode 100644
+index 00000000000..c3ddffea5fa
+--- /dev/null
++++ b/tools/ingest-converter/src/main/java/org/logstash/ingest/Grok.java
+@@ -0,0 +1,41 @@
++package org.logstash.ingest;
++
++import java.io.IOException;
++import java.io.InputStreamReader;
++import java.io.Reader;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Paths;
++import javax.script.Invocable;
++import javax.script.ScriptEngine;
++import javax.script.ScriptEngineManager;
++import javax.script.ScriptException;
++
++/**
++ * Ingest JSON DSL to Logstash Grok Transpiler.
++ */
++public final class Grok {
++
++    private Grok() {
++        // Utility Wrapper for JS Script.
++    }
++
++    public static void main(final String... args) throws ScriptException, NoSuchMethodException {
++        try (final Reader reader = new InputStreamReader(
++                     Grok.class.getResourceAsStream("/ingest-to-grok.js")
++             )
++        ) {
++            final ScriptEngine engine =
++                new ScriptEngineManager().getEngineByName("nashorn");
++            engine.eval(reader);
++            Files.write(Paths.get(args[1]), ((String) ((Invocable) engine).invokeFunction(
++                "json_to_grok",
++                new String(
++                    Files.readAllBytes(Paths.get(args[0])), StandardCharsets.UTF_8
++                )
++            )).getBytes(StandardCharsets.UTF_8));
++        } catch (final IOException ex) {
++            throw new IllegalStateException(ex);
++        }
++    }
++}
+diff --git a/tools/ingest-converter/src/main/resources/ingest-to-grok.js b/tools/ingest-converter/src/main/resources/ingest-to-grok.js
+new file mode 100644
+index 00000000000..6cc7ddc7b17
+--- /dev/null
++++ b/tools/ingest-converter/src/main/resources/ingest-to-grok.js
+@@ -0,0 +1,116 @@
++/**
++ * Converts Ingest JSON to Grok.
++ */
++function json_to_grok(json) {
++
++    function quote_string(string) {
++        return "\"" + string.replace(/"/g, "\\\"") + "\"";
++    }
++
++    function wrap_in_curly(string) {
++        return "{\n" + string + "\n}";
++    }
++
++    function create_field(name, content) {
++        return name + " => " + content;
++    }
++
++    function create_hash_field(name, content) {
++        return create_field(name, wrap_in_curly(content));
++    }
++
++    function create_hash(name, content) {
++        return name + " " + wrap_in_curly(content);
++    }
++
++    /**
++     * Converts Ingest/JSON style pattern array to Grok pattern array, performing necessary variable
++     * name and quote escaping adjustments.
++     * @param patterns Pattern Array in JSON formatting
++     * @returns {string} Pattern array in Grok formatting
++     */
++    function create_pattern_array(patterns) {
++        
++        /**
++         * Translates the JSON naming pattern (`name.qualifier.sub`) into the grok pattern
++         * [name][qualifier][sub] for all applicable tokens in the given string.
++         * This function correctly identifies and omits renaming of string literals.
++         * @param string to replace naming pattern in
++         * @returns {string} with Json naming translated into grok naming
++         */
++        function dots_to_square_brackets(string) {
++
++            function token_dots_to_square_brackets(string) {
++                return string.replace(/(\w*)\.(\w*)/g, "$1][$2").replace(/(\w+)}/g, "$1]}")
++                    .replace(/{(\w+):(\w+)]/g, "{$1:[$2]");
++            }
++
++            var literals = string.match(/\(\?:%{.*\|-\)/);
++            var i;
++            var tokens = [];
++            // Copy String before Manipulation
++            var right = string;
++            if (literals) {
++                for (i = 0; i < literals.length; ++i) {
++                    var parts = right.split(literals[i], 2);
++                    right = parts[1];
++                    tokens.push(token_dots_to_square_brackets(parts[0]));
++                    tokens.push(literals[i]);
++                }
++            }
++            tokens.push(token_dots_to_square_brackets(right));
++            return tokens.join("");
++        }
++        
++        return "[\n" + patterns.map(dots_to_square_brackets).map(quote_string).join(",\n") + "\n]";
++    }
++
++    /**
++     * Fixes indentation in Grok string.
++     * @param string Grok string to fix indentation in, that has no indentation intentionally with 
++     * all lines starting on a token without preceding spaces.
++     * @returns {string} Grok string indented by 3 spaces per level
++     */
++    function fix_indent(string) {
++        
++        function indent(string, shifts) {
++            return new Array(shifts * 3 + 1).join(" ") + string;
++        }
++        
++        var lines = string.split("\n");
++        var count = 0;
++        var i;
++        for (i = 0; i < lines.length; ++i) {
++            if (lines[i].match(/(\{|\[)$/)) {
++                lines[i] = indent(lines[i], count);
++                ++count;
++            } else if (lines[i].match(/(\}|\])$/)) {
++                --count;
++                lines[i] = indent(lines[i], count);
++            } else {
++                lines[i] = indent(lines[i], count);
++            }
++        }
++        return lines.join("\n");
++    }
++
++    var parsed = JSON.parse(json);
++    var processors = parsed["processors"];
++    return processors.map(function (filter) {
++        return fix_indent(
++            create_hash(
++                "filter",
++                create_hash(
++                    "grok",
++                    create_hash_field(
++                        "match",
++                        create_field(
++                            quote_string(filter["grok"]["field"]),
++                            create_pattern_array(filter["grok"]["patterns"])
++                        )
++                    )
++                )
++            )
++        )
++    }).join("\n\n") + "\n";
++}
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/GrokTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/GrokTest.java
+new file mode 100644
+index 00000000000..c4953bd2fa3
+--- /dev/null
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/GrokTest.java
+@@ -0,0 +1,37 @@
++package org.logstash.ingest;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Paths;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import static org.hamcrest.CoreMatchers.is;
++import static org.hamcrest.MatcherAssert.assertThat;
++
++public final class GrokTest {
++
++    @Rule
++    public final TemporaryFolder temp = new TemporaryFolder();
++
++    @Test
++    public void convertsCorrectly() throws Exception {
++        final File testdir = temp.newFolder();
++        final String grok = testdir.toPath().resolve("converted.grok").toString();
++        Grok.main(resourcePath("ingestTestConfig.json"), grok);
++        assertThat(
++            utf8File(grok), is(utf8File(resourcePath("ingestTestConfig.grok")))
++        );
++    }
++
++    private static String utf8File(final String path) throws IOException {
++        return new String(Files.readAllBytes(Paths.get(path)), StandardCharsets.UTF_8);
++    }
++
++    private static String resourcePath(final String name) {
++        return Grok.class.getResource(name).getPath();
++    }
++}
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestTestConfig.grok b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestTestConfig.grok
+new file mode 100644
+index 00000000000..37d9b94a834
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestTestConfig.grok
+@@ -0,0 +1,10 @@
++filter {
++   grok {
++      match => {
++         "message" => [
++            "%{IPORHOST:[apache2][access][remote_ip]} - %{DATA:[apache2][access][user_name]} \[%{HTTPDATE:[apache2][access][time]}\] \"%{WORD:[apache2][access][method]} %{DATA:[apache2][access][url]} HTTP/%{NUMBER:[apache2][access][http_version]}\" %{NUMBER:[apache2][access][response_code]} (?:%{NUMBER:apache2.access.body_sent.bytes}|-)( \"%{DATA:[apache2][access][referrer]}\")?( \"%{DATA:[apache2][access][agent]}\")?",
++            "%{IPORHOST:[apache2][access][remote_ip]} - %{DATA:[apache2][access][user_name]} \[%{HTTPDATE:[apache2][access][time]}\] \"-\" %{NUMBER:[apache2][access][response_code]} -"
++         ]
++      }
++   }
++}
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestTestConfig.json b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestTestConfig.json
+new file mode 100644
+index 00000000000..36db975a177
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestTestConfig.json
+@@ -0,0 +1,15 @@
++{
++  "description": "Pipeline for parsing apache error logs",
++  "processors": [
++    {
++      "grok": {
++        "field": "message",
++        "patterns": [
++          "%{IPORHOST:apache2.access.remote_ip} - %{DATA:apache2.access.user_name} \\[%{HTTPDATE:apache2.access.time}\\] \"%{WORD:apache2.access.method} %{DATA:apache2.access.url} HTTP/%{NUMBER:apache2.access.http_version}\" %{NUMBER:apache2.access.response_code} (?:%{NUMBER:apache2.access.body_sent.bytes}|-)( \"%{DATA:apache2.access.referrer}\")?( \"%{DATA:apache2.access.agent}\")?",
++          "%{IPORHOST:apache2.access.remote_ip} - %{DATA:apache2.access.user_name} \\[%{HTTPDATE:apache2.access.time}\\] \"-\" %{NUMBER:apache2.access.response_code} -"
++        ],
++        "ignore_missing": true
++      }
++    }
++  ]
++}

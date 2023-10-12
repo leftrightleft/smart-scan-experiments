@@ -1,0 +1,167 @@
+diff --git a/logstash-core/spec/logstash/filters/base_spec.rb b/logstash-core/spec/logstash/filters/base_spec.rb
+index 7d6f2eb5fed..34a8ac94df1 100644
+--- a/logstash-core/spec/logstash/filters/base_spec.rb
++++ b/logstash-core/spec/logstash/filters/base_spec.rb
+@@ -280,6 +280,41 @@ def filter(event)
+     end
+   end
+ 
++  describe "remove_field within @metadata" do
++    config <<-CONFIG
++    filter {
++      noop {
++        remove_field => ["[@metadata][f1]", "[@metadata][f2]", "[@metadata][f4][f5]"]
++      }
++    }
++    CONFIG
++
++    sample_one("type" => "noop", "@metadata" => {"f1" => "one", "f2" => { "f3" => "three"}, "f4" => { "f5" => "five", "f6" => "six"}, "f7" => "seven"}) do
++      expect(subject.include?("[@metadata][f1]")).to be_falsey
++      expect(subject.include?("[@metadata][f2]")).to be_falsey
++      expect(subject.include?("[@metadata][f4]")).to be_truthy
++      expect(subject.include?("[@metadata][f4][f5]")).to be_falsey
++      expect(subject.include?("[@metadata][f4][f6]")).to be_truthy
++      expect(subject.include?("[@metadata][f7]")).to be_truthy
++    end
++  end
++
++  describe "remove_field on @metadata" do
++    config <<-CONFIG
++    filter {
++      noop {
++        remove_field => ["[@metadata]"]
++      }
++    }
++    CONFIG
++
++    sample_one("type" => "noop", "@metadata" => {"f1" => "one", "f2" => { "f3" => "three"}}) do
++      expect(subject.include?("[@metadata]")).to be_truthy
++      expect(subject.include?("[@metadata][f1]")).to be_falsey
++      expect(subject.include?("[@metadata][f2]")).to be_falsey
++    end
++  end
++
+  describe "remove_field on array" do
+     config <<-CONFIG
+     filter {
+diff --git a/logstash-core/src/main/java/org/logstash/Event.java b/logstash-core/src/main/java/org/logstash/Event.java
+index 7885de87b98..ea8450191bd 100644
+--- a/logstash-core/src/main/java/org/logstash/Event.java
++++ b/logstash-core/src/main/java/org/logstash/Event.java
+@@ -296,7 +296,17 @@ public Object remove(final String path) {
+     }
+ 
+     public Object remove(final FieldReference field) {
+-        return Accessors.del(data, field);
++        switch (field.type()) {
++            case FieldReference.META_PARENT:
++                // removal of metadata is actually emptying metadata.
++                final ConvertedMap old_value =  ConvertedMap.newFromMap(this.metadata);
++                this.metadata = new ConvertedMap();
++                return Javafier.deep(old_value);
++            case FieldReference.META_CHILD:
++                return Accessors.del(metadata, field);
++            default:
++                return Accessors.del(data, field);
++        }
+     }
+ 
+     @Override
+diff --git a/logstash-core/src/test/java/org/logstash/EventTest.java b/logstash-core/src/test/java/org/logstash/EventTest.java
+index d823d6dbf0a..d974a31ec6e 100644
+--- a/logstash-core/src/test/java/org/logstash/EventTest.java
++++ b/logstash-core/src/test/java/org/logstash/EventTest.java
+@@ -453,4 +453,32 @@ public void metadataRootShouldBeValuefied() {
+         assertEquals(list, Arrays.asList("hello"));
+ 
+     }
++
++    @Test
++    public void removeMetadataField() {
++        final Event event = new Event();
++        final Map<String, Object> metadata = new HashMap<>();
++        metadata.put("foo", "bar");
++        event.setField("@metadata", metadata);
++
++        final RubyString s = (RubyString)event.remove("[@metadata][foo]");
++        assertEquals(s.toString(), "bar");
++
++        assertFalse(event.includes("[@metadata][foo]"));
++    }
++
++    @SuppressWarnings("unchecked")
++    @Test
++    public void removeMetadata() {
++        final Event event = new Event();
++        final Map<String, Object> metadata = new HashMap<>();
++        metadata.put("foo", "bar");
++        event.setField("@metadata", metadata);
++
++        final Map<String, Object> m = (Map)(event.remove("[@metadata]"));
++        assertEquals(m.get("foo"), "bar");
++
++        assertTrue(event.getMetadata().isEmpty());
++        assertFalse(event.includes("[@metadata][foo]"));
++    }
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/compiler/CommonActionsTest.java b/logstash-core/src/test/java/org/logstash/config/ir/compiler/CommonActionsTest.java
+index 31214c95b37..1b9fce89995 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/compiler/CommonActionsTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/compiler/CommonActionsTest.java
+@@ -242,4 +242,56 @@ public void testRemoveTag() {
+         Assert.assertTrue(o instanceof List);
+         Assert.assertEquals(0, ((List) o).size());
+     }
++
++    @Test
++    public void testRemoveFieldFromMetadata() {
++        // remove a field
++        Event e = new Event();
++        String testField = "test_field";
++        String testFieldRef = "[@metadata][" + testField + "]";
++        String testValue = "test_value";
++        e.setField(testFieldRef, testValue);
++        CommonActions.removeField(e, Collections.singletonList(testFieldRef));
++        Assert.assertFalse(e.getMetadata().keySet().contains(testField));
++
++        // remove non-existent field
++        e = new Event();
++        String testField2 = "test_field2";
++        String testField2Ref = "[@metadata][" + testField2 + "]";
++        e.setField(testField2Ref, testValue);
++        CommonActions.removeField(e, Collections.singletonList(testFieldRef));
++        Assert.assertFalse(e.getMetadata().keySet().contains(testField));
++        Assert.assertTrue(e.getMetadata().keySet().contains(testField2));
++
++        // remove multiple fields
++        e = new Event();
++        List<String> fields = new ArrayList<>();
++        List<String> fieldsRef = new ArrayList<>();
++        for (int k = 0; k < 3; k++) {
++            String field = testField + k;
++            String fieldRef = "[@metadata][" + field + "]";
++            e.setField(fieldRef, testValue);
++            fields.add(field);
++            fieldsRef.add(fieldRef);
++        }
++        e.setField(testFieldRef, testValue);
++        CommonActions.removeField(e, fieldsRef);
++        for (String field : fields) {
++            Assert.assertFalse(e.getMetadata().keySet().contains(field));
++        }
++        Assert.assertTrue(e.getMetadata().keySet().contains(testField));
++
++        // remove dynamically-named field
++        e = new Event();
++        String otherField = "other_field";
++        String otherFieldRef = "[@metadata][" + otherField + "]";
++        String otherValue = "other_value";
++        e.setField(otherFieldRef, otherValue);
++        String derivativeField = otherValue + "_foo";
++        String derivativeFieldRef = "[@metadata][" + derivativeField + "]";
++        e.setField(derivativeFieldRef, otherValue);
++        CommonActions.removeField(e, Collections.singletonList("[@metadata][" + "%{" + otherField + "}_foo" + "]"));
++        Assert.assertFalse(e.getMetadata().keySet().contains(derivativeField));
++        Assert.assertTrue(e.getMetadata().keySet().contains(otherField));
++    }
+ }

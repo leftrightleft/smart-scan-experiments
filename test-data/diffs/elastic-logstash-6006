@@ -1,0 +1,252 @@
+diff --git a/config/logstash.yml b/config/logstash.yml
+index 573e7e0f402..63849da9b4e 100644
+--- a/config/logstash.yml
++++ b/config/logstash.yml
+@@ -159,3 +159,4 @@
+ #
+ # Where to find custom plugins
+ # path.plugins: []
++config.multi_pipeline: true
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 2931f3bf065..3900bcf2210 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -21,6 +21,8 @@ module Environment
+  Setting::WritableDirectory.new("path.data", ::File.join(LogStash::Environment::LOGSTASH_HOME, "data")),
+     Setting::NullableString.new("config.string", nil, false),
+            Setting::Boolean.new("config.test_and_exit", false),
++           Setting::Boolean.new("config.multi_pipeline", false),
++                    Setting.new("pipelines", Array, []),
+            Setting::Boolean.new("config.reload.automatic", false),
+            Setting::Numeric.new("config.reload.interval", 3), # in seconds
+            Setting::Boolean.new("metric.collect", true),
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index 24e28b0d4da..644d7705ce9 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -91,7 +91,7 @@ def initialize(config_str, settings = SETTINGS, namespaced_metric = nil)
+     # So just print it.
+ 
+     if @settings.get_value("config.debug") && @logger.debug?
+-      @logger.debug("Compiled pipeline code", :code => code)
++      @logger.debug("Compiled pipeline code", :pipeline_id => pipeline_id, :code => code)
+     end
+ 
+     begin
+@@ -161,14 +161,14 @@ def safe_pipeline_worker_count
+     if @settings.set?("pipeline.workers")
+       if pipeline_workers > 1
+         @logger.warn("Warning: Manual override - there are filters that might not work with multiple worker threads",
+-                     :worker_threads => pipeline_workers, :filters => plugins)
++                     :worker_threads => pipeline_workers, :filters => plugins, :pipeline_id => @pipeline_id)
+       end
+     else
+       # user did not specify a worker thread count
+       # warn if the default is multiple
+       if default > 1
+         @logger.warn("Defaulting pipeline worker threads to 1 because there are some filters that might not work with multiple worker threads",
+-                     :count_was => default, :filters => plugins)
++                     :count_was => default, :filters => plugins, :pipeline_id => @pipeline_id)
+         return 1 # can't allow the default value to propagate if there are unsafe filters
+       end
+     end
+@@ -187,7 +187,7 @@ def run
+ 
+     start_workers
+ 
+-    @logger.info("Pipeline #{@pipeline_id} started")
++    @logger.info("Pipeline started.", :pipeline_id => @pipeline_id)
+ 
+     # Block until all inputs have stopped
+     # Generally this happens if SIGINT is sent and `shutdown` is called from an external thread
+@@ -197,7 +197,7 @@ def run
+     wait_inputs
+     transition_to_stopped
+ 
+-    @logger.debug("Input plugins stopped! Will shutdown filter/output workers.")
++    @logger.debug("Input plugins stopped! Will shutdown filter/output workers.", :pipeline_id => @pipeline_id)
+ 
+     shutdown_flusher
+     shutdown_workers
+@@ -205,7 +205,7 @@ def run
+     @filter_queue_client.close
+     @queue.close
+ 
+-    @logger.debug("Pipeline #{@pipeline_id} has been shutdown")
++    @logger.debug("Pipeline has been shutdown.", :pipeline_id => @pipeline_id)
+ 
+     # exit code
+     return 0
+@@ -248,13 +248,13 @@ def start_workers
+       config_metric.gauge(:config_reload_interval, @settings.get("config.reload.interval"))
+ 
+       @logger.info("Starting pipeline",
+-                   "id" => self.pipeline_id,
++                   "id" => @pipeline_id,
+                    "pipeline.workers" => pipeline_workers,
+                    "pipeline.batch.size" => batch_size,
+                    "pipeline.batch.delay" => batch_delay,
+                    "pipeline.max_inflight" => max_inflight)
+       if max_inflight > MAX_INFLIGHT_WARN_THRESHOLD
+-        @logger.warn "CAUTION: Recommended inflight events max exceeded! Logstash will run with up to #{max_inflight} events in memory in your current configuration. If your message sizes are large this may cause instability with the default heap size. Please consider setting a non-standard heap size, changing the batch size (currently #{batch_size}), or changing the number of pipeline workers (currently #{pipeline_workers})"
++        @logger.warn "CAUTION: Recommended inflight events max exceeded! Logstash will run with up to #{max_inflight} events in memory in your current configuration. If your message sizes are large this may cause instability with the default heap size. Please consider setting a non-standard heap size, changing the batch size (currently #{batch_size}), or changing the number of pipeline workers (currently #{pipeline_workers})", :pipeline_id => @pipeline_id
+       end
+ 
+       pipeline_workers.times do |t|
+@@ -312,7 +312,7 @@ def filter_batch(batch)
+     # Users need to check their configuration or see if there is a bug in the
+     # plugin.
+     @logger.error("Exception in pipelineworker, the pipeline stopped processing new events, please check your filter configuration and restart Logstash.",
+-                  "exception" => e, "backtrace" => e.backtrace)
++                  "exception" => e, "backtrace" => e.backtrace, :pipeline_id => @pipeline_id)
+     raise
+   end
+ 
+@@ -372,7 +372,7 @@ def inputworker(plugin)
+       if plugin.stop?
+         @logger.debug("Input plugin raised exception during shutdown, ignoring it.",
+                       :plugin => plugin.class.config_name, :exception => e,
+-                      :backtrace => e.backtrace)
++                      :backtrace => e.backtrace, :pipeline_id => @pipeline_id)
+         return
+       end
+ 
+@@ -409,9 +409,9 @@ def shutdown(&before_stop)
+ 
+     before_stop.call if block_given?
+ 
+-    @logger.debug "Closing inputs"
++    @logger.debug("Closing inputs", :pipeline_id => @pipeline_id)
+     @inputs.each(&:do_stop)
+-    @logger.debug "Closed inputs"
++    @logger.debug("Closed inputs", :pipeline_id => @pipeline_id)
+   end # def shutdown
+ 
+   # After `shutdown` is called from an external thread this is called from the main thread to
+@@ -425,7 +425,7 @@ def shutdown_workers
+     end
+ 
+     @worker_threads.each do |t|
+-      @logger.debug("Shutdown waiting for worker thread #{t}")
++      @logger.debug("Shutdown waiting for worker thread", :thread => t.inspect, :pipeline_id => @pipeline_id)
+       t.join
+     end
+ 
+diff --git a/logstash-core/lib/logstash/runner.rb b/logstash-core/lib/logstash/runner.rb
+index eeed1eb6bcd..c8c109b4e3b 100644
+--- a/logstash-core/lib/logstash/runner.rb
++++ b/logstash-core/lib/logstash/runner.rb
+@@ -232,7 +232,13 @@ def execute
+     @settings.format_settings.each {|line| logger.debug(line) }
+ 
+     if setting("config.string").nil? && setting("path.config").nil?
+-      fail(I18n.t("logstash.runner.missing-configuration"))
++      if !setting("config.multi_pipeline")
++        signal_usage_error(I18n.t("logstash.runner.missing-configuration"))
++      end
++    elsif setting("path.config") || setting("config.string")
++      if setting("config.multi_pipeline")
++        signal_usage_error(I18n.t("logstash.runner.multi-pipeline-with-config-flags"))
++      end
+     end
+ 
+     if setting("config.reload.automatic") && setting("path.config").nil?
+@@ -240,23 +246,41 @@ def execute
+       signal_usage_error(I18n.t("logstash.runner.reload-without-config-path"))
+     end
+ 
++    pipelines = []
++
++    if setting("config.multi_pipeline")
++      setting("pipelines").each do |pipeline_settings|
++        settings = @settings.clone
++        pipeline_settings.each do |setting_name, value|
++          settings.set(setting_name, value)
++        end
++        pipelines << settings
++      end
++    else
++      pipelines << @settings
++    end
++
+     if setting("config.test_and_exit")
+       config_loader = LogStash::Config::Loader.new(logger)
+-      config_str = config_loader.format_config(setting("path.config"), setting("config.string"))
+-      begin
+-        LogStash::Pipeline.new(config_str)
+-        puts "Configuration OK"
+-        logger.info "Using config.test_and_exit mode. Config Validation Result: OK. Exiting Logstash"
+-        return 0
+-      rescue => e
+-        logger.fatal I18n.t("logstash.runner.invalid-configuration", :error => e.message)
+-        return 1
++      pipelines.each do |settings|
++        config_str = config_loader.format_config(settings.get("path.config"), settings.get("config.string"))
++        begin
++          LogStash::Pipeline.new(config_str, settings)
++          puts "Configuration OK"
++          logger.info "Using config.test_and_exit mode. Config Validation Result: OK. Exiting Logstash"
++          return 0
++        rescue => e
++          logger.fatal I18n.t("logstash.runner.invalid-configuration", :error => e.message)
++          return 1
++        end
+       end
+     end
+ 
+     @agent = create_agent(@settings)
+ 
+-    @agent.register_pipeline("main", @settings)
++    pipelines.each do |settings|
++      @agent.register_pipeline(settings.get("pipeline.id"), settings)
++    end
+ 
+     # enable sigint/sigterm before starting the agent
+     # to properly handle a stalled agent
+diff --git a/logstash-core/locales/en.yml b/logstash-core/locales/en.yml
+index cda5bdf5f8e..a6c6a9d0503 100644
+--- a/logstash-core/locales/en.yml
++++ b/logstash-core/locales/en.yml
+@@ -100,6 +100,8 @@ en:
+         Configuration reloading also requires passing a configuration path with '-f yourlogstash.conf'
+       invalid-shell: >-
+         Invalid option for interactive Ruby shell. Use either "irb" or "pry"
++      multi-pipeline-with-config-flags: >-
++        Cannot use config.multi_pipeline with path.config (-f) or config.string (-w)
+       configtest-flag-information: |-
+         You may be interested in the '--configtest' flag which you can use to validate
+         logstash's configuration before you choose to restart a running system.
+diff --git a/logstash-core/spec/logstash/runner_spec.rb b/logstash-core/spec/logstash/runner_spec.rb
+index cab9dae268e..4bf831837a0 100644
+--- a/logstash-core/spec/logstash/runner_spec.rb
++++ b/logstash-core/spec/logstash/runner_spec.rb
+@@ -366,4 +366,29 @@ def run(args); end
+       end
+     end
+   end
++
++  describe "setting config.multi_pipeline" do
++    subject { LogStash::Runner.new("") }
++    context "when enabled" do
++      before :each do
++        LogStash::SETTINGS.set("config.multi_pipeline", true)
++      end
++      context "and -f is enabled too" do
++        let(:args) { ["-f", Stud::Temporary.pathname] }
++
++        it "terminates runner and shows help" do
++          expect(subject).to receive(:signal_usage_error)
++          expect(subject.run(args)).to eq(1)
++        end
++      end
++      context "and -e is enabled too" do
++        let(:args) { ["-e", ""] }
++
++        it "terminates runner and shows help" do
++          expect(subject).to receive(:signal_usage_error)
++          expect(subject.run(args)).to eq(1)
++        end
++      end
++    end
++  end
+ end

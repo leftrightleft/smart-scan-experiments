@@ -1,0 +1,202 @@
+diff --git a/.travis.yml b/.travis.yml
+index f2dfb53f000..f9ccbe43007 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -9,7 +9,9 @@ rvm:
+ jdk:
+   - oraclejdk8
+ env:
+-  - INTEGRATION=true  
++  - INTEGRATION=true
++services:
++  - postgresql
+ before_install:
+   # Force bundler 1.12.5 because version 1.13 has issues, see https://github.com/fastlane/fastlane/issues/6065#issuecomment-246044617
+   - gem uninstall -i /home/travis/.rvm/gems/jruby-1.7.25@global bundler
+@@ -19,6 +21,9 @@ install:
+   - ci/travis_integration_install.sh
+ before_script:
+   - echo "--order rand" > .rspec
++  - curl -s -o /tmp/postgres-driver.jar "https://jdbc.postgresql.org/download/postgresql-9.4.1211.jar"
++  - psql -c 'create database travis_logstash_db;' -U postgres
++  - psql -U postgres -d travis_logstash_db -a -f qa/integration/fixtures/travis_postgres.sql
+ script:
+   - rake test:core
+   - ci/travis_integration_run.sh
+diff --git a/qa/integration/fixtures/jdbc_input_spec.yml b/qa/integration/fixtures/jdbc_input_spec.yml
+new file mode 100644
+index 00000000000..46a5f86b26e
+--- /dev/null
++++ b/qa/integration/fixtures/jdbc_input_spec.yml
+@@ -0,0 +1,24 @@
++---
++name: JDBC test
++services:
++  - logstash
++config: |-
++ input {
++   jdbc {
++      jdbc_driver_library => "/tmp/postgres-driver.jar"
++      jdbc_driver_class => "org.postgresql.Driver"
++      jdbc_connection_string => "jdbc:postgresql://localhost:5432/travis_logstash_db"
++      jdbc_user => "postgres"
++      jdbc_paging_enabled => true
++      jdbc_page_size => 10000
++      statement => "SELECT * from EMPLOYEES"
++   }
++ }
++ output {
++   file {
++      path => "jdbc_input.output"
++      flush_interval => 0
++      codec => json_lines
++   }
++ }
++actual_output: jdbc_input.output 
+\ No newline at end of file
+diff --git a/qa/integration/fixtures/travis_postgres.sql b/qa/integration/fixtures/travis_postgres.sql
+new file mode 100644
+index 00000000000..4cb56e61120
+--- /dev/null
++++ b/qa/integration/fixtures/travis_postgres.sql
+@@ -0,0 +1,13 @@
++CREATE TABLE EMPLOYEES(
++   ID  SERIAL PRIMARY KEY,
++   NAME           TEXT      NOT NULL,
++   AGE            INT       NOT NULL,
++   CITY           TEXT,
++   TITLE          TEXT,
++   JOIN_DATE      DATE
++);
++
++INSERT INTO EMPLOYEES (NAME, AGE, CITY, TITLE, JOIN_DATE) VALUES
++    ('John', 100, 'San Francisco', 'Engineer', '2014-02-10'),
++    ('Jane', 101, 'San Jose', 'CTO', '2015-02-10'),
++    ('Jack', 102, 'Mobile', 'Engineer', '2016-02-10');
+diff --git a/qa/integration/services/postgres_setup.sh b/qa/integration/services/postgres_setup.sh
+new file mode 100755
+index 00000000000..d03ccbf0364
+--- /dev/null
++++ b/qa/integration/services/postgres_setup.sh
+@@ -0,0 +1,10 @@
++#!/bin/bash
++
++# Note: This assumes for now that Postgres DB is setup already, outside of RATS. This test is targeted
++# for now to run on Travis using their postgres services
++set -e
++curl -s -o /tmp/postgres-driver.jar "https://jdbc.postgresql.org/download/postgresql-9.4.1211.jar"
++[[ ! -s /tmp/postgres-driver.jar ]]
++psql -c 'create database travis_logstash_db;' -U $POSTGRES_USER
++psql -U $POSTGRES_USER -d travis_logstash_db -a -f $current_dir/../fixtures/travis_postgres.sql
++
+diff --git a/qa/integration/services/postgres_teardown.sh b/qa/integration/services/postgres_teardown.sh
+new file mode 100755
+index 00000000000..48a257f646d
+--- /dev/null
++++ b/qa/integration/services/postgres_teardown.sh
+@@ -0,0 +1,10 @@
++#!/bin/bash
++
++# Note: This assumes for now that Postgres DB is setup already, outside of RATS. This test is targeted
++# for now to run on Travis using their postgres services
++
++set -e
++current_dir="$(dirname "$0")"
++POSTGRES_USER=postgres
++
++psql -c 'drop database travis_logstash_db;' -U $POSTGRES_USER
+\ No newline at end of file
+diff --git a/qa/integration/services/service.rb b/qa/integration/services/service.rb
+index f2c3525d2f6..1375c7b0e2d 100644
+--- a/qa/integration/services/service.rb
++++ b/qa/integration/services/service.rb
+@@ -20,7 +20,7 @@ def setup
+ 
+   def teardown
+     puts "Tearing down #{@name} service"
+-    if File.exists?(@setup_script)
++    if File.exists?(@teardown_script)
+       `#{@teardown_script}`
+     else
+       puts "Teardown script not found for #{@name}"
+diff --git a/qa/integration/specs/01_logstash_bin_smoke_spec.rb b/qa/integration/specs/01_logstash_bin_smoke_spec.rb
+index 3fa9e3faf02..f6e1e78b170 100644
+--- a/qa/integration/specs/01_logstash_bin_smoke_spec.rb
++++ b/qa/integration/specs/01_logstash_bin_smoke_spec.rb
+@@ -22,7 +22,7 @@
+     @ls2.teardown
+   }
+   
+-  let(:num_retries) { 10 }
++  let(:num_retries) { 30 }
+   let(:config1) { config_to_temp_file(@fixture.config("root", { :port => random_port })) }
+   let(:config2) { config_to_temp_file(@fixture.config("root", { :port => random_port })) }
+ 
+diff --git a/qa/integration/specs/beats_input_spec.rb b/qa/integration/specs/beats_input_spec.rb
+index 1dc31b5e10a..b0a646768fb 100644
+--- a/qa/integration/specs/beats_input_spec.rb
++++ b/qa/integration/specs/beats_input_spec.rb
+@@ -10,6 +10,10 @@
+   before(:all) do
+     @fixture = Fixture.new(__FILE__)
+   end
++  
++  after(:all) do
++    @fixture.teardown
++  end
+ 
+   after :each do
+     logstash_service.teardown
+diff --git a/qa/integration/specs/jdbc_input_spec.rb b/qa/integration/specs/jdbc_input_spec.rb
+new file mode 100644
+index 00000000000..a34cb663271
+--- /dev/null
++++ b/qa/integration/specs/jdbc_input_spec.rb
+@@ -0,0 +1,47 @@
++require_relative '../framework/fixture'
++require_relative '../framework/settings'
++require_relative '../services/logstash_service'
++require "logstash/devutils/rspec/spec_helper"
++
++describe "Test JDBC Input" do
++  before(:all) {
++    @fixture = Fixture.new(__FILE__)
++    @driver_path = File.expand_path(File.join("..", "..", "services", "installed", "postgres-driver.jar"), __FILE__)
++  }
++
++  after(:all) {
++    @fixture.teardown
++  }
++  
++  #let(:config) { @fixture.config("root", { :driver_path => '/tmp/postgres-driver.jar' }) }
++  let(:number_of_events) { 3 }
++  let(:row1) { {"city"=>"San Francisco", "join_date"=>"2014-02-10T00:00:00.000Z", "name"=>"John", "id"=>1, "title"=>"Engineer", "age"=>100} }
++  let(:row2) { {"city"=>"San Jose", "join_date"=>"2015-02-10T00:00:00.000Z", "name"=>"Jane", "id"=>2, "title"=>"CTO", "age"=>101} }
++  let(:row3) { {"city"=>"Mobile", "join_date"=>"2016-02-10T00:00:00.000Z", "name"=>"Jack", "id"=>3, "title"=>"Engineer", "age"=>102} }
++  
++  def remove_meta_fields(line)
++    line.delete("@version")
++    line.delete("@timestamp")
++    line
++  end  
++
++  it "can retrieve events from table" do
++    puts @driver_path
++    logstash_service = @fixture.get_service("logstash")
++    logstash_service.start_background(@fixture.config)
++    
++    try(40) do
++      expect(@fixture.output_exists?).to be true
++    end
++    
++    lines = []
++    try(20) do
++      lines = File.readlines(@fixture.actual_output)
++      expect(lines.size).to eq(number_of_events)
++    end
++    
++    expect(remove_meta_fields(JSON.load(lines[0]))).to eq(row1)
++    expect(remove_meta_fields(JSON.load(lines[1]))).to eq(row2)
++    expect(remove_meta_fields(JSON.load(lines[2]))).to eq(row3)
++  end
++end

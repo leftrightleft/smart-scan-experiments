@@ -1,0 +1,359 @@
+diff --git a/bin/pqrepair b/bin/pqrepair
+new file mode 100755
+index 00000000000..efe480c6b1d
+--- /dev/null
++++ b/bin/pqrepair
+@@ -0,0 +1,41 @@
++#!/usr/bin/env bash
++
++unset CDPATH
++# This unwieldy bit of scripting is to try to catch instances where Logstash
++# was launched from a symlink, rather than a full path to the Logstash binary
++if [ -L "$0" ]; then
++  # Launched from a symlink
++  # --Test for the readlink binary
++  RL="$(command -v readlink)"
++  if [ $? -eq 0 ]; then
++    # readlink exists
++    SOURCEPATH="$(${RL} $0)"
++  else
++    # readlink not found, attempt to parse the output of stat
++    SOURCEPATH="$(stat -c %N $0 | awk '{print $3}' | sed -e 's/\‘//' -e 's/\’//')"
++    if [ $? -ne 0 ]; then
++      # Failed to execute or parse stat
++      echo "Failed to find source library at path $(cd `dirname $0`/..; pwd)/bin/logstash.lib.sh"
++      echo "You may need to launch Logstash with a full path instead of a symlink."
++      exit 1
++    fi
++  fi
++else
++  # Not a symlink
++  SOURCEPATH="$0"
++fi
++
++. "$(cd `dirname ${SOURCEPATH}`/..; pwd)/bin/logstash.lib.sh"
++setup
++
++
++function classpath() {
++    echo -n "$1"
++    shift
++    while [ $# -gt 0 ] ; do
++      echo -n ":${1}"
++      shift
++    done
++}
++CLASSPATH="$(classpath ${LOGSTASH_HOME}/logstash-core/lib/jars/*.jar)"
++exec "${JAVACMD}" ${JAVA_OPTS} -cp "${CLASSPATH}" org.logstash.ackedqueue.PqRepair "$@"
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/PqRepair.java b/logstash-core/src/main/java/org/logstash/ackedqueue/PqRepair.java
+new file mode 100644
+index 00000000000..a713a8b0a8d
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/PqRepair.java
+@@ -0,0 +1,201 @@
++package org.logstash.ackedqueue;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.nio.channels.FileChannel;
++import java.nio.file.DirectoryStream;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.Map;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import org.logstash.ackedqueue.io.FileCheckpointIO;
++import org.logstash.ackedqueue.io.MmapPageIOV1;
++import org.logstash.ackedqueue.io.MmapPageIOV2;
++
++/**
++ * Tool that attempts to fix a broken PQ data directory.
++ */
++public final class PqRepair {
++
++    private static final Logger LOGGER = LogManager.getLogger(PqRepair.class);
++
++    private PqRepair() {
++        // Utility Class
++    }
++
++    public static void main(final String... args) throws IOException {
++        if (args.length == 0) {
++            throw new IllegalArgumentException("No queue directory given.");
++        }
++        final Path pqRoot = Paths.get(args[0]);
++        repair(pqRoot);
++    }
++
++    public static void repair(final Path path) throws IOException {
++        if (!path.toFile().isDirectory()) {
++            throw new IllegalArgumentException(
++                String.format("Given PQ path %s is not a directory.", path)
++            );
++        }
++        final Map<Integer, Path> pageFiles = new HashMap<>();
++        try (final DirectoryStream<Path> pfs = Files.newDirectoryStream(path, "page.*")) {
++            pfs.forEach(p -> pageFiles.put(
++                Integer.parseInt(p.getFileName().toString().substring("page.".length())), p)
++            );
++        }
++        final Map<Integer, Path> checkpointFiles = new HashMap<>();
++        try (final DirectoryStream<Path> cpfs = Files.newDirectoryStream(path, "checkpoint.*")) {
++            cpfs.forEach(
++                c -> {
++                    final String cpFilename = c.getFileName().toString();
++                    if (!"checkpoint.head".equals(cpFilename)) {
++                        checkpointFiles.put(
++                            Integer.parseInt(cpFilename.substring("checkpoint.".length())), c
++                        );
++                    }
++                }
++            );
++        }
++        deleteFullyAcked(path, pageFiles, checkpointFiles);
++        fixMissingPages(pageFiles, checkpointFiles);
++        fixZeroSizePages(pageFiles, checkpointFiles);
++        fixMissingCheckpoints(pageFiles, checkpointFiles);
++    }
++
++    private static void deleteFullyAcked(final Path root, final Map<Integer, Path> pages,
++        final Map<Integer, Path> checkpoints) throws IOException {
++        final String headCpName = "checkpoint.head";
++        final File headCheckpoint = root.resolve(headCpName).toFile();
++        if (headCheckpoint.exists()) {
++            final int lowestUnAcked = new FileCheckpointIO(root).read(headCpName)
++                .getFirstUnackedPageNum();
++            deleteFullyAcked(pages, lowestUnAcked, extractPagenums(pages));
++            deleteFullyAcked(checkpoints, lowestUnAcked, extractPagenums(checkpoints));
++        }
++    }
++
++    private static void deleteFullyAcked(final Map<Integer, Path> files,
++        final int lowestUnAcked, final int[] knownPagenums) throws IOException {
++        for (final int number : knownPagenums) {
++            if (number < lowestUnAcked) {
++                final Path file = files.remove(number);
++                if (file != null) {
++                    LOGGER.info("Deleting {} because it was fully acknowledged.", file);
++                    Files.delete(file);
++                }
++            } else {
++                break;
++            }
++        }
++    }
++
++    private static void fixMissingCheckpoints(final Map<Integer, Path> pages,
++        final Map<Integer, Path> checkpoints) throws IOException {
++        final int[] knownPagenums = extractPagenums(pages);
++        for (int i = 0; i < knownPagenums.length - 1; i++) {
++            final int number = knownPagenums[i];
++            final Path cpPath = checkpoints.get(number);
++            if (cpPath == null) {
++                final Path page = pages.get(number);
++                recreateCheckpoint(page, number);
++            } else if (cpPath.toFile().length() != FileCheckpointIO.BUFFER_SIZE) {
++                Files.delete(cpPath);
++                recreateCheckpoint(pages.get(number), number);
++            }
++        }
++    }
++
++    private static void recreateCheckpoint(final Path pageFile, final int number)
++        throws IOException {
++        final ByteBuffer buffer = ByteBuffer.allocateDirect(
++            MmapPageIOV2.SEQNUM_SIZE + MmapPageIOV2.LENGTH_SIZE
++        );
++        LOGGER.info("Recreating missing checkpoint for page {}", pageFile);
++        try (final FileChannel page = FileChannel.open(pageFile)) {
++            page.read(buffer);
++            final byte version = buffer.get(0);
++            if (version != MmapPageIOV1.VERSION_ONE && version != MmapPageIOV2.VERSION_TWO) {
++                throw new IllegalStateException(
++                    String.format(
++                        "Pagefile %s contains version byte %d, this tool only supports versions 1 and 2.",
++                        pageFile, version
++                    )
++                );
++            }
++            buffer.position(1);
++            buffer.compact();
++            page.read(buffer);
++            final long firstSeqNum = buffer.getLong(0);
++            final long maxSize = page.size();
++            long position = page.position();
++            position += (long) buffer.getInt(8) + (long) MmapPageIOV2.CHECKSUM_SIZE;
++            int count = 1;
++            while (position < maxSize - MmapPageIOV2.MIN_CAPACITY) {
++                page.position(position);
++                buffer.clear();
++                page.read(buffer);
++                position += (long) buffer.getInt(8) + (long) MmapPageIOV2.CHECKSUM_SIZE;
++                ++count;
++            }
++            // Writing 0 for the first unacked page num is ok here, since this value is only
++            // used by the head checkpoint
++            new FileCheckpointIO(pageFile.getParent()).write(
++                String.format("checkpoint.%d", number), number, 0, firstSeqNum,
++                firstSeqNum,
++                count
++            );
++        }
++    }
++
++    private static void fixMissingPages(final Map<Integer, Path> pages,
++        final Map<Integer, Path> checkpoints) throws IOException {
++        final int[] knownCpNums = extractPagenums(checkpoints);
++        for (final int number : knownCpNums) {
++            if (!pages.containsKey(number)) {
++                final Path cpPath = checkpoints.remove(number);
++                Files.delete(cpPath);
++                LOGGER.info(
++                    "Deleting checkpoint {} because it has no associated page", cpPath
++                );
++            }
++        }
++    }
++
++    /**
++     * Deletes all pages that are too small in size to hold at least one event and hence are
++     * certainly corrupted as well as their associated checkpoints.
++     * @param pages Pages
++     * @param checkpoints Checkpoints
++     * @throws IOException On Failure
++     */
++    private static void fixZeroSizePages(final Map<Integer, Path> pages,
++        final Map<Integer, Path> checkpoints) throws IOException {
++        final int[] knownPagenums = extractPagenums(pages);
++        for (final int number : knownPagenums) {
++            final Path pagePath = pages.get(number);
++            if (pagePath.toFile().length() < (long) MmapPageIOV2.MIN_CAPACITY) {
++                LOGGER.info("Deleting empty page found at {}", pagePath);
++                Files.delete(pagePath);
++                pages.remove(number);
++                final Path cpPath = checkpoints.remove(number);
++                if (cpPath != null) {
++                    LOGGER.info(
++                        "Deleting checkpoint {} because it has no associated page", cpPath
++                    );
++                    Files.delete(cpPath);
++                }
++            }
++        }
++    }
++
++    private static int[] extractPagenums(final Map<Integer, Path> fileMap) {
++        final int[] knownPagenums = fileMap.keySet().stream().mapToInt(Integer::intValue).toArray();
++        Arrays.sort(knownPagenums);
++        return knownPagenums;
++    }
++}
+diff --git a/logstash-core/src/test/java/org/logstash/ackedqueue/PqRepairTest.java b/logstash-core/src/test/java/org/logstash/ackedqueue/PqRepairTest.java
+new file mode 100644
+index 00000000000..3d62f2f582a
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/ackedqueue/PqRepairTest.java
+@@ -0,0 +1,99 @@
++package org.logstash.ackedqueue;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardOpenOption;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
++import java.util.stream.Collectors;
++import java.util.stream.IntStream;
++import org.assertj.core.api.Assertions;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import static org.logstash.ackedqueue.QueueTestHelpers.computeCapacityForMmapPageIO;
++
++public final class PqRepairTest {
++
++    private static final List<Queueable> TEST_ELEMENTS = Collections.unmodifiableList(Arrays.asList(
++        new StringElement("foobarbaz1"), new StringElement("foobarbaz2"),
++        new StringElement("foobarbaz3"), new StringElement("foobarbaz4"),
++        new StringElement("foobarbaz5"), new StringElement("foobarbaz6")
++    ));
++
++    @Rule
++    public TemporaryFolder temporaryFolder = new TemporaryFolder();
++
++    private Path dataPath;
++
++    private Settings testSettings;
++
++    @Before
++    public void setUp() throws Exception {
++        dataPath = temporaryFolder.newFolder("data").toPath();
++        testSettings = TestSettings.persistedQueueSettings(
++            computeCapacityForMmapPageIO(TEST_ELEMENTS.get(0), 2), dataPath.toString()
++        );
++        try (final Queue q = new Queue(testSettings)) {
++            q.open();
++            for (final Queueable e : TEST_ELEMENTS) {
++                q.write(e);
++            }
++        }
++    }
++
++    @Test
++    public void testRecreateMissingCheckPoint() throws Exception {
++        Files.delete(dataPath.resolve("checkpoint.1"));
++        PqRepair.repair(dataPath);
++        verifyQueue();
++    }
++
++    @Test
++    public void testRecreateCorruptCheckPoint() throws Exception {
++        Files.write(dataPath.resolve("checkpoint.1"), new byte[0], StandardOpenOption.TRUNCATE_EXISTING);
++        PqRepair.repair(dataPath);
++        verifyQueue();
++    }
++
++    @Test
++    public void testRemoveBrokenPage() throws Exception {
++        Files.write(dataPath.resolve("page.1"), new byte[0], StandardOpenOption.TRUNCATE_EXISTING);
++        PqRepair.repair(dataPath);
++        verifyQueue(0, 1, 4, 5);
++    }
++
++    @Test
++    public void testRemoveUselessCheckpoint() throws Exception {
++        Files.delete(dataPath.resolve("page.1"));
++        PqRepair.repair(dataPath);
++        verifyQueue(0, 1, 4, 5);
++    }
++
++    private void verifyQueue() throws IOException {
++        verifyQueue(IntStream.range(0, 6).toArray());
++    }
++
++    private void verifyQueue(final int... indices) throws IOException {
++        try (final Queue q = new Queue(testSettings)) {
++            q.open();
++            final List<Queueable> read = new ArrayList<>();
++            while (true) {
++                try (final Batch batch = q.readBatch(10, 100L)) {
++                    if (batch.size() == 0) {
++                        break;
++                    }
++                    read.addAll(batch.getElements());
++                }
++            }
++            Assertions.assertThat(read).containsExactlyElementsOf(
++                IntStream.of(indices).mapToObj(TEST_ELEMENTS::get).collect(Collectors.toList())
++            );
++        }
++    }
++}

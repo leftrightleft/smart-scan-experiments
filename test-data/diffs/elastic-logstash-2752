@@ -1,0 +1,381 @@
+diff --git a/dripmain.rb b/dripmain.rb
+index e1348ce0f18..b4f537db588 100644
+--- a/dripmain.rb
++++ b/dripmain.rb
+@@ -5,8 +5,8 @@
+ lib_path = File.expand_path(File.join(File.dirname(__FILE__), "./lib"))
+ $:.unshift(lib_path)
+ 
+-require "logstash/environment"
+-LogStash::Environment.bundler_setup!
++require "logstash/bundler"
++LogStash::Bundler.setup!
+ 
+ # typical required gems and libs
+ require "i18n"
+diff --git a/lib/logstash/bundler.rb b/lib/logstash/bundler.rb
+index 13b491592c3..4ea3801de1c 100644
+--- a/lib/logstash/bundler.rb
++++ b/lib/logstash/bundler.rb
+@@ -1,25 +1,4 @@
+-require "bundler"
+-require "bundler/cli"
+-
+-module Bundler
+-  # Patch bundler to write a .lock file specific to the version of ruby.
+-  # This keeps MRI/JRuby/RBX from conflicting over the Gemfile.lock updates
+-  module SharedHelpers
+-    def default_lockfile
+-      ruby = "#{LogStash::Environment.ruby_engine}-#{LogStash::Environment.ruby_abi_version}"
+-      Pathname.new("#{default_gemfile}.#{ruby}.lock")
+-    end
+-  end
+-
+-  # Add the Bundler.reset! method which has been added in master but is not in 1.7.9.
+-  class << self
+-    unless self.method_defined?("reset!")
+-      def reset!
+-        @definition = nil
+-      end
+-    end
+-  end
+-end
++require "logstash/environment"
+ 
+ module LogStash
+   module Bundler
+@@ -46,6 +25,32 @@ def self.unpack(file, path)
+       return [package, target_path]
+     end
+ 
++    def self.setup!(options = {})
++      options = {:without => [:development]}.merge(options)
++      options[:without] = Array(options[:without])
++
++      # make sure we use our own installed bundler
++      require "logstash/patches/rubygems" # patch rubygems before clear_paths
++      ::Gem.clear_paths
++      ::Gem.paths = ENV['GEM_HOME'] = ENV['GEM_PATH'] = LogStash::Environment.logstash_gem_home
++
++      # set BUNDLE_GEMFILE ENV before requiring bundler to avoid bundler recurse and load unrelated Gemfile(s)
++      ENV["BUNDLE_GEMFILE"] = LogStash::Environment::GEMFILE_PATH
++
++      require "bundler"
++      require "logstash/bundler"
++      require "logstash/patches/bundler"
++
++      ::Bundler.settings[:path]    = LogStash::Environment::BUNDLE_DIR
++      ::Bundler.settings[:without] = options[:without].join(":")
++      # in the context of Bundler.setup it looks like this is useless here because Gemfile path can only be specified using
++      # the ENV, see https://github.com/bundler/bundler/blob/v1.8.3/lib/bundler/shared_helpers.rb#L103
++      ::Bundler.settings[:gemfile] = LogStash::Environment::GEMFILE_PATH
++
++      ::Bundler.reset!
++      ::Bundler.setup
++    end
++
+     # capture any $stdout from the passed block. also trap any exception in that block, in which case the trapped exception will be returned
+     # @param [Proc] the code block to execute
+     # @return [String, Exception] the captured $stdout string and any trapped exception or nil if none
+@@ -73,7 +78,19 @@ def self.invoke_bundler!(options = {})
+       options[:without] = Array(options[:without])
+       options[:update] = Array(options[:update]) if options[:update]
+ 
+-      ENV["GEM_PATH"] = LogStash::Environment.logstash_gem_home
++      # make sure we use our own installed bundler
++      require "logstash/patches/rubygems" # patch rubygems before clear_paths
++      ::Gem.clear_paths
++      ::Gem.paths = ENV['GEM_HOME'] = ENV['GEM_PATH'] = LogStash::Environment.logstash_gem_home
++
++      # set BUNDLE_GEMFILE ENV before requiring bundler to avoid bundler recurse and load unrelated Gemfile(s).
++      # in the context of calling Bundler::CLI this is not really required since Bundler::CLI will look at
++      # Bundler.settings[:gemfile] unlike Bundler.setup. For the sake of consistency and defensive/future proofing, let's keep it here.
++      ENV["BUNDLE_GEMFILE"] = LogStash::Environment::GEMFILE_PATH
++
++      require "bundler"
++      require "bundler/cli"
++      require "logstash/patches/bundler"
+ 
+       # force Rubygems sources to our Gemfile sources
+       ::Gem.sources = options[:rubygems_source] if options[:rubygems_source]
+diff --git a/lib/logstash/environment.rb b/lib/logstash/environment.rb
+index 9f9deee996c..351d293b620 100644
+--- a/lib/logstash/environment.rb
++++ b/lib/logstash/environment.rb
+@@ -1,44 +1,6 @@
+ require "logstash/errors"
+ require "logstash/version"
+ 
+-# monkey patch RubyGems to silence ffi warnings:
+-#
+-# WARN: Unresolved specs during Gem::Specification.reset:
+-#       ffi (>= 0)
+-# WARN: Clearing out unresolved specs.
+-# Please report a bug if this causes problems.
+-#
+-# see https://github.com/elasticsearch/logstash/issues/2556 and https://github.com/rubygems/rubygems/issues/1070
+-#
+-# this code is from Rubygems v2.1.9 in JRuby 1.7.17. Per tickets this issue should be solved at JRuby >= 1.7.20.
+-
+-# this method implementation works for Rubygems version 2.1.0 and up, verified up to 2.4.6
+-if Gem::Version.new(Gem::VERSION) >= Gem::Version.new("2.1.0") && Gem::Version.new(Gem::VERSION) < Gem::Version.new("2.5.0")
+-  class Gem::Specification
+-    def self.reset
+-      @@dirs = nil
+-      Gem.pre_reset_hooks.each { |hook| hook.call }
+-      @@all = nil
+-      @@stubs = nil
+-      _clear_load_cache
+-      unresolved = unresolved_deps
+-      unless unresolved.empty?
+-        unless (unresolved.size == 1 && unresolved["ffi"])
+-          w = "W" + "ARN"
+-          warn "#{w}: Unresolved specs during Gem::Specification.reset:"
+-          unresolved.values.each do |dep|
+-            warn "      #{dep}"
+-          end
+-          warn "#{w}: Clearing out unresolved specs."
+-          warn "Please report a bug if this causes problems."
+-        end
+-        unresolved.clear
+-      end
+-      Gem.post_reset_hooks.each { |hook| hook.call }
+-    end
+-  end
+-end
+-
+ module LogStash
+   module Environment
+     extend self
+@@ -72,29 +34,6 @@ def test?
+       env.downcase == "test"
+     end
+ 
+-    def bundler_setup!(options = {})
+-      options = {:without => [:development]}.merge(options)
+-      options[:without] = Array(options[:without])
+-      # make sure we use our own nicely installed bundler and not a rogue, bad, mean, ugly, stupid other bundler. bad bundler, bad bad bundler go away.
+-      ::Gem.clear_paths
+-      ::Gem.paths = ENV['GEM_HOME'] = ENV['GEM_PATH'] = logstash_gem_home
+-
+-      # set BUNDLE_GEMFILE ENV before requiring bundler to avoid bundler recurse and load unrelated Gemfile(s)
+-      ENV["BUNDLE_GEMFILE"] = LogStash::Environment::GEMFILE_PATH
+-
+-      require "bundler"
+-      require "logstash/bundler"
+-
+-      ::Bundler.settings[:path]    = LogStash::Environment::BUNDLE_DIR
+-      ::Bundler.settings[:without] = options[:without].join(":")
+-      # in the context of Bundler.setup it looks like this is useless here because Gemfile path can only be specified using
+-      # the ENV, see https://github.com/bundler/bundler/blob/v1.8.3/lib/bundler/shared_helpers.rb#L103
+-      ::Bundler.settings[:gemfile] = LogStash::Environment::GEMFILE_PATH
+-
+-      ::Bundler.reset!
+-      ::Bundler.setup
+-    end
+-
+     def runtime_jars_root(dir_name, package)
+       ::File.join(dir_name, package, "runtime-jars")
+     end
+diff --git a/lib/logstash/patches/bundler.rb b/lib/logstash/patches/bundler.rb
+new file mode 100644
+index 00000000000..182222e4532
+--- /dev/null
++++ b/lib/logstash/patches/bundler.rb
+@@ -0,0 +1,20 @@
++# Bundler monkey patches
++module ::Bundler
++  # Patch bundler to write a .lock file specific to the version of ruby.
++  # This keeps MRI/JRuby/RBX from conflicting over the Gemfile.lock updates
++  module SharedHelpers
++    def default_lockfile
++      ruby = "#{LogStash::Environment.ruby_engine}-#{LogStash::Environment.ruby_abi_version}"
++      Pathname.new("#{default_gemfile}.#{ruby}.lock")
++    end
++  end
++
++  # Add the Bundler.reset! method which has been added in master but is not in 1.7.9.
++  class << self
++    unless self.method_defined?("reset!")
++      def reset!
++        @definition = nil
++      end
++    end
++  end
++end
+diff --git a/lib/logstash/patches/rubygems.rb b/lib/logstash/patches/rubygems.rb
+new file mode 100644
+index 00000000000..ebea50329bf
+--- /dev/null
++++ b/lib/logstash/patches/rubygems.rb
+@@ -0,0 +1,37 @@
++# monkey patch RubyGems to silence ffi warnings:
++#
++# WARN: Unresolved specs during Gem::Specification.reset:
++#       ffi (>= 0)
++# WARN: Clearing out unresolved specs.
++# Please report a bug if this causes problems.
++#
++# see https://github.com/elasticsearch/logstash/issues/2556 and https://github.com/rubygems/rubygems/issues/1070
++#
++# this code is from Rubygems v2.1.9 in JRuby 1.7.17. Per tickets this issue should be solved at JRuby >= 1.7.20.
++#
++# this method implementation works for Rubygems version 2.1.0 and up, verified up to 2.4.6
++if ::Gem::Version.new(::Gem::VERSION) >= ::Gem::Version.new("2.1.0") && ::Gem::Version.new(::Gem::VERSION) < ::Gem::Version.new("2.5.0")
++  class ::Gem::Specification
++    def self.reset
++      @@dirs = nil
++      ::Gem.pre_reset_hooks.each { |hook| hook.call }
++      @@all = nil
++      @@stubs = nil
++      _clear_load_cache
++      unresolved = unresolved_deps
++      unless unresolved.empty?
++        unless (unresolved.size == 1 && unresolved["ffi"])
++          w = "W" + "ARN"
++          warn "#{w}: Unresolved specs during Gem::Specification.reset:"
++          unresolved.values.each do |dep|
++            warn "      #{dep}"
++          end
++          warn "#{w}: Clearing out unresolved specs."
++          warn "Please report a bug if this causes problems."
++        end
++        unresolved.clear
++      end
++      ::Gem.post_reset_hooks.each { |hook| hook.call }
++    end
++  end
++end
+diff --git a/lib/logstash/pluginmanager/list.rb b/lib/logstash/pluginmanager/list.rb
+index d367d794b9c..b29c3f08859 100644
+--- a/lib/logstash/pluginmanager/list.rb
++++ b/lib/logstash/pluginmanager/list.rb
+@@ -2,6 +2,7 @@
+ require 'logstash/namespace'
+ require 'logstash/pluginmanager/util'
+ require 'logstash/pluginmanager/command'
++require "logstash/bundler"
+ require 'rubygems/spec_fetcher'
+ 
+ class LogStash::PluginManager::List < LogStash::PluginManager::Command
+@@ -16,8 +17,7 @@ class LogStash::PluginManager::List < LogStash::PluginManager::Command
+   end
+ 
+   def execute
+-    require 'logstash/environment'
+-    LogStash::Environment.bundler_setup!
++    LogStash::Bundler.setup!
+ 
+     signal_error("No plugins found") if filtered_specs.empty?
+ 
+diff --git a/lib/logstash/runner.rb b/lib/logstash/runner.rb
+index 6b9f2022cca..6fb9657c23e 100644
+--- a/lib/logstash/runner.rb
++++ b/lib/logstash/runner.rb
+@@ -1,15 +1,17 @@
+ # encoding: utf-8
+ 
++Thread.abort_on_exception = true
++
+ Encoding.default_external = Encoding::UTF_8
+ $START = Time.now
+ $DEBUGLIST = (ENV["DEBUG"] || "").split(",")
+ 
++require "logstash/bundler"
++LogStash::Bundler.setup!
++
+ require "logstash/environment"
+-LogStash::Environment.bundler_setup!
+ LogStash::Environment.load_locale!
+ 
+-Thread.abort_on_exception = true
+-
+ require "logstash/namespace"
+ require "logstash/program"
+ 
+diff --git a/rakelib/dependency.rake b/rakelib/dependency.rake
+index 4947a3e4e1b..212dcc7f18e 100644
+--- a/rakelib/dependency.rake
++++ b/rakelib/dependency.rake
+@@ -2,7 +2,6 @@
+ namespace "dependency" do
+   task "bundler" do
+     Rake::Task["gem:require"].invoke("bundler", ">= 1.3.5", LogStash::Environment.logstash_gem_home)
+-    require "logstash/bundler"
+   end
+ 
+   task "rbx-stdlib" do
+diff --git a/rakelib/test.rake b/rakelib/test.rake
+index c4ea6556027..62545933b72 100644
+--- a/rakelib/test.rake
++++ b/rakelib/test.rake
+@@ -9,8 +9,8 @@ require "logstash/pluginmanager/util"
+ 
+ namespace "test" do
+   task "setup" do
+-    require "logstash/environment"
+-    LogStash::Environment.bundler_setup!({:without => []})
++    require "logstash/bundler"
++    LogStash::Bundler.setup!({:without => []})
+     require "rspec/core/runner"
+     require "rspec"
+   end
+diff --git a/rakelib/vendor.rake b/rakelib/vendor.rake
+index 9ef2cbf5542..36303185fa5 100644
+--- a/rakelib/vendor.rake
++++ b/rakelib/vendor.rake
+@@ -126,6 +126,7 @@ namespace "vendor" do
+ 
+   task "gems", [:bundle] do |task, args|
+     require "logstash/environment"
++    require "logstash/bundler"
+     Rake::Task["dependency:rbx-stdlib"] if LogStash::Environment.ruby_engine == "rbx"
+     Rake::Task["dependency:stud"].invoke
+     Rake::Task["dependency:bundler"].invoke
+diff --git a/spec/lib/logstash/bundler_spec.rb b/spec/lib/logstash/bundler_spec.rb
+index a9a59e685a3..63cb602d472 100644
+--- a/spec/lib/logstash/bundler_spec.rb
++++ b/spec/lib/logstash/bundler_spec.rb
+@@ -1,6 +1,7 @@
+ # encoding: utf-8
+ require "spec_helper"
+ require "logstash/bundler"
++require "bundler/cli"
+ 
+ describe LogStash::Bundler do
+   context "capture_stdout" do
+@@ -25,7 +26,7 @@
+       expect(exception.message).to eq("baz")
+     end
+   end
+-  
++
+   context 'when invoking bundler' do
+     original_stderr = $stderr
+ 
+@@ -59,14 +60,14 @@
+       it 'gem conflict' do
+         allow(::Bundler::CLI).to receive(:start).with(bundler_args) { raise ::Bundler::VersionConflict.new('conflict') }
+         expect { subject }.to raise_error(::Bundler::VersionConflict)
+-      end 
++      end
+ 
+       it 'gem is not found' do
+         allow(::Bundler::CLI).to receive(:start).with(bundler_args) { raise ::Bundler::GemNotFound.new('conflict') }
+         expect { subject }.to raise_error(::Bundler::GemNotFound)
+       end
+ 
+-      it 'on max retries' do 
++      it 'on max retries' do
+         options.merge!({ :max_tries => 2 })
+         expect(::Bundler::CLI).to receive(:start).with(bundler_args).at_most(options[:max_tries] + 1) { raise RuntimeError }
+         expect { subject }.to raise_error(RuntimeError)
+@@ -80,7 +81,7 @@
+ 
+     context 'when installing' do
+       let(:options) { { :install => true } }
+-    
++
+       it 'should call bundler install' do
+         expect(subject).to include('install')
+       end

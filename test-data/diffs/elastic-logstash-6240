@@ -1,0 +1,378 @@
+diff --git a/logstash-core/lib/logstash/api/commands/stats.rb b/logstash-core/lib/logstash/api/commands/stats.rb
+index c82038be660..f5ef39043bc 100644
+--- a/logstash-core/lib/logstash/api/commands/stats.rb
++++ b/logstash-core/lib/logstash/api/commands/stats.rb
+@@ -27,7 +27,7 @@ def process
+             :peak_open_file_descriptors,
+             :max_file_descriptors,
+             [:mem, [:total_virtual_in_bytes]],
+-            [:cpu, [:total_in_millis, :percent]]
++            [:cpu, [:total_in_millis, :percent, :load_average]]
+           )
+         end
+ 
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 20b67bd4bb2..04b4e3447bf 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -59,6 +59,10 @@ module Environment
+     LOGSTASH_CORE = ::File.expand_path(::File.join(::File.dirname(__FILE__), "..", ".."))
+     LOGSTASH_ENV = (ENV["LS_ENV"] || 'production').to_s.freeze
+ 
++    LINUX_OS_RE = /linux/
++    WINDOW_OS_RE = /mswin|msys|mingw|cygwin|bccwin|wince|emc/
++    MACOS_OS_RE = /darwin/
++
+     def env
+       LOGSTASH_ENV
+     end
+@@ -121,7 +125,11 @@ def jruby?
+     end
+ 
+     def windows?
+-      ::Gem.win_platform?
++      RbConfig::CONFIG['host_os'] =~ WINDOW_OS_RE
++    end
++
++    def linux?
++      RbConfig::CONFIG['host_os'] =~ LINUX_OS_RE
+     end
+ 
+     def locales_path(path)
+diff --git a/logstash-core/lib/logstash/instrument/periodic_poller/jvm.rb b/logstash-core/lib/logstash/instrument/periodic_poller/jvm.rb
+index f51b38bb2b3..c1186cf9e9e 100644
+--- a/logstash-core/lib/logstash/instrument/periodic_poller/jvm.rb
++++ b/logstash-core/lib/logstash/instrument/periodic_poller/jvm.rb
+@@ -1,6 +1,7 @@
+-
+ # encoding: utf-8
+ require "logstash/instrument/periodic_poller/base"
++require "logstash/instrument/periodic_poller/load_average"
++require "logstash/environment"
+ require "jrmonitor"
+ require "set"
+ 
+@@ -33,11 +34,13 @@ def self.get(gc_name)
+       end
+     end
+ 
++
+     attr_reader :metric
+ 
+     def initialize(metric, options = {})
+       super(metric, options)
+       @metric = metric
++      @load_average = LoadAverage.create
+     end
+ 
+     def collect
+@@ -47,6 +50,7 @@ def collect
+       collect_threads_metrics
+       collect_process_metrics
+       collect_gc_stats
++      collect_load_average
+     end
+ 
+     private
+@@ -97,6 +101,18 @@ def collect_process_metrics
+       metric.gauge(cpu_path, :total_in_millis, cpu_metrics["total_in_millis"])
+ 
+       metric.gauge(path + [:mem], :total_virtual_in_bytes, process_metrics["mem"]["total_virtual_in_bytes"])
++
++    end
++
++    def collect_load_average
++      begin
++        load_average = @load_average.get
++      rescue => e
++        logger.debug("Can't retrieve load average", :exception => e.class.name, :message => e.message)
++        load_average = nil
++      end
++
++      metric.gauge([:jvm, :process, :cpu], :load_average, load_average) unless load_average.nil?
+     end
+     
+     def collect_jvm_metrics(data)
+diff --git a/logstash-core/lib/logstash/instrument/periodic_poller/load_average.rb b/logstash-core/lib/logstash/instrument/periodic_poller/load_average.rb
+new file mode 100644
+index 00000000000..4660401f24e
+--- /dev/null
++++ b/logstash-core/lib/logstash/instrument/periodic_poller/load_average.rb
+@@ -0,0 +1,47 @@
++# encoding: utf-8
++module LogStash module Instrument module PeriodicPoller
++  class LoadAverage
++    class Windows
++      def self.get
++        nil
++      end
++    end
++
++    class Linux
++      LOAD_AVG_FILE = "/proc/loadavg"
++      TOKEN_SEPARATOR = " "
++
++      def self.get
++        load_average = ::File.read(LOAD_AVG_FILE).chomp.split(TOKEN_SEPARATOR)
++
++        {
++          :"1m" => load_average[0].to_f,
++          :"5m" => load_average[1].to_f,
++          :"15m" => load_average[2].to_f
++        }
++      end
++    end
++
++    class Other
++      def self.get()
++        load_average_1m = ManagementFactory.getOperatingSystemMXBean().getSystemLoadAverage()
++
++        return nil if load_average_1m.nil?
++
++        {
++          :"1m" => load_average_1m
++        }
++      end
++    end
++
++    def self.create
++      if LogStash::Environment.windows?
++        Windows
++      elsif LogStash::Environment.linux?
++        Linux
++      else
++        Other
++      end
++    end
++  end
++end end end
+diff --git a/logstash-core/spec/api/lib/api/node_stats_spec.rb b/logstash-core/spec/api/lib/api/node_stats_spec.rb
+index a77a01c3e23..1602599e1ce 100644
+--- a/logstash-core/spec/api/lib/api/node_stats_spec.rb
++++ b/logstash-core/spec/api/lib/api/node_stats_spec.rb
+@@ -69,7 +69,8 @@
+       },
+       "cpu"=>{
+         "total_in_millis"=>Numeric,
+-        "percent"=>Numeric
++        "percent"=>Numeric,
++        "load_average" => { "1m" => Numeric }
+       }
+     },
+    "pipeline" => {
+diff --git a/logstash-core/spec/logstash/environment_spec.rb b/logstash-core/spec/logstash/environment_spec.rb
+index 581ef6ae8be..28637ea2323 100644
+--- a/logstash-core/spec/logstash/environment_spec.rb
++++ b/logstash-core/spec/logstash/environment_spec.rb
+@@ -53,4 +53,42 @@
+       expect($LOAD_PATH).to include(path)
+     end
+   end
++
++
++  describe "OS detection" do
++    windows_host_os = %w(bccwin cygwin mingw mswin wince)
++    linux_host_os = %w(linux)
++
++    context "windows" do
++      windows_host_os.each do |host|
++        it "#{host} returns true" do
++          expect(RbConfig::CONFIG).to receive(:[]).with("host_os").and_return(host)
++          expect(LogStash::Environment.windows?).to be_truthy
++        end
++      end
++
++      linux_host_os.each do |host|
++        it "#{host} returns false" do
++          expect(RbConfig::CONFIG).to receive(:[]).with("host_os").and_return(host)
++          expect(LogStash::Environment.windows?).to be_falsey
++        end
++      end
++    end
++
++    context "Linux" do
++      windows_host_os.each do |host|
++        it "#{host} returns true" do
++          expect(RbConfig::CONFIG).to receive(:[]).with("host_os").and_return(host)
++          expect(LogStash::Environment.linux?).to be_falsey
++        end
++      end
++
++      linux_host_os.each do |host|
++        it "#{host} returns false" do
++          expect(RbConfig::CONFIG).to receive(:[]).with("host_os").and_return(host)
++          expect(LogStash::Environment.linux?).to be_truthy
++        end
++      end
++    end
++  end
+ end
+diff --git a/logstash-core/spec/logstash/instrument/periodic_poller/jvm_spec.rb b/logstash-core/spec/logstash/instrument/periodic_poller/jvm_spec.rb
+index e3e113ca117..db51647a38d 100644
+--- a/logstash-core/spec/logstash/instrument/periodic_poller/jvm_spec.rb
++++ b/logstash-core/spec/logstash/instrument/periodic_poller/jvm_spec.rb
+@@ -2,6 +2,7 @@
+ require "spec_helper"
+ require "logstash/instrument/periodic_poller/jvm"
+ require "logstash/instrument/collector"
++require "logstash/environment"
+ 
+ describe LogStash::Instrument::PeriodicPoller::JVM::GarbageCollectorName do
+   subject { LogStash::Instrument::PeriodicPoller::JVM::GarbageCollectorName }
+@@ -27,6 +28,7 @@
+   end
+ end
+ 
++
+ describe LogStash::Instrument::PeriodicPoller::JVM do
+   let(:metric) { LogStash::Instrument::Metric.new(LogStash::Instrument::Collector.new) }
+   let(:options) { {} }
+@@ -36,6 +38,22 @@
+     expect { jvm }.not_to raise_error
+   end
+ 
++  describe "load average" do
++    context "on linux" do
++      context "when an exception occur reading the file" do
++        before do
++          expect(LogStash::Environment).to receive(:windows?).and_return(false)
++          expect(LogStash::Environment).to receive(:linux?).and_return(true)
++          expect(::File).to receive(:read).with("/proc/loadavg").and_raise("Didnt work out so well")
++        end
++
++        it "doesn't raise an exception" do
++          expect { subject.collect }.not_to raise_error
++        end
++      end
++    end
++  end
++
+   describe "collections" do
+     subject(:collection) { jvm.collect }
+     it "should run cleanly" do
+@@ -70,6 +88,28 @@ def mval(*metric_path)
+           expect(mval(*path)).to be_a(Numeric)
+         end
+       end
++
++      context "real system" do
++        if LogStash::Environment.linux?
++          context "Linux" do
++            it "returns the load avg" do
++              expect(subject[:process][:cpu][:load_average].value).to include(:"1m" => a_kind_of(Numeric), :"5m" => a_kind_of(Numeric), :"15m" => a_kind_of(Numeric))
++            end
++          end
++        elsif LogStash::Environment.windows?
++          context "Window" do
++            it "returns nothing" do
++              expect(subject[:process][:cpu].has_key?(:load_average)).to be_falsey
++            end
++          end
++        else
++          context "Other" do
++            it "returns 1m only" do
++              expect(subject[:process][:cpu][:load_average].value).to include(:"1m" => a_kind_of(Numeric))
++            end
++          end
++        end
++      end
+     end
+   end
+ end
+diff --git a/logstash-core/spec/logstash/instrument/periodic_poller/load_average_spec.rb b/logstash-core/spec/logstash/instrument/periodic_poller/load_average_spec.rb
+new file mode 100644
+index 00000000000..626ba52dc22
+--- /dev/null
++++ b/logstash-core/spec/logstash/instrument/periodic_poller/load_average_spec.rb
+@@ -0,0 +1,91 @@
++# encoding: utf-8
++require "logstash/instrument/periodic_poller/load_average"
++describe LogStash::Instrument::PeriodicPoller::LoadAverage do
++  subject { described_class.create }
++
++  context "on mocked system" do
++    context "on Linux" do
++      before do
++        expect(LogStash::Environment).to receive(:windows?).and_return(false)
++        expect(LogStash::Environment).to receive(:linux?).and_return(true)
++      end
++
++      context "when it can read the file" do
++        let(:proc_loadavg) { "0.00 0.01 0.05 3/180 29727" }
++
++        before do
++          expect(::File).to receive(:read).with("/proc/loadavg").and_return(proc_loadavg)
++        end
++
++        it "return the 3 load average from `/proc/loadavg`" do
++          avg_1m, avg_5m, avg_15m = proc_loadavg.chomp.split(" ")
++
++          expect(subject.get).to include(:"1m" => avg_1m.to_f, :"5m" => avg_5m.to_f, :"15m" => avg_15m.to_f)
++        end
++      end
++    end
++
++    context "on windows" do
++      before do
++        expect(LogStash::Environment).to receive(:windows?).and_return(true)
++      end
++
++      it "Xreturns nil" do
++        expect(subject.get).to be_nil
++      end
++    end
++
++    context "on other" do
++      before do
++        expect(LogStash::Environment).to receive(:windows?).and_return(false)
++        expect(LogStash::Environment).to receive(:linux?).and_return(false)
++      end
++
++      context "when 'OperatingSystemMXBean.getSystemLoadAverage' return something" do
++        let(:load_avg) { 5 }
++
++        before do
++          expect(ManagementFactory).to receive(:getOperatingSystemMXBean).and_return(double("OperatingSystemMXBean", :getSystemLoadAverage => load_avg))
++        end
++
++        it "returns the value" do
++          expect(subject.get).to include(:"1m" => 5)
++        end
++      end
++
++      context "when 'OperatingSystemMXBean.getSystemLoadAverage' doesn't return anything" do
++        before do
++          expect(ManagementFactory).to receive(:getOperatingSystemMXBean).and_return(double("OperatingSystemMXBean", :getSystemLoadAverage => nil))
++        end
++
++        it "returns nothing" do
++          expect(subject.get).to be_nil
++        end
++      end
++    end
++  end
++
++  # Since we are running this on macos and linux I think it make sense to have real test
++  # insteadof only mock
++  context "real system" do
++    if LogStash::Environment.linux?
++      context "Linux" do
++        it "returns the load avg" do
++          expect(subject.get).to include(:"1m" => a_kind_of(Numeric), :"5m" => a_kind_of(Numeric), :"15m" => a_kind_of(Numeric))
++        end
++      end
++    elsif LogStash::Environment.windows?
++      context "window" do
++        it "returns nothing" do
++          expect(subject.get).to be_nil
++        end
++      end
++    else
++      context "Other" do
++        it "returns 1m only" do
++          expect(subject.get).to include(:"1m" => a_kind_of(Numeric))
++        end
++      end
++    end
++  end
++end

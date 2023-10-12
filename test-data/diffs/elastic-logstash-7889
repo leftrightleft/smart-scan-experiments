@@ -1,0 +1,737 @@
+diff --git a/logstash-core/src/main/java/org/logstash/Accessors.java b/logstash-core/src/main/java/org/logstash/Accessors.java
+index d7f545b90b3..86aa7ab00ea 100644
+--- a/logstash-core/src/main/java/org/logstash/Accessors.java
++++ b/logstash-core/src/main/java/org/logstash/Accessors.java
+@@ -8,20 +8,17 @@ private Accessors() {
+         //Utility Class
+     }
+ 
+-    public static Object get(final ConvertedMap data, final String reference) {
+-        final FieldReference field = PathCache.cache(reference);
++    public static Object get(final ConvertedMap data, final FieldReference field) {
+         final Object target = findParent(data, field);
+         return target == null ? null : fetch(target, field.getKey());
+     }
+ 
+-    public static Object set(final ConvertedMap data, final String reference,
++    public static Object set(final ConvertedMap data, final FieldReference field,
+         final Object value) {
+-        final FieldReference field = PathCache.cache(reference);
+         return setChild(findCreateTarget(data, field), field.getKey(), value);
+     }
+ 
+-    public static Object del(final ConvertedMap data, final String reference) {
+-        final FieldReference field = PathCache.cache(reference);
++    public static Object del(final ConvertedMap data, final FieldReference field) {
+         final Object target = findParent(data, field);
+         if (target instanceof ConvertedMap) {
+             return ((ConvertedMap) target).remove(field.getKey());
+@@ -30,8 +27,7 @@ public static Object del(final ConvertedMap data, final String reference) {
+         }
+     }
+ 
+-    public static boolean includes(final ConvertedMap data, final String reference) {
+-        final FieldReference field = PathCache.cache(reference);
++    public static boolean includes(final ConvertedMap data, final FieldReference field) {
+         final Object target = findParent(data, field);
+         final String key = field.getKey();
+         return target instanceof ConvertedMap && ((ConvertedMap) target).containsKey(key) ||
+@@ -138,9 +134,10 @@ private static boolean foundInList(final String key, final ConvertedList target)
+     }
+ 
+     /**
+-     * Returns a positive integer offset for a list of known size.
+-     * @param size the size of the list.
+-     * @return the positive integer offset for the list given by index i.
++     * Returns a positive integer offset from a Ruby style positive or negative list index.
++     * @param i List index
++     * @param size the size of the list
++     * @return the positive integer offset for the list given by index i
+      */
+     public static int listIndex(int i, int size) {
+         return i < 0 ? size + i : i;
+@@ -148,8 +145,9 @@ public static int listIndex(int i, int size) {
+ 
+     /**
+      * Returns a positive integer offset for a list of known size.
+-     * @param size the size of the list.
+-     * @return the positive integer offset for the list given by index i.
++     * @param key List index (String matching /[0-9]+/)
++     * @param size the size of the list
++     * @return the positive integer offset for the list given by index i
+      */
+     private static int listIndex(final String key, final int size) {
+         return listIndex(Integer.parseInt(key), size);
+diff --git a/logstash-core/src/main/java/org/logstash/Event.java b/logstash-core/src/main/java/org/logstash/Event.java
+index d5a6905ce78..6d78b877d04 100644
+--- a/logstash-core/src/main/java/org/logstash/Event.java
++++ b/logstash-core/src/main/java/org/logstash/Event.java
+@@ -37,6 +37,8 @@ public final class Event implements Cloneable, Queueable {
+     private static final String DATA_MAP_KEY = "DATA";
+     private static final String META_MAP_KEY = "META";
+ 
++    private static final FieldReference TAGS_FIELD = PathCache.cache("tags");
++    
+     private static final Logger logger = LogManager.getLogger(Event.class);
+ 
+     public Event()
+@@ -81,9 +83,7 @@ public Event(ConvertedMap data) {
+         // keep reference to the parsedTimestamp for tagging below
+         Timestamp parsedTimestamp = initTimestamp(providedTimestamp);
+         this.timestamp = (parsedTimestamp == null) ? Timestamp.now() : parsedTimestamp;
+-
+-        this.data.put(TIMESTAMP, this.timestamp);
+-
++        Accessors.set(data, FieldReference.TIMESTAMP_REFERENCE, timestamp);
+         // the tag() method has to be called after the Accessors initialization
+         if (parsedTimestamp == null) {
+             tag(TIMESTAMP_FAILURE_TAG);
+@@ -124,41 +124,55 @@ public void setTimestamp(Timestamp t) {
+         this.data.put(TIMESTAMP, this.timestamp);
+     }
+ 
+-    public Object getField(String reference) {
+-        final Object unconverted = getUnconvertedField(reference);
++    public Object getField(final String reference) {
++        final Object unconverted = getUnconvertedField(PathCache.cache(reference));
+         return unconverted == null ? null : Javafier.deep(unconverted);
+     }
+ 
+-    public Object getUnconvertedField(String reference) {
+-        if (reference.equals(METADATA)) {
+-            return this.metadata;
+-        } else if (reference.startsWith(METADATA_BRACKETS)) {
+-            return Accessors.get(metadata, reference.substring(METADATA_BRACKETS.length()));
+-        } else {
+-            return Accessors.get(data, reference);
++    public Object getUnconvertedField(final String reference) {
++        return getUnconvertedField(PathCache.cache(reference));
++    }
++
++    public Object getUnconvertedField(final FieldReference field) {
++        switch (field.type()) {
++            case FieldReference.META_PARENT:
++                return this.metadata;
++            case FieldReference.META_CHILD:
++                return Accessors.get(metadata, field);
++            default:
++                return Accessors.get(data, field);
+         }
+     }
+ 
+-    public void setField(String reference, Object value) {
+-        if (reference.equals(TIMESTAMP)) {
+-            // TODO(talevy): check type of timestamp
+-            Accessors.set(data, reference, value);
+-        } else if (reference.equals(METADATA_BRACKETS) || reference.equals(METADATA)) {
+-            this.metadata = ConvertedMap.newFromMap((Map) value);
+-        } else if (reference.startsWith(METADATA_BRACKETS)) {
+-            Accessors.set(metadata, reference.substring(METADATA_BRACKETS.length()), value);
+-        } else {
+-            Accessors.set(data, reference, Valuefier.convert(value));
++    public void setField(final String reference, final Object value) {
++        setField(PathCache.cache(reference), value);
++    }
++
++    public void setField(final FieldReference field, final Object value) {
++        switch (field.type()) {
++            case FieldReference.META_PARENT:
++                this.metadata = ConvertedMap.newFromMap((Map) value);
++                break;
++            case FieldReference.META_CHILD:
++                Accessors.set(metadata, field, value);
++                break;
++            default:
++                Accessors.set(data, field, Valuefier.convert(value));
+         }
+     }
+ 
+-    public boolean includes(String reference) {
+-        if (reference.equals(METADATA_BRACKETS) || reference.equals(METADATA)) {
+-            return true;
+-        } else if (reference.startsWith(METADATA_BRACKETS)) {
+-            return Accessors.includes(metadata, reference.substring(METADATA_BRACKETS.length()));
+-        } else {
+-            return Accessors.includes(data, reference);
++    public boolean includes(final String field) {
++        return includes(PathCache.cache(field));
++    }
++
++    public boolean includes(final FieldReference field) {
++        switch (field.type()) {
++            case FieldReference.META_PARENT:
++                return true;
++            case FieldReference.META_CHILD:
++                return Accessors.includes(metadata, field);
++            default:
++                return Accessors.includes(data, field);
+         }
+     }
+ 
+@@ -247,8 +261,12 @@ public Event append(Event e) {
+         return this;
+     }
+ 
+-    public Object remove(String path) {
+-        return Accessors.del(data, path);
++    public Object remove(final String path) {
++        return remove(PathCache.cache(path));
++    }
++
++    public Object remove(final FieldReference field) {
++        return Accessors.del(data, field);
+     }
+ 
+     public String sprintf(String s) throws IOException {
+@@ -318,7 +336,7 @@ private static Timestamp parseTimestamp(final Object o) {
+     }
+ 
+     public void tag(final String tag) {
+-        final Object tags = Accessors.get(data,"tags");
++        final Object tags = Accessors.get(data, TAGS_FIELD);
+         // short circuit the null case where we know we won't need deduplication step below at the end
+         if (tags == null) {
+             initTag(tag);
+@@ -334,7 +352,7 @@ public void tag(final String tag) {
+     private void initTag(final String tag) {
+         final ConvertedList list = new ConvertedList(1);
+         list.add(new StringBiValue(tag));
+-        Accessors.set(data, "tags", list);
++        Accessors.set(data, TAGS_FIELD, list);
+     }
+ 
+     /**
+@@ -360,7 +378,7 @@ private void appendTag(final List<String> tags, final String tag) {
+         // TODO: we should eventually look into using alternate data structures to do more efficient dedup but that will require properly defining the tagging API too
+         if (!tags.contains(tag)) {
+             tags.add(tag);
+-            Accessors.set(data,"tags", ConvertedList.newFromList(tags));
++            Accessors.set(data, TAGS_FIELD, ConvertedList.newFromList(tags));
+         }
+     }
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/FieldReference.java b/logstash-core/src/main/java/org/logstash/FieldReference.java
+index 440fd61772b..4665bac9c46 100644
+--- a/logstash-core/src/main/java/org/logstash/FieldReference.java
++++ b/logstash-core/src/main/java/org/logstash/FieldReference.java
+@@ -1,25 +1,99 @@
+ package org.logstash;
+ 
+ import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.regex.Pattern;
+-// TODO: implement thread-safe path cache singleton to avoid parsing
+ 
+-public class FieldReference {
++public final class FieldReference {
++
++    /**
++     * This type indicates that the referenced that is the metadata of an {@link Event} found in
++     * {@link Event#metadata}.
++     */
++    public static final int META_PARENT = 0;
++
++    /**
++     * This type indicates that the referenced data must be looked up from {@link Event#metadata}.
++     */
++    public static final int META_CHILD = 1;
++
++    /**
++     * This type indicates that the referenced data must be looked up from {@link Event#data}.
++     */
++    private static final int DATA_CHILD = -1;
++
++    private static final String[] EMPTY_STRING_ARRAY = new String[0];
+ 
+     private static final Pattern SPLIT_PATTERN = Pattern.compile("[\\[\\]]");
+ 
+-    private List<String> path;
+-    private String key;
+-    private String reference;
++    /**
++     * Holds all existing {@link FieldReference} instances for de-duplication.
++     */
++    private static final Map<FieldReference, FieldReference> DEDUP = new HashMap<>(64);
+ 
+-    public FieldReference(List<String> path, String key, String reference) {
+-        this.path = path;
++    /**
++     * Unique {@link FieldReference} pointing at the timestamp field in a {@link Event}.
++     */
++    public static final FieldReference TIMESTAMP_REFERENCE =
++        deduplicate(new FieldReference(EMPTY_STRING_ARRAY, Event.TIMESTAMP, DATA_CHILD));
++
++    private static final FieldReference METADATA_PARENT_REFERENCE =
++        new FieldReference(EMPTY_STRING_ARRAY, Event.METADATA, META_PARENT);
++
++    private final String[] path;
++
++    private final String key;
++
++    private final int hash;
++    
++    /**
++     * Either {@link FieldReference#META_PARENT}, {@link FieldReference#META_CHILD} or
++     * {@link FieldReference#DATA_CHILD}.
++     */
++    private final int type;
++
++    private FieldReference(final String[] path, final String key, final int type) {
+         this.key = key;
+-        this.reference = reference;
++        this.type = type;
++        this.path = path;
++        hash = calculateHash(this.key, this.path, this.type);
+     }
+ 
+-    public List<String> getPath() {
++    public static FieldReference parse(final CharSequence reference) {
++        final String[] parts = SPLIT_PATTERN.split(reference);
++        final List<String> path = new ArrayList<>(parts.length);
++        for (final String part : parts) {
++            if (!part.isEmpty()) {
++                path.add(part);
++            }
++        }
++        final String key = path.remove(path.size() - 1);
++        final boolean empty = path.isEmpty();
++        if (empty && key.equals(Event.METADATA)) {
++            return METADATA_PARENT_REFERENCE;
++        } else if (!empty && path.get(0).equals(Event.METADATA)) {
++            return deduplicate(new FieldReference(
++                path.subList(1, path.size()).toArray(EMPTY_STRING_ARRAY), key, META_CHILD));
++        } else {
++            return deduplicate(
++                new FieldReference(path.toArray(EMPTY_STRING_ARRAY), key, DATA_CHILD));
++        }
++    }
++
++    /**
++     * Returns the type of this instance to allow for fast switch operations in
++     * {@link Event#getUnconvertedField(FieldReference)} and
++     * {@link Event#setField(FieldReference, Object)}.
++     * @return Type of the FieldReference
++     */
++    public int type() {
++        return type;
++    }
++
++    public String[] getPath() {
+         return path;
+     }
+ 
+@@ -27,19 +101,49 @@ public String getKey() {
+         return key;
+     }
+ 
+-    public String getReference() {
+-        return reference;
++    @Override
++    public boolean equals(final Object that) {
++        if (this == that) return true;
++        if (!(that instanceof FieldReference)) return false;
++        final FieldReference other = (FieldReference) that;
++        return type == other.type && key.equals(other.key) && Arrays.equals(path, other.path);
+     }
+ 
+-    public static FieldReference parse(String reference) {
+-        final String[] parts = SPLIT_PATTERN.split(reference);
+-        List<String> path = new ArrayList<>(parts.length);
+-        for (final String part : parts) {
+-            if (!part.isEmpty()) {
+-                path.add(part);
+-            }
++    @Override
++    public int hashCode() {
++        return hash;
++    }
++    
++    /**
++     * De-duplicates instances using {@link FieldReference#DEDUP}. This method must be
++     * {@code synchronized} since we are running non-atomic get-put sequence on
++     * {@link FieldReference#DEDUP}.
++     * @param parsed FieldReference to de-duplicate
++     * @return De-duplicated FieldReference
++     */
++    private static synchronized FieldReference deduplicate(final FieldReference parsed) {
++        FieldReference ret = DEDUP.get(parsed);
++        if (ret == null) {
++            DEDUP.put(parsed, parsed);
++            ret = parsed;
++        }
++        return ret;
++    }
++
++    /**
++     * Effective hashcode implementation using knowledge of field types.
++     * @param key Key Field
++     * @param path Path Field
++     * @param type Type Field
++     * @return Hash Code
++     */
++    private static int calculateHash(final String key, final String[] path, final int type) {
++        final int prime = 31;
++        int hash = prime;
++        for (final String element : path) {
++            hash = prime * hash + element.hashCode();
+         }
+-        String key = path.remove(path.size() - 1);
+-        return new FieldReference(path, key, reference);
++        hash = prime * hash + key.hashCode();
++        return prime * hash + type;
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/PathCache.java b/logstash-core/src/main/java/org/logstash/PathCache.java
+index 2d295fafa49..c54c4a66991 100644
+--- a/logstash-core/src/main/java/org/logstash/PathCache.java
++++ b/logstash-core/src/main/java/org/logstash/PathCache.java
+@@ -5,34 +5,24 @@
+ 
+ public final class PathCache {
+ 
+-    private static final Map<String, FieldReference> cache =
++    private static final Map<CharSequence, FieldReference> CACHE =
+         new ConcurrentHashMap<>(64, 0.2F, 1);
+ 
+-    private static final FieldReference timestamp = cache(Event.TIMESTAMP);
+-
+-    private static final String BRACKETS_TIMESTAMP = "[" + Event.TIMESTAMP + "]";
+-
+-    static {
+-        // inject @timestamp
+-        cache.put(BRACKETS_TIMESTAMP, timestamp);
++    private PathCache() {
+     }
+ 
+-    public static boolean isTimestamp(String reference) {
+-        return cache(reference) == timestamp;
+-    }
+-
+-    public static FieldReference cache(String reference) {
++    public static FieldReference cache(final CharSequence reference) {
+         // atomicity between the get and put is not important
+-        final FieldReference result = cache.get(reference);
++        final FieldReference result = CACHE.get(reference);
+         if (result != null) {
+             return result;
+         }
+         return parseToCache(reference);
+     }
+-    
+-    private static FieldReference parseToCache(final String reference) {
++
++    private static FieldReference parseToCache(final CharSequence reference) {
+         final FieldReference result = FieldReference.parse(reference);
+-        cache.put(reference, result);
++        CACHE.put(reference, result);
+         return result;
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java b/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java
+index 1836841d2d4..4ea04af2b14 100644
+--- a/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java
++++ b/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java
+@@ -20,6 +20,7 @@
+ import org.jruby.runtime.load.Library;
+ import org.logstash.ConvertedMap;
+ import org.logstash.Event;
++import org.logstash.FieldReference;
+ import org.logstash.PathCache;
+ import org.logstash.Rubyfier;
+ import org.logstash.Valuefier;
+@@ -96,16 +97,17 @@ public IRubyObject ruby_initialize(ThreadContext context, IRubyObject[] args) {
+         @JRubyMethod(name = "get", required = 1)
+         public IRubyObject ruby_get_field(ThreadContext context, RubyString reference)
+         {
+-            Object value = this.event.getUnconvertedField(reference.asJavaString());
+-            return Rubyfier.deep(context.runtime, value);
++            return Rubyfier.deep(
++                context.runtime,
++                this.event.getUnconvertedField(PathCache.cache(reference.getByteList()))
++            );
+         }
+ 
+         @JRubyMethod(name = "set", required = 2)
+         public IRubyObject ruby_set_field(ThreadContext context, RubyString reference, IRubyObject value)
+         {
+-            String r = reference.asJavaString();
+-
+-            if (PathCache.isTimestamp(r)) {
++            final FieldReference r = PathCache.cache(reference.getByteList());
++            if (r  == FieldReference.TIMESTAMP_REFERENCE) {
+                 if (!(value instanceof JrubyTimestampExtLibrary.RubyTimestamp)) {
+                     throw context.runtime.newTypeError("wrong argument type " + value.getMetaClass() + " (expected LogStash::Timestamp)");
+                 }
+@@ -137,15 +139,18 @@ public IRubyObject ruby_cancelled(ThreadContext context)
+         }
+ 
+         @JRubyMethod(name = "include?", required = 1)
+-        public IRubyObject ruby_includes(ThreadContext context, RubyString reference)
+-        {
+-            return RubyBoolean.newBoolean(context.runtime, this.event.includes(reference.asJavaString()));
++        public IRubyObject ruby_includes(ThreadContext context, RubyString reference) {
++            return RubyBoolean.newBoolean(
++                context.runtime, this.event.includes(PathCache.cache(reference.getByteList()))
++            );
+         }
+ 
+         @JRubyMethod(name = "remove", required = 1)
+-        public IRubyObject ruby_remove(ThreadContext context, RubyString reference)
+-        {
+-            return Rubyfier.deep(context.runtime, this.event.remove(reference.asJavaString()));
++        public IRubyObject ruby_remove(ThreadContext context, RubyString reference) {
++            return Rubyfier.deep(
++                context.runtime,
++                this.event.remove(PathCache.cache(reference.getByteList()))
++            );
+         }
+ 
+         @JRubyMethod(name = "clone")
+diff --git a/logstash-core/src/test/java/org/logstash/AccessorsTest.java b/logstash-core/src/test/java/org/logstash/AccessorsTest.java
+index ee06aade3be..b5833c91d3b 100644
+--- a/logstash-core/src/test/java/org/logstash/AccessorsTest.java
++++ b/logstash-core/src/test/java/org/logstash/AccessorsTest.java
+@@ -20,7 +20,7 @@ public void testBareGet() throws Exception {
+         Map<Serializable, Object> data = new HashMap<>();
+         data.put("foo", "bar");
+         String reference = "foo";
+-        assertEquals(new StringBiValue("bar"), Accessors.get(ConvertedMap.newFromMap(data), reference));
++        assertEquals(new StringBiValue("bar"), get(ConvertedMap.newFromMap(data), reference));
+     }
+ 
+     @Test
+@@ -28,7 +28,7 @@ public void testAbsentBareGet() throws Exception {
+         Map<Serializable, Object>  data = new HashMap<>();
+         data.put("foo", "bar");
+         String reference = "baz";
+-        assertNull(Accessors.get(ConvertedMap.newFromMap(data), reference));
++        assertNull(get(ConvertedMap.newFromMap(data), reference));
+     }
+ 
+     @Test
+@@ -36,7 +36,7 @@ public void testBareBracketsGet() throws Exception {
+         Map<Serializable, Object>  data = new HashMap<>();
+         data.put("foo", "bar");
+         String reference = "[foo]";
+-        assertEquals(new StringBiValue("bar"), Accessors.get(ConvertedMap.newFromMap(data), reference));
++        assertEquals(new StringBiValue("bar"), get(ConvertedMap.newFromMap(data), reference));
+     }
+ 
+     @Test
+@@ -46,7 +46,7 @@ public void testDeepMapGet() throws Exception {
+         data.put("foo", inner);
+         inner.put("bar", "baz");
+         String reference = "[foo][bar]";
+-        assertEquals(new StringBiValue("baz"), Accessors.get(ConvertedMap.newFromMap(data), reference));
++        assertEquals(new StringBiValue("baz"), get(ConvertedMap.newFromMap(data), reference));
+     }
+ 
+     @Test
+@@ -56,7 +56,7 @@ public void testAbsentDeepMapGet() throws Exception {
+         data.put("foo", inner);
+         inner.put("bar", "baz");
+         String reference = "[foo][foo]";
+-        assertNull(Accessors.get(ConvertedMap.newFromMap(data), reference));
++        assertNull(get(ConvertedMap.newFromMap(data), reference));
+     }
+ 
+     @Test
+@@ -66,7 +66,7 @@ public void testDeepListGet() throws Exception {
+         data.put("foo", inner);
+         inner.add("bar");
+         String reference = "[foo][0]";
+-        assertEquals(new StringBiValue("bar"), Accessors.get(ConvertedMap.newFromMap(data), reference));
++        assertEquals(new StringBiValue("bar"), get(ConvertedMap.newFromMap(data), reference));
+     }
+ 
+     @Test
+@@ -76,7 +76,7 @@ public void testAbsentDeepListGet() throws Exception {
+         data.put("foo", inner);
+         inner.add("bar");
+         String reference = "[foo][1]";
+-        assertNull(Accessors.get(ConvertedMap.newFromMap(data), reference));
++        assertNull(get(ConvertedMap.newFromMap(data), reference));
+     }
+     /*
+      * Check if accessors are able to recovery from
+@@ -94,18 +94,18 @@ public void testInvalidIdList() throws Exception {
+ 
+         String reference = "[map1][IdNonNumeric]";
+ 
+-        assertNull(Accessors.get(data, reference));
+-        assertNull(Accessors.set(data, reference, "obj3"));
+-        assertFalse(Accessors.includes(data, reference));
+-        assertNull(Accessors.del(data, reference));
++        assertNull(get(data, reference));
++        assertNull(set(data, reference, "obj3"));
++        assertFalse(includes(data, reference));
++        assertNull(del(data, reference));
+     }
+ 
+     @Test
+     public void testBarePut() throws Exception {
+         final ConvertedMap data = new ConvertedMap(1);
+         String reference = "foo";
+-        assertEquals("bar", Accessors.set(data, reference, "bar"));
+-        assertEquals("bar", Accessors.get(data, reference));
++        assertEquals("bar", set(data, reference, "bar"));
++        assertEquals("bar", get(data, reference));
+     }
+ 
+     @Test
+@@ -113,8 +113,8 @@ public void testBareBracketsPut() throws Exception {
+         final ConvertedMap data = new ConvertedMap(1);
+         String reference = "[foo]";
+ 
+-        assertEquals("bar", Accessors.set(data, reference, "bar"));
+-        assertEquals("bar", Accessors.get(data, reference));
++        assertEquals("bar", set(data, reference, "bar"));
++        assertEquals("bar", get(data, reference));
+     }
+ 
+     @Test
+@@ -123,8 +123,8 @@ public void testDeepMapSet() throws Exception {
+ 
+         String reference = "[foo][bar]";
+ 
+-        assertEquals("baz", Accessors.set(data, reference, "baz"));
+-        assertEquals("baz", Accessors.get(data, reference));
++        assertEquals("baz", set(data, reference, "baz"));
++        assertEquals("baz", get(data, reference));
+     }
+ 
+     @Test
+@@ -135,39 +135,39 @@ public void testDel() throws Exception {
+         inner.add("bar");
+         data.put("bar", "baz");
+ 
+-        assertEquals("bar", Accessors.del(data, "[foo][0]"));
+-        assertNull(Accessors.del(data, "[foo][0]"));
+-        assertEquals(new ConvertedList(0), Accessors.get(data,"[foo]"));
+-        assertEquals("baz", Accessors.del(data, "[bar]"));
+-        assertNull(Accessors.get(data, "[bar]"));
++        assertEquals("bar", del(data, "[foo][0]"));
++        assertNull(del(data, "[foo][0]"));
++        assertEquals(new ConvertedList(0), get(data,"[foo]"));
++        assertEquals("baz", del(data, "[bar]"));
++        assertNull(get(data, "[bar]"));
+     }
+ 
+     @Test
+     public void testNilInclude() throws Exception {
+         final ConvertedMap data = new ConvertedMap(1);
+         data.put("nilfield", null);
+-        assertTrue(Accessors.includes(data, "nilfield"));
++        assertTrue(includes(data, "nilfield"));
+     }
+ 
+     @Test
+     public void testInvalidPath() throws Exception {
+         final ConvertedMap data = new ConvertedMap(1);
+ 
+-        assertEquals(1, Accessors.set(data, "[foo]", 1));
+-        assertNull(Accessors.get(data, "[foo][bar]"));
++        assertEquals(1, set(data, "[foo]", 1));
++        assertNull(get(data, "[foo][bar]"));
+     }
+ 
+     @Test
+     public void testStaleTargetCache() throws Exception {
+         final ConvertedMap data = new ConvertedMap(1);
+ 
+-        assertNull(Accessors.get(data,"[foo][bar]"));
+-        assertEquals("baz", Accessors.set(data,"[foo][bar]", "baz"));
+-        assertEquals("baz", Accessors.get(data, "[foo][bar]"));
++        assertNull(get(data,"[foo][bar]"));
++        assertEquals("baz", set(data,"[foo][bar]", "baz"));
++        assertEquals("baz", get(data, "[foo][bar]"));
+ 
+-        assertEquals("boom", Accessors.set(data, "[foo]", "boom"));
+-        assertNull(Accessors.get(data, "[foo][bar]"));
+-        assertEquals("boom", Accessors.get(data,"[foo]"));
++        assertEquals("boom", set(data, "[foo]", "boom"));
++        assertNull(get(data, "[foo][bar]"));
++        assertEquals("boom", get(data,"[foo]"));
+     }
+ 
+     @Test
+@@ -179,4 +179,21 @@ public void testListIndexOutOfBounds() {
+         assertEquals(1, Accessors.listIndex(-9, 10));
+         assertEquals(0, Accessors.listIndex(-10, 10));
+     }
++
++    private static Object get(final ConvertedMap data, final CharSequence reference) {
++        return Accessors.get(data, PathCache.cache(reference));
++    }
++
++    private static Object set(final ConvertedMap data, final CharSequence reference,
++        final Object value) {
++        return Accessors.set(data, PathCache.cache(reference), value);
++    }
++
++    private static Object del(final ConvertedMap data, final CharSequence reference) {
++        return Accessors.del(data, PathCache.cache(reference));
++    }
++
++    private static boolean includes(final ConvertedMap data, final CharSequence reference) {
++        return Accessors.includes(data, PathCache.cache(reference));
++    }
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/FieldReferenceTest.java b/logstash-core/src/test/java/org/logstash/FieldReferenceTest.java
+index 280975f3230..68d1527b3c4 100644
+--- a/logstash-core/src/test/java/org/logstash/FieldReferenceTest.java
++++ b/logstash-core/src/test/java/org/logstash/FieldReferenceTest.java
+@@ -2,35 +2,42 @@
+ 
+ import org.junit.Test;
+ 
+-import static org.junit.Assert.*;
++import static org.junit.Assert.assertArrayEquals;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
+ 
+-public class FieldReferenceTest {
++public final class FieldReferenceTest {
+ 
+     @Test
+     public void testParseSingleBareField() throws Exception {
+         FieldReference f = FieldReference.parse("foo");
+-        assertTrue(f.getPath().isEmpty());
++        assertEquals(0, f.getPath().length);
+         assertEquals(f.getKey(), "foo");
+     }
+ 
+     @Test
+     public void testParseSingleFieldPath() throws Exception {
+         FieldReference f = FieldReference.parse("[foo]");
+-        assertTrue(f.getPath().isEmpty());
++        assertEquals(0, f.getPath().length);
+         assertEquals(f.getKey(), "foo");
+     }
+ 
+     @Test
+     public void testParse2FieldsPath() throws Exception {
+         FieldReference f = FieldReference.parse("[foo][bar]");
+-        assertArrayEquals(f.getPath().toArray(), new String[]{"foo"});
++        assertArrayEquals(f.getPath(), new String[]{"foo"});
+         assertEquals(f.getKey(), "bar");
+     }
+ 
+     @Test
+     public void testParse3FieldsPath() throws Exception {
+         FieldReference f = FieldReference.parse("[foo][bar]]baz]");
+-        assertArrayEquals(f.getPath().toArray(), new String[]{"foo", "bar"});
++        assertArrayEquals(f.getPath(), new String[]{"foo", "bar"});
+         assertEquals(f.getKey(), "baz");
+     }
+-}
+\ No newline at end of file
++
++    @Test
++    public void deduplicatesTimestamp() throws Exception {
++        assertTrue(FieldReference.parse("@timestamp") == FieldReference.parse("[@timestamp]"));
++    }
++}

@@ -1,0 +1,588 @@
+diff --git a/config/logstash.yml b/config/logstash.yml
+index 1e93cf6dacc..71d43a6cd01 100644
+--- a/config/logstash.yml
++++ b/config/logstash.yml
+@@ -132,7 +132,7 @@
+ # When secured with SSL and Basic Auth, the API is bound to _all_ interfaces
+ # unless configured otherwise.
+ #
+-# api.http.host: 127.0.0.1
++api.http.host: 0.0.0.0 # 127.0.0.1
+ #
+ # The HTTP API web server will listen on an available port from the given range.
+ # Values can be specified as a single port (e.g., `9600`), or an inclusive range
+@@ -148,9 +148,12 @@
+ # The HTTP API can be secured with SSL (TLS). To do so, you will need to provide
+ # the path to a password-protected keystore in p12 or jks format, along with credentials.
+ #
+-# api.ssl.enabled: false
+-# api.ssl.keystore.path: /path/to/keystore.jks
+-# api.ssl.keystore.password: "y0uRp4$$w0rD"
++api.ssl.enabled: true
++api.ssl.keystore.path: /home/kares/workspace/work/elastic/logstash/qa/integration/fixtures/webserver_certs/generated/server_from_root_and_root.p12
++api.ssl.keystore.password: "12345678"
++
++api.ssl.client_authentication: required
++
+ #
+ # The HTTP API can be configured to require authentication. Acceptable values are
+ #  - `none`:  no auth is required (default)
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 6a34b8debeb..0d9459fd81c 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -79,6 +79,7 @@ module Environment
+            Setting::Boolean.new("api.ssl.enabled", false),
+   Setting::ExistingFilePath.new("api.ssl.keystore.path", nil, false).nullable,
+           Setting::Password.new("api.ssl.keystore.password", nil, false).nullable,
++            Setting::String.new("api.ssl.client_authentication", "none", true, %w(none optional required)),
+             Setting::String.new("queue.type", "memory", true, ["persisted", "memory"]),
+             Setting::Boolean.new("queue.drain", false),
+             Setting::Bytes.new("queue.page_capacity", "64mb"),
+diff --git a/logstash-core/lib/logstash/webserver.rb b/logstash-core/lib/logstash/webserver.rb
+index 93fa29914c8..3d3f545e0b3 100644
+--- a/logstash-core/lib/logstash/webserver.rb
++++ b/logstash-core/lib/logstash/webserver.rb
+@@ -41,6 +41,11 @@ def self.from_settings(logger, agent, settings)
+         ssl_params = {}
+         ssl_params[:keystore_path] = required_setting(settings, 'api.ssl.keystore.path', "api.ssl.enabled")
+         ssl_params[:keystore_password] = required_setting(settings, 'api.ssl.keystore.password', "api.ssl.enabled")
++        ssl_params[:verify_mode] = {
++            'none'     => 'none',
++            'optional' => 'peer',
++            'required' => 'force_peer',
++        }.fetch(settings.get('api.ssl.client_authentication'))
+ 
+         options[:ssl_params] = ssl_params.freeze
+       else
+@@ -184,7 +189,8 @@ def bind_to_available_port
+           if @ssl_params
+             unwrapped_ssl_params = {
+               'keystore'      => @ssl_params.fetch(:keystore_path),
+-              'keystore-pass' => @ssl_params.fetch(:keystore_password).value
++              'keystore-pass' => @ssl_params.fetch(:keystore_password).value,
++              'verify_mode'   => @ssl_params.fetch(:verify_mode)
+             }
+             ssl_context = Puma::MiniSSL::ContextBuilder.new(unwrapped_ssl_params, @server.events).context
+             @server.add_ssl_listener(http_host, candidate_port, ssl_context)
+diff --git a/qa/integration/fixtures/webserver_certs/generate.sh b/qa/integration/fixtures/webserver_certs/generate.sh
+index 544165cf201..19fac06c8a7 100755
+--- a/qa/integration/fixtures/webserver_certs/generate.sh
++++ b/qa/integration/fixtures/webserver_certs/generate.sh
+@@ -16,30 +16,30 @@ openssl req -new -x509 -days 1826 -extensions ca -key root.key -out root.crt -su
+ # intermediate CA
+ openssl genrsa -out intermediate-ca.key 4096
+ openssl req -new -key intermediate-ca.key -out intermediate-ca.csr -subj "/C=PT/ST=NA/L=Lisbon/O=MyLab/CN=intermediate-ca" -config ../openssl.cnf
+-openssl x509 -req -days 1000 -extfile ../openssl.cnf -extensions intermediate_ca -in intermediate-ca.csr -CA root.crt -CAkey root.key -out intermediate-ca.crt -set_serial 01
++openssl x509 -req -days 1000 -extfile ../openssl.cnf -extensions intermediate_ca -in intermediate-ca.csr -CA root.crt -CAkey root.key -set_serial 01 -sha256 -out intermediate-ca.crt
+ 
+ # server certificate from intermediate CA
+ openssl genrsa -out server_from_intermediate.key 4096
+ openssl req -new -key server_from_intermediate.key -out server_from_intermediate.csr -subj "/C=PT/ST=NA/L=Lisbon/O=MyLab/CN=server" -config ../openssl.cnf
+-openssl x509 -req -extensions server_cert -extfile ../openssl.cnf -days 1000 -in server_from_intermediate.csr -CA intermediate-ca.crt -CAkey intermediate-ca.key -set_serial 02 -out server_from_intermediate.crt
++openssl x509 -req -extensions server_cert -extfile ../openssl.cnf -days 1000 -in server_from_intermediate.csr -CA intermediate-ca.crt -CAkey intermediate-ca.key -set_serial 02 -sha256 -out server_from_intermediate.crt
+ 
+ # server certificate from root
+ openssl genrsa -out server_from_root.key 4096
+ openssl req -new -key server_from_root.key -out server_from_root.csr -subj "/C=PT/ST=NA/L=Lisbon/O=MyLab/CN=server" -config ../openssl.cnf
+-openssl x509 -req -extensions server_cert -extfile ../openssl.cnf -days 1000 -in server_from_root.csr -CA root.crt -CAkey root.key -set_serial 03 -out server_from_root.crt
++openssl x509 -req -extensions server_cert -extfile ../openssl.cnf -days 1000 -in server_from_root.csr -CA root.crt -CAkey root.key -set_serial 03 -sha256 -out server_from_root.crt
+ 
+ 
+ # Client certificates - We don't need them now
+ 
+ # client certificate from intermediate CA
+-# openssl genrsa -out client_from_intermediate.key 4096
+-# openssl req -new -key client_from_intermediate.key -out client_from_intermediate.csr -subj "/C=PT/ST=NA/L=Lisbon/O=MyLab/CN=client" -config ../openssl.cnf
+-# openssl x509 -req -extensions client_cert -extfile ../openssl.cnf -days 1000 -in client_from_intermediate.csr -CA intermediate-ca.crt -CAkey intermediate-ca.key -set_serial 04 -out client_from_intermediate.crt
++openssl genrsa -out client_from_intermediate.key 4096
++openssl req -new -key client_from_intermediate.key -out client_from_intermediate.csr -subj "/C=PT/ST=NA/L=Lisbon/O=MyLab/CN=client" -config ../openssl.cnf
++openssl x509 -req -extensions client_cert -extfile ../openssl.cnf -days 1000 -in client_from_intermediate.csr -CA intermediate-ca.crt -CAkey intermediate-ca.key -set_serial 04 -out client_from_intermediate.crt
+ 
+ # client certificate from root
+-# openssl genrsa -out client_from_root.key 4096
+-# openssl req -new -key client_from_root.key -out client_from_root.csr -subj "/C=PT/ST=NA/L=Lisbon/O=MyLab/CN=client" -config ../openssl.cnf
+-# openssl x509 -req -extensions client_cert -extfile ../openssl.cnf -days 1000 -in client_from_root.csr -CA root.crt -CAkey root.key -set_serial 04 -out client_from_root.crt
++openssl genrsa -out client_from_root.key 4096
++openssl req -new -key client_from_root.key -out client_from_root.csr -subj "/C=PT/ST=NA/L=Lisbon/O=MyLab/CN=client" -config ../openssl.cnf
++openssl x509 -req -extensions client_cert -extfile ../openssl.cnf -days 1000 -in client_from_root.csr -CA root.crt -CAkey root.key -set_serial 04 -out client_from_root.crt
+ 
+ # create server chain pems.
+ cat intermediate-ca.crt server_from_intermediate.crt > server_from_intermediate.chain.crt
+@@ -65,6 +65,8 @@ openssl pkcs12 -export -in server_from_root.chain.crt -inkey server_from_root.ke
+ # use java keytool to convert all pkcs12 keystores to jks-format keystores (pass:12345678)
+ keytool -importkeystore -srckeystore server_from_intermediate.p12 -srcstoretype pkcs12 -srcstorepass 12345678 -destkeystore server_from_intermediate.jks -deststorepass 12345678 -alias server_from_intermediate
+ keytool -importkeystore -srckeystore server_from_root.p12 -srcstoretype pkcs12 -srcstorepass 12345678 -destkeystore server_from_root.jks -deststorepass 12345678 -alias server_from_root
++cp server_from_root.p12 server_from_root_and_root.p12
++keytool -importcert -storetype PKCS12 -keystore server_from_root_and_root.p12 -storepass 12345678 -alias root -file root.crt -noprompt
+ 
+ # cleanup csr, we don't need them
+ rm -rf *.csr
+diff --git a/qa/integration/fixtures/webserver_certs/generated/client_from_intermediate.crt b/qa/integration/fixtures/webserver_certs/generated/client_from_intermediate.crt
+new file mode 100644
+index 00000000000..cdcb445dd93
+--- /dev/null
++++ b/qa/integration/fixtures/webserver_certs/generated/client_from_intermediate.crt
+@@ -0,0 +1,35 @@
++-----BEGIN CERTIFICATE-----
++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
++01Y=
++-----END CERTIFICATE-----
+diff --git a/qa/integration/fixtures/webserver_certs/generated/client_from_intermediate.key b/qa/integration/fixtures/webserver_certs/generated/client_from_intermediate.key
+new file mode 100644
+index 00000000000..0637e08cece
+--- /dev/null
++++ b/qa/integration/fixtures/webserver_certs/generated/client_from_intermediate.key
+@@ -0,0 +1,51 @@
++-----BEGIN RSA PRIVATE KEY-----
++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
++-----END RSA PRIVATE KEY-----
+diff --git a/qa/integration/fixtures/webserver_certs/generated/client_from_root.crt b/qa/integration/fixtures/webserver_certs/generated/client_from_root.crt
+new file mode 100644
+index 00000000000..691d1b8bcb7
+--- /dev/null
++++ b/qa/integration/fixtures/webserver_certs/generated/client_from_root.crt
+@@ -0,0 +1,34 @@
++-----BEGIN CERTIFICATE-----
++MIIF8zCCA9ugAwIBAgIBBDANBgkqhkiG9w0BAQsFADBKMQswCQYDVQQGEwJQVDEL
++MAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxDTAL
++BgNVBAMMBHJvb3QwHhcNMjExMDI2MTcyMDQ2WhcNMjQwNzIyMTcyMDQ2WjBMMQsw
++CQYDVQQGEwJQVDELMAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UE
++CgwFTXlMYWIxDzANBgNVBAMMBmNsaWVudDCCAiIwDQYJKoZIhvcNAQEBBQADggIP
++ADCCAgoCggIBALj5hzbq13iu/rIgVuvn1cFGnCdFH1bAbwqJljjHqgkbkvhQ3QXl
++78Trzcr9yIQSXzahuBNpvcwTREDyrUMRWPNjw5KRC572h/4UloT87HwGIRNW2NnU
++BUuYq4ZcyX+akSIxM168cXfVHD3L739nGDlyCDwP0SCWXpuYhEXnlqnYCwVfDWyv
++TDh7TA75p6AHcFMNj3MhPJLyaX9CZMns1mZFqs9Yue9RYSM+CaNXKH4u2aDH/rXU
++gIYff1Tdng5Pg37FROx6asGFLNazKwWCRfUV4hog3R/wsAqk2HygePj3yUICne/I
++0XqRy1rTQM0DHDIP7y6aNvSi5cD60q4iGYiyCOYXIbp8P7UW7oX86hXOdcaP4v3j
++yge6/875Abmj/OIF+jQCZdVBnP5EbX2tLKX4gWb3h/yLtHODLd7KCqAB8a64lau3
++0Fj0M7vPefNQTUWQy/vqCcrAlCLkEYkseMJJDD6uoo14Mx+oiBDasVgtt0RwTg6i
++sczVAu+H+j5FWIVQgWM8JRv/jqxuspdgRqFQySSOrrd8ca+jwvxvaKRRDc/eYx94
++5k1I85uXz/fATE718R1wFR15x1HzRORqvcIiM+gMgzQGvVgEVWa8/OEo9Mdv2j4K
++1+/wuzID8Z9COm7mguZdtfVmzePTiz/WsrV/EYn9U+fHm/LTjvR8CHk3AgMBAAGj
++geEwgd4wCQYDVR0TBAIwADARBglghkgBhvhCAQEEBAMCBaAwMwYJYIZIAYb4QgEN
++BCYWJE9wZW5TU0wgR2VuZXJhdGVkIENsaWVudCBDZXJ0aWZpY2F0ZTAdBgNVHQ4E
++FgQUCwCle602/RNFY0vdilIIqQCLE/gwHwYDVR0jBBgwFoAUljtVFZBZeSzrqZWN
++PMQS3HxsnPowDgYDVR0PAQH/BAQDAgXgMB0GA1UdJQQWMBQGCCsGAQUFBwMCBggr
++BgEFBQcDBDAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwDQYJKoZIhvcNAQEL
++BQADggIBAH5XJGV3uXk5Q8o33CHACVkjhhcYlkZPaTNcp5XUcm+z49vOeg6Gjejw
++lTpZgpaXlZpwbrQCUY0DvTbbhN8i0uZq/QaOH3nlFkojqT5uZz5D5SkrvJM6KlDH
++HF4BWqls1Y26OVk500G5qiiG6Dinej37g007Gs58ym9uBhNSfuU0T+Yum5QWiZgi
++X0lJ5nj42Q1jrUgXIxRoJeiKGnRbQZNce6l4V/7JtLZQuktdkiIGFGAnmaYBHtDe
++sbSXCPzgx2fOa+D+FY7sD5LPR2CK1sCOfSACpknU2H0t1swiR65hVMAp7F1uxSEN
++5za07Ghmo0kJj4DrgMdZ+yWfX16Vq7hArPfvAuFP9jn+iLmVfi0w4Gaiva8NzNmB
++BEU/s5PXPbxi/lNghsXFDb8jMqFeD4+OeH2VV2IDRpcPw5PXrAjP+Ppk/0dilA4B
++cvNNLs1vFJFAQHBOeeXt1jbfiuZjLE3Jg1mDp4E2z3HCL0q/8rK8InqVhBCv7oIy
++gQn3dWiqR6M7agXh0+2wrhGDAupO4KLbn/Nj+dUy3dpeI91NKLZru8ZtEV5MBW/S
++3l5ES8J14LknPuw7ikIjvtfg8OHkm7fmJYFCXctJdUTw1K42FdvCjHs61ez8QiJX
++n6mFCdd+ngCarH6/IIdEVNv6p1orsZVQCy4USMkvKHtZnYy88jsC
++-----END CERTIFICATE-----
+diff --git a/qa/integration/fixtures/webserver_certs/generated/client_from_root.key b/qa/integration/fixtures/webserver_certs/generated/client_from_root.key
+new file mode 100644
+index 00000000000..67ef6dc0229
+--- /dev/null
++++ b/qa/integration/fixtures/webserver_certs/generated/client_from_root.key
+@@ -0,0 +1,51 @@
++-----BEGIN RSA PRIVATE KEY-----
++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
++-----END RSA PRIVATE KEY-----
+diff --git a/qa/integration/fixtures/webserver_certs/generated/intermediate-ca.crt b/qa/integration/fixtures/webserver_certs/generated/intermediate-ca.crt
+index e772b2ea1fa..89c547991e9 100644
+--- a/qa/integration/fixtures/webserver_certs/generated/intermediate-ca.crt
++++ b/qa/integration/fixtures/webserver_certs/generated/intermediate-ca.crt
+@@ -1,7 +1,7 @@
+ -----BEGIN CERTIFICATE-----
+-MIIFgDCCA2igAwIBAgIBATANBgkqhkiG9w0BAQUFADBKMQswCQYDVQQGEwJQVDEL
++MIIFgDCCA2igAwIBAgIBATANBgkqhkiG9w0BAQsFADBKMQswCQYDVQQGEwJQVDEL
+ MAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxDTAL
+-BgNVBAMMBHJvb3QwHhcNMjExMDE5MTgyNzI4WhcNMjQwNzE1MTgyNzI4WjBVMQsw
++BgNVBAMMBHJvb3QwHhcNMjExMDI2MTQwMDQ1WhcNMjQwNzIyMTQwMDQ1WjBVMQsw
+ CQYDVQQGEwJQVDELMAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UE
+ CgwFTXlMYWIxGDAWBgNVBAMMD2ludGVybWVkaWF0ZS1jYTCCAiIwDQYJKoZIhvcN
+ AQEBBQADggIPADCCAgoCggIBAPHXRKHl/LsaDFGnys0b4mlLlGQ6qJSC5ut8FZoa
+@@ -17,16 +17,16 @@ TM5PtxpZCLmqELaBFydB5hEBQly8Fxh3SVpuwkcaCxOlXMkdvHEK9daYfE9jV0fu
+ StfckkCLdDZMHI+iSdQsqK6E9vc4tX2rnhzgKex0Byu0GUEg6XoFL2GKdUOvRZTJ
+ /tMxAgMBAAGjZjBkMB0GA1UdDgQWBBR6wQ0Is6YucsLFNwdZ3ANX1jrgsjAfBgNV
+ HSMEGDAWgBSWO1UVkFl5LOuplY08xBLcfGyc+jASBgNVHRMBAf8ECDAGAQH/AgEA
+-MA4GA1UdDwEB/wQEAwIBhjANBgkqhkiG9w0BAQUFAAOCAgEANoo45TDx1lfglAmJ
+-8nt/58y7fm8trxmrSQmDAIuXZKqATNsEw/+VbIXqeC9sT2lWY9URFmmFm505JP+1
+-43nM68cjfAK7ihLcGS7XwQMtQCgiQzJKeZFOx/l30lN5rRje5HHbSIF+uuwO987J
+-LNYJ+rS7N25lB5EQY8satuZWMVtSZ7YQCMkSJve7KjfrbE3kORjHs6jn3bdyuWAr
+-oApgKJgCUX3JSPZyH3T/xakMneZNkYr0CC1kNi9wL4js5I/nN2Z4er0N1Zt6PIM+
+-hIJcW/Qv0BtI4bzkNkGSehm+Ofr+njuqWaaQMF7kLPTGDg/0SN63Y+X59CJQMnjF
+-+oW0oGm30S3okFpgXSU+DDxNPlh1j3jTMoArPvIaTceImfmsBXU62JRXQWaAr1jF
+-EujYbTJ147/7NmsmnskFO37Mp35JxL3ELWfMeBAL/HC11mzUbGFhtvtFqhQMWMbt
+-5AAR9ZUaPO8xTX6Ag8/8MXF5wFRkJBqTNn6GaX5PUrWhlAKpGuAuuR1NBY5TGUHX
+-NcFu+bf5JtjhgSUGB0FuZfdZvw46k30NLlT39NbXayY102XYfrAsl0X0TNqjQua1
+-7j7FqYrAALQVLfYeKrE0nKaH35nU6Kk1Iy42CbB71MHqcg7DTjn0MvTKZcnQ8pxv
+-RQwP+BXkzwfWWEp05rlVeKS0IjQ=
++MA4GA1UdDwEB/wQEAwIBhjANBgkqhkiG9w0BAQsFAAOCAgEAoamqg8XW7vqLxBy5
++pE+SxGAB3cxuYSVsFEHWHMJBaCU5PN6yGpGdQIREH1mSbJ5Tib9646CLts6MFUY6
++RsuDubiW52nfuMMAlBS7qLFqzYrZXyDU8sYV1Uo/hCcarEknVE1rohmtX7E/lkSb
++EirJaTLd3/hRRVtT7mB3zbgeO37U0mkuVsMlJdS/nIqialkvNoPW4V1PB+GzX/WT
++lL3yxESAL51tVBQhxyVU2UTVYQOhqVDrjfzzH9lU6+e2LO2oxVBVayy15WaEYY2K
++3ioDx/WVWwmaybC2aPA/bRwnuJbVma41/yXk58mGXjkiJE9uI4mB1wkqTHvl1Xsx
++Ss/FvdNEBYpSyA1f68NbD9FRPmwjcnynLMe8Z7yZ2inN4WJ/pgwiWytYRvUYr7DM
++6d2kx+/SWA3I42ymCtFFwpyLyDdegm7KHpQ7SU67pZC/kIpoyf4BdmiCTN0JrFv3
++91lT/HLHvXwSPArIKCxkS2Y17f4BAcJoL0gQWj32MM659cYG8VYagenT/B7+hN0l
++ntDfiidljTNWMd8yLCzDSq5sxvyxjN+MQAdyRC0KRzGEtGCkiTKoQ7zrznzaIvIc
++9yJSgU4Vjs3zVMaqujqt1j0TvGDwg/ce2WJInqXkvEA8WLhce+1H2wJ/S1UL9wEf
++IQE08RMX9UlCONdPurZt8HPRlwg=
+ -----END CERTIFICATE-----
+diff --git a/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.chain.crt b/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.chain.crt
+index f4c8cf7f5a5..85410a0b028 100644
+--- a/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.chain.crt
++++ b/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.chain.crt
+@@ -1,7 +1,7 @@
+ -----BEGIN CERTIFICATE-----
+-MIIFgDCCA2igAwIBAgIBATANBgkqhkiG9w0BAQUFADBKMQswCQYDVQQGEwJQVDEL
++MIIFgDCCA2igAwIBAgIBATANBgkqhkiG9w0BAQsFADBKMQswCQYDVQQGEwJQVDEL
+ MAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxDTAL
+-BgNVBAMMBHJvb3QwHhcNMjExMDE5MTgyNzI4WhcNMjQwNzE1MTgyNzI4WjBVMQsw
++BgNVBAMMBHJvb3QwHhcNMjExMDI2MTQwMDQ1WhcNMjQwNzIyMTQwMDQ1WjBVMQsw
+ CQYDVQQGEwJQVDELMAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UE
+ CgwFTXlMYWIxGDAWBgNVBAMMD2ludGVybWVkaWF0ZS1jYTCCAiIwDQYJKoZIhvcN
+ AQEBBQADggIPADCCAgoCggIBAPHXRKHl/LsaDFGnys0b4mlLlGQ6qJSC5ut8FZoa
+@@ -17,24 +17,24 @@ TM5PtxpZCLmqELaBFydB5hEBQly8Fxh3SVpuwkcaCxOlXMkdvHEK9daYfE9jV0fu
+ StfckkCLdDZMHI+iSdQsqK6E9vc4tX2rnhzgKex0Byu0GUEg6XoFL2GKdUOvRZTJ
+ /tMxAgMBAAGjZjBkMB0GA1UdDgQWBBR6wQ0Is6YucsLFNwdZ3ANX1jrgsjAfBgNV
+ HSMEGDAWgBSWO1UVkFl5LOuplY08xBLcfGyc+jASBgNVHRMBAf8ECDAGAQH/AgEA
+-MA4GA1UdDwEB/wQEAwIBhjANBgkqhkiG9w0BAQUFAAOCAgEANoo45TDx1lfglAmJ
+-8nt/58y7fm8trxmrSQmDAIuXZKqATNsEw/+VbIXqeC9sT2lWY9URFmmFm505JP+1
+-43nM68cjfAK7ihLcGS7XwQMtQCgiQzJKeZFOx/l30lN5rRje5HHbSIF+uuwO987J
+-LNYJ+rS7N25lB5EQY8satuZWMVtSZ7YQCMkSJve7KjfrbE3kORjHs6jn3bdyuWAr
+-oApgKJgCUX3JSPZyH3T/xakMneZNkYr0CC1kNi9wL4js5I/nN2Z4er0N1Zt6PIM+
+-hIJcW/Qv0BtI4bzkNkGSehm+Ofr+njuqWaaQMF7kLPTGDg/0SN63Y+X59CJQMnjF
+-+oW0oGm30S3okFpgXSU+DDxNPlh1j3jTMoArPvIaTceImfmsBXU62JRXQWaAr1jF
+-EujYbTJ147/7NmsmnskFO37Mp35JxL3ELWfMeBAL/HC11mzUbGFhtvtFqhQMWMbt
+-5AAR9ZUaPO8xTX6Ag8/8MXF5wFRkJBqTNn6GaX5PUrWhlAKpGuAuuR1NBY5TGUHX
+-NcFu+bf5JtjhgSUGB0FuZfdZvw46k30NLlT39NbXayY102XYfrAsl0X0TNqjQua1
+-7j7FqYrAALQVLfYeKrE0nKaH35nU6Kk1Iy42CbB71MHqcg7DTjn0MvTKZcnQ8pxv
+-RQwP+BXkzwfWWEp05rlVeKS0IjQ=
++MA4GA1UdDwEB/wQEAwIBhjANBgkqhkiG9w0BAQsFAAOCAgEAoamqg8XW7vqLxBy5
++pE+SxGAB3cxuYSVsFEHWHMJBaCU5PN6yGpGdQIREH1mSbJ5Tib9646CLts6MFUY6
++RsuDubiW52nfuMMAlBS7qLFqzYrZXyDU8sYV1Uo/hCcarEknVE1rohmtX7E/lkSb
++EirJaTLd3/hRRVtT7mB3zbgeO37U0mkuVsMlJdS/nIqialkvNoPW4V1PB+GzX/WT
++lL3yxESAL51tVBQhxyVU2UTVYQOhqVDrjfzzH9lU6+e2LO2oxVBVayy15WaEYY2K
++3ioDx/WVWwmaybC2aPA/bRwnuJbVma41/yXk58mGXjkiJE9uI4mB1wkqTHvl1Xsx
++Ss/FvdNEBYpSyA1f68NbD9FRPmwjcnynLMe8Z7yZ2inN4WJ/pgwiWytYRvUYr7DM
++6d2kx+/SWA3I42ymCtFFwpyLyDdegm7KHpQ7SU67pZC/kIpoyf4BdmiCTN0JrFv3
++91lT/HLHvXwSPArIKCxkS2Y17f4BAcJoL0gQWj32MM659cYG8VYagenT/B7+hN0l
++ntDfiidljTNWMd8yLCzDSq5sxvyxjN+MQAdyRC0KRzGEtGCkiTKoQ7zrznzaIvIc
++9yJSgU4Vjs3zVMaqujqt1j0TvGDwg/ce2WJInqXkvEA8WLhce+1H2wJ/S1UL9wEf
++IQE08RMX9UlCONdPurZt8HPRlwg=
+ -----END CERTIFICATE-----
+ -----BEGIN CERTIFICATE-----
+-MIIGSTCCBDGgAwIBAgIBAjANBgkqhkiG9w0BAQUFADBVMQswCQYDVQQGEwJQVDEL
++MIIGSTCCBDGgAwIBAgIBAjANBgkqhkiG9w0BAQsFADBVMQswCQYDVQQGEwJQVDEL
+ MAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxGDAW
+-BgNVBAMMD2ludGVybWVkaWF0ZS1jYTAeFw0yMTEwMTkxODI3MzFaFw0yNDA3MTUx
+-ODI3MzFaMEwxCzAJBgNVBAYTAlBUMQswCQYDVQQIDAJOQTEPMA0GA1UEBwwGTGlz
++BgNVBAMMD2ludGVybWVkaWF0ZS1jYTAeFw0yMTEwMjYxNDAxMDlaFw0yNDA3MjIx
++NDAxMDlaMEwxCzAJBgNVBAYTAlBUMQswCQYDVQQIDAJOQTEPMA0GA1UEBwwGTGlz
+ Ym9uMQ4wDAYDVQQKDAVNeUxhYjEPMA0GA1UEAwwGc2VydmVyMIICIjANBgkqhkiG
+ 9w0BAQEFAAOCAg8AMIICCgKCAgEAvkyxB/z2frDqa1F3lDqkW5L0F5L0sGZiOnzR
+ 0kgPsPtxIjt3ntm+8SZAL7dJ4VSmH7DNo/IUtwent/ypN9b7rR11kl3EDcCoISPf
+@@ -53,16 +53,16 @@ aWNhdGUwHQYDVR0OBBYEFBFYhgtW76vGDcp6aW80KokkSmJgMHIGA1UdIwRrMGmA
+ FHrBDQizpi5ywsU3B1ncA1fWOuCyoU6kTDBKMQswCQYDVQQGEwJQVDELMAkGA1UE
+ CAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxDTALBgNVBAMM
+ BHJvb3SCAQEwDgYDVR0PAQH/BAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMBoG
+-A1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQUFAAOCAgEAnwfk
+-vd9EAll9Bo8G2Hj5ibLDnS4hdFnT3Z8J3Okgj8jme6vKInJrNm7wepWZEqq/Sqhs
+-B4uYCHYN86WrOalSqON3KsT0cue6gRKXSe/zjhNc9Uk2emJsR+uPNrUrfrIlL7Z8
+-IQmewQTkfbsKL+AqT3VzIdPENnEK1N9u5w0ie5vxVz2xPbtVjqmsNgiFaAP3r8pA
+-mIKW3Pbay8q3wMEAWXw6EHTKelj9/7QpshzgR3AM9sYnbcr+pycRZTBEwuCv5Kvm
+-jbUFxY8BMZPS/b0ZbPgs8rBxE0BhMt+VlgpDbskeT25/0V2pPbAcyHQth6Qker5w
+-DcycKMaGGQYivLfyz+9kktIOm3AGoUdCHRxAc7xmSkIhFhQVzEgAnlK0QeojntOg
+-c65vbgy9x6WdTkSwMBRa4d9oNPSreTIq1ygUKOAwxZo+X38q4Oo4MTQrXDNOhGbR
+-/ylw/avihYJszGl9lCni6kIuqCw8CN2pvQTQcvU9UJTgy6LC7CzPqFfPjBXxN65P
+-WV+7N0dZ9MWHb+eAoVA/ykUrp52oStAqCYLRwCxC5NjDRXR6AdXtXTC9a3T3JLkR
+-LW7j8CqFmbMjhuys3Y8MEysgxKAg1PFggkeN5O5uOJXWqlUF8X2ipoMSnSIIa+Q6
+-4C4CAspB8k7S5LNUVzw7V4RVLG4Mi1cSCy+Sggc=
++A1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQsFAAOCAgEATavS
++MZZGc42ujcjgsconLbgDMOTfqOEos7IagjLsgGbtqJKUnhEv3W0bUfeWg2paqeRR
++xh/0XFvHg8WzWyYiL0sAE2lKU8gSTFjliKIKK9sUjJhWyATywsqHercC4InHs3hb
++nae2Y2SPRQSJ/OZl8/L3VvpPF610ouqoJH9Dyzfw3D/M7w4mC9xOBn6t3KOhYcIv
++TKcFD9YQmWd/JfzqD/UatA1Dwpl+lALHfi30TveUIcN9Sp9HOzc9HfYcjeU4vFjP
++Wm4x+nAnEhRGO1FsF/F72VTW5JCrxB7c1/YJmpnf63dQPEO5vVRwZssPVHNIUk8/
++XQT2hzU0RCIx7DEMQOAxm3hUfQID5zEK4DkHY4zdKC4mUGgRYDcEw8d98WM4VPUl
++xFq/wmkv9HhxCEp9M1drFrXj0QGfnrj4ckyjdxP5+4kl1QtMejMGDia1azp1Z8w9
++FlfJx15VXT7hwcJTp44IjukH9tmTkzw8k8CA46hCy0ihbbmOqW/A1zxhTH4m7nZx
++RCPouFYawA6CPoC0eO1nf1ld3o+0iuK7S7MZ+lY0/4b88ANlPR1QGdsNU01PQ/J/
++QHnuJLNJWz3Cfb62708hqsICe5P1cmvbuqYl7esevgmlR3fqRT5bANWGz8dKGyxh
++73F7RsgsIhKWPql6Q787dZrau2kab2OyiNomoGs=
+ -----END CERTIFICATE-----
+diff --git a/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.crt b/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.crt
+index 7329e46a571..905876548f4 100644
+--- a/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.crt
++++ b/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.crt
+@@ -1,8 +1,8 @@
+ -----BEGIN CERTIFICATE-----
+-MIIGSTCCBDGgAwIBAgIBAjANBgkqhkiG9w0BAQUFADBVMQswCQYDVQQGEwJQVDEL
++MIIGSTCCBDGgAwIBAgIBAjANBgkqhkiG9w0BAQsFADBVMQswCQYDVQQGEwJQVDEL
+ MAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxGDAW
+-BgNVBAMMD2ludGVybWVkaWF0ZS1jYTAeFw0yMTEwMTkxODI3MzFaFw0yNDA3MTUx
+-ODI3MzFaMEwxCzAJBgNVBAYTAlBUMQswCQYDVQQIDAJOQTEPMA0GA1UEBwwGTGlz
++BgNVBAMMD2ludGVybWVkaWF0ZS1jYTAeFw0yMTEwMjYxNDAxMDlaFw0yNDA3MjIx
++NDAxMDlaMEwxCzAJBgNVBAYTAlBUMQswCQYDVQQIDAJOQTEPMA0GA1UEBwwGTGlz
+ Ym9uMQ4wDAYDVQQKDAVNeUxhYjEPMA0GA1UEAwwGc2VydmVyMIICIjANBgkqhkiG
+ 9w0BAQEFAAOCAg8AMIICCgKCAgEAvkyxB/z2frDqa1F3lDqkW5L0F5L0sGZiOnzR
+ 0kgPsPtxIjt3ntm+8SZAL7dJ4VSmH7DNo/IUtwent/ypN9b7rR11kl3EDcCoISPf
+@@ -21,16 +21,16 @@ aWNhdGUwHQYDVR0OBBYEFBFYhgtW76vGDcp6aW80KokkSmJgMHIGA1UdIwRrMGmA
+ FHrBDQizpi5ywsU3B1ncA1fWOuCyoU6kTDBKMQswCQYDVQQGEwJQVDELMAkGA1UE
+ CAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxDTALBgNVBAMM
+ BHJvb3SCAQEwDgYDVR0PAQH/BAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMBoG
+-A1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQUFAAOCAgEAnwfk
+-vd9EAll9Bo8G2Hj5ibLDnS4hdFnT3Z8J3Okgj8jme6vKInJrNm7wepWZEqq/Sqhs
+-B4uYCHYN86WrOalSqON3KsT0cue6gRKXSe/zjhNc9Uk2emJsR+uPNrUrfrIlL7Z8
+-IQmewQTkfbsKL+AqT3VzIdPENnEK1N9u5w0ie5vxVz2xPbtVjqmsNgiFaAP3r8pA
+-mIKW3Pbay8q3wMEAWXw6EHTKelj9/7QpshzgR3AM9sYnbcr+pycRZTBEwuCv5Kvm
+-jbUFxY8BMZPS/b0ZbPgs8rBxE0BhMt+VlgpDbskeT25/0V2pPbAcyHQth6Qker5w
+-DcycKMaGGQYivLfyz+9kktIOm3AGoUdCHRxAc7xmSkIhFhQVzEgAnlK0QeojntOg
+-c65vbgy9x6WdTkSwMBRa4d9oNPSreTIq1ygUKOAwxZo+X38q4Oo4MTQrXDNOhGbR
+-/ylw/avihYJszGl9lCni6kIuqCw8CN2pvQTQcvU9UJTgy6LC7CzPqFfPjBXxN65P
+-WV+7N0dZ9MWHb+eAoVA/ykUrp52oStAqCYLRwCxC5NjDRXR6AdXtXTC9a3T3JLkR
+-LW7j8CqFmbMjhuys3Y8MEysgxKAg1PFggkeN5O5uOJXWqlUF8X2ipoMSnSIIa+Q6
+-4C4CAspB8k7S5LNUVzw7V4RVLG4Mi1cSCy+Sggc=
++A1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQsFAAOCAgEATavS
++MZZGc42ujcjgsconLbgDMOTfqOEos7IagjLsgGbtqJKUnhEv3W0bUfeWg2paqeRR
++xh/0XFvHg8WzWyYiL0sAE2lKU8gSTFjliKIKK9sUjJhWyATywsqHercC4InHs3hb
++nae2Y2SPRQSJ/OZl8/L3VvpPF610ouqoJH9Dyzfw3D/M7w4mC9xOBn6t3KOhYcIv
++TKcFD9YQmWd/JfzqD/UatA1Dwpl+lALHfi30TveUIcN9Sp9HOzc9HfYcjeU4vFjP
++Wm4x+nAnEhRGO1FsF/F72VTW5JCrxB7c1/YJmpnf63dQPEO5vVRwZssPVHNIUk8/
++XQT2hzU0RCIx7DEMQOAxm3hUfQID5zEK4DkHY4zdKC4mUGgRYDcEw8d98WM4VPUl
++xFq/wmkv9HhxCEp9M1drFrXj0QGfnrj4ckyjdxP5+4kl1QtMejMGDia1azp1Z8w9
++FlfJx15VXT7hwcJTp44IjukH9tmTkzw8k8CA46hCy0ihbbmOqW/A1zxhTH4m7nZx
++RCPouFYawA6CPoC0eO1nf1ld3o+0iuK7S7MZ+lY0/4b88ANlPR1QGdsNU01PQ/J/
++QHnuJLNJWz3Cfb62708hqsICe5P1cmvbuqYl7esevgmlR3fqRT5bANWGz8dKGyxh
++73F7RsgsIhKWPql6Q787dZrau2kab2OyiNomoGs=
+ -----END CERTIFICATE-----
+diff --git a/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.jks b/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.jks
+index 86a0a72c5db..efa54ce5ec0 100644
+Binary files a/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.jks and b/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.jks differ
+diff --git a/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.p12 b/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.p12
+index 3181caeb3bd..6025c27375c 100644
+Binary files a/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.p12 and b/qa/integration/fixtures/webserver_certs/generated/server_from_intermediate.p12 differ
+diff --git a/qa/integration/fixtures/webserver_certs/generated/server_from_root.chain.crt b/qa/integration/fixtures/webserver_certs/generated/server_from_root.chain.crt
+index 6ba9acb7a07..d619768b1b3 100644
+--- a/qa/integration/fixtures/webserver_certs/generated/server_from_root.chain.crt
++++ b/qa/integration/fixtures/webserver_certs/generated/server_from_root.chain.crt
+@@ -1,7 +1,7 @@
+ -----BEGIN CERTIFICATE-----
+-MIIGRjCCBC6gAwIBAgIBAzANBgkqhkiG9w0BAQUFADBKMQswCQYDVQQGEwJQVDEL
++MIIGRjCCBC6gAwIBAgIBAzANBgkqhkiG9w0BAQsFADBKMQswCQYDVQQGEwJQVDEL
+ MAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxDTAL
+-BgNVBAMMBHJvb3QwHhcNMjExMDE5MTgyNzMyWhcNMjQwNzE1MTgyNzMyWjBMMQsw
++BgNVBAMMBHJvb3QwHhcNMjExMDI2MTQwMTI4WhcNMjQwNzIyMTQwMTI4WjBMMQsw
+ CQYDVQQGEwJQVDELMAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UE
+ CgwFTXlMYWIxDzANBgNVBAMMBnNlcnZlcjCCAiIwDQYJKoZIhvcNAQEBBQADggIP
+ ADCCAgoCggIBAKJZa8jP+LalBAlQ8uWWlTm8TLHWkGLFxr+rNzs23mAAfLo8FFGJ
+@@ -21,16 +21,16 @@ DgQWBBQGuAQ6NLkmWyZGLYEAYVc3+43eIDB6BgNVHSMEczBxgBSWO1UVkFl5LOup
+ lY08xBLcfGyc+qFOpEwwSjELMAkGA1UEBhMCUFQxCzAJBgNVBAgMAk5BMQ8wDQYD
+ VQQHDAZMaXNib24xDjAMBgNVBAoMBU15TGFiMQ0wCwYDVQQDDARyb290ggkAzDBe
+ dcABQHMwDgYDVR0PAQH/BAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMBoGA1Ud
+-EQQTMBGCCWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQUFAAOCAgEAoUitYEBW
+-lzBMuuDMHvVrtwTcKNXeOXZ6PC78OXNxGCSK4CxTzOceyHjj0K30r2qOd4hNbq43
+-J60Zf+69qIpkezG3hcCy/8Yu1lLyhxLvErCbgkvZ1MH4HkEyJOeoh0PJoIq1U3vu
+-SA2Ny6LDA5QOWaVME6c1L0ntueu5/BddrTGtqHvK4Td9E3Y8gQhtJHCkN2GbkRRS
+-vr2+efC2hNIWEfxFTP+RRKKGfn+B+YASPgLDvHpIapz65MVebJH+gIo/k57swPMJ
+-K3Zet53tXqUvnbh87vyGdaOpq897WISNfleQ/XJB28Q3G5qBdLiTu7oxYG42XhC1
+-qIm4pZ/gGW5lauu3h9bvzODB2DV6ShnBujtzbd0vBBX38BMP2oOOQ3X2QgalGOKO
+-jd6yTCN6VO0ZiFD4xO2XsE1CKkRqPx9rRCKR85NCvlpyytC4KIZjcomf0miMl9e1
+-G9Js2y9agiXgQ5lrlZSQ8XyvRD8PC1anCxeyn8HaBblYNwUZ8S6vXkq7K13MuPgX
+-3vw106gUcWjw6GwC3BOi7UNtcAYyoXn6jLJ2unpn2mqjpCfbQZ3mnAI7MbEoaSFa
+-1CTYh9bxYK6cN+8dOnYoXUyD27aDq6xfP9YJoNmQdYTW4Wwf5JCK23j2DtDB/qen
+-uyydJBuI6Me+ctWntImvjM97Teu8s+ssQaA=
++EQQTMBGCCWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQsFAAOCAgEATy+ZX7ps
++XWwn29vhMwTHPYxXHlzI6nSj+t2pcadMeAURAc/on8zWBN4/jyeLUBhqABDaZUIK
++Wuc6PsWr8WUJ5GJvMyaRg6C2iK54R/EbpUyv8Ht00iZ50cj6fOkPfsRGZfXM/ftc
++USFZtZd2Fsj4uxhc9RXClQm3UBwkMZi2ON1kizvjUHMuTRwS8TZgFwpLPtyZcZJT
++RsmRVhI3Bofm22UdsRlWeRYVNuMvrXI9NZbBsDtsvujo7lhl0yrgZ0aTfurvIlv5
++Qfi66g5iRiu2FJsAS/67ZlEniabtq+16/+nN8BoLb3lYwpSEf746OtwMpmHD7gOd
++OfMGTmhvxSthUDO29vpgXtuysc6FfD0valTdsOhauvPHsVMO9mLl3pbB7XhgF1vL
++kO7XJ50UyWL76fORywEKB5+Y1B/IwjNv3PGpTPM4et6R6qI9INOg1GH8FHBojBVV
++rXjYvLkFQ/a5InkutroKe3+FbNpBX4eg/k1k68VvuG9aS18KmHAsLM8xQQ7esHGd
++nwoex+zZGJUTDYNGUvU/HYezhwoHZG/bkuzMqTYt4cBjVCTbSba60WU8RplyblXx
++NgyXS1XaLn0ub50xROuxisWI8P7JDKprB+NxLV8bhREMU8YbSb4a0qtMJoFPVXCq
++pTcOvEGTVP0l6daZ6mmNjlIZmJLsJH3Wi1g=
+ -----END CERTIFICATE-----
+diff --git a/qa/integration/fixtures/webserver_certs/generated/server_from_root.crt b/qa/integration/fixtures/webserver_certs/generated/server_from_root.crt
+index 6ba9acb7a07..d619768b1b3 100644
+--- a/qa/integration/fixtures/webserver_certs/generated/server_from_root.crt
++++ b/qa/integration/fixtures/webserver_certs/generated/server_from_root.crt
+@@ -1,7 +1,7 @@
+ -----BEGIN CERTIFICATE-----
+-MIIGRjCCBC6gAwIBAgIBAzANBgkqhkiG9w0BAQUFADBKMQswCQYDVQQGEwJQVDEL
++MIIGRjCCBC6gAwIBAgIBAzANBgkqhkiG9w0BAQsFADBKMQswCQYDVQQGEwJQVDEL
+ MAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UECgwFTXlMYWIxDTAL
+-BgNVBAMMBHJvb3QwHhcNMjExMDE5MTgyNzMyWhcNMjQwNzE1MTgyNzMyWjBMMQsw
++BgNVBAMMBHJvb3QwHhcNMjExMDI2MTQwMTI4WhcNMjQwNzIyMTQwMTI4WjBMMQsw
+ CQYDVQQGEwJQVDELMAkGA1UECAwCTkExDzANBgNVBAcMBkxpc2JvbjEOMAwGA1UE
+ CgwFTXlMYWIxDzANBgNVBAMMBnNlcnZlcjCCAiIwDQYJKoZIhvcNAQEBBQADggIP
+ ADCCAgoCggIBAKJZa8jP+LalBAlQ8uWWlTm8TLHWkGLFxr+rNzs23mAAfLo8FFGJ
+@@ -21,16 +21,16 @@ DgQWBBQGuAQ6NLkmWyZGLYEAYVc3+43eIDB6BgNVHSMEczBxgBSWO1UVkFl5LOup
+ lY08xBLcfGyc+qFOpEwwSjELMAkGA1UEBhMCUFQxCzAJBgNVBAgMAk5BMQ8wDQYD
+ VQQHDAZMaXNib24xDjAMBgNVBAoMBU15TGFiMQ0wCwYDVQQDDARyb290ggkAzDBe
+ dcABQHMwDgYDVR0PAQH/BAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMBoGA1Ud
+-EQQTMBGCCWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQUFAAOCAgEAoUitYEBW
+-lzBMuuDMHvVrtwTcKNXeOXZ6PC78OXNxGCSK4CxTzOceyHjj0K30r2qOd4hNbq43
+-J60Zf+69qIpkezG3hcCy/8Yu1lLyhxLvErCbgkvZ1MH4HkEyJOeoh0PJoIq1U3vu
+-SA2Ny6LDA5QOWaVME6c1L0ntueu5/BddrTGtqHvK4Td9E3Y8gQhtJHCkN2GbkRRS
+-vr2+efC2hNIWEfxFTP+RRKKGfn+B+YASPgLDvHpIapz65MVebJH+gIo/k57swPMJ
+-K3Zet53tXqUvnbh87vyGdaOpq897WISNfleQ/XJB28Q3G5qBdLiTu7oxYG42XhC1
+-qIm4pZ/gGW5lauu3h9bvzODB2DV6ShnBujtzbd0vBBX38BMP2oOOQ3X2QgalGOKO
+-jd6yTCN6VO0ZiFD4xO2XsE1CKkRqPx9rRCKR85NCvlpyytC4KIZjcomf0miMl9e1
+-G9Js2y9agiXgQ5lrlZSQ8XyvRD8PC1anCxeyn8HaBblYNwUZ8S6vXkq7K13MuPgX
+-3vw106gUcWjw6GwC3BOi7UNtcAYyoXn6jLJ2unpn2mqjpCfbQZ3mnAI7MbEoaSFa
+-1CTYh9bxYK6cN+8dOnYoXUyD27aDq6xfP9YJoNmQdYTW4Wwf5JCK23j2DtDB/qen
+-uyydJBuI6Me+ctWntImvjM97Teu8s+ssQaA=
++EQQTMBGCCWxvY2FsaG9zdIcEfwAAATANBgkqhkiG9w0BAQsFAAOCAgEATy+ZX7ps
++XWwn29vhMwTHPYxXHlzI6nSj+t2pcadMeAURAc/on8zWBN4/jyeLUBhqABDaZUIK
++Wuc6PsWr8WUJ5GJvMyaRg6C2iK54R/EbpUyv8Ht00iZ50cj6fOkPfsRGZfXM/ftc
++USFZtZd2Fsj4uxhc9RXClQm3UBwkMZi2ON1kizvjUHMuTRwS8TZgFwpLPtyZcZJT
++RsmRVhI3Bofm22UdsRlWeRYVNuMvrXI9NZbBsDtsvujo7lhl0yrgZ0aTfurvIlv5
++Qfi66g5iRiu2FJsAS/67ZlEniabtq+16/+nN8BoLb3lYwpSEf746OtwMpmHD7gOd
++OfMGTmhvxSthUDO29vpgXtuysc6FfD0valTdsOhauvPHsVMO9mLl3pbB7XhgF1vL
++kO7XJ50UyWL76fORywEKB5+Y1B/IwjNv3PGpTPM4et6R6qI9INOg1GH8FHBojBVV
++rXjYvLkFQ/a5InkutroKe3+FbNpBX4eg/k1k68VvuG9aS18KmHAsLM8xQQ7esHGd
++nwoex+zZGJUTDYNGUvU/HYezhwoHZG/bkuzMqTYt4cBjVCTbSba60WU8RplyblXx
++NgyXS1XaLn0ub50xROuxisWI8P7JDKprB+NxLV8bhREMU8YbSb4a0qtMJoFPVXCq
++pTcOvEGTVP0l6daZ6mmNjlIZmJLsJH3Wi1g=
+ -----END CERTIFICATE-----
+diff --git a/qa/integration/fixtures/webserver_certs/generated/server_from_root.jks b/qa/integration/fixtures/webserver_certs/generated/server_from_root.jks
+index 1596eef7b5d..300e983b2a4 100644
+Binary files a/qa/integration/fixtures/webserver_certs/generated/server_from_root.jks and b/qa/integration/fixtures/webserver_certs/generated/server_from_root.jks differ
+diff --git a/qa/integration/fixtures/webserver_certs/generated/server_from_root.p12 b/qa/integration/fixtures/webserver_certs/generated/server_from_root.p12
+index 11d41714b40..d44535f983a 100644
+Binary files a/qa/integration/fixtures/webserver_certs/generated/server_from_root.p12 and b/qa/integration/fixtures/webserver_certs/generated/server_from_root.p12 differ
+diff --git a/qa/integration/fixtures/webserver_certs/generated/server_from_root_and_root.p12 b/qa/integration/fixtures/webserver_certs/generated/server_from_root_and_root.p12
+new file mode 100644
+index 00000000000..2d2b1b9f145
+Binary files /dev/null and b/qa/integration/fixtures/webserver_certs/generated/server_from_root_and_root.p12 differ

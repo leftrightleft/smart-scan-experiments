@@ -1,0 +1,524 @@
+diff --git a/bin/lock b/bin/lock
+deleted file mode 100755
+index a8a0529a943..00000000000
+--- a/bin/lock
++++ /dev/null
+@@ -1,9 +0,0 @@
+-#!/usr/bin/env bin/ruby
+-
+-require_relative "../lib/bootstrap/environment"
+-LogStash::Bundler.setup!({:without => [:build, :development]})
+-require "logstash-core"
+-
+-lock = Java::OrgLogstash::FileLockFactory.getDefault.obtainLock(ARGV[0], ".lock")
+-puts("locking " + File.join(ARGV[0], ".lock"))
+-sleep
+diff --git a/docs/static/offline-plugins.asciidoc b/docs/static/offline-plugins.asciidoc
+index 508b79fe71b..b67f34169bb 100644
+--- a/docs/static/offline-plugins.asciidoc
++++ b/docs/static/offline-plugins.asciidoc
+@@ -60,14 +60,23 @@ To install an offline plugin pack:
+ 
+ . Move the compressed bundle to the machine where you want to install the plugins.
+ 
+-. Run the `bin/logstash-plugin install` subcommand to install the packaged plugins:
++. Run the `bin/logstash-plugin install` subcommand and pass in the file URI of
++the offline plugin pack. 
+ +
+ ["source","sh",subs="attributes"]
++.Windows example:
++-------------------------------------------------------------------------------
++bin/logstash-plugin install file:///c:/path/to/logstash-offline-plugins-{logstash_version}.zip
++-------------------------------------------------------------------------------
+++
++["source","sh",subs="attributes"]
++.Linux example:
+ -------------------------------------------------------------------------------
+ bin/logstash-plugin install file:///path/to/logstash-offline-plugins-{logstash_version}.zip
+ -------------------------------------------------------------------------------
+ +
+-Where +path/to/logstash-offline-plugins-{logstash_version}.zip+ is the path to the offline plugin pack.
++This command expects a file URI, so make sure you use forward slashes and
++specify the full path to the pack.
+ 
+ [float]
+ === Updating Offline Plugins
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index 3fd8b58b218..11ca63339d0 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -25,7 +25,7 @@ class LogStash::Agent
+   include LogStash::Util::Loggable
+   STARTED_AT = Time.now.freeze
+ 
+-  attr_reader :metric, :name, :pipelines, :settings, :webserver, :dispatcher
++  attr_reader :metric, :name, :settings, :webserver, :dispatcher
+   attr_accessor :logger
+ 
+   # initialize method for LogStash::Agent
+@@ -38,7 +38,10 @@ def initialize(settings = LogStash::SETTINGS, source_loader = nil)
+     @settings = settings
+     @auto_reload = setting("config.reload.automatic")
+ 
++    # Do not use @pipelines directly. Use #with_pipelines which does locking
+     @pipelines = {}
++    @pipelines_lock = java.util.concurrent.locks.ReentrantLock.new
++
+     @name = setting("node.name")
+     @http_host = setting("http.host")
+     @http_port = setting("http.port")
+@@ -55,7 +58,6 @@ def initialize(settings = LogStash::SETTINGS, source_loader = nil)
+     end
+ 
+     @reload_interval = setting("config.reload.interval")
+-    @pipelines_mutex = Mutex.new
+ 
+     @collect_metric = setting("metric.collect")
+ 
+@@ -129,6 +131,17 @@ def stopped?
+     !@running.value
+   end
+ 
++  # Safely perform an operation on the pipelines hash
++  # Using the correct synchronization
++  def with_pipelines
++    begin
++      @pipelines_lock.lock
++      yield @pipelines
++    ensure
++      @pipelines_lock.unlock
++    end
++  end
++
+   def converge_state_and_update
+     results = @source_loader.fetch
+ 
+@@ -145,7 +158,8 @@ def converge_state_and_update
+     # content of it.
+     converge_result = nil
+ 
+-    @pipelines_mutex.synchronize do
++    # we don't use the variable here, but we want the locking
++    with_pipelines do |pipelines|
+       pipeline_actions = resolve_actions(results.response)
+       converge_result = converge_state(pipeline_actions)
+       update_metrics(converge_result)
+@@ -220,26 +234,26 @@ def id_path
+   end
+ 
+   def get_pipeline(pipeline_id)
+-    @pipelines_mutex.synchronize do
+-      @pipelines[pipeline_id]
++    with_pipelines do |pipelines|
++      pipelines[pipeline_id]
+     end
+   end
+ 
+   def pipelines_count
+-    @pipelines_mutex.synchronize do
++    with_pipelines do |pipelines|
+       pipelines.size
+     end
+   end
+ 
+   def running_pipelines
+-    @pipelines_mutex.synchronize do
+-      @pipelines.select {|pipeline_id, _| running_pipeline?(pipeline_id) }
++    with_pipelines do |pipelines|
++      pipelines.select {|pipeline_id, _| running_pipeline?(pipeline_id) }
+     end
+   end
+ 
+   def running_pipelines?
+-    @pipelines_mutex.synchronize do
+-      @pipelines.select {|pipeline_id, _| running_pipeline?(pipeline_id) }.any?
++    with_pipelines do |pipelines|
++      pipelines.select {|pipeline_id, _| running_pipeline?(pipeline_id) }.any?
+     end
+   end
+ 
+@@ -248,24 +262,28 @@ def running_user_defined_pipelines?
+   end
+ 
+   def running_user_defined_pipelines
+-    @pipelines_mutex.synchronize do
+-      @pipelines.select do |_, pipeline|
++    with_pipelines do |pipelines|
++      pipelines.select do |_, pipeline|
+         pipeline.running? && !pipeline.system?
+       end
+     end
+   end
+ 
+   def close_pipeline(id)
+-    pipeline = @pipelines[id]
+-    if pipeline
+-      @logger.warn("closing pipeline", :id => id)
+-      pipeline.close
++    with_pipelines do |pipelines|
++      pipeline = pipelines[id]
++      if pipeline
++        @logger.warn("closing pipeline", :id => id)
++        pipeline.close
++      end
+     end
+   end
+ 
+   def close_pipelines
+-    @pipelines.each  do |id, _|
+-      close_pipeline(id)
++    with_pipelines do |pipelines|
++      pipelines.each  do |id, _|
++        close_pipeline(id)
++      end
+     end
+   end
+ 
+@@ -308,20 +326,22 @@ def converge_state(pipeline_actions)
+       #
+       # This give us a bit more extensibility with the current startup/validation model
+       # that we currently have.
+-      begin
+-        logger.debug("Executing action", :action => action)
+-        action_result = action.execute(self, @pipelines)
+-        converge_result.add(action, action_result)
+-
+-        unless action_result.successful?
+-          logger.error("Failed to execute action", :id => action.pipeline_id,
+-                       :action_type => action_result.class, :message => action_result.message)
++      with_pipelines do |pipelines|
++        begin
++          logger.debug("Executing action", :action => action)
++            action_result = action.execute(self, pipelines)
++          converge_result.add(action, action_result)
++
++          unless action_result.successful?
++            logger.error("Failed to execute action", :id => action.pipeline_id,
++                        :action_type => action_result.class, :message => action_result.message)
++          end
++        rescue SystemExit => e
++          converge_result.add(action, e)
++        rescue Exception => e
++          logger.error("Failed to execute action", :action => action, :exception => e.class.name, :message => e.message)
++          converge_result.add(action, e)
+         end
+-      rescue SystemExit => e
+-        converge_result.add(action, e)
+-      rescue Exception => e
+-        logger.error("Failed to execute action", :action => action, :exception => e.class.name, :message => e.message)
+-        converge_result.add(action, e)
+       end
+     end
+ 
+@@ -335,7 +355,9 @@ def converge_state(pipeline_actions)
+   end
+ 
+   def resolve_actions(pipeline_configs)
+-    @state_resolver.resolve(@pipelines, pipeline_configs)
++    with_pipelines do |pipelines|
++      @state_resolver.resolve(pipelines, pipeline_configs)
++    end
+   end
+ 
+   def report_currently_running_pipelines(converge_result)
+@@ -394,9 +416,11 @@ def collect_metrics?
+   end
+ 
+   def force_shutdown_pipelines!
+-    @pipelines.each do |_, pipeline|
+-      # TODO(ph): should it be his own action?
+-      pipeline.force_shutdown!
++    with_pipelines do |pipelines|
++      pipelines.each do |_, pipeline|
++        # TODO(ph): should it be his own action?
++        pipeline.force_shutdown!
++      end
+     end
+   end
+ 
+@@ -406,19 +430,21 @@ def shutdown_pipelines
+     # In this context I could just call shutdown, but I've decided to
+     # use the stop action implementation for that so we have the same code.
+     # This also give us some context into why a shutdown is failing
+-    @pipelines_mutex.synchronize do
++    with_pipelines do |pipelines|
+       pipeline_actions = resolve_actions([]) # We stop all the pipeline, so we converge to a empty state
+       converge_state(pipeline_actions)
+     end
+   end
+ 
+   def running_pipeline?(pipeline_id)
+-    thread = @pipelines[pipeline_id].thread
++    thread = get_pipeline(pipeline_id).thread
+     thread.is_a?(Thread) && thread.alive?
+   end
+ 
+   def clean_state?
+-    @pipelines.empty?
++    with_pipelines do |pipelines|
++      pipelines.empty?
++    end
+   end
+ 
+   def setting(key)
+diff --git a/logstash-core/spec/logstash/agent_spec.rb b/logstash-core/spec/logstash/agent_spec.rb
+index a33472c01aa..1da3c75faa1 100644
+--- a/logstash-core/spec/logstash/agent_spec.rb
++++ b/logstash-core/spec/logstash/agent_spec.rb
+@@ -122,7 +122,7 @@
+ 
+           it "does not upgrade the new config" do
+             t = Thread.new { subject.execute }
+-            sleep(0.01) until subject.running_pipelines? && subject.pipelines.values.first.ready?
++            sleep(0.01) until subject.with_pipelines {|pipelines| subject.running_pipelines? && pipelines.values.first.ready? }
+ 
+             expect(subject.converge_state_and_update).not_to be_a_successful_converge
+             expect(subject).to have_running_pipeline?(mock_config_pipeline)
+@@ -141,7 +141,7 @@
+ 
+           it "does upgrade the new config" do
+             t = Thread.new { subject.execute }
+-            sleep(0.01) until subject.pipelines_count > 0 && subject.pipelines.values.first.ready?
++            sleep(0.01) until subject.with_pipelines {|pipelines| subject.pipelines_count > 0 && pipelines.values.first.ready? }
+ 
+             expect(subject.converge_state_and_update).to be_a_successful_converge
+             expect(subject).to have_running_pipeline?(mock_second_pipeline_config)
+@@ -163,7 +163,7 @@
+ 
+           it "does not try to reload the pipeline" do
+             t = Thread.new { subject.execute }
+-            sleep(0.01) until subject.running_pipelines? && subject.pipelines.values.first.running?
++            sleep(0.01) until subject.with_pipelines {|pipelines| subject.running_pipelines? && pipelines.values.first.running? }
+ 
+             expect(subject.converge_state_and_update).not_to be_a_successful_converge
+             expect(subject).to have_running_pipeline?(mock_config_pipeline)
+@@ -182,7 +182,7 @@
+ 
+           it "tries to reload the pipeline" do
+             t = Thread.new { subject.execute }
+-            sleep(0.01) until subject.running_pipelines? && subject.pipelines.values.first.running?
++            sleep(0.01) until subject.with_pipelines {|pipelines| subject.running_pipelines? && pipelines.values.first.running? }
+ 
+             expect(subject.converge_state_and_update).to be_a_successful_converge
+             expect(subject).to have_running_pipeline?(mock_second_pipeline_config)
+@@ -194,28 +194,6 @@
+         end
+       end
+     end
+-
+-    context "when auto_reload is true" do
+-      let(:agent_settings) { mock_settings("config.reload.automatic" => true, "config.reload.interval" => 0.0001) }
+-      subject { described_class.new(agent_settings, default_source_loader) }
+-
+-      let(:agent_args) { { "path.config" => config_file } }
+-
+-      context "if state is clean" do
+-        it "should periodically reload_state" do
+-          allow(subject).to receive(:clean_state?).and_return(false)
+-          t = Thread.new { subject.execute }
+-          sleep(0.01) until subject.running_pipelines? && subject.pipelines.values.first.running?
+-          expect(subject).to receive(:converge_state_and_update).at_least(2).times
+-          # TODO this is a bad practice, any suggestions on how to test something happens
+-          # without some form of timing or expiring condition?
+-          sleep 0.1
+-          Stud.stop!(t)
+-          t.join
+-          subject.shutdown
+-        end
+-      end
+-    end
+   end
+ 
+   describe "Environment Variables In Configs" do
+@@ -285,7 +263,7 @@
+     context "when the upgrade fails" do
+       it "leaves the state untouched" do
+         expect(subject.converge_state_and_update).not_to be_a_successful_converge
+-        expect(subject.pipelines[default_pipeline_id].config_str).to eq(pipeline_config)
++        expect(subject.get_pipeline(default_pipeline_id).config_str).to eq(pipeline_config)
+       end
+ 
+       # TODO(ph): This valid?
+@@ -303,12 +281,12 @@
+ 
+       it "updates the state" do
+         expect(subject.converge_state_and_update).to be_a_successful_converge
+-        expect(subject.pipelines[default_pipeline_id].config_str).to eq(new_config)
++        expect(subject.get_pipeline(default_pipeline_id).config_str).to eq(new_config)
+       end
+ 
+       it "starts the pipeline" do
+         expect(subject.converge_state_and_update).to be_a_successful_converge
+-        expect(subject.pipelines[default_pipeline_id].running?).to be_truthy
++        expect(subject.get_pipeline(default_pipeline_id).running?).to be_truthy
+       end
+     end
+   end
+diff --git a/logstash-core/src/test/java/org/logstash/FileLockFactoryMain.java b/logstash-core/src/test/java/org/logstash/FileLockFactoryMain.java
+new file mode 100644
+index 00000000000..b285ea246d5
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/FileLockFactoryMain.java
+@@ -0,0 +1,23 @@
++package org.logstash;
++
++import java.io.IOException;
++
++/*
++ * This program is used to test the FileLockFactory in cross-process/JVM.
++ */
++public class FileLockFactoryMain {
++
++    public static void main(String[] args) {
++        try {
++            FileLockFactory.getDefault().obtainLock(args[0], args[1]);
++            System.out.println("File locked");
++            // Sleep enough time until this process is killed.
++            Thread.sleep(Long.MAX_VALUE);
++        } catch (InterruptedException e) {
++            // This process is killed. Do nothing.
++        } catch (IOException e) {
++            // Failed to obtain the lock.
++            System.exit(1);
++        }
++    }
++}
+diff --git a/logstash-core/src/test/java/org/logstash/FileLockFactoryTest.java b/logstash-core/src/test/java/org/logstash/FileLockFactoryTest.java
+index f11c97dd2f6..c1487f7e501 100644
+--- a/logstash-core/src/test/java/org/logstash/FileLockFactoryTest.java
++++ b/logstash-core/src/test/java/org/logstash/FileLockFactoryTest.java
+@@ -1,16 +1,24 @@
+ package org.logstash;
+ 
++import org.junit.After;
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+ import org.junit.rules.TemporaryFolder;
+ 
+ import static org.junit.Assert.fail;
++import static org.junit.Assert.assertTrue;
+ 
+ import java.io.IOException;
++import java.io.InputStream;
+ import java.nio.channels.FileLock;
+ import java.nio.file.FileSystems;
+ import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
+ 
+ import static org.hamcrest.CoreMatchers.equalTo;
+ import static org.hamcrest.CoreMatchers.is;
+@@ -24,9 +32,12 @@ public class FileLockFactoryTest {
+ 
+     private FileLock lock;
+ 
++    private ExecutorService executor;
++
+     @Before
+     public void setUp() throws Exception {
+         lockDir = temporaryFolder.newFolder("lock").getPath();
++        executor = Executors.newSingleThreadExecutor();
+     }
+ 
+     @Before
+@@ -36,6 +47,14 @@ public void lockFirst() throws Exception {
+         assertThat(lock.isShared(), is(equalTo(false)));
+     }
+ 
++    @After
++    public void tearDown() throws Exception {
++        executor.shutdownNow();
++        if (!executor.awaitTermination(2L, TimeUnit.MINUTES)) {
++            throw new IllegalStateException("Failed to shut down Executor");
++        }
++    }
++
+     @Test
+     public void ObtainLockOnNonLocked() throws IOException {
+         // empty to just test the lone @Before lockFirst() test
+@@ -88,4 +107,45 @@ public void ReleaseUnobtainedLock() throws IOException {
+         FileLockFactory.getDefault().releaseLock(lock);
+         FileLockFactory.getDefault().releaseLock(lock);
+     }
++
++    @Test
++    public void crossJvmObtainLockOnLocked() throws Exception {
++        Process p = null;
++        String lockFile = ".testCrossJvm";
++        FileLock lock = null;
++
++        // Build the command to spawn a children JVM.
++        String[] cmd = {
++            Paths.get(System.getProperty("java.home"), "bin", "java").toString(),
++            "-cp", System.getProperty("java.class.path"),
++            Class.forName("org.logstash.FileLockFactoryMain").getName(),
++            lockDir, lockFile
++        };
++
++        try {
++            // Start the children program that will lock the file.
++            p = new ProcessBuilder(cmd).start();
++            InputStream is = p.getInputStream();
++            /* Wait the children program write to stdout, meaning the file
++             * is locked. Set a timeout to ensure it returns.
++             */
++            Future<Integer> future = executor.submit(() -> {return is.read();});
++            assertTrue(future.get(30, TimeUnit.SECONDS) > -1);
++
++            // Check the children process is still running.
++            assertThat(p.isAlive(), is(equalTo(true)));
++
++            try {
++                // Try to obtain the lock held by the children process.
++                FileLockFactory.getDefault().obtainLock(lockDir, lockFile);
++                fail("Should have threw an exception");
++            } catch (LockException e) {
++                // Expected exception as the file is already locked.
++            }
++        } finally {
++            if (p != null) {
++                p.destroy();
++            }
++        }
++    }
+ }
+diff --git a/qa/acceptance/spec/lib/cli_operation_spec.rb b/qa/acceptance/spec/lib/cli_operation_spec.rb
+index 9c11aceff83..6f6ec1a2946 100644
+--- a/qa/acceptance/spec/lib/cli_operation_spec.rb
++++ b/qa/acceptance/spec/lib/cli_operation_spec.rb
+@@ -20,6 +20,6 @@
+     it_behaves_like "logstash uninstall", logstash
+     it_behaves_like "logstash remove", logstash
+     it_behaves_like "logstash update", logstash
+-    it_behaves_like "logstash generate", logstash
++#    it_behaves_like "logstash generate", logstash
+   end
+ end
+diff --git a/qa/sys/debian/debian-8/bootstrap.sh b/qa/sys/debian/debian-8/bootstrap.sh
+index d1a23d54430..da56514aae8 100644
+--- a/qa/sys/debian/debian-8/bootstrap.sh
++++ b/qa/sys/debian/debian-8/bootstrap.sh
+@@ -1,5 +1,6 @@
+ #!/usr/bin/env bash
+ 
+ echo "deb http://http.debian.net/debian jessie-backports main" >> /etc/apt/sources.list
++puts "installing jdk8"
+ apt-get update
+-apt-get install -y openjdk-8-jdk
++apt-get install -y ca-certificates-java openjdk-8-jdk-headless
+diff --git a/rakelib/artifacts.rake b/rakelib/artifacts.rake
+index f518449740b..1f72d947bef 100644
+--- a/rakelib/artifacts.rake
++++ b/rakelib/artifacts.rake
+@@ -52,7 +52,6 @@ namespace "artifact" do
+     @exclude_paths << "bin/bundle"
+     @exclude_paths << "bin/rspec"
+     @exclude_paths << "bin/rspec.bat"
+-    @exclude_paths << "bin/lock"
+ 
+     @exclude_paths
+   end

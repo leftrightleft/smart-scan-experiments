@@ -1,0 +1,340 @@
+diff --git a/logstash-core/lib/logstash/util/wrapped_acked_queue.rb b/logstash-core/lib/logstash/util/wrapped_acked_queue.rb
+index bb838e8c0ac..b65e7171ff1 100644
+--- a/logstash-core/lib/logstash/util/wrapped_acked_queue.rb
++++ b/logstash-core/lib/logstash/util/wrapped_acked_queue.rb
+@@ -59,7 +59,7 @@ def write_client
+     end
+ 
+     def read_client()
+-      ReadClient.new(self)
++      LogStash::AckedReadClient.create(self)
+     end
+ 
+     def check_closed(action)
+@@ -76,104 +76,5 @@ def close
+       @queue.close
+       @closed.set(true)
+     end
+-
+-    class ReadClient
+-      # We generally only want one thread at a time able to access pop/take/poll operations
+-      # from this queue. We also depend on this to be able to block consumers while we snapshot
+-      # in-flight buffers
+-
+-      def initialize(queue, batch_size = 125, wait_for = 50)
+-        @queue = queue
+-        # Note that @inflight_batches as a central mechanism for tracking inflight
+-        # batches will fail if we have multiple read clients in the pipeline.
+-        @inflight_batches = Concurrent::Map.new
+-        # allow the worker thread to report the execution time of the filter + output
+-        @inflight_clocks = Concurrent::Map.new
+-        @batch_size = batch_size
+-        @wait_for = wait_for
+-      end
+-
+-      def close
+-        @queue.close
+-      end
+-
+-      def empty?
+-        @queue.is_empty?
+-      end
+-
+-      def set_batch_dimensions(batch_size, wait_for)
+-        @batch_size = batch_size
+-        @wait_for = wait_for
+-      end
+-
+-      def set_events_metric(metric)
+-        @event_metric = metric
+-        define_initial_metrics_values(@event_metric)
+-      end
+-
+-      def set_pipeline_metric(metric)
+-        @pipeline_metric = metric
+-        define_initial_metrics_values(@pipeline_metric)
+-      end
+-
+-      def define_initial_metrics_values(namespaced_metric)
+-        namespaced_metric.report_time(:duration_in_millis, 0)
+-        namespaced_metric.increment(:filtered, 0)
+-        namespaced_metric.increment(:out, 0)
+-      end
+-
+-      def inflight_batches
+-        @inflight_batches
+-      end
+-
+-      # create a new empty batch
+-      # @return [ReadBatch] a new empty read batch
+-      def new_batch
+-        LogStash::AckedReadBatch.new(@queue, 0, 0)
+-      end
+-
+-      def read_batch
+-        if @queue.closed?
+-          raise QueueClosedError.new("Attempt to take a batch from a closed AckedQueue")
+-        end
+-
+-        batch = LogStash::AckedReadBatch.new(@queue, @batch_size, @wait_for)
+-        start_metrics(batch)
+-        batch
+-      end
+-
+-      def start_metrics(batch)
+-        thread = Thread.current
+-        @inflight_batches[thread] = batch
+-        @inflight_clocks[thread] = java.lang.System.nano_time
+-      end
+-
+-      def close_batch(batch)
+-        thread = Thread.current
+-        batch.close
+-        @inflight_batches.delete(thread)
+-        start_time = @inflight_clocks.get_and_set(thread, nil)
+-        unless start_time.nil?
+-          if batch.size > 0
+-            # only stop (which also records) the metrics if the batch is non-empty.
+-            # start_clock is now called at empty batch creation and an empty batch could
+-            # stay empty all the way down to the close_batch call.
+-            time_taken = (java.lang.System.nano_time - start_time) / 1_000_000
+-            @event_metric.report_time(:duration_in_millis, time_taken)
+-            @pipeline_metric.report_time(:duration_in_millis, time_taken)
+-          end
+-        end
+-      end
+-
+-      def add_filtered_metrics(filtered_size)
+-        @event_metric.increment(:filtered, filtered_size)
+-        @pipeline_metric.increment(:filtered, filtered_size)
+-      end
+-
+-      def add_output_metrics(filtered_size)
+-        @event_metric.increment(:out, filtered_size)
+-        @pipeline_metric.increment(:out, filtered_size)
+-      end
+-    end
+   end
+ end end
+diff --git a/logstash-core/src/main/java/org/logstash/RubyUtil.java b/logstash-core/src/main/java/org/logstash/RubyUtil.java
+index 6249c578216..9e25ae3883f 100644
+--- a/logstash-core/src/main/java/org/logstash/RubyUtil.java
++++ b/logstash-core/src/main/java/org/logstash/RubyUtil.java
+@@ -12,6 +12,7 @@
+ import org.logstash.ackedqueue.ext.RubyAckedBatch;
+ import org.logstash.ext.JRubyWrappedWriteClientExt;
+ import org.logstash.ext.JrubyAckedReadBatchExt;
++import org.logstash.ext.JrubyAckedReadClientExt;
+ import org.logstash.ext.JrubyAckedWriteClientExt;
+ import org.logstash.ext.JrubyEventExtLibrary;
+ import org.logstash.ext.JrubyMemoryReadBatchExt;
+@@ -57,6 +58,8 @@ public final class RubyUtil {
+ 
+     public static final RubyClass MEMORY_READ_CLIENT_CLASS;
+ 
++    public static final RubyClass ACKED_READ_CLIENT_CLASS;
++
+     public static final RubyClass MEMORY_WRITE_CLIENT_CLASS;
+ 
+     public static final RubyClass ACKED_WRITE_CLIENT_CLASS;
+@@ -77,6 +80,8 @@ public final class RubyUtil {
+             setupLogstashClass(JRubyWrappedWriteClientExt::new, JRubyWrappedWriteClientExt.class);
+         MEMORY_READ_CLIENT_CLASS =
+             setupLogstashClass(JrubyMemoryReadClientExt::new, JrubyMemoryReadClientExt.class);
++        ACKED_READ_CLIENT_CLASS =
++            setupLogstashClass(JrubyAckedReadClientExt::new, JrubyAckedReadClientExt.class);
+         MEMORY_WRITE_CLIENT_CLASS =
+             setupLogstashClass(JrubyMemoryWriteClientExt::new, JrubyMemoryWriteClientExt.class);
+         ACKED_WRITE_CLIENT_CLASS =
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JrubyAckedReadBatchExt.java b/logstash-core/src/main/java/org/logstash/ext/JrubyAckedReadBatchExt.java
+index dcc3c36b881..50ba68f7d2f 100644
+--- a/logstash-core/src/main/java/org/logstash/ext/JrubyAckedReadBatchExt.java
++++ b/logstash-core/src/main/java/org/logstash/ext/JrubyAckedReadBatchExt.java
+@@ -12,6 +12,7 @@
+ import org.jruby.runtime.Block;
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
++import org.logstash.RubyUtil;
+ import org.logstash.ackedqueue.ext.RubyAckedBatch;
+ 
+ @JRubyClass(name = "AckedReadBatch")
+@@ -27,6 +28,13 @@ public JrubyAckedReadBatchExt(final Ruby runtime, final RubyClass metaClass) {
+         super(runtime, metaClass);
+     }
+ 
++    public static JrubyAckedReadBatchExt create(final ThreadContext context,
++        final IRubyObject queue, final IRubyObject size, final IRubyObject timeout) {
++        final JrubyAckedReadBatchExt batch =
++            new JrubyAckedReadBatchExt(context.runtime, RubyUtil.ACKED_READ_BATCH_CLASS);
++        return (JrubyAckedReadBatchExt) batch.ruby_initialize(context, queue, size, timeout);
++    }
++
+     @JRubyMethod(name = "initialize", required = 3)
+     public IRubyObject ruby_initialize(final ThreadContext context, final IRubyObject queue,
+         final IRubyObject size, final IRubyObject timeout) {
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JrubyAckedReadClientExt.java b/logstash-core/src/main/java/org/logstash/ext/JrubyAckedReadClientExt.java
+new file mode 100644
+index 00000000000..c7e50cfc7f7
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/ext/JrubyAckedReadClientExt.java
+@@ -0,0 +1,160 @@
++package org.logstash.ext;
++
++import java.util.concurrent.ConcurrentHashMap;
++import org.jruby.Ruby;
++import org.jruby.RubyClass;
++import org.jruby.RubyHash;
++import org.jruby.RubyNumeric;
++import org.jruby.RubyObject;
++import org.jruby.RubySymbol;
++import org.jruby.anno.JRubyClass;
++import org.jruby.anno.JRubyMethod;
++import org.jruby.runtime.ThreadContext;
++import org.jruby.runtime.builtin.IRubyObject;
++import org.logstash.RubyUtil;
++import org.logstash.instrument.metrics.counter.LongCounter;
++
++@JRubyClass(name = "AckedReadClient")
++public final class JrubyAckedReadClientExt extends RubyObject {
++
++    private static final RubySymbol OUT_KEY = RubyUtil.RUBY.newSymbol("out");
++    private static final RubySymbol FILTERED_KEY = RubyUtil.RUBY.newSymbol("filtered");
++    private static final RubySymbol DURATION_IN_MILLIS_KEY =
++        RubyUtil.RUBY.newSymbol("duration_in_millis");
++
++    private final ConcurrentHashMap<Long, IRubyObject> inflightBatches = new ConcurrentHashMap<>();
++
++    private final ConcurrentHashMap<Long, Long> inflightClocks = new ConcurrentHashMap<>();
++
++    private IRubyObject queue;
++    private IRubyObject batchSize;
++    private IRubyObject waitForMillis;
++    private LongCounter eventMetricOut;
++    private LongCounter eventMetricFiltered;
++    private LongCounter eventMetricTime;
++    private LongCounter pipelineMetricOut;
++    private LongCounter pipelineMetricFiltered;
++    private LongCounter pipelineMetricTime;
++
++    @JRubyMethod(meta = true, required = 1)
++    public static JrubyAckedReadClientExt create(final ThreadContext context,
++        final IRubyObject recv, final IRubyObject queue) {
++        return new JrubyAckedReadClientExt(
++            context.runtime, RubyUtil.ACKED_READ_CLIENT_CLASS, queue
++        );
++    }
++
++    public JrubyAckedReadClientExt(final Ruby runtime, final RubyClass metaClass) {
++        super(runtime, metaClass);
++    }
++
++    private JrubyAckedReadClientExt(final Ruby runtime, final RubyClass metaClass,
++        final IRubyObject queue) {
++        super(runtime, metaClass);
++        this.queue = queue;
++    }
++
++    @JRubyMethod(name = "close")
++    public void rubyClose(final ThreadContext context) {
++        queue.callMethod(context, "close");
++    }
++
++    public boolean isEmpty() {
++        return rubyIsEmpty(RubyUtil.RUBY.getCurrentContext()).isTrue();
++    }
++
++    @JRubyMethod(name = "empty?")
++    public IRubyObject rubyIsEmpty(final ThreadContext context) {
++        return queue.callMethod(context, "is_empty?");
++    }
++
++    @JRubyMethod(name = "set_batch_dimensions")
++    public IRubyObject rubySetBatchDimensions(final ThreadContext context, IRubyObject batchSize,
++        IRubyObject waitForMillis) {
++        this.batchSize = batchSize;
++        this.waitForMillis = waitForMillis;
++        return this;
++    }
++
++    @JRubyMethod(name = "set_events_metric", required = 1)
++    public IRubyObject setEventsMetric(final ThreadContext context, IRubyObject metric) {
++        eventMetricOut = LongCounter.fromRubyBase(metric, OUT_KEY);
++        eventMetricFiltered = LongCounter.fromRubyBase(metric, FILTERED_KEY);
++        eventMetricTime = LongCounter.fromRubyBase(metric, DURATION_IN_MILLIS_KEY);
++        return this;
++    }
++
++    @JRubyMethod(name = "set_pipeline_metric", required = 1)
++    public IRubyObject setPipelineMetric(final ThreadContext context, IRubyObject metric) {
++        pipelineMetricOut = LongCounter.fromRubyBase(metric, OUT_KEY);
++        pipelineMetricFiltered = LongCounter.fromRubyBase(metric, FILTERED_KEY);
++        pipelineMetricTime = LongCounter.fromRubyBase(metric, DURATION_IN_MILLIS_KEY);
++        return this;
++    }
++
++    @JRubyMethod(name = "inflight_batches")
++    public IRubyObject rubyGetInflightBatches(final ThreadContext context) {
++        final RubyHash result = RubyHash.newHash(context.runtime);
++        result.putAll(inflightBatches);
++        return result;
++    }
++
++    @JRubyMethod(name = "new_batch")
++    public IRubyObject newBatch(final ThreadContext context) {
++        return JrubyAckedReadBatchExt.create(
++            context, queue, context.runtime.newFixnum(0),
++            context.runtime.newFixnum(0)
++        );
++    }
++
++    @JRubyMethod(name = "read_batch")
++    public IRubyObject readBatch(final ThreadContext context) {
++        JrubyAckedReadBatchExt batch =
++            JrubyAckedReadBatchExt.create(context, queue, batchSize, waitForMillis);
++        startMetrics(batch);
++        return batch;
++    }
++
++    @JRubyMethod(name = "start_metrics")
++    public IRubyObject rubyStartMetrics(final ThreadContext context, IRubyObject batch) {
++        startMetrics((JrubyAckedReadBatchExt) batch);
++        return this;
++    }
++
++    @JRubyMethod(name = "close_batch", required = 1)
++    public IRubyObject closeBatch(final ThreadContext context, IRubyObject batch) {
++        JrubyAckedReadBatchExt typedBatch = (JrubyAckedReadBatchExt) batch;
++        typedBatch.close(context);
++        inflightBatches.remove(Thread.currentThread().getId());
++        Long startTime = inflightClocks.remove(Thread.currentThread().getId());
++        if (startTime != null && typedBatch.filteredSize() > 0) {
++            // stop timer and record metrics iff the batch is non-empty.
++            long elapsedTimeMillis = (System.nanoTime() - startTime) / 1_000_000;
++            eventMetricTime.increment(elapsedTimeMillis);
++            pipelineMetricTime.increment(elapsedTimeMillis);
++        }
++        return this;
++    }
++
++    @JRubyMethod(name = "add_filtered_metrics", required = 1)
++    public IRubyObject addFilteredMetrics(final ThreadContext context, IRubyObject filteredSize) {
++        int typedFilteredSize = ((RubyNumeric) filteredSize).getIntValue();
++        eventMetricFiltered.increment(typedFilteredSize);
++        pipelineMetricFiltered.increment(typedFilteredSize);
++        return this;
++    }
++
++    @JRubyMethod(name = "add_output_metrics", required = 1)
++    public IRubyObject addOutputMetrics(final ThreadContext context, IRubyObject filteredSize) {
++        int typedFilteredSize = ((RubyNumeric) filteredSize).getIntValue();
++        eventMetricOut.increment(typedFilteredSize);
++        pipelineMetricOut.increment(typedFilteredSize);
++        return this;
++    }
++
++    private void startMetrics(JrubyAckedReadBatchExt batch) {
++        long threadId = Thread.currentThread().getId();
++        inflightBatches.put(threadId, batch);
++        inflightClocks.put(threadId, System.nanoTime());
++    }
++}

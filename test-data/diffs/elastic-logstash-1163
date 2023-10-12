@@ -1,0 +1,686 @@
+diff --git a/lib/logstash/event.rb b/lib/logstash/event.rb
+index f4dde9c5b86..08d30f2024c 100644
+--- a/lib/logstash/event.rb
++++ b/lib/logstash/event.rb
+@@ -4,6 +4,7 @@
+ require "date"
+ require "logstash/namespace"
+ require "logstash/util/fieldreference"
++require "logstash/util/accessors"
+ require "logstash/time_addon"
+ 
+ # Use a custom serialization for jsonifying Time objects.
+@@ -31,7 +32,7 @@ def inspect
+ # * "@version" - the version of the schema. Currently "1"
+ #
+ # They are prefixed with an "@" symbol to avoid clashing with your
+-# own custom fields. 
++# own custom fields.
+ #
+ # When serialized, this is represented in JSON. For example:
+ #
+@@ -53,8 +54,10 @@ def initialize(data={})
+     @cancelled = false
+ 
+     @data = data
++    @accessors = LogStash::Util::Accessors.new(data)
++
+     data[VERSION] = VERSION_ONE if !@data.include?(VERSION)
+-    if data.include?(TIMESTAMP) 
++    if data.include?(TIMESTAMP)
+       t = data[TIMESTAMP]
+       if t.is_a?(String)
+         data[TIMESTAMP] = LogStash::Time.parse_iso8601(t)
+@@ -113,59 +116,36 @@ def unix_timestamp
+   def ruby_timestamp
+     raise DeprecatedMethod
+   end # def unix_timestamp
+-  
++
+   # field-related access
+   public
+   def [](str)
+     if str[0,1] == CHAR_PLUS
+       # nothing?
+     else
+-      return LogStash::Util::FieldReference.exec(str, @data)
++      # return LogStash::Util::FieldReference.exec(str, @data)
++      @accessors.get(str)
+     end
+   end # def []
+-  
++
+   public
+   def []=(str, value)
+     if str == TIMESTAMP && !value.is_a?(Time)
+       raise TypeError, "The field '@timestamp' must be a Time, not a #{value.class} (#{value})"
+     end
+ 
+-    r = LogStash::Util::FieldReference.exec(str, @data) do |obj, key|
+-      obj[key] = value
+-    end
+-
+-    # The assignment can fail if the given field reference (str) does not exist
+-    # In this case, we'll want to set the value manually.
+-    if r.nil?
+-      # TODO(sissel): Implement this in LogStash::Util::FieldReference
+-      if str[0,1] != "["
+-        return @data[str] = value
+-      end
+-
+-      # No existing element was found, so let's set one.
+-      *parents, key = str.scan(/(?<=\[)[^\]]+(?=\])/)
+-      obj = @data
+-      parents.each do |p|
+-        if obj.include?(p)
+-          obj = obj[p]
+-        else
+-          obj[p] = {}
+-          obj = obj[p]
+-        end
+-      end
+-      obj[key] = value
+-    end
+-    return value
++    # return LogStash::Util::FieldReference.set(str, value, @data)
++    @accessors.set(str, value)
+   end # def []=
+ 
+   public
+   def fields
+     raise DeprecatedMethod
+   end
+-  
++
+   public
+   def to_json(*args)
+-    return @data.to_json(*args) 
++    return @data.to_json(*args)
+   end # def to_json
+ 
+   def to_hash
+@@ -193,13 +173,14 @@ def append(event)
+   # deleted
+   public
+   def remove(str)
+-    return LogStash::Util::FieldReference.exec(str, @data) do |obj, key|
+-      next obj.delete(key)
+-    end
++    # return LogStash::Util::FieldReference.exec(str, @data) do |obj, key|
++    #   next obj.delete(key)
++    # end
++    @accessors.del(str)
+   end # def remove
+ 
+   # sprintf. This could use a better method name.
+-  # The idea is to take an event and convert it to a string based on 
++  # The idea is to take an event and convert it to a string based on
+   # any format values, delimited by %{foo} where 'foo' is a field or
+   # metadata member.
+   #
+@@ -212,7 +193,7 @@ def remove(str)
+   # If a %{name} value is an array, then we will join by ','
+   # If a %{name} value does not exist, then no substitution occurs.
+   #
+-  # TODO(sissel): It is not clear what the value of a field that 
++  # TODO(sissel): It is not clear what the value of a field that
+   # is an array (or hash?) should be. Join by comma? Something else?
+   public
+   def sprintf(format)
+diff --git a/lib/logstash/util/accessors.rb b/lib/logstash/util/accessors.rb
+new file mode 100644
+index 00000000000..2d525400992
+--- /dev/null
++++ b/lib/logstash/util/accessors.rb
+@@ -0,0 +1,62 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/util"
++
++
++module LogStash::Util
++
++  # PathCache is a singleton which globally caches a parsed fields path for the path to the
++  # container hash and key in that hash.
++  module PathCache
++    extend self
++
++    def get(accessor)
++      @cache ||= {}
++      @cache[accessor] ||= parse(accessor)
++    end
++
++    def parse(accessor)
++      path = accessor.split(/[\[\]]/).select{|s| !s.empty?}
++      [path.pop, path]
++    end
++  end
++
++
++  # Accessors uses a lookup table to speedup access of an accessor field of the type
++  # "[hello][world]" to the underlying store hash into {"hello" => {"world" => "foo"}}
++  class Accessors
++
++    def initialize(store)
++      @store = store
++      @lut = {}
++    end
++
++    def get(accessor)
++      target, key = lookup(accessor)
++      target.is_a?(Array) ? target[key.to_i] : target[key]
++    end
++
++    def set(accessor, value)
++      target, key = lookup(accessor)
++      target[key] = value
++    end
++
++    def del(accessor)
++      target, key = lookup(accessor)
++      target.delete(key)
++    end
++
++    private
++
++    def lookup(accessor)
++      @lut[accessor] ||= store_path(accessor)
++    end
++
++    def store_path(accessor)
++      key, path = PathCache.get(accessor)
++      target = path.inject(@store) {|r, k| r[k] ||= {}}
++      [target, key]
++    end
++
++  end
++end # module LogStash::Util::Accessors
+diff --git a/lib/logstash/util/fieldreference.rb b/lib/logstash/util/fieldreference.rb
+index 041304a6b8f..0683310533c 100644
+--- a/lib/logstash/util/fieldreference.rb
++++ b/lib/logstash/util/fieldreference.rb
+@@ -3,47 +3,65 @@
+ require "logstash/util"
+ 
+ module LogStash::Util::FieldReference
+-  def compile(str)
+-    if str[0,1] != '['
++
++  def compile(accessor)
++    if accessor[0,1] != '['
+       return <<-"CODE"
+-        lambda do |e, &block|
+-          return block.call(e, #{str.inspect}) unless block.nil?
+-          return e[#{str.inspect}]
++        lambda do |store, &block|
++          return block.nil? ? store[#{accessor.inspect}] : block.call(store, #{accessor.inspect})
+         end
+       CODE
+     end
+ 
+-    code = "lambda do |e, &block|\n"
+-    selectors = str.scan(/(?<=\[).+?(?=\])/)
++    code = "lambda do |store, &block|\n"
++    selectors = accessor.scan(/(?<=\[).+?(?=\])/)
+     selectors.each_with_index do |tok, i|
+       last = (i == selectors.count() - 1)
+       code << "   # [#{tok}]#{ last ? " (last selector)" : "" }\n"
+-     
++
+       if last
+         code << <<-"CODE"
+-          return block.call(e, #{tok.inspect}) unless block.nil?
++          return block.call(store, #{tok.inspect}) unless block.nil?
+         CODE
+       end
+ 
+       code << <<-"CODE"
+-        if e.is_a?(Array)
+-          e = e[#{tok.to_i}]
+-        else
+-          e = e[#{tok.inspect}]
+-        end
+-        return e if e.nil?
++        store = store.is_a?(Array) ? store[#{tok.to_i}] : store[#{tok.inspect}]
++        return store if store.nil?
+       CODE
+-      
++
+     end
+-    code << "return e\nend"
++    code << "return store\nend"
+     #puts code
+     return code
+   end # def compile
+ 
+-  def exec(str, obj, &block)
++  def exec(accessor, store, &block)
+     @__fieldeval_cache ||= {}
+-    @__fieldeval_cache[str] ||= eval(compile(str))
+-    return @__fieldeval_cache[str].call(obj, &block)
++    @__fieldeval_cache[accessor] ||= eval(compile(accessor))
++    return @__fieldeval_cache[accessor].call(store, &block)
++  end
++
++  def set(accessor, value, store)
++    # The assignment can fail if the given field reference (accessor) does not exist
++    # In this case, we'll want to set the value manually.
++    if exec(accessor, store) { |hash, key| hash[key] = value }.nil?
++      return (store[accessor] = value) if accessor[0,1] != "["
++
++      # No existing element was found, so let's set one.
++      *parents, key = accessor.scan(/(?<=\[)[^\]]+(?=\])/)
++      parents.each do |p|
++        if store.include?(p)
++          store = store[p]
++        else
++          store[p] = {}
++          store = store[p]
++        end
++      end
++      store[key] = value
++    end
++
++    return value
+   end
+ 
+   extend self
+diff --git a/spec/event.rb b/spec/event.rb
+index a9c1ed2fa53..64533f80900 100644
+--- a/spec/event.rb
++++ b/spec/event.rb
+@@ -9,19 +9,19 @@
+       "message" => "hello world",
+       "tags" => [ "tag1" ],
+       "source" => "/home/foo",
+-      "a" => "b", 
++      "a" => "b",
+       "c" => {
+         "d" => "f",
+         "e" => {"f" => "g"}
+-      }, 
++      },
+       "f" => { "g" => { "h" => "i" } },
+-      "j" => { 
+-          "k1" => "v", 
++      "j" => {
++          "k1" => "v",
+           "k2" => [ "w", "x" ],
+           "k3" => {"4" => "m"},
+           5 => 6,
+           "5" => 7
+-      } 
++      }
+     )
+   end
+ 
+@@ -29,24 +29,54 @@
+     it "should raise an exception if you attempt to set @timestamp to a value type other than a Time object" do
+       insist { subject["@timestamp"] = "crash!" }.raises(TypeError)
+     end
++
++    it "should assign simple fields" do
++      insist { subject["foo"] }.nil?
++      insist { subject["foo"] = "bar"} == "bar"
++      insist { subject["foo"] } == "bar"
++    end
++
++    it "should overwrite simple fields" do
++      insist { subject["foo"] }.nil?
++      insist { subject["foo"] = "bar"} == "bar"
++      insist { subject["foo"] } == "bar"
++
++      insist { subject["foo"] = "baz"} == "baz"
++      insist { subject["foo"] } == "baz"
++    end
++
++    it "should assign deep fields" do
++      insist { subject["[foo][bar]"] }.nil?
++      insist { subject["[foo][bar]"] = "baz"} == "baz"
++      insist { subject["[foo][bar]"] } == "baz"
++    end
++
++    it "should overwrite deep fields" do
++      insist { subject["[foo][bar]"] }.nil?
++      insist { subject["[foo][bar]"] = "baz"} == "baz"
++      insist { subject["[foo][bar]"] } == "baz"
++
++      insist { subject["[foo][bar]"] = "zab"} == "zab"
++      insist { subject["[foo][bar]"] } == "zab"
++    end
+   end
+ 
+   context "#sprintf" do
+     it "should report a unix timestamp for %{+%s}" do
+       insist { subject.sprintf("%{+%s}") } == "1356998400"
+     end
+-    
++
+     it "should report a time with %{+format} syntax", :if => RUBY_ENGINE == "jruby" do
+       insist { subject.sprintf("%{+YYYY}") } == "2013"
+       insist { subject.sprintf("%{+MM}") } == "01"
+       insist { subject.sprintf("%{+HH}") } == "00"
+     end
+-  
++
+     it "should report fields with %{field} syntax" do
+       insist { subject.sprintf("%{type}") } == "sprintf"
+       insist { subject.sprintf("%{message}") } == subject["message"]
+     end
+-    
++
+     it "should print deep fields" do
+       insist { subject.sprintf("%{[j][k1]}") } == "v"
+       insist { subject.sprintf("%{[j][k2][0]}") } == "w"
+@@ -56,7 +86,7 @@
+       insist { subject.sprintf(2) } == "2"
+     end
+   end
+-  
++
+   context "#[]" do
+     it "should fetch data" do
+       insist { subject["type"] } == "sprintf"
+@@ -88,12 +118,12 @@
+       subject.append(LogStash::Event.new("message" => "another thing"))
+       insist { subject["message"] } == [ "hello world", "another thing" ]
+     end
+-  
++
+     it "should concatenate tags" do
+       subject.append(LogStash::Event.new("tags" => [ "tag2" ]))
+       insist { subject["tags"] } == [ "tag1", "tag2" ]
+     end
+-  
++
+     context "when event field is nil" do
+       it "should add single value as string" do
+         subject.append(LogStash::Event.new({"field1" => "append1"}))
+@@ -104,10 +134,10 @@
+         insist { subject[ "field1" ] } == [ "append1","append2" ]
+       end
+     end
+-  
++
+     context "when event field is a string" do
+       before { subject[ "field1" ] = "original1" }
+-  
++
+       it "should append string to values, if different from current" do
+         subject.append(LogStash::Event.new({"field1" => "append1"}))
+         insist { subject[ "field1" ] } == [ "original1", "append1" ]
+@@ -127,7 +157,7 @@
+     end
+     context "when event field is an array" do
+       before { subject[ "field1" ] = [ "original1", "original2" ] }
+-  
++
+       it "should append string values to array, if not present in array" do
+         subject.append(LogStash::Event.new({"field1" => "append1"}))
+         insist { subject[ "field1" ] } == [ "original1", "original2", "append1" ]
+@@ -166,7 +196,7 @@
+   context "acceptable @timestamp formats" do
+     subject { LogStash::Event.new }
+ 
+-    formats = [ 
++    formats = [
+       "YYYY-MM-dd'T'HH:mm:ss.SSSZ",
+       "YYYY-MM-dd'T'HH:mm:ss.SSSSSSZ",
+       "YYYY-MM-dd'T'HH:mm:ss.SSS",
+diff --git a/spec/util/accessors_spec.rb b/spec/util/accessors_spec.rb
+new file mode 100644
+index 00000000000..dd2e1e5afe9
+--- /dev/null
++++ b/spec/util/accessors_spec.rb
+@@ -0,0 +1,116 @@
++require "test_utils"
++require "logstash/util/accessors"
++
++describe LogStash::Util::Accessors, :if => true do
++
++  context "using simple field" do
++
++    it "should get value of word key" do
++      str = "hello"
++      data = { "hello" => "world" }
++      accessors = LogStash::Util::Accessors.new(data)
++      insist { accessors.get(str) } == data[str]
++    end
++
++    it "should get value of key with spaces" do
++      str = "hel lo"
++      data = { "hel lo" => "world" }
++      accessors = LogStash::Util::Accessors.new(data)
++      insist { accessors.get(str) } == data[str]
++    end
++
++    it "should get value of numeric key string" do
++      str = "1"
++      data = { "1" => "world" }
++      accessors = LogStash::Util::Accessors.new(data)
++      insist { accessors.get(str) } == data[str]
++    end
++
++    it "should handle delete" do
++      str = "simple"
++      data = { "simple" => "things" }
++      accessors = LogStash::Util::Accessors.new(data)
++      insist { accessors.del(str) } == "things"
++      insist { data }.empty?
++    end
++
++    it "should set value" do
++      str = "simple"
++      data = {}
++      accessors = LogStash::Util::Accessors.new(data)
++      insist { accessors.set(str, "things") } == "things"
++      insist { data } == { "simple" => "things" }
++    end
++  end
++
++  context "using field path" do
++
++    it "should get shallow value of word key" do
++      str = "[hello]"
++      data = { "hello" =>  "world" }
++      accessors = LogStash::Util::Accessors.new(data)
++      insist { accessors.get(str) } == "world"
++    end
++
++    it "should get shallow value of key with spaces" do
++      str = "[hel lo]"
++      data = { "hel lo" =>  "world" }
++      accessors = LogStash::Util::Accessors.new(data)
++      insist { accessors.get(str) } == "world"
++    end
++
++    it "should get shallow value of numeric key string" do
++      str = "[1]"
++      data = { "1" =>  "world" }
++      accessors = LogStash::Util::Accessors.new(data)
++      insist { accessors.get(str) } == "world"
++    end
++
++    it "should get deep value" do
++      str = "[hello][world]"
++      data = { "hello" => { "world" => "foo", "bar" => "baz" } }
++      accessors = LogStash::Util::Accessors.new(data)
++      insist { accessors.get(str) } == data["hello"]["world"]
++    end
++
++    it "should get deep value" do
++      str = "[hello][world]"
++      data = { "hello" => { "world" => "foo", "bar" => "baz" } }
++      accessors = LogStash::Util::Accessors.new(data)
++      insist { accessors.get(str) } == data["hello"]["world"]
++    end
++
++    it "should handle delete" do
++      str = "[hello][world]"
++      data = { "hello" => { "world" => "foo", "bar" => "baz" } }
++      accessors = LogStash::Util::Accessors.new(data)
++      insist { accessors.del(str) } ==  "foo"
++
++      # Make sure the "world" key is removed.
++      insist { data["hello"] } == { "bar" => "baz" }
++    end
++
++    it "should set shallow value" do
++      str = "[hello]"
++      data = {}
++      accessors = LogStash::Util::Accessors.new(data)
++      insist { accessors.set(str, "foo") } == "foo"
++      insist { data } == { "hello" => "foo" }
++    end
++
++    it "should set deep value" do
++      str = "[hello][world]"
++      data = {}
++      accessors = LogStash::Util::Accessors.new(data)
++      insist { accessors.set(str, "foo") } == "foo"
++      insist { data } == { "hello" => { "world" => "foo" } }
++    end
++
++    it "should retrieve array item" do
++      data = { "hello" => { "world" => ["a", "b"], "bar" => "baz" } }
++      accessors = LogStash::Util::Accessors.new(data)
++      insist { accessors.get("[hello][world][0]") } == data["hello"]["world"][0]
++      insist { accessors.get("[hello][world][1]") } == data["hello"]["world"][1]
++    end
++  end
++end
+diff --git a/spec/util/fieldeval_spec.rb b/spec/util/fieldeval_spec.rb
+index c2aa1f7dd3d..4cf10597ba2 100644
+--- a/spec/util/fieldeval_spec.rb
++++ b/spec/util/fieldeval_spec.rb
+@@ -2,43 +2,95 @@
+ require "logstash/util/fieldreference"
+ 
+ describe LogStash::Util::FieldReference, :if => true do
+-  it "should permit simple key names" do
+-    str = "hello"
+-    m = eval(subject.compile(str))
+-    data = { "hello" => "world" }
+-    insist { m.call(data) } == data[str]
+-  end
+ 
+-  it "should permit [key][access]" do
+-    str = "[hello][world]"
+-    m = eval(subject.compile(str))
+-    data = { "hello" => { "world" => "foo", "bar" => "baz" } }
+-    insist { m.call(data) } == data["hello"]["world"]
+-  end
+-  it "should permit [key][access]" do
+-    str = "[hello][world]"
+-    m = eval(subject.compile(str))
+-    data = { "hello" => { "world" => "foo", "bar" => "baz" } }
+-    insist { m.call(data) } == data["hello"]["world"]
+-  end
+-  
+-  it "should permit blocks" do
+-    str = "[hello][world]"
+-    code = subject.compile(str)
+-    m = eval(subject.compile(str))
+-    data = { "hello" => { "world" => "foo", "bar" => "baz" } }
+-    m.call(data) { |obj, key| obj.delete(key) }
+-
+-    # Make sure the "world" key is removed.
+-    insist { data["hello"] } == { "bar" => "baz" }
++  context "using simple accessor" do
++
++    it "should retrieve value" do
++      str = "hello"
++      m = eval(subject.compile(str))
++      data = { "hello" => "world" }
++      insist { m.call(data) } == data[str]
++    end
++
++    it "should handle delete in block" do
++      str = "simple"
++      m = eval(subject.compile(str))
++      data = { "simple" => "things" }
++      m.call(data) { |obj, key| obj.delete(key) }
++      insist { data }.empty?
++    end
++
++    it "should handle assignment in block" do
++      str = "simple"
++      m = eval(subject.compile(str))
++      data = {}
++      insist { m.call(data) { |obj, key| obj[key] = "things" }} == "things"
++      insist { data } == { "simple" => "things" }
++    end
++
++    it "should handle assignment using set" do
++      str = "simple"
++      data = {}
++      insist { subject.set(str, "things", data) } == "things"
++      insist { data } == { "simple" => "things" }
++    end
+   end
+ 
+-  it "should permit blocks #2" do
+-    str = "simple"
+-    code = subject.compile(str)
+-    m = eval(subject.compile(str))
+-    data = { "simple" => "things" }
+-    m.call(data) { |obj, key| obj.delete(key) }
+-    insist { data }.empty?
++  context "using accessor path" do
++
++    it "should retrieve shallow value" do
++      str = "[hello]"
++      m = eval(subject.compile(str))
++      data = { "hello" =>  "world" }
++      insist { m.call(data) } == "world"
++    end
++
++    it "should retrieve deep value" do
++      str = "[hello][world]"
++      m = eval(subject.compile(str))
++      data = { "hello" => { "world" => "foo", "bar" => "baz" } }
++      insist { m.call(data) } == data["hello"]["world"]
++    end
++
++    it "should handle delete in block" do
++      str = "[hello][world]"
++      m = eval(subject.compile(str))
++      data = { "hello" => { "world" => "foo", "bar" => "baz" } }
++      m.call(data) { |obj, key| obj.delete(key) }
++
++      # Make sure the "world" key is removed.
++      insist { data["hello"] } == { "bar" => "baz" }
++    end
++
++    it "should not handle assignment in block" do
++      str = "[hello][world]"
++      m = eval(subject.compile(str))
++      data = {}
++      insist { m.call(data) { |obj, key| obj[key] = "things" }}.nil?
++      insist { data } == { }
++    end
++
++    it "should set shallow value" do
++      str = "[hello]"
++      data = {}
++      insist { subject.set(str, "foo", data) } == "foo"
++      insist { data } == { "hello" => "foo" }
++    end
++
++    it "should set deep value" do
++      str = "[hello][world]"
++      data = {}
++      insist { subject.set(str, "foo", data) } == "foo"
++      insist { data } == { "hello" => { "world" => "foo" } }
++    end
++
++    it "should retrieve array item" do
++      data = { "hello" => { "world" => ["a", "b"], "bar" => "baz" } }
++      m = eval(subject.compile("[hello][world][0]"))
++      insist { m.call(data) } == data["hello"]["world"][0]
++
++      m = eval(subject.compile("[hello][world][1]"))
++      insist { m.call(data) } == data["hello"]["world"][1]
++    end
+   end
+ end

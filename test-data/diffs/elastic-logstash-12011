@@ -1,0 +1,317 @@
+diff --git a/build.gradle b/build.gradle
+index f5ee79650c7..550fb9a5e13 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -121,15 +121,49 @@ subprojects {
+     }
+ }
+ 
+-// fetch version from Logstash's master versions.yml file
+ version = versionMap['logstash-core']
+-def versionQualifier = System.getenv('VERSION_QUALIFIER')
+-if (versionQualifier) {
+-    version = "$version-$versionQualifier"
++String artifactVersionsApi = "https://artifacts-api.elastic.co/v1/versions"
++
++tasks.register("configureArchitecture") {
++    String arch = "x86_64"
++    String osName = System.properties['os.name']
++
++    if (osName ==~ /Mac OS X/) {
++        osName = "darwin"
++    } else {
++        osName = "linux"
++    }
++    String architecture = "${osName}-${arch}"
++    project.ext.set("architecture", architecture)
++}
++
++tasks.register("configureArtifactInfo") {
++    dependsOn configureArchitecture
++    def versionQualifier = System.getenv('VERSION_QUALIFIER')
++    if (versionQualifier) {
++        version = "$version-$versionQualifier"
++    }
++
++    def isReleaseBuild = System.getenv('RELEASE') == "1" || versionQualifier
++    String apiResponse = artifactVersionsApi.toURL().text
++
++    def dlVersions = new JsonSlurper().parseText(apiResponse)
++    String qualifiedVersion = dlVersions['versions'].grep(isReleaseBuild ? ~/^${version}$/ : ~/^${version}-SNAPSHOT/)[0]
++    if (qualifiedVersion == null) {
++        throw new GradleException("could not find the current artifact from the artifact-api ${artifactVersionsApi} for ${version}")
++    }
++    // find latest reference to last build
++    String buildsListApi = "${artifactVersionsApi}/${qualifiedVersion}/builds/"
++    apiResponse = buildsListApi.toURL().text
++    def dlBuilds = new JsonSlurper().parseText(apiResponse)
++    def stackBuildVersion = dlBuilds["builds"][0]
++
++    project.ext.set("artifactApiVersionedBuildUrl", "${artifactVersionsApi}/${qualifiedVersion}/builds/${stackBuildVersion}")
++    project.ext.set("stackArtifactSuffix", "${qualifiedVersion}-${project.ext.get('architecture')}")
++    project.ext.set("stackArtifactSuffixNoArch", qualifiedVersion)
+ }
+-// a release build will try to download the exact version artifact and not append -SNAPSHOT to it see
+-// the downloadEs task below
+-def isReleaseBuild = System.getenv('RELEASE') == "1" || versionQualifier
++
++
+ 
+ // Tasks
+ 
+@@ -300,20 +334,68 @@ tasks.register("installIntegrationTestGems") {
+   }
+ }
+ 
++
++
++tasks.register("downloadFilebeat", Download) {
++    dependsOn  configureArtifactInfo
++    description "Download Filebeat Snapshot for current branch version: ${version}"
++
++    project.ext.set("versionFound", true)
++
++    String downloadedFilebeatName = "filebeat-${project.ext.get("stackArtifactSuffix")}"
++    project.ext.set("unpackedFilebeatName", downloadedFilebeatName)
++
++    // find url of build artifact
++    String artifactApiUrl = "${project.ext.get("artifactApiVersionedBuildUrl")}/projects/beats/packages/${downloadedFilebeatName}.tar.gz"
++    String apiResponse = artifactApiUrl.toURL().text
++    def buildUrls = new JsonSlurper().parseText(apiResponse)
++
++    project.ext.set("filebeatSnapshotUrl", System.getenv("FILEBEAT_SNAPSHOT_URL") ?: buildUrls["package"]["url"])
++    project.ext.set("filebeatDownloadLocation", "${projectDir}/build/${downloadedFilebeatName}.tar.gz")
++
++
++    src project.ext.filebeatSnapshotUrl
++    onlyIfNewer true
++    inputs.file("${projectDir}/versions.yml")
++    outputs.file(project.ext.filebeatDownloadLocation)
++    dest new File(project.ext.filebeatDownloadLocation)
++    retries 3
++    doLast {
++        System.out.println "Downloaded to ${project.ext.filebeatDownloadLocation}"
++    }
++}
++
++tasks.register("deleteLocalFilebeat", Delete) {
++    delete ('./build/filebeat')
++}
++
++tasks.register("copyFilebeat", Copy){
++    dependsOn = [downloadFilebeat, deleteLocalFilebeat]
++    from tarTree(resources.gzip(project.ext.filebeatDownloadLocation))
++    into "./build/"
++    doLast {
++        file("./build/${project.ext.unpackedFilebeatName}").renameTo('./build/filebeat')
++        System.out.println "Unzipped ${project.ext.filebeatDownloadLocation} to ./build/filebeat"
++        System.out.println "Deleting ${project.ext.filebeatDownloadLocation}"
++        delete(project.ext.filebeatDownloadLocation)
++    }
++}
++
+ def rubyIntegrationSpecs = project.hasProperty("rubyIntegrationSpecs") ? ((String) project.property("rubyIntegrationSpecs")).split(/\s+/).join(",") : "specs/**/*_spec.rb"
+ def integrationTestPwd = "${projectDir}/qa/integration"
+ 
+ project(":logstash-integration-tests") {
+     tasks.getByPath(":logstash-integration-tests:integrationTests").configure {
+-      systemProperty 'org.logstash.integration.specs', rubyIntegrationSpecs
+-      environment "FEATURE_FLAG", System.getenv('FEATURE_FLAG')
+-      workingDir integrationTestPwd
+-      dependsOn installIntegrationTestGems
+-  }
++        systemProperty 'org.logstash.integration.specs', rubyIntegrationSpecs
++        environment "FEATURE_FLAG", System.getenv('FEATURE_FLAG')
++        workingDir integrationTestPwd
++        dependsOn installIntegrationTestGems
++    }
+ }
+ 
+ tasks.register("runIntegrationTests"){
+     dependsOn tasks.getByPath(":logstash-integration-tests:integrationTests")
++    dependsOn copyFilebeat
+ }
+ 
+ tasks.register("generateLicenseReport", JavaExec) {
+@@ -368,69 +450,25 @@ bootstrap.dependsOn assemblyDeps
+ runIntegrationTests.shouldRunAfter tasks.getByPath(":logstash-core:test")
+ check.dependsOn runIntegrationTests
+ 
+-String artifactsVersionApi = "https://artifacts-api.elastic.co/v1/versions/"
+ 
+ tasks.register("downloadEs", Download) {
++    dependsOn  configureArtifactInfo
+     description "Download ES Snapshot for current branch version: ${version}"
+-
+-    doFirst {
+-        if (!project.ext.versionFound) {
+-            throw new GradleException("could not find the current artifact from the artifact-api ${artifactsVersionApi} for " + (isReleaseBuild ? "release" : "snapshot") + " version: ${version}")
+-        }
+-    }
+-
+-    String apiResponse = artifactsVersionApi.toURL().text
+-    def dlVersions = new JsonSlurper().parseText(apiResponse)
+-    // the version string can be either '7.0.0' or '7.0.0-alpha1', i.e. with the qualifier.
+-    // in the normal PR type builds it is plain '7.0.0'
+-    // in the build invoked by the release manager it is '7.0.0-alpha1' etc.
+-    // the artifacts-api will return JSON like this: `{"versions":["5.6.13-SNAPSHOT","6.4.3-SNAPSHOT","6.5.0-SNAPSHOT","6.6.0-SNAPSHOT","7.0.0-alpha1-SNAPSHOT"]}`
+     
+-    String qualifiedVersion = dlVersions['versions'].grep(isReleaseBuild ? ~/^${version}$/ : ~/^${version}-SNAPSHOT/)[0]
++    String downloadedElasticsearchName = "elasticsearch-${project.ext.get("stackArtifactSuffix")}"
++    project.ext.set("unpackedElasticsearchName", "elasticsearch-${project.ext.get("stackArtifactSuffixNoArch")}")
+ 
+-    if (qualifiedVersion == null) {
+-        // the version is not found in the versions API, for now just set dummy values so the
+-        // task parameters like src and dest below sees these dummy values but also set
+-        // versionFound to false so that we can fail the task in the doFirst closure.
+-        // this is somewhat convoluted and there is certainly a better way to do this but
+-        // it seems to be an acceptable solution for now.
+-        project.ext.set("versionFound", false)
+-        project.ext.set("elasticsearchSnapshotURL", "http://elastic.co/invalid")
+-        project.ext.set("elasticsearchDownloadLocation", "${projectDir}/build/invalid")
+-    } else {
+-        project.ext.set("versionFound", true)
+-
+-        String arch = "x86_64"
+-        String osName = System.properties['os.name']
+-
+-        if (osName ==~ /Mac OS X/) {
+-            osName = "darwin"
+-        } else {
+-            osName = "linux"
+-        }
++    // find url of build artifact
++    String artifactApiUrl = "${project.ext.get("artifactApiVersionedBuildUrl")}/projects/elasticsearch/packages/${downloadedElasticsearchName}.tar.gz"
++    String apiResponse = artifactApiUrl.toURL().text
++    def buildUrls = new JsonSlurper().parseText(apiResponse)
+ 
+-        String architecture = "${osName}-${arch}"
+-
+-        String downloadedElasticsearchName = "elasticsearch-${qualifiedVersion}-${architecture}"
+-        project.ext.set("unpackedElasticsearchName", "elasticsearch-${qualifiedVersion}")
+-
+-        // find latest reference to last build
+-        String buildsListApi = "https://artifacts-api.elastic.co/v1/versions/${qualifiedVersion}/builds/"
+-        apiResponse = buildsListApi.toURL().text
+-        def dlBuilds = new JsonSlurper().parseText(apiResponse)
+-        String build = dlBuilds["builds"][0]
+-
+-        // find url of build artifact
+-        String artifactApiUrl = "https://artifacts-api.elastic.co/v1/versions/${qualifiedVersion}/builds/${build}/projects/elasticsearch/packages/${downloadedElasticsearchName}.tar.gz"
+-        apiResponse = artifactApiUrl.toURL().text
+-        def buildUrls = new JsonSlurper().parseText(apiResponse)
+-
+-        project.ext.set("elasticsearchSnapshotURL", System.getenv("ELASTICSEARCH_SNAPSHOT_URL") ?: buildUrls["package"]["url"])
+-        project.ext.set("elasticsearchDownloadLocation", "${projectDir}/build/${downloadedElasticsearchName}.tar.gz")
+-    }
++    project.ext.set("elasticsearchSnapshotURL", System.getenv("ELASTICSEARCH_SNAPSHOT_URL") ?: buildUrls["package"]["url"])
++    project.ext.set("elasticsearchDownloadLocation", "${projectDir}/build/${downloadedElasticsearchName}.tar.gz")
+ 
+     src project.ext.elasticsearchSnapshotURL
+     onlyIfNewer true
++    retries 3
+     inputs.file("${projectDir}/versions.yml")
+     outputs.file(project.ext.elasticsearchDownloadLocation)
+     dest new File(project.ext.elasticsearchDownloadLocation)
+@@ -440,6 +478,7 @@ tasks.register("downloadEs", Download) {
+     }
+ }
+ 
++
+ tasks.register("deleteLocalEs", Delete) {
+     delete ('./build/elasticsearch')
+ }
+@@ -451,6 +490,8 @@ tasks.register("copyEs", Copy){
+     doLast {
+         file("./build/${project.ext.unpackedElasticsearchName}").renameTo('./build/elasticsearch')
+         System.out.println "Unzipped ${project.ext.elasticsearchDownloadLocation} to ./build/elasticsearch"
++        System.out.println "Deleting ${project.ext.elasticsearchDownloadLocation}"
++        delete(project.ext.elasticsearchDownloadLocation)
+     }
+ }
+ 
+diff --git a/qa/integration/services/filebeat_service.rb b/qa/integration/services/filebeat_service.rb
+index d735e8a1e3e..04decf8c320 100644
+--- a/qa/integration/services/filebeat_service.rb
++++ b/qa/integration/services/filebeat_service.rb
+@@ -16,7 +16,7 @@
+ # under the License.
+ 
+ class FilebeatService < Service
+-  FILEBEAT_CMD = [File.join(File.dirname(__FILE__), "installed", "filebeat", "filebeat"), "--strict.perms=false", "-c"]
++  FILEBEAT_CMD = [File.join(File.dirname(__FILE__), "../../../build", "filebeat", "filebeat"), "--strict.perms=false", "-c"]
+ 
+   class BackgroundProcess
+     def initialize(cmd)
+diff --git a/qa/integration/services/filebeat_setup.sh b/qa/integration/services/filebeat_setup.sh
+index 3bd73b3a73f..bbe995e764a 100755
+--- a/qa/integration/services/filebeat_setup.sh
++++ b/qa/integration/services/filebeat_setup.sh
+@@ -4,35 +4,10 @@ current_dir="$(dirname "$0")"
+ 
+ source "$current_dir/helpers.sh"
+ 
+-if [ -n "${FILEBEAT_VERSION}" ]; then
+-  echo "Filebeat version is $FILEBEAT_VERSION"
+-  version=$FILEBEAT_VERSION
+-else
+-  version=6.5.4
+-fi
+-
+-FB_HOME=$INSTALL_DIR/filebeat
+-
+-setup_fb() {
+-    local version=$1
+-    platform=`uname -s | tr '[:upper:]' '[:lower:]'`
+-    architecture=`uname -m | tr '[:upper:]' '[:lower:]'`
+-    download_url=https://artifacts.elastic.co/downloads/beats/filebeat/filebeat-$version-$platform-$architecture.tar.gz
+-    curl -sL $download_url > $INSTALL_DIR/filebeat.tar.gz
+-    mkdir $FB_HOME
+-    tar -xzf $INSTALL_DIR/filebeat.tar.gz --strip-components=1 -C $FB_HOME/.
+-    rm $INSTALL_DIR/filebeat.tar.gz
+-}
+-
+ generate_certificate() {
+     target_directory=$current_dir/../fixtures/certificates
+     mkdir -p $target_directory
+     openssl req -subj '/CN=localhost/' -x509 -days $((100 * 365)) -batch -nodes -newkey rsa:2048 -keyout $target_directory/certificate.key -out $target_directory/certificate.crt
+ }
+ 
+-setup_install_dir
+-
+-if [ ! -d $FB_HOME ]; then
+-    generate_certificate
+-    setup_fb $version
+-fi
++generate_certificate
+diff --git a/qa/integration/specs/beats_input_spec.rb b/qa/integration/specs/beats_input_spec.rb
+index b35956d614c..d87e2c248b3 100644
+--- a/qa/integration/specs/beats_input_spec.rb
++++ b/qa/integration/specs/beats_input_spec.rb
+@@ -85,7 +85,7 @@
+       {
+         "filebeat" => {
+           "inputs" => [{ "paths" => [log_path], "input_type" => "log" }],
+-          "registry_file" => registry_file,
++          "registry.path" => registry_file,
+           "scan_frequency" => "1s"
+         },
+         "output" => {
+@@ -110,7 +110,7 @@
+         {
+           "filebeat" => {
+             "inputs" => [{ "paths" => [log_path], "input_type" => "log" }],
+-            "registry_file" => registry_file,
++            "registry.path" => registry_file,
+             "scan_frequency" => "1s"
+           },
+           "output" => {
+@@ -137,7 +137,7 @@
+         {
+           "filebeat" => {
+             "inputs" => [{ "paths" => [log_path], "input_type" => "log" }],
+-            "registry_file" => registry_file,
++            "registry.path" => registry_file,
+             "scan_frequency" => "1s"
+           },
+           "output" => {

@@ -1,0 +1,159 @@
+diff --git a/logstash-core/src/main/java/org/logstash/Accessors.java b/logstash-core/src/main/java/org/logstash/Accessors.java
+index 86aa7ab00ea..fb4826305cc 100644
+--- a/logstash-core/src/main/java/org/logstash/Accessors.java
++++ b/logstash-core/src/main/java/org/logstash/Accessors.java
+@@ -103,7 +103,7 @@ private static Object findCreateTarget(final ConvertedMap data, final FieldRefer
+ 
+     private static Object setChild(final Object target, final String key, final Object value) {
+         if (target instanceof Map) {
+-            ((ConvertedMap) target).put(key, value);
++            ((ConvertedMap) target).putInterned(key, value);
+             return value;
+         } else {
+             return setOnList(key, value, (ConvertedList) target);
+@@ -112,7 +112,7 @@ private static Object setChild(final Object target, final String key, final Obje
+ 
+     private static Object createChild(final ConvertedMap target, final String key) {
+         final Object result = new ConvertedMap(1);
+-        target.put(key, result);
++        target.putInterned(key, result);
+         return result;
+     }
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/ConvertedMap.java b/logstash-core/src/main/java/org/logstash/ConvertedMap.java
+index 76ec9a24451..47f2ef37c24 100644
+--- a/logstash-core/src/main/java/org/logstash/ConvertedMap.java
++++ b/logstash-core/src/main/java/org/logstash/ConvertedMap.java
+@@ -2,14 +2,27 @@
+ 
+ import java.io.Serializable;
+ import java.util.HashMap;
++import java.util.IdentityHashMap;
+ import java.util.Map;
+ import org.jruby.RubyHash;
++import org.jruby.RubyString;
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
+ 
+-public final class ConvertedMap extends HashMap<String, Object> {
++/**
++ * <p>This class is an internal API and behaves very different from a standard {@link Map}.</p>
++ * <p>The {@code get} method only has defined behaviour when used with an interned {@link String}
++ * as key.</p>
++ * <p>The {@code put} method will work with any {@link String} key but is only intended for use in
++ * situations where {@link ConvertedMap#putInterned(String, Object)} would require manually
++ * interning the {@link String} key. This is due to the fact that we use our internal
++ * {@link PathCache} to get an interned version of the given key instead of JDKs
++ * {@link String#intern()}, which is faster since it works from a much smaller and hotter cache
++ * in {@link PathCache} than using String interning directly.</p>
++ */
++public final class ConvertedMap extends IdentityHashMap<String, Object> {
+ 
+-    private static final long serialVersionUID = -4651798808586901122L;
++    private static final long serialVersionUID = 1L;
+ 
+     private static final RubyHash.VisitorWithState<ConvertedMap> RUBY_HASH_VISITOR =
+         new RubyHash.VisitorWithState<ConvertedMap>() {
+@@ -17,18 +30,27 @@ public final class ConvertedMap extends HashMap<String, Object> {
+             public void visit(final ThreadContext context, final RubyHash self,
+                 final IRubyObject key, final IRubyObject value,
+                 final int index, final ConvertedMap state) {
+-                state.put(key.toString(), Valuefier.convert(value));
++                if (key instanceof RubyString) {
++                    state.putInterned(convertKey((RubyString) key), Valuefier.convert(value));
++                } else {
++                    state.put(key.toString(), Valuefier.convert(value));
++                }
+             }
+         };
+ 
+     ConvertedMap(final int size) {
+-        super((size << 2) / 3 + 2);
++        super(size);
+     }
+-    
++
+     public static ConvertedMap newFromMap(Map<Serializable, Object> o) {
+         ConvertedMap cm = new ConvertedMap(o.size());
+         for (final Map.Entry<Serializable, Object> entry : o.entrySet()) {
+-            cm.put(entry.getKey().toString(), Valuefier.convert(entry.getValue()));
++            final Serializable found = entry.getKey();
++            if (found instanceof String) {
++                cm.put((String) found, Valuefier.convert(entry.getValue()));
++            } else {
++                cm.putInterned(convertKey((RubyString) found), entry.getValue());
++            }
+         }
+         return cm;
+     }
+@@ -43,6 +65,21 @@ public static ConvertedMap newFromRubyHash(final ThreadContext context, final Ru
+         return result;
+     }
+ 
++    @Override
++    public Object put(final String key, final Object value) {
++        return super.put(PathCache.cache(key).getKey(), value);
++    }
++
++    /**
++     * <p>Behaves like a standard {@link Map#put(Object, Object)} but without the return value.</p>
++     * <p>Only produces correct results if the given {@code key} is an interned {@link String}.</p>
++     * @param key Interned String
++     * @param value Value to put
++     */
++    public void putInterned(final String key, final Object value) {
++        super.put(key, value);
++    }
++
+     public Object unconvert() {
+         final HashMap<String, Object> result = new HashMap<>(size());
+         for (final Map.Entry<String, Object> entry : entrySet()) {
+@@ -50,4 +87,13 @@ public Object unconvert() {
+         }
+         return result;
+     }
++
++    /**
++     * Converts a {@link RubyString} into a {@link String} that is guaranteed to be interned.
++     * @param key RubyString to convert
++     * @return Interned String
++     */
++    private static String convertKey(final RubyString key) {
++        return PathCache.cache(key.getByteList()).getKey();
++    }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/Event.java b/logstash-core/src/main/java/org/logstash/Event.java
+index 729d0d7668c..51c6631996c 100644
+--- a/logstash-core/src/main/java/org/logstash/Event.java
++++ b/logstash-core/src/main/java/org/logstash/Event.java
+@@ -44,10 +44,10 @@ public Event()
+     {
+         this.metadata = new ConvertedMap(10);
+         this.data = new ConvertedMap(10);
+-        this.data.put(VERSION, VERSION_ONE);
++        this.data.putInterned(VERSION, VERSION_ONE);
+         this.cancelled = false;
+         this.timestamp = new Timestamp();
+-        this.data.put(TIMESTAMP, this.timestamp);
++        this.data.putInterned(TIMESTAMP, this.timestamp);
+     }
+ 
+     /**
+@@ -68,7 +68,7 @@ public Event(Map data) {
+     public Event(ConvertedMap data) {
+         this.data = data;
+         if (!this.data.containsKey(VERSION)) {
+-            this.data.put(VERSION, VERSION_ONE);
++            this.data.putInterned(VERSION, VERSION_ONE);
+         }
+ 
+         if (this.data.containsKey(METADATA)) {
+@@ -120,7 +120,7 @@ public Timestamp getTimestamp() throws IOException {
+ 
+     public void setTimestamp(Timestamp t) {
+         this.timestamp = t;
+-        this.data.put(TIMESTAMP, this.timestamp);
++        this.data.putInterned(TIMESTAMP, this.timestamp);
+     }
+ 
+     public Object getField(final String reference) {

@@ -1,0 +1,392 @@
+diff --git a/lib/logstash/plugin.rb b/lib/logstash/plugin.rb
+index ce8de95a5a0..5723d7c3ddd 100644
+--- a/lib/logstash/plugin.rb
++++ b/lib/logstash/plugin.rb
+@@ -124,32 +124,54 @@ def inspect
+   # Look up a plugin by type and name.
+   public
+   def self.lookup(type, name)
+-    # Try to load the plugin requested.
+-    # For example, load("filter", "grok") will try to require
+-    #   logstash/filters/grok
+-    #
+-    # And expects to find LogStash::Filters::Grok (or something similar based
+-    # on pattern matching
+-
+     path = "logstash/#{type}s/#{name}"
++
++    # first check if plugin already exists in namespace and continue to next step if not
++    begin
++      return namespace_lookup(type, name)
++    rescue NameError
++      logger.debug("Plugin not defined in namespace, checking for plugin file", :type => type, :name => name, :path => path)
++    end
++
++    # try to load the plugin file. ex.: lookup("filter", "grok") will require logstash/filters/grok
+     require(path)
+ 
+-    base = LogStash.const_get("#{type.capitalize}s")
+-    klass = nil
+-    #klass_sym = base.constants.find { |c| c.to_s =~ /^#{Regexp.quote(name)}$/i }
+-    #if klass_sym.nil?
++    # check again if plugin is now defined in namespace after the require
++    namespace_lookup(type, name)
++  rescue LoadError, NameError => e
++    raise(LogStash::PluginLoadingError, I18n.t("logstash.pipeline.plugin-loading-error", :type => type, :name => name, :path => path, :error => e.to_s))
++  end
+ 
+-    # Look for a plugin by the config_name
++  private
++
++  # lookup a plugin by type and name in the existing LogStash module namespace
++  # ex.: namespace_lookup("filter", "grok") looks for LogStash::Filters::Grok
++  # @param type [String] plugin type, "input", "ouput", "filter"
++  # @param name [String] plugin name, ex.: "grok"
++  # @return [Class] the plugin class or raises NameError
++  # @raise NameError if plugin class does not exist or is invalid
++  def self.namespace_lookup(type, name)
++    type_const = "#{type.capitalize}s"
++    namespace = LogStash.const_get(type_const)
+     # the namespace can contain constants which are not for plugins classes (do not respond to :config_name)
+-    # for example, the ElasticSearch output adds the LogStash::Outputs::Elasticsearch::Protocols namespace
+-    klass_sym = base.constants.find { |c| o = base.const_get(c); o.respond_to?(:config_name) && o.config_name == name }
+-    klass = base.const_get(klass_sym)
++    # namespace.constants is the shallow collection of all constants symbols in namespace
++    # note that below namespace.const_get(c) should never result in a NameError since c is from the constants collection
++    klass_sym = namespace.constants.find { |c| is_a_plugin?(namespace.const_get(c), name) }
++    klass = klass_sym && namespace.const_get(klass_sym)
++    raise(NameError) unless klass
++    klass
++  end
+ 
+-    raise LoadError if klass.nil?
++  # check if klass is a valid plugin for name
++  # @param klass [Class] plugin class
++  # @param name [String] plugin name
++  # @return [Boolean] true if klass is a valid plugin for name
++  def self.is_a_plugin?(klass, name)
++    klass.ancestors.include?(LogStash::Plugin) && klass.respond_to?(:config_name) && klass.config_name == name
++  end
+ 
+-    return klass
+-  rescue LoadError => e
+-    raise LogStash::PluginLoadingError,
+-      I18n.t("logstash.pipeline.plugin-loading-error", :type => type, :name => name, :path => path, :error => e.to_s)
+-  end # def load
++  # @return [Cabin::Channel] logger channel for class methods
++  def self.logger
++    @logger ||= Cabin::Channel.get(LogStash)
++  end
+ end # class LogStash::Plugin
+diff --git a/spec/core/plugin_spec.rb b/spec/core/plugin_spec.rb
+new file mode 100644
+index 00000000000..76498129503
+--- /dev/null
++++ b/spec/core/plugin_spec.rb
+@@ -0,0 +1,32 @@
++require "logstash/namespace"
++require "logstash/plugin"
++require "logstash/filters/base"
++
++describe LogStash::Plugin do
++  it "should fail lookup on inexisting type" do
++    expect_any_instance_of(Cabin::Channel).to receive(:debug).once
++    expect { LogStash::Plugin.lookup("badbadtype", "badname") }.to raise_error(LogStash::PluginLoadingError)
++  end
++
++  it "should fail lookup on inexisting name" do
++    expect_any_instance_of(Cabin::Channel).to receive(:debug).once
++    expect { LogStash::Plugin.lookup("filter", "badname") }.to raise_error(LogStash::PluginLoadingError)
++  end
++
++  it "should fail on bad plugin class" do
++    LogStash::Filters::BadSuperClass = Class.new
++    expect { LogStash::Plugin.lookup("filter", "bad_super_class") }.to raise_error(LogStash::PluginLoadingError)
++  end
++
++  it "should fail on missing config_name method" do
++    LogStash::Filters::MissingConfigName = Class.new(LogStash::Filters::Base)
++    expect { LogStash::Plugin.lookup("filter", "missing_config_name") }.to raise_error(LogStash::PluginLoadingError)
++  end
++
++  it "should lookup an already defined plugin class" do
++    class LogStash::Filters::LadyGaga < LogStash::Filters::Base
++      config_name "lady_gaga"
++    end
++    expect(LogStash::Plugin.lookup("filter", "lady_gaga")).to eq(LogStash::Filters::LadyGaga)
++  end
++end
+diff --git a/spec/filters/base_spec.rb b/spec/filters/base_spec.rb
+new file mode 100644
+index 00000000000..c7a88597a94
+--- /dev/null
++++ b/spec/filters/base_spec.rb
+@@ -0,0 +1,267 @@
++# encoding: utf-8
++require "logstash/devutils/rspec/spec_helper"
++require "logstash/filters/base"
++require "logstash/namespace"
++
++# use a dummy NOOP filter to test Filters::Base
++class LogStash::Filters::NOOP < LogStash::Filters::Base
++  config_name "noop"
++  milestone 2
++
++  def register; end
++
++  def filter(event)
++    return unless filter?(event)
++    filter_matched(event)
++  end
++end
++
++describe LogStash::Filters::NOOP do
++
++  describe "adding multiple values to one field" do
++    config <<-CONFIG
++    filter {
++      noop {
++        add_field => ["new_field", "new_value"]
++        add_field => ["new_field", "new_value_2"]
++      }
++    }
++    CONFIG
++
++    sample "example" do
++      insist { subject["new_field"] } == ["new_value", "new_value_2"]
++    end
++  end
++
++  describe "type parsing" do
++    config <<-CONFIG
++    filter {
++      noop {
++        type => "noop"
++        add_tag => ["test"]
++      }
++    }
++    CONFIG
++
++    sample("type" => "noop") do
++      insist { subject["tags"] } == ["test"]
++    end
++
++    sample("type" => "not_noop") do
++      insist { subject["tags"] }.nil?
++    end
++  end
++
++  describe "tags parsing with one tag" do
++    config <<-CONFIG
++    filter {
++      noop {
++        type => "noop"
++        tags => ["t1"]
++        add_tag => ["test"]
++      }
++    }
++    CONFIG
++
++    sample("type" => "noop") do
++      insist { subject["tags"] }.nil?
++    end
++
++    sample("type" => "noop", "tags" => ["t1", "t2"]) do
++      insist { subject["tags"] } == ["t1", "t2", "test"]
++    end
++  end
++
++  describe "tags parsing with multiple tags" do
++    config <<-CONFIG
++    filter {
++      noop {
++        type => "noop"
++        tags => ["t1", "t2"]
++        add_tag => ["test"]
++      }
++    }
++    CONFIG
++
++    sample("type" => "noop") do
++      insist { subject["tags"] }.nil?
++    end
++
++    sample("type" => "noop", "tags" => ["t1"]) do
++      insist { subject["tags"] } == ["t1"]
++    end
++
++    sample("type" => "noop", "tags" => ["t1", "t2"]) do
++      insist { subject["tags"] } == ["t1", "t2", "test"]
++    end
++
++    sample("type" => "noop", "tags" => ["t1", "t2", "t3"]) do
++      insist { subject["tags"] } == ["t1", "t2", "t3", "test"]
++    end
++  end
++
++  describe "exclude_tags with 1 tag" do
++    config <<-CONFIG
++    filter {
++      noop {
++        type => "noop"
++        tags => ["t1"]
++        add_tag => ["test"]
++        exclude_tags => ["t2"]
++      }
++    }
++    CONFIG
++
++    sample("type" => "noop") do
++      insist { subject["tags"] }.nil?
++    end
++
++    sample("type" => "noop", "tags" => ["t1"]) do
++      insist { subject["tags"] } == ["t1", "test"]
++    end
++
++    sample("type" => "noop", "tags" => ["t1", "t2"]) do
++      insist { subject["tags"] } == ["t1", "t2"]
++    end
++  end
++
++  describe "exclude_tags with >1 tags" do
++    config <<-CONFIG
++    filter {
++      noop {
++        type => "noop"
++        tags => ["t1"]
++        add_tag => ["test"]
++        exclude_tags => ["t2", "t3"]
++      }
++    }
++    CONFIG
++
++    sample("type" => "noop", "tags" => ["t1", "t2", "t4"]) do
++      insist { subject["tags"] } == ["t1", "t2", "t4"]
++    end
++
++    sample("type" => "noop", "tags" => ["t1", "t3", "t4"]) do
++      insist { subject["tags"] } == ["t1", "t3", "t4"]
++    end
++
++    sample("type" => "noop", "tags" => ["t1", "t4", "t5"]) do
++      insist { subject["tags"] } == ["t1", "t4", "t5", "test"]
++    end
++  end
++
++  describe "remove_tag" do
++    config <<-CONFIG
++    filter {
++      noop {
++        type => "noop"
++        tags => ["t1"]
++        remove_tag => ["t2", "t3"]
++      }
++    }
++    CONFIG
++
++    sample("type" => "noop", "tags" => ["t4"]) do
++      insist { subject["tags"] } == ["t4"]
++    end
++
++    sample("type" => "noop", "tags" => ["t1", "t2", "t3"]) do
++      insist { subject["tags"] } == ["t1"]
++    end
++
++    sample("type" => "noop", "tags" => ["t1", "t2"]) do
++      insist { subject["tags"] } == ["t1"]
++    end
++  end
++
++  describe "remove_tag with dynamic value" do
++    config <<-CONFIG
++    filter {
++      noop {
++        type => "noop"
++        tags => ["t1"]
++        remove_tag => ["%{blackhole}"]
++      }
++    }
++    CONFIG
++
++    sample("type" => "noop", "tags" => ["t1", "goaway", "t3"], "blackhole" => "goaway") do
++      insist { subject["tags"] } == ["t1", "t3"]
++    end
++  end
++
++  describe "remove_field" do
++    config <<-CONFIG
++    filter {
++      noop {
++        type => "noop"
++        remove_field => ["t2", "t3"]
++      }
++    }
++    CONFIG
++
++    sample("type" => "noop", "t4" => "four") do
++      insist { subject }.include?("t4")
++    end
++
++    sample("type" => "noop", "t1" => "one", "t2" => "two", "t3" => "three") do
++      insist { subject }.include?("t1")
++      reject { subject }.include?("t2")
++      reject { subject }.include?("t3")
++    end
++
++    sample("type" => "noop", "t1" => "one", "t2" => "two") do
++      insist { subject }.include?("t1")
++      reject { subject }.include?("t2")
++    end
++  end
++
++ describe "remove_field on deep objects" do
++    config <<-CONFIG
++    filter {
++      noop {
++        type => "noop"
++        remove_field => ["[t1][t2]"]
++      }
++    }
++    CONFIG
++
++    sample("type" => "noop", "t1" => {"t2" => "two", "t3" => "three"}) do
++      insist { subject }.include?("t1")
++      reject { subject }.include?("[t1][t2]")
++      insist { subject }.include?("[t1][t3]")
++    end
++  end
++
++ describe "remove_field on array" do
++    config <<-CONFIG
++    filter {
++      noop {
++        type => "noop"
++        remove_field => ["[t1][0]"]
++      }
++    }
++    CONFIG
++
++    sample("type" => "noop", "t1" => ["t2", "t3"]) do
++      insist { subject }.include?("t1")
++      insist { subject["[t1][0]"] } == "t3"
++    end
++  end
++
++  describe "remove_field with dynamic value in field name" do
++    config <<-CONFIG
++    filter {
++      noop {
++        type => "noop"
++        remove_field => ["%{blackhole}"]
++      }
++    }
++    CONFIG
++
++    sample("type" => "noop", "blackhole" => "go", "go" => "away") do
++      insist { subject }.include?("blackhole")
++      reject { subject }.include?("go")
++    end
++  end
++end
+\ No newline at end of file

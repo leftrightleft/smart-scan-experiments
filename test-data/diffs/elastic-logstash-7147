@@ -1,0 +1,599 @@
+diff --git a/logstash-core/spec/api/spec_helper.rb b/logstash-core/spec/api/spec_helper.rb
+deleted file mode 100644
+index 193eff2d916..00000000000
+--- a/logstash-core/spec/api/spec_helper.rb
++++ /dev/null
+@@ -1,111 +0,0 @@
+-# encoding: utf-8
+-API_ROOT = File.expand_path(File.join(File.dirname(__FILE__), "..", "..", "lib", "logstash", "api"))
+-
+-require "stud/task"
+-require "logstash/devutils/rspec/spec_helper"
+-$LOAD_PATH.unshift(File.expand_path(File.dirname(__FILE__)))
+-require "lib/api/support/resource_dsl_methods"
+-require_relative "../support/mocks_classes"
+-require 'rspec/expectations'
+-require "logstash/settings"
+-require 'rack/test'
+-require 'rspec'
+-require "json"
+-
+-def read_fixture(name)
+-  path = File.join(File.dirname(__FILE__), "fixtures", name)
+-  File.read(path)
+-end
+-
+-module LogStash
+-  class DummyAgent < Agent
+-    def start_webserver
+-      http_address = "#{Socket.gethostname}:#{::LogStash::WebServer::DEFAULT_PORTS.first}"
+-      @webserver = Struct.new(:address).new(http_address)
+-      self.metric.gauge([], :http_address, http_address)
+-    end
+-    def stop_webserver; end
+-  end
+-end
+-
+-##
+-# Class used to wrap and manage the execution of an agent for test,
+-# this helps a lot in order to have a more integrated test for the
+-# web api, could be also used for other use cases if generalized enough
+-##
+-class LogStashRunner
+-
+-  attr_reader :config_str, :agent, :pipeline_settings
+-
+-  def initialize
+-    @config_str   = "input { generator {count => 100 } } output { dummyoutput {} }"
+-
+-    args = {
+-      "config.reload.automatic" => false,
+-      "metric.collect" => true,
+-      "log.level" => "debug",
+-      "node.name" => "test_agent",
+-      "http.port" => rand(9600..9700),
+-      "http.environment" => "test",      
+-      "config.string" => @config_str,
+-      "pipeline.batch.size" => 1,
+-      "pipeline.workers" => 1
+-    }
+-    @settings = ::LogStash::SETTINGS.clone.merge(args)
+-
+-    @agent = LogStash::DummyAgent.new(@settings)
+-  end
+-
+-  def start
+-    # We start a pipeline that will generate a finite number of events
+-    # before starting the expectations
+-    agent.register_pipeline(@settings)
+-    @agent_task = Stud::Task.new { agent.execute }
+-    @agent_task.wait
+-  end
+-
+-  def stop
+-    agent.shutdown
+-  end
+-end
+-
+-##
+-# Method used to wrap up a request in between of a running
+-# pipeline, this makes the whole execution model easier and
+-# more contained as some threads might go wild.
+-##
+-def do_request(&block)
+-  runner = LogStashRunner.new
+-  runner.start
+-  ret_val = block.call
+-  runner.stop
+-  ret_val
+-end
+-
+-RSpec::Matchers.define :be_available? do
+-  match do |plugin|
+-    begin
+-      Gem::Specification.find_by_name(plugin["name"])
+-      true
+-    rescue
+-      false
+-    end
+-  end
+-end
+-
+-shared_context "api setup" do
+-  before :all do
+-    @runner = LogStashRunner.new
+-    @runner.start
+-  end
+-  
+-  after :all do
+-    @runner.stop
+-  end
+-
+-  include Rack::Test::Methods
+-
+-  def app()
+-    described_class.new(nil, @runner.agent)
+-  end
+-end
+diff --git a/logstash-core/spec/api/lib/commands/stats.rb b/logstash-core/spec/logstash/api/commands/stats_spec.rb
+similarity index 82%
+rename from logstash-core/spec/api/lib/commands/stats.rb
+rename to logstash-core/spec/logstash/api/commands/stats_spec.rb
+index 3059e1460f3..62335fb1e14 100644
+--- a/logstash-core/spec/api/lib/commands/stats.rb
++++ b/logstash-core/spec/logstash/api/commands/stats_spec.rb
+@@ -1,10 +1,15 @@
+ # encoding: utf-8
+-require_relative "../../spec_helper"
++require "spec_helper"
+ 
+ describe LogStash::Api::Commands::Stats do
++  include_context "api setup"
+ 
+   let(:report_method) { :run }
+-  subject(:report) { do_request { report_class.new.send(report_method) } }
++  subject(:report) do
++    factory = ::LogStash::Api::CommandFactory.new(LogStash::Api::Service.new(@agent))
++   
++    factory.build(:stats).send(report_method)
++  end
+ 
+   let(:report_class) { described_class }
+ 
+diff --git a/logstash-core/spec/api/lib/errors_spec.rb b/logstash-core/spec/logstash/api/errors_spec.rb
+similarity index 94%
+rename from logstash-core/spec/api/lib/errors_spec.rb
+rename to logstash-core/spec/logstash/api/errors_spec.rb
+index 430671402d0..49e6e1462c2 100644
+--- a/logstash-core/spec/api/lib/errors_spec.rb
++++ b/logstash-core/spec/logstash/api/errors_spec.rb
+@@ -1,5 +1,5 @@
+ # encoding: utf-8
+-require_relative "../spec_helper"
++require "spec_helper"
+ require "logstash/api/errors"
+ 
+ describe LogStash::Api::ApiError do
+diff --git a/logstash-core/spec/api/lib/api/logging_spec.rb b/logstash-core/spec/logstash/api/modules/logging_spec.rb
+similarity index 84%
+rename from logstash-core/spec/api/lib/api/logging_spec.rb
+rename to logstash-core/spec/logstash/api/modules/logging_spec.rb
+index 214a2ad69f2..952cdf872a6 100644
+--- a/logstash-core/spec/api/lib/api/logging_spec.rb
++++ b/logstash-core/spec/logstash/api/modules/logging_spec.rb
+@@ -1,5 +1,5 @@
+ # encoding: utf-8
+-require_relative "../../spec_helper"
++require "spec_helper"
+ require "sinatra"
+ require "logstash/api/modules/logging"
+ require "logstash/json"
+@@ -10,15 +10,6 @@
+   describe "#logging" do
+ 
+     context "when setting a logger's log level" do
+-      before(:all) do
+-        @runner = LogStashRunner.new
+-        @runner.start
+-      end
+-
+-      after(:all) do
+-        @runner.stop
+-      end
+-
+       it "should return a positive acknowledgement on success" do
+         put '/', '{"logger.logstash": "ERROR"}'
+         payload = LogStash::Json.load(last_response.body)
+diff --git a/logstash-core/spec/api/lib/api/node_plugins_spec.rb b/logstash-core/spec/logstash/api/modules/node_plugins_spec.rb
+similarity index 84%
+rename from logstash-core/spec/api/lib/api/node_plugins_spec.rb
+rename to logstash-core/spec/logstash/api/modules/node_plugins_spec.rb
+index 5389e10c418..4cfb30e5eb5 100644
+--- a/logstash-core/spec/api/lib/api/node_plugins_spec.rb
++++ b/logstash-core/spec/logstash/api/modules/node_plugins_spec.rb
+@@ -1,6 +1,5 @@
+ # encoding: utf-8
+-require_relative "../../../support/shared_examples"
+-require_relative "../../spec_helper"
++require "spec_helper"
+ require "sinatra"
+ require "logstash/api/modules/plugins"
+ require "logstash/json"
+@@ -12,7 +11,7 @@
+   extend ResourceDSLMethods
+ 
+   before(:each) do
+-    do_request { get "/" }
++    get "/"
+   end
+ 
+   let(:payload) { LogStash::Json.load(last_response.body) }
+diff --git a/logstash-core/spec/api/lib/api/node_spec.rb b/logstash-core/spec/logstash/api/modules/node_spec.rb
+similarity index 92%
+rename from logstash-core/spec/api/lib/api/node_spec.rb
+rename to logstash-core/spec/logstash/api/modules/node_spec.rb
+index a8f8b009f5b..9d2daa2c9ef 100644
+--- a/logstash-core/spec/api/lib/api/node_spec.rb
++++ b/logstash-core/spec/logstash/api/modules/node_spec.rb
+@@ -1,6 +1,5 @@
+ # encoding: utf-8
+-require_relative "../../spec_helper"
+-require_relative "../../../support/shared_examples"
++require "spec_helper"
+ require "sinatra"
+ require "logstash/api/modules/node"
+ require "logstash/json"
+@@ -12,7 +11,7 @@
+   describe "#hot threads" do
+ 
+     before(:all) do
+-      do_request { get "/hot_threads" }
++      get "/hot_threads"
+     end
+ 
+     it "respond OK" do
+@@ -26,7 +25,7 @@
+     context "#threads count" do
+ 
+       before(:all) do
+-        do_request { get "/hot_threads?threads=5" }
++        get "/hot_threads?threads=5"
+       end
+ 
+       let(:payload) { LogStash::Json.load(last_response.body) }
+@@ -49,7 +48,7 @@
+       ].each do |path|
+ 
+         before(:all) do
+-          do_request { get path }
++          get path
+         end
+ 
+         let(:payload) { last_response.body }
+@@ -70,7 +69,7 @@
+         @threads = []
+         5.times { @threads << Thread.new { loop {} } }
+ 
+-        do_request { get "/hot_threads?human=t&threads=2"}
++        get "/hot_threads?human=t&threads=2"
+       end
+ 
+       after(:all) do
+@@ -91,7 +90,7 @@
+         "/hot_threads?human=f",
+       ].each do |path|
+         before(:all) do
+-          do_request { get path }
++          get path
+         end
+ 
+         it "should return a json payload content type" do
+diff --git a/logstash-core/spec/api/lib/api/node_stats_spec.rb b/logstash-core/spec/logstash/api/modules/node_stats_spec.rb
+similarity index 96%
+rename from logstash-core/spec/api/lib/api/node_stats_spec.rb
+rename to logstash-core/spec/logstash/api/modules/node_stats_spec.rb
+index a4eae4d5aa3..2250e885e1a 100644
+--- a/logstash-core/spec/api/lib/api/node_stats_spec.rb
++++ b/logstash-core/spec/logstash/api/modules/node_stats_spec.rb
+@@ -1,6 +1,6 @@
+ # encoding: utf-8
+-require_relative "../../spec_helper"
+-require_relative "../../../support/shared_examples"
++require "spec_helper"
++
+ require "sinatra"
+ require "logstash/api/modules/node_stats"
+ require "logstash/json"
+diff --git a/logstash-core/spec/api/lib/api/plugins_spec.rb b/logstash-core/spec/logstash/api/modules/plugins_spec.rb
+similarity index 90%
+rename from logstash-core/spec/api/lib/api/plugins_spec.rb
+rename to logstash-core/spec/logstash/api/modules/plugins_spec.rb
+index ee554dae22f..506633a1455 100644
+--- a/logstash-core/spec/api/lib/api/plugins_spec.rb
++++ b/logstash-core/spec/logstash/api/modules/plugins_spec.rb
+@@ -1,6 +1,5 @@
+ # encoding: utf-8
+-require_relative "../../spec_helper"
+-require_relative "../../../support/shared_examples"
++require "spec_helper"
+ require "sinatra"
+ require "logstash/api/modules/plugins"
+ require "logstash/json"
+@@ -40,7 +39,9 @@
+ 
+     it "return a list of available plugins" do
+       payload["plugins"].each do |plugin|
+-        expect(plugin).to be_available?
++        expect do 
++          Gem::Specification.find_by_name(plugin["name"])
++        end.not_to raise_error
+       end
+     end
+ 
+diff --git a/logstash-core/spec/api/lib/api/root_spec.rb b/logstash-core/spec/logstash/api/modules/root_spec.rb
+similarity index 71%
+rename from logstash-core/spec/api/lib/api/root_spec.rb
+rename to logstash-core/spec/logstash/api/modules/root_spec.rb
+index ad9dc08381a..88cac6d4026 100644
+--- a/logstash-core/spec/api/lib/api/root_spec.rb
++++ b/logstash-core/spec/logstash/api/modules/root_spec.rb
+@@ -1,6 +1,6 @@
+ # encoding: utf-8
+-require_relative "../../spec_helper"
+-require_relative "../../../support/shared_examples"
++require "spec_helper"
++
+ require "sinatra"
+ require "logstash/api/modules/root"
+ require "logstash/json"
+@@ -9,7 +9,7 @@
+   include_context "api setup"
+ 
+   it "should respond to root resource" do
+-    do_request { get "/" }
++    get "/"
+     expect(last_response).to be_ok
+   end
+ 
+diff --git a/logstash-core/spec/api/lib/rack_app_spec.rb b/logstash-core/spec/logstash/api/rack_app_spec.rb
+similarity index 100%
+rename from logstash-core/spec/api/lib/rack_app_spec.rb
+rename to logstash-core/spec/logstash/api/rack_app_spec.rb
+diff --git a/logstash-core/spec/logstash/runner_spec.rb b/logstash-core/spec/logstash/runner_spec.rb
+index 73f8647baad..f0225894451 100644
+--- a/logstash-core/spec/logstash/runner_spec.rb
++++ b/logstash-core/spec/logstash/runner_spec.rb
+@@ -32,13 +32,6 @@ def run(args); end
+     end
+   end
+ 
+-  after :each do
+-    LogStash::SETTINGS.reset
+-  end
+-
+-  after :all do
+-  end
+-
+   describe "argument precedence" do
+     let(:config) { "input {} output {}" }
+     let(:cli_args) { ["-e", config, "-w", "20"] }
+@@ -48,10 +41,6 @@ def run(args); end
+       allow(LogStash::SETTINGS).to receive(:read_yaml).and_return(settings_yml_hash)
+     end
+ 
+-    after :each do
+-      LogStash::SETTINGS.reset
+-    end
+-
+     it "favors the last occurence of an option" do
+       expect(LogStash::Agent).to receive(:new) do |settings|
+         expect(settings.get("config.string")).to eq(config)
+diff --git a/logstash-core/spec/support/helpers.rb b/logstash-core/spec/support/helpers.rb
+index 6d55ab80339..2d41d51f08b 100644
+--- a/logstash-core/spec/support/helpers.rb
++++ b/logstash-core/spec/support/helpers.rb
+@@ -8,9 +8,88 @@ def silence_warnings
+ end
+ 
+ def clear_data_dir
+-    data_path = agent_settings.get("path.data")
++    if defined?(agent_settings)
++      data_path = agent_settings.get("path.data")
++    else
++      data_path = LogStash::SETTINGS.get("path.data")
++    end
++
+     Dir.foreach(data_path) do |f|
+     next if f == "." || f == ".." || f == ".gitkeep"
+     FileUtils.rm_rf(File.join(data_path, f))
+   end
+ end
++
++def mock_settings(settings_values={})
++  settings = LogStash::SETTINGS.clone
++
++  settings_values.each do |key, value|
++    settings.set(key, value)
++  end
++
++  settings
++end
++
++def make_test_agent(settings=mock_settings)
++    ::LogStash::Agent.new(settings)
++end
++
++def mock_pipeline(pipeline_id, reloadable = true, config_hash = nil)
++  config_string = "input { stdin { id => '#{pipeline_id}' }}"
++  settings = mock_settings("pipeline.id" => pipeline_id.to_s,
++                           "config.string" => config_string,
++                           "config.reload.automatic" => reloadable)
++  pipeline = LogStash::Pipeline.new(config_string, settings)
++  pipeline
++end
++
++def mock_pipeline_config(pipeline_id, config_string = nil, settings = {})
++  config_string = "input { stdin { id => '#{pipeline_id}' }}" if config_string.nil?
++
++  # This is for older tests when we already have a config
++  unless settings.is_a?(LogStash::Settings)
++    settings.merge!({ "pipeline.id" => pipeline_id.to_s })
++    settings = mock_settings(settings)
++  end
++
++  config_part = org.logstash.common.SourceWithMetadata.new("config_string", "config_string", config_string)
++
++  LogStash::Config::PipelineConfig.new(LogStash::Config::Source::Local, pipeline_id, config_part, settings)
++end
++
++def start_agent(agent)
++  agent_task = Stud::Task.new do
++    begin
++      agent.execute
++    rescue => e
++      raise "Start Agent exception: #{e}"
++    end
++  end
++
++  sleep(0.1) unless subject.running?
++  agent_task
++end
++
++def temporary_file(content, file_name = Time.now.to_i.to_s, directory = Stud::Temporary.pathname)
++  FileUtils.mkdir_p(directory)
++  target = ::File.join(directory, file_name)
++
++  File.open(target, "w+") do |f|
++    f.write(content)
++  end
++  target
++end
++
++RSpec::Matchers.define :ir_eql do |expected|
++  match do |actual|
++    next unless expected.java_kind_of?(org.logstash.config.ir.SourceComponent) && actual.java_kind_of?(org.logstash.config.ir.SourceComponent)
++
++    expected.sourceComponentEquals(actual)
++  end
++
++  failure_message do |actual|
++    "actual value \n#{actual.to_s}\nis not .sourceComponentEquals to the expected value: \n#{expected.to_s}\n"
++  end
++end
++
++SUPPORT_DIR = Pathname.new(::File.join(::File.dirname(__FILE__), "support"))
+diff --git a/logstash-core/spec/support/shared_contexts.rb b/logstash-core/spec/support/shared_contexts.rb
+index 2fd922005a7..26db2195d1d 100644
+--- a/logstash-core/spec/support/shared_contexts.rb
++++ b/logstash-core/spec/support/shared_contexts.rb
+@@ -14,3 +14,25 @@
+     allow(pipeline).to receive(:agent).and_return(agent)
+   end
+ end
++
++shared_context "api setup" do
++  before :all do
++    clear_data_dir
++    settings = mock_settings
++    config_string = "input { generator {id => 'api-generator-pipeline' count => 100 } } output { dummyoutput {} }"
++    settings.set("config.string", config_string)
++    @agent = make_test_agent(settings)
++    @agent.register_pipeline(settings)
++    @agent.execute
++  end
++
++  after :all do
++    @agent.shutdown
++  end
++
++  include Rack::Test::Methods
++
++  def app()
++    described_class.new(nil, @agent)
++  end
++end
+\ No newline at end of file
+diff --git a/logstash-core/spec/support/shared_examples.rb b/logstash-core/spec/support/shared_examples.rb
+index 0218bebb53c..04a409d2b21 100644
+--- a/logstash-core/spec/support/shared_examples.rb
++++ b/logstash-core/spec/support/shared_examples.rb
+@@ -97,7 +97,7 @@
+ 
+ shared_examples "not found" do
+   it "should return a 404 to unknown request" do
+-    do_request { get "/i_want_to_believe-#{Time.now.to_i}" }
++    get "/i_want_to_believe-#{Time.now.to_i}"
+     expect(last_response.content_type).to eq("application/json")
+     expect(last_response).not_to be_ok
+     expect(last_response.status).to eq(404)
+diff --git a/spec/spec_helper.rb b/spec/spec_helper.rb
+index 44919e332c7..c323ec86b29 100644
+--- a/spec/spec_helper.rb
++++ b/spec/spec_helper.rb
+@@ -9,6 +9,19 @@
+ require "flores/rspec"
+ require "flores/random"
+ require "pathname"
++require "stud/task"
++require "logstash/devutils/rspec/spec_helper"
++require "support/resource_dsl_methods"
++require "support/mocks_classes"
++require "support/helpers"
++require "support/shared_contexts"
++require "support/shared_examples"
++require 'rspec/expectations'
++require "logstash/settings"
++require 'rack/test'
++require 'rspec'
++require "json"
++
+ 
+ SUPPORT_DIR = Pathname.new(::File.join(::File.dirname(__FILE__), "support"))
+ 
+@@ -24,7 +37,7 @@ def puts(payload)
+ 
+ RSpec.configure do |c|
+   Flores::RSpec.configure(c)
+-  c.before do
++  c.before(:each) do
+     # TODO: commented out on post-merged in master - the logger has moved to log4j
+     #
+     #
+@@ -41,6 +54,9 @@ def puts(payload)
+     #   logger
+     # end
+ 
++    # Some tests mess with the settings. This ensures one test cannot pollute another
++    LogStash::SETTINGS.reset
++
+     LogStash::SETTINGS.set("queue.type", "memory_acked")
+     LogStash::SETTINGS.set("queue.page_capacity", 1024 * 1024)
+     LogStash::SETTINGS.set("queue.max_events", 250)
+@@ -50,3 +66,4 @@ def puts(payload)
+ def installed_plugins
+   Gem::Specification.find_all.select { |spec| spec.metadata["logstash_plugin"] }.map { |plugin| plugin.name }
+ end
++
+diff --git a/logstash-core/spec/api/lib/api/support/resource_dsl_methods.rb b/spec/support/resource_dsl_methods.rb
+similarity index 87%
+rename from logstash-core/spec/api/lib/api/support/resource_dsl_methods.rb
+rename to spec/support/resource_dsl_methods.rb
+index 0800e731e97..9d9b7275576 100644
+--- a/logstash-core/spec/api/lib/api/support/resource_dsl_methods.rb
++++ b/spec/support/resource_dsl_methods.rb
+@@ -27,7 +27,7 @@ def test_api(expected, path)
+       let(:payload) { LogStash::Json.load(last_response.body) }
+ 
+       before(:all) do
+-        do_request { get path }
++        get path
+       end
+ 
+       it "should respond OK" do
+@@ -45,15 +45,15 @@ def test_api(expected, path)
+         end
+ 
+         it "should include the http address" do
+-          expect(payload["http_address"]).to eql("#{Socket.gethostname}:#{::LogStash::WebServer::DEFAULT_PORTS.first}")
++          expect(payload["http_address"]).to eql("127.0.0.1:#{::LogStash::WebServer::DEFAULT_PORTS.first}")
+         end
+ 
+         it "should include the node name" do
+-          expect(payload["name"]).to eql(@runner.agent.name)
++          expect(payload["name"]).to eql(@agent.name)
+         end
+ 
+         it "should include the node id" do
+-          expect(payload["id"]).to eql(@runner.agent.id)
++          expect(payload["id"]).to eql(@agent.id)
+         end
+       end
+ 
+@@ -63,6 +63,7 @@ def test_api(expected, path)
+         it "should set '#{dotted}' at '#{path}' to be a '#{klass}'" do
+           expect(last_response).to be_ok # fail early if need be
+           resource_path_value = resource_path.reduce(payload) do |acc,v|
++            expect(acc).to be_a(Hash), "Got a nil looking for #{resource_path} in #{payload}"
+             expect(acc.has_key?(v)).to eql(true), "Expected to find value '#{v}' in structure '#{acc}', but could not. Payload was '#{payload}'"
+             acc[v]
+           end

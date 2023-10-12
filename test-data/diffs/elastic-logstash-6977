@@ -1,0 +1,388 @@
+diff --git a/qa/integration/services/logstash_service.rb b/qa/integration/services/logstash_service.rb
+index 9d0a56f38d3..ed2046d2a04 100644
+--- a/qa/integration/services/logstash_service.rb
++++ b/qa/integration/services/logstash_service.rb
+@@ -1,12 +1,15 @@
+ require_relative "monitoring_api"
+-
+ require "childprocess"
+ require "bundler"
+ require "tempfile"
+-require 'yaml'
++require "yaml"
++require "json"
++require "net/http"
++require "uri"
+ 
+ # A locally started Logstash service
+ class LogstashService < Service
++  API_URL = "http://localhost:%s/"
+ 
+   LS_ROOT_DIR = File.join("..", "..", "..", "..")
+   LS_VERSION_FILE = File.expand_path(File.join(LS_ROOT_DIR, "versions.yml"), __FILE__)
+@@ -16,10 +19,10 @@ class LogstashService < Service
+   SETTINGS_CLI_FLAG = "--path.settings"
+ 
+   STDIN_CONFIG = "input {stdin {}} output { }"
+-  RETRY_ATTEMPTS = 10
++  MAXIMUM_WAIT_TIME = 5 * 60
+ 
+   @process = nil
+-  
++
+   attr_reader :logstash_home
+   attr_reader :default_settings_file
+   attr_writer :env_variables
+@@ -42,7 +45,7 @@ def initialize(settings)
+       @logstash_bin = File.join("#{@logstash_home}", LS_BIN)
+       raise "Logstash binary not found in path #{@logstash_home}" unless File.file? @logstash_bin
+     end
+-    
++
+     @default_settings_file = File.join(@logstash_home, LS_CONFIG_FILE)
+     @monitoring_api = MonitoringAPI.new
+   end
+@@ -54,14 +57,14 @@ def alive?
+       @process.alive?
+     end
+   end
+-  
++
+   def exited?
+     @process.exited?
+   end
+-  
++
+   def exit_code
+     @process.exit_code
+-  end  
++  end
+ 
+   # Starts a LS process in background with a given config file
+   # and shuts it down after input is completely processed
+@@ -82,7 +85,7 @@ def start_with_config_string(config)
+ 
+   # Can start LS in stdin and can send messages to stdin
+   # Useful to test metrics and such
+-  def start_with_stdin
++  def start_with_stdin(wait_for_pipelines_to_start = true)
+     puts "Starting Logstash #{@logstash_bin} -e #{STDIN_CONFIG}"
+     Bundler.with_clean_env do
+       out = Tempfile.new("duplex")
+@@ -92,11 +95,38 @@ def start_with_stdin
+       @process.io.stdout = @process.io.stderr = out
+       @process.duplex = true
+       @process.start
+-      wait_for_logstash
++      wait_for_startup_message(out) if wait_for_pipelines_to_start
+       puts "Logstash started with PID #{@process.pid}" if alive?
+     end
+   end
+ 
++  # This is based on the logging message right now
++  # We know at this time that logstash has started and tried to run some pipeline.
++  def wait_for_startup_message(out)
++    successful = maximum_wait_loop do
++      out.rewind
++      lines = out.readlines
++      lines.any? { |line| line =~ /Pipelines running {:count=>1/ }
++    end
++
++    if !successful
++      out.rewind
++      raise "Logstash took more time to start than the #{MAXIMUM_WAIT_TIME}s, Complete output:\n#{out.readlines}"
++    end
++  end
++
++  def maximum_wait_loop
++    started_at = Time.now
++    successful = false
++    while Time.now - started_at < MAXIMUM_WAIT_TIME
++      successful = yield
++      sleep(1)
++      break if successful
++    end
++
++    successful
++  end
++
+   def write_to_stdin(input)
+     if alive?
+       @process.io.stdin.puts(input)
+@@ -105,12 +135,19 @@ def write_to_stdin(input)
+ 
+   # Spawn LS as a child process
+   def spawn_logstash(*args)
++    dont_wait_for_pipelines = args.find_index(:dont_wait_for_pipelines)
++    args.delete_at(dont_wait_for_pipelines) if dont_wait_for_pipelines
++    dont_wait_for_pipelines ||= false # if we don't explicitely set it to false we will wait for it
++
+     Bundler.with_clean_env do
++      out = Tempfile.new("duplex")
++      out.sync = true
+       @process = build_child_process(*args)
+       @env_variables.map { |k, v|  @process.environment[k] = v} unless @env_variables.nil?
+-      @process.io.inherit!
++      # @process.io.inherit!
++      @process.io.stdout = @process.io.stderr = out
+       @process.start
+-      wait_for_logstash
++      wait_for_startup_message(out) unless dont_wait_for_pipelines
+       puts "Logstash started with PID #{@process.pid}" if @process.alive?
+     end
+   end
+@@ -139,9 +176,9 @@ def teardown
+   end
+ 
+   # check if LS HTTP port is open
+-  def is_port_open?
++  def is_port_open?(port = 9600)
+     begin
+-      s = TCPSocket.open("localhost", 9600)
++      s = TCPSocket.open("localhost", port)
+       s.close
+       return true
+     rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH
+@@ -154,34 +191,60 @@ def monitoring_api
+     @monitoring_api
+   end
+ 
+-  # Wait until LS is started by repeatedly doing a socket connection to HTTP port
+-  def wait_for_logstash
+-    tries = RETRY_ATTEMPTS
+-    while tries > 0
+-      if is_port_open?
+-        break
+-      else
+-        sleep 1
++  # Make sure Logstash can return a complete http response before proceeding forward
++  def wait_for_logstash_api(port = 9600)
++    started_at = Time.now
++    sleep_time = 1
++    maximum_sleep_time = 10
++
++    uri = URI(sprintf(API_URL, port))
++    successful = false
++
++    while Time.now - started_at < MAXIMUM_WAIT_TIME
++      begin
++        response = Net::HTTP.get_response(uri)
++
++        if response.code.to_i == 200
++          data = JSON.parse(response.body)
++          if !data["host"].nil? && !data["version"].nil?
++            successful = true
++            break
++          else
++            puts "Received wrong response from the Logstash's API: #{data}"
++          end
++          puts "Received wrong code, expected 200 received #{response.code}"
++        end
++
++        sleep(sleep_time)
++        sleep_time = [sleep_time + 1, maximum_sleep_time].min
++      rescue => e
++        puts "Retrying to reach Logstash's API, but got an error: #{e}"
++        sleep(sleep_time)
++        sleep_time = [sleep_time + 1, maximum_sleep_time].min
+       end
+-      tries -= 1
++    end
++
++    if !successful
++      raise "Logstash's API didn't answer corrrectly within the specified maximum time of #{MAXIMUM_WAIT_TIME}"
+     end
+   end
+-  
++  alias_method :wait_for_logstash, :wait_for_logstash_api
++
+   # this method only overwrites existing config with new config
+-  # it does not assume that LS pipeline is fully reloaded after a 
++  # it does not assume that LS pipeline is fully reloaded after a
+   # config change. It is up to the caller to validate that.
+   def reload_config(initial_config_file, reload_config_file)
+     FileUtils.cp(reload_config_file, initial_config_file)
+-  end  
+-  
++  end
++
+   def get_version
+     `#{@logstash_bin} --version`
+   end
+-  
++
+   def get_version_yml
+     LS_VERSION_FILE
+-  end   
+-  
++  end
++
+   def process_id
+     @process.pid
+   end
+diff --git a/qa/integration/services/monitoring_api.rb b/qa/integration/services/monitoring_api.rb
+index e14f56e3db9..550d96d9e76 100644
+--- a/qa/integration/services/monitoring_api.rb
++++ b/qa/integration/services/monitoring_api.rb
+@@ -23,13 +23,13 @@ def version
+   end
+   
+   def node_info
+-    resp = Manticore.get("http://localhost:9600/_node").body
+-    JSON.parse(resp)
++    resp = Manticore.get("http://localhost:9600/_node")
++    JSON.parse(resp.body)
+   end
+ 
+   def node_stats
+-    resp = Manticore.get("http://localhost:9600/_node/stats").body
+-    JSON.parse(resp)
++    resp = Manticore.get("http://localhost:9600/_node/stats")
++    JSON.parse(resp.body)
+   end
+ 
+ end
+diff --git a/qa/integration/specs/01_logstash_bin_smoke_spec.rb b/qa/integration/specs/01_logstash_bin_smoke_spec.rb
+index 840fdd3bfa3..e2fcdc02fee 100644
+--- a/qa/integration/specs/01_logstash_bin_smoke_spec.rb
++++ b/qa/integration/specs/01_logstash_bin_smoke_spec.rb
+@@ -55,7 +55,7 @@
+       sleep(0.1) until File.exist?(file_config1) && File.size(file_config1) > 0 # Everything is started successfully at this point
+       expect(is_port_open?(9600)).to be true
+ 
+-      @ls2.spawn_logstash("-f", config2, "--path.data", tmp_data_path)
++      @ls2.spawn_logstash("-f", config2, "--path.data", tmp_data_path, :dont_wait_for_pipelines)
+       try(20) do
+         expect(@ls2.exited?).to be(true)
+       end
+@@ -139,7 +139,7 @@
+   end
+ 
+   it "should not start when -e is not specified and -f has no valid config files" do
+-    @ls2.spawn_logstash("-e", "", "-f" "/tmp/foobartest")
++    @ls2.spawn_logstash("-e", "", "-f" "/tmp/foobartest", :dont_wait_for_pipelines)
+     try(num_retries) do
+       expect(is_port_open?(9600)).to be_falsey
+     end
+diff --git a/qa/integration/specs/es_output_how_spec.rb b/qa/integration/specs/es_output_how_spec.rb
+index da1916f52bb..9559940771c 100644
+--- a/qa/integration/specs/es_output_how_spec.rb
++++ b/qa/integration/specs/es_output_how_spec.rb
+@@ -21,20 +21,22 @@
+     es_client = es_service.get_client
+     # now we test if all data was indexed by ES, but first refresh manually
+     es_client.indices.refresh
+-    result = es_client.search(index: 'logstash-*', size: 0, q: '*')
+-    expect(result["hits"]["total"]).to eq(37)
+-    
+-    # randomly checked for results and structured fields
+-    result = es_client.search(index: 'logstash-*', size: 1, q: 'dynamic')
+-    expect(result["hits"]["total"]).to eq(1)
+-    s = result["hits"]["hits"][0]["_source"]
+-    expect(s["bytes"]).to eq(18848)
+-    expect(s["response"]).to eq(200)
+-    expect(s["clientip"]).to eq("213.113.233.227")
+-    expect(s["geoip"]["longitude"]).to eq(12.9443)
+-    expect(s["geoip"]["latitude"]).to eq(56.1357)
+-    expect(s["verb"]).to eq("GET")
+-    expect(s["useragent"]["os"]).to eq("Windows 7")
+-  end
+ 
++    try do
++      result = es_client.search(index: 'logstash-*', size: 0, q: '*')
++      expect(result["hits"]["total"]).to eq(37)
++
++      # randomly checked for results and structured fields
++      result = es_client.search(index: 'logstash-*', size: 1, q: 'dynamic')
++      expect(result["hits"]["total"]).to eq(1)
++      s = result["hits"]["hits"][0]["_source"]
++      expect(s["bytes"]).to eq(18848)
++      expect(s["response"]).to eq(200)
++      expect(s["clientip"]).to eq("213.113.233.227")
++      expect(s["geoip"]["longitude"]).to eq(12.9443)
++      expect(s["geoip"]["latitude"]).to eq(56.1357)
++      expect(s["verb"]).to eq("GET")
++      expect(s["useragent"]["os"]).to eq("Windows 7")
++    end
++  end
+ end
+diff --git a/qa/integration/specs/monitoring_api_spec.rb b/qa/integration/specs/monitoring_api_spec.rb
+index 69b7a3a7517..ecfef7abc38 100644
+--- a/qa/integration/specs/monitoring_api_spec.rb
++++ b/qa/integration/specs/monitoring_api_spec.rb
+@@ -39,7 +39,6 @@
+   it "can retrieve JVM stats" do
+     logstash_service = @fixture.get_service("logstash")
+     logstash_service.start_with_stdin
+-    logstash_service.wait_for_logstash
+ 
+     Stud.try(max_retry.times, RSpec::Expectations::ExpectationNotMetError) do
+        result = logstash_service.monitoring_api.node_stats
+@@ -50,7 +49,6 @@
+   it "can retrieve queue stats" do
+     logstash_service = @fixture.get_service("logstash")
+     logstash_service.start_with_stdin
+-    logstash_service.wait_for_logstash
+ 
+     Stud.try(max_retry.times, RSpec::Expectations::ExpectationNotMetError) do
+       result = logstash_service.monitoring_api.node_stats
+diff --git a/qa/integration/specs/reload_config_spec.rb b/qa/integration/specs/reload_config_spec.rb
+index 24f37aba942..4c4fe14b0c8 100644
+--- a/qa/integration/specs/reload_config_spec.rb
++++ b/qa/integration/specs/reload_config_spec.rb
+@@ -65,16 +65,20 @@
+     # check reload stats
+     reload_stats = logstash_service.monitoring_api.pipeline_stats["reloads"]
+     instance_reload_stats = logstash_service.monitoring_api.node_stats["reloads"]
+-    expect(reload_stats["successes"]).to eq(1)
+-    expect(reload_stats["failures"]).to eq(0)
+-    expect(reload_stats["last_success_timestamp"].blank?).to be false
+-    expect(reload_stats["last_error"]).to eq(nil)
+-    
+-    expect(instance_reload_stats["successes"]).to eq(1)
+-    expect(instance_reload_stats["failures"]).to eq(0)
+-    # parse the results and validate
+-    re = JSON.load(File.new(output_file2))
+-    expect(re["clientip"]).to eq("74.125.176.147")
+-    expect(re["response"]).to eq(200)
++
++    # If it goes really fast the reload didn't finish yet.
++    Stud.try(retry_attempts.times, RSpec::Expectations::ExpectationNotMetError) do
++      expect(reload_stats["successes"]).to eq(1)
++      expect(reload_stats["failures"]).to eq(0)
++      expect(reload_stats["last_success_timestamp"].blank?).to be false
++      expect(reload_stats["last_error"]).to eq(nil)
++
++      expect(instance_reload_stats["successes"]).to eq(1)
++      expect(instance_reload_stats["failures"]).to eq(0)
++      # parse the results and validate
++      re = JSON.load(File.new(output_file2))
++      expect(re["clientip"]).to eq("74.125.176.147")
++      expect(re["response"]).to eq(200)
++    end
+   end
+-end
+\ No newline at end of file
++end
+diff --git a/qa/integration/specs/settings_spec.rb b/qa/integration/specs/settings_spec.rb
+index b552a593eba..3c5c8045eac 100644
+--- a/qa/integration/specs/settings_spec.rb
++++ b/qa/integration/specs/settings_spec.rb
+@@ -83,7 +83,7 @@ def overwrite_settings(settings)
+     test_config_path = File.join(temp_dir, "test.config")
+     IO.write(test_config_path, "#{tcp_config}")
+     expect(File.exists?(test_config_path)).to be true
+-    @logstash_service.spawn_logstash
++    @logstash_service.spawn_logstash(:dont_wait_for_pipelines)
+     try(num_retries) do
+       expect(@logstash_service.exited?).to be true
+     end
+@@ -92,7 +92,7 @@ def overwrite_settings(settings)
+     # now with bad config
+     IO.write(test_config_path, "#{tcp_config} filters {} ")
+     expect(File.exists?(test_config_path)).to be true
+-    @logstash_service.spawn_logstash
++    @logstash_service.spawn_logstash(:dont_wait_for_pipelines)
+     try(num_retries) do
+       expect(@logstash_service.exited?).to be true
+     end

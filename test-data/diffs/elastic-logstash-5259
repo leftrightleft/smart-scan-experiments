@@ -1,0 +1,558 @@
+diff --git a/qa/Gemfile b/qa/Gemfile
+index 1919a50f272..662249894ae 100644
+--- a/qa/Gemfile
++++ b/qa/Gemfile
+@@ -3,3 +3,5 @@ gem "runner-tool", :git => "https://github.com/purbon/runner-tool.git"
+ gem "rspec", "~> 3.1.0"
+ gem "rake"
+ gem "pry", :group => :test
++gem "stud"
++gem "logstash-devutils"
+diff --git a/qa/Rakefile b/qa/Rakefile
+index 5c8ea3cf73a..ffcde89f07a 100644
+--- a/qa/Rakefile
++++ b/qa/Rakefile
+@@ -28,7 +28,6 @@ namespace :qa do
+ 
+       message  = "bootstraping all VM's defined in acceptance/Vagrantfile"
+       message  = "#{message} for #{args[:platform]}: #{machines}" if !args[:platform].nil?
+-      puts message
+ 
+       LogStash::VagrantHelpers.destroy(machines)
+       LogStash::VagrantHelpers.bootstrap(machines)
+@@ -49,7 +48,7 @@ namespace :qa do
+   namespace :acceptance do
+     desc "Run all acceptance"
+     task :all do
+-      exit(RSpec::Core::Runner.run([Rake::FileList["acceptance/spec/lib/*_spec.rb"]]))
++      exit(RSpec::Core::Runner.run([Rake::FileList["acceptance/spec/lib/**/*_spec.rb"]]))
+     end
+ 
+     platforms.types.each do |type|
+@@ -63,7 +62,7 @@ namespace :qa do
+     desc "Run one single machine acceptance test"
+     task :single, :machine do |t, args|
+       ENV['LS_VAGRANT_HOST']  = args[:machine]
+-      exit(RSpec::Core::Runner.run([Rake::FileList["acceptance/spec/lib/*_spec.rb"]]))
++      exit(RSpec::Core::Runner.run([Rake::FileList["acceptance/spec/lib/**/**/*_spec.rb"]]))
+     end
+   end
+ end
+diff --git a/qa/acceptance/spec/lib/cli_operation_spec.rb b/qa/acceptance/spec/lib/cli_operation_spec.rb
+new file mode 100644
+index 00000000000..3830c58001a
+--- /dev/null
++++ b/qa/acceptance/spec/lib/cli_operation_spec.rb
+@@ -0,0 +1,19 @@
++# encoding: utf-8
++require_relative "../spec_helper"
++require_relative "../shared_examples/cli/logstash/version"
++require_relative "../shared_examples/cli/logstash-plugin/install"
++require_relative "../shared_examples/cli/logstash-plugin/list"
++require_relative "../shared_examples/cli/logstash-plugin/uninstall"
++require_relative "../shared_examples/cli/logstash-plugin/update"
++
++describe "CLI operation" do
++  config = ServiceTester.configuration
++  config.servers.each do |address|
++    logstash = ServiceTester::Artifact.new(address, config.lookup[address])
++    it_behaves_like "logstash version", logstash
++    it_behaves_like "logstash install", logstash
++    it_behaves_like "logstash list", logstash
++    it_behaves_like "logstash uninstall", logstash
++    it_behaves_like "logstash update", logstash
++  end
++end
+diff --git a/qa/acceptance/spec/shared_examples/cli/logstash-plugin/install.rb b/qa/acceptance/spec/shared_examples/cli/logstash-plugin/install.rb
+new file mode 100644
+index 00000000000..8e0c6814933
+--- /dev/null
++++ b/qa/acceptance/spec/shared_examples/cli/logstash-plugin/install.rb
+@@ -0,0 +1,58 @@
++# encoding: utf-8
++require_relative "../../../spec_helper"
++require "logstash/version"
++require "fileutils"
++require "logstash/devutils/rake"
++
++shared_examples "logstash install" do |logstash|
++  before(:each) do
++    logstash.install(LOGSTASH_VERSION)
++  end
++
++  after(:each) do
++    logstash.uninstall
++  end
++
++  describe "on #{logstash.hostname}" do
++    context "with a direct internet connection" do
++      context "when the plugin exist" do
++        context "from a local `.GEM` file" do
++          let(:gem_name) { "logstash-filter-qatest-0.1.1.gem" }
++          let(:gem_path_on_vagrant) { "/tmp/#{gem_name}" }
++          before(:each) do
++            logstash.download("https://rubygems.org/gems/#{gem_name}", gem_path_on_vagrant)
++          end
++
++          after(:each) { logstash.delete_file(gem_path_on_vagrant) }
++
++          it "successfully install the plugin" do
++            command = logstash.run_command_in_path("bin/logstash-plugin install #{gem_path_on_vagrant}")
++            expect(command).to install_successfully
++            expect(logstash).to have_installed?("logstash-filter-dns")
++          end
++        end
++
++        context "when fetching a gem from rubygems" do
++          it "successfully install the plugin" do
++            command = logstash.run_command_in_path("bin/logstash-plugin install logstash-filter-qatest")
++            expect(command).to install_successfully
++            expect(logstash).to have_installed?("logstash-filter-qatest")
++          end
++
++          it "allow to install a specific version" do
++            command = logstash.run_command_in_path("bin/logstash-plugin install --version 0.1.0 logstash-filter-qatest")
++            expect(command).to install_successfully
++            expect(logstash).to have_installed?("logstash-filter-qatest", "0.1.0")
++          end
++        end
++      end
++
++      context "when the plugin doesnt exist" do
++        it "fails to install and report an error" do
++          command = logstash.run_command_in_path("bin/logstash-plugin install --no-verify logstash-output-impossible-plugin")
++          expect(command.stderr).to match(/Plugin not found, aborting/)
++        end
++      end
++    end
++  end
++end
+diff --git a/qa/acceptance/spec/shared_examples/cli/logstash-plugin/list.rb b/qa/acceptance/spec/shared_examples/cli/logstash-plugin/list.rb
+new file mode 100644
+index 00000000000..64e6cd1be1a
+--- /dev/null
++++ b/qa/acceptance/spec/shared_examples/cli/logstash-plugin/list.rb
+@@ -0,0 +1,48 @@
++# encoding: utf-8
++require_relative "../../../spec_helper"
++require "logstash/version"
++require "fileutils"
++
++shared_examples "logstash list" do |logstash|
++  describe "logstash-plugin list on #{logstash.hostname}" do
++    before(:all) do
++      logstash.install(LOGSTASH_VERSION)
++    end
++
++    after(:all) do
++      logstash.uninstall
++    end
++
++    context "without a specific plugin" do
++      it "display a list of plugins" do
++        result = logstash.run_command_in_path("bin/logstash-plugin list")
++        expect(result.stdout.split("\n").size).to be > 1
++      end
++
++      it "display a list of installed plugins" do
++        result = logstash.run_command_in_path("bin/logstash-plugin list --installed")
++        expect(result.stdout.split("\n").size).to be > 1
++      end
++
++      it "list the plugins with their versions" do
++        result = logstash.run_command_in_path("bin/logstash-plugin list --verbose")
++        result.stdout.split("\n").each do |plugin|
++          expect(plugin).to match(/^logstash-\w+-\w+\s\(\d+\.\d+.\d+\)/)
++        end
++      end
++    end
++
++    context "with a specific plugin" do
++      let(:plugin_name) { "logstash-input-stdin" }
++      it "list the plugin and display the plugin name" do
++        result = logstash.run_command_in_path("bin/logstash-plugin list #{plugin_name}")
++        expect(result).to run_successfully_and_output(/^#{plugin_name}$/)
++      end
++
++      it "list the plugin with his version" do
++        result = logstash.run_command_in_path("bin/logstash-plugin list --verbose #{plugin_name}")
++        expect(result).to run_successfully_and_output(/^#{plugin_name} \(\d+\.\d+.\d+\)/)
++      end
++    end
++  end
++end
+diff --git a/qa/acceptance/spec/shared_examples/cli/logstash-plugin/uninstall.rb b/qa/acceptance/spec/shared_examples/cli/logstash-plugin/uninstall.rb
+new file mode 100644
+index 00000000000..d12bbb954c0
+--- /dev/null
++++ b/qa/acceptance/spec/shared_examples/cli/logstash-plugin/uninstall.rb
+@@ -0,0 +1,35 @@
++# encoding: utf-8
++require_relative "../../../spec_helper"
++require "logstash/version"
++require "fileutils"
++
++shared_examples "logstash uninstall" do |logstash|
++  describe "logstash uninstall on #{logstash.hostname}" do
++    before :each do
++      logstash.install(LOGSTASH_VERSION)
++    end
++
++    after :each do
++      logstash.uninstall
++    end
++
++    context "when the plugin isn't installed" do
++      it "fails to uninstall it" do
++        result = logstash.run_command_in_path("bin/logstash-plugin uninstall logstash-filter-qatest")
++        expect(result.stderr).to match(/ERROR: Uninstall Aborted, message: This plugin has not been previously installed, aborting/)
++      end
++    end
++
++    # Disabled because of this bug https://github.com/elastic/logstash/issues/5286
++    xcontext "when the plugin is installed" do
++      it "succesfully uninstall it" do
++        result = logstash.run_command_in_path("bin/logstash-plugin install logstash-filter-qatest")
++        expect(logstash).to have_installed?("logstash-filter-qatest")
++
++        result = logstash.run_command_in_path("bin/logstash-plugin uninstall logstash-filter-qatest")
++        expect(result.stdout).to match(/^Uninstalling logstash-filter-qatest/)
++        expect(logstash).not_to have_installed?("logstash-filter-qatest")
++      end
++    end
++  end
++end
+diff --git a/qa/acceptance/spec/shared_examples/cli/logstash-plugin/update.rb b/qa/acceptance/spec/shared_examples/cli/logstash-plugin/update.rb
+new file mode 100644
+index 00000000000..3aaaa30523a
+--- /dev/null
++++ b/qa/acceptance/spec/shared_examples/cli/logstash-plugin/update.rb
+@@ -0,0 +1,40 @@
++# encoding: utf-8
++require_relative "../../../spec_helper"
++require "logstash/version"
++
++shared_examples "logstash update" do |logstash|
++  describe "logstash update on #{logstash.hostname}" do
++    before :each do
++      logstash.install(LOGSTASH_VERSION)
++    end
++
++    after :each do
++      logstash.uninstall
++    end
++
++    let(:plugin_name) { "logstash-filter-qatest" }
++    let(:previous_version) { "0.1.0" }
++
++    before do
++      logstash.run_command_in_path("bin/logstash-plugin install --version #{previous_version} #{plugin_name}")
++      # Logstash wont update when we have a pinned versionin the gemfile so we remove them
++      logstash.replace_in_gemfile(',\s"0.1.0"', "")
++      expect(logstash).to have_installed?(plugin_name, previous_version)
++    end
++
++    context "update a specific plugin" do
++      it "has executed succesfully" do
++        cmd = logstash.run_command_in_path("bin/logstash-plugin update #{plugin_name}")
++        expect(cmd.stdout).to match(/Updating #{plugin_name}/)
++        expect(logstash).not_to have_installed?(plugin_name, previous_version)
++      end
++    end
++
++    context "update all the plugins" do
++      it "has executed succesfully" do
++        logstash.run_command_in_path("bin/logstash-plugin update")
++        expect(logstash).to have_installed?(plugin_name, "0.1.1")
++      end
++    end
++  end
++end
+diff --git a/qa/acceptance/spec/shared_examples/cli/logstash/version.rb b/qa/acceptance/spec/shared_examples/cli/logstash/version.rb
+new file mode 100644
+index 00000000000..cde8d10eec8
+--- /dev/null
++++ b/qa/acceptance/spec/shared_examples/cli/logstash/version.rb
+@@ -0,0 +1,22 @@
++# encoding: utf-8
++require_relative "../../../spec_helper"
++require "logstash/version"
++
++shared_examples "logstash version" do |logstash|
++  describe "logstash --version" do
++    before :all do
++      logstash.install(LOGSTASH_VERSION)
++    end
++
++    after :all do
++      logstash.uninstall
++    end
++
++    context "on #{logstash.hostname}" do
++      it "returns the right logstash version" do
++        result = logstash.run_command_in_path("bin/logstash --version")
++        expect(result).to run_successfully_and_output(/#{LOGSTASH_VERSION}/)
++      end
++    end
++  end
++end
+diff --git a/qa/rspec/commands.rb b/qa/rspec/commands.rb
+index ca775fc3e75..e78434fd6a7 100644
+--- a/qa/rspec/commands.rb
++++ b/qa/rspec/commands.rb
+@@ -53,6 +53,30 @@ def uninstall
+       client.uninstall(name, host)
+     end
+ 
++    def run_command_in_path(cmd)
++      client.run_command_in_path(cmd, host)
++    end
++
++    def run_command(cmd)
++      client.run_command(cmd, host)
++    end
++
++    def plugin_installed?(name, version = nil)
++      client.plugin_installed?(host, name, version)
++    end
++
++    def download(from, to)
++      client.download(from, to , host)
++    end
++    
++    def replace_in_gemfile(pattern, replace)
++      client.replace_in_gemfile(pattern, replace, host)
++    end
++
++    def delete_file(path)
++      client.delete_file(path, host)
++    end
++
+     def to_s
+       "Artifact #{name}@#{host}"
+     end
+diff --git a/qa/rspec/commands/base.rb b/qa/rspec/commands/base.rb
+index 0f4f6daa2cf..7262825db32 100644
+--- a/qa/rspec/commands/base.rb
++++ b/qa/rspec/commands/base.rb
+@@ -4,8 +4,8 @@
+ module ServiceTester
+ 
+   class Base
+-
+     LOCATION="/logstash-build".freeze
++    LOGSTASH_PATH="/opt/logstash/".freeze
+ 
+     def snapshot(host)
+       LogStash::VagrantHelpers.save_snapshot(host)
+@@ -23,5 +23,44 @@ def stop_service(service, host=nil)
+       service_manager(service, "stop", host)
+     end
+ 
++    def run_command(cmd, host)
++      hosts = (host.nil? ? servers : Array(host))
++
++      response = nil
++      at(hosts, {in: :serial}) do |_host|
++        response = sudo_exec!(cmd)
++      end
++      response
++    end
++
++    def replace_in_gemfile(pattern, replace, host)
++      cmd = "/bin/env sed -i.sedbak 's/#{pattern}/#{replace}/' /opt/logstash/Gemfile"
++      run_command(cmd, host)
++    end
++
++    def run_command_in_path(cmd, host)
++      run_command("#{File.join(LOGSTASH_PATH, cmd)}", host)
++    end
++
++    def plugin_installed?(host, plugin_name, version = nil)
++      if version.nil?
++        cmd = run_command_in_path("bin/logstash-plugin list", host)
++        search_token = plugin_name
++      else
++        cmd = run_command_in_path("bin/logstash-plugin list --verbose", host)
++        search_token ="#{plugin_name} (#{version})"
++      end
++
++      plugins_list = cmd.stdout.split("\n")
++      plugins_list.include?(search_token)
++    end
++
++    def download(from, to, host)
++      run_command("wget #{from} -O #{to}", host)
++    end
++
++    def delete_file(path, host)
++      run_command("rm -rf #{path}", host)
++    end
+   end
+ end
+diff --git a/qa/rspec/commands/debian.rb b/qa/rspec/commands/debian.rb
+index e007de88fcb..b2e1a37e534 100644
+--- a/qa/rspec/commands/debian.rb
++++ b/qa/rspec/commands/debian.rb
+@@ -15,7 +15,7 @@ def installed?(hosts, package)
+     end
+ 
+     def package_for(version, base=ServiceTester::Base::LOCATION)
+-      File.join(base, "logstash-#{version}_all.deb")
++      File.join(base, "logstash-#{version}.deb")
+     end
+ 
+     def install(package, host=nil)
+@@ -60,6 +60,5 @@ def service_manager(service, action, host=nil)
+         sudo_exec!("service #{service} #{action}")
+       end
+     end
+-
+   end
+ end
+diff --git a/qa/rspec/commands/redhat.rb b/qa/rspec/commands/redhat.rb
+index d29934da3dd..76275b5fbfc 100644
+--- a/qa/rspec/commands/redhat.rb
++++ b/qa/rspec/commands/redhat.rb
+@@ -15,7 +15,7 @@ def installed?(hosts, package)
+     end
+ 
+     def package_for(version, base=ServiceTester::Base::LOCATION)
+-      File.join(base, "logstash-#{version}.noarch.rpm")
++      File.join(base, "logstash-#{version}.rpm")
+     end
+ 
+     def install(package, host=nil)
+diff --git a/qa/rspec/matchers.rb b/qa/rspec/matchers.rb
+index 226a0ce9cd6..4da583262f2 100644
+--- a/qa/rspec/matchers.rb
++++ b/qa/rspec/matchers.rb
+@@ -1,3 +1,4 @@
+ # encoding: utf-8
+-require_relative './matchers/be_installed'
+-require_relative './matchers/be_running'
++require_relative "./matchers/be_installed"
++require_relative "./matchers/be_running"
++require_relative "./matchers/cli_matchers"
+diff --git a/qa/rspec/matchers/be_installed.rb b/qa/rspec/matchers/be_installed.rb
+index cca6c56a0be..4de70ae21ed 100644
+--- a/qa/rspec/matchers/be_installed.rb
++++ b/qa/rspec/matchers/be_installed.rb
+@@ -3,7 +3,6 @@
+ require_relative '../helpers'
+ 
+ RSpec::Matchers.define :be_installed do
+-
+   match do |subject|
+     subject.installed?(subject.hosts, subject.name)
+   end
+diff --git a/qa/rspec/matchers/be_running.rb b/qa/rspec/matchers/be_running.rb
+index 53dc2738c47..dc687e1b11d 100644
+--- a/qa/rspec/matchers/be_running.rb
++++ b/qa/rspec/matchers/be_running.rb
+@@ -3,7 +3,6 @@
+ require_relative '../helpers'
+ 
+ RSpec::Matchers.define :be_running do
+-
+   match do |subject|
+     subject.running?(subject.hosts, subject.name)
+   end
+diff --git a/qa/rspec/matchers/cli_matchers.rb b/qa/rspec/matchers/cli_matchers.rb
+new file mode 100644
+index 00000000000..e31aa050af3
+--- /dev/null
++++ b/qa/rspec/matchers/cli_matchers.rb
+@@ -0,0 +1,31 @@
++# encoding: utf-8
++RSpec::Matchers.define :be_successful do
++  match do |actual|
++    actual.exit_status == 0
++  end
++end
++
++RSpec::Matchers.define :fail_and_output do |expected_output|
++  match do |actual|
++    actual.exit_status == 1 && actual.stderr =~ expected_output
++  end
++end
++
++RSpec::Matchers.define :run_successfully_and_output do |expected_output|
++  match do |actual|
++    (actual.exit_status == 0 || actual.exit_status.nil?) && actual.stdout =~ expected_output
++  end
++end
++
++RSpec::Matchers.define :have_installed? do |name,*args|
++  match do |actual|
++    version = args.first
++    actual.plugin_installed?(name, version)
++  end
++end
++
++RSpec::Matchers.define :install_successfully do
++  match do |cmd|
++    expect(cmd).to run_successfully_and_output(/Installation successful/)
++  end
++end
+diff --git a/qa/support/logstash-filter-qatest/logstash-filter-qatest-newer.gemspec b/qa/support/logstash-filter-qatest/logstash-filter-qatest-newer.gemspec
+new file mode 100644
+index 00000000000..1e9fe168abe
+--- /dev/null
++++ b/qa/support/logstash-filter-qatest/logstash-filter-qatest-newer.gemspec
+@@ -0,0 +1,25 @@
++Gem::Specification.new do |s|
++  s.name            = 'logstash-filter-qatest'
++  s.version         = '0.1.1'
++  s.licenses        = ['Apache License (2.0)']
++  s.summary         = "This plugin is only used in the acceptance test"
++  s.description     = "This plugin is only used in the acceptance test"
++  s.authors         = ["Elasticsearch"]
++  s.email           = 'info@elasticsearch.com'
++  s.homepage        = "http://www.elasticsearch.org/guide/en/logstash/current/index.html"
++  s.require_paths = ["lib"]
++
++  # Files
++  s.files = `git ls-files`.split($\)+::Dir.glob('vendor/*')
++
++  # Tests
++  s.test_files = s.files.grep(%r{^(test|spec|features)/})
++
++  # Special flag to let us know this is actually a logstash plugin
++  s.metadata = { "logstash_plugin" => "true", "logstash_group" => "filter" }
++
++  # Gem dependencies
++  s.add_development_dependency 'logstash-devutils'
++  s.add_runtime_dependency "logstash-core-plugin-api", "~> 2.0"
++end
++
+diff --git a/qa/support/logstash-filter-qatest/logstash-filter-qatest-old.gemspec b/qa/support/logstash-filter-qatest/logstash-filter-qatest-old.gemspec
+new file mode 100644
+index 00000000000..82e3be79baf
+--- /dev/null
++++ b/qa/support/logstash-filter-qatest/logstash-filter-qatest-old.gemspec
+@@ -0,0 +1,24 @@
++Gem::Specification.new do |s|
++  s.name            = 'logstash-filter-qatest'
++  s.version         = '0.1.0'
++  s.licenses        = ['Apache License (2.0)']
++  s.summary         = "This plugin is only used in the acceptance test"
++  s.description     = "This plugin is only used in the acceptance test"
++  s.authors         = ["Elasticsearch"]
++  s.email           = 'info@elasticsearch.com'
++  s.homepage        = "http://www.elasticsearch.org/guide/en/logstash/current/index.html"
++  s.require_paths = ["lib"]
++
++  # Files
++  s.files = `git ls-files`.split($\)+::Dir.glob('vendor/*')
++
++  # Tests
++  s.test_files = s.files.grep(%r{^(test|spec|features)/})
++
++  # Special flag to let us know this is actually a logstash plugin
++  s.metadata = { "logstash_plugin" => "true", "logstash_group" => "filter" }
++
++  # Gem dependencies
++  s.add_development_dependency 'logstash-devutils'
++  s.add_runtime_dependency "logstash-core-plugin-api", "~> 2.0"
++end

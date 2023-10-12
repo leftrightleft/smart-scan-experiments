@@ -1,0 +1,1381 @@
+diff --git a/logstash-core/spec/logstash/compiler/compiler_spec.rb b/logstash-core/spec/logstash/compiler/compiler_spec.rb
+index a25fe2e4525..f09857405cd 100644
+--- a/logstash-core/spec/logstash/compiler/compiler_spec.rb
++++ b/logstash-core/spec/logstash/compiler/compiler_spec.rb
+@@ -52,6 +52,7 @@ def rand_meta
+   describe "compiling imperative" do
+     let(:source_id) { "fake_sourcefile" }
+     let(:source_with_metadata) { org.logstash.common.SourceWithMetadata.new(source_protocol, source_id, 0, 0, source) }
++    let(:cve) { org.logstash.plugins.ConfigVariableExpander.without_secret(org.logstash.common.EnvironmentVariableProvider.default_provider()) }
+     subject(:compiled) { described_class.compile_imperative(source_with_metadata, settings.get_value("config.support_escapes")) }
+ 
+     context "when config.support_escapes" do
+@@ -70,7 +71,7 @@ def rand_meta
+       }
+ 
+       let(:compiled_string) do
+-        compiled[:input].toGraph.vertices.toArray.first.getPluginDefinition.arguments["bar"]
++        compiled[:input].toGraph(cve).vertices.toArray.first.getPluginDefinition.arguments["bar"]
+       end
+ 
+       before do
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java b/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
+index f70d7d28850..d31794cde4a 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/CompiledPipeline.java
+@@ -19,12 +19,10 @@
+ 
+ package org.logstash.config.ir;
+ 
+-import co.elastic.logstash.api.Codec;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ import org.jruby.RubyArray;
+ import org.jruby.RubyHash;
+-import org.jruby.javasupport.JavaUtil;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.logstash.RubyUtil;
+ import org.logstash.Rubyfier;
+@@ -38,6 +36,7 @@
+ import org.logstash.config.ir.compiler.EventCondition;
+ import org.logstash.config.ir.compiler.RubyIntegration;
+ import org.logstash.config.ir.compiler.SplitDataset;
++import org.logstash.config.ir.expression.*;
+ import org.logstash.config.ir.graph.SeparatorVertex;
+ import org.logstash.config.ir.graph.IfVertex;
+ import org.logstash.config.ir.graph.PluginVertex;
+@@ -48,6 +47,8 @@
+ import org.logstash.plugins.ConfigVariableExpander;
+ import org.logstash.secret.store.SecretStore;
+ 
++import java.lang.reflect.Constructor;
++import java.lang.reflect.InvocationTargetException;
+ import java.util.*;
+ import java.util.stream.Collectors;
+ import java.util.stream.Stream;
+@@ -207,7 +208,6 @@ private Collection<IRubyObject> setupInputs(ConfigVariableExpander cve) {
+         return nodes;
+     }
+ 
+-
+     final RubyHash convertArgs(final Map<String, Object> input) {
+         final RubyHash converted = RubyHash.newHash(RubyUtil.RUBY);
+         for (final Map.Entry<String, Object> entry : input.entrySet()) {
+@@ -243,7 +243,7 @@ private Map<String, Object> expandArguments(final PluginDefinition pluginDefinit
+     }
+ 
+     @SuppressWarnings({"rawtypes", "unchecked"})
+-    private Map<String, Object> expandConfigVariables(ConfigVariableExpander cve, Map<String, Object> configArgs) {
++    public static Map<String, Object> expandConfigVariables(ConfigVariableExpander cve, Map<String, Object> configArgs) {
+         Map<String, Object> expandedConfig = new HashMap<>();
+         for (Map.Entry<String, Object> e : configArgs.entrySet()) {
+             if (e.getValue() instanceof List) {
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/ConfigCompiler.java b/logstash-core/src/main/java/org/logstash/config/ir/ConfigCompiler.java
+index f94a3ca47e0..cd2a5cd266e 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/ConfigCompiler.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/ConfigCompiler.java
+@@ -20,7 +20,6 @@
+ 
+ package org.logstash.config.ir;
+ 
+-import org.jruby.RubyArray;
+ import org.jruby.RubyHash;
+ import org.jruby.javasupport.JavaUtil;
+ import org.jruby.runtime.builtin.IRubyObject;
+@@ -28,6 +27,7 @@
+ import org.logstash.common.SourceWithMetadata;
+ import org.logstash.config.ir.graph.Graph;
+ import org.logstash.config.ir.imperative.Statement;
++import org.logstash.plugins.ConfigVariableExpander;
+ 
+ import java.util.List;
+ import java.util.Map;
+@@ -49,18 +49,19 @@ private ConfigCompiler() {
+     /**
+      * @param sourcesWithMetadata Logstash Config partitioned
+      * @param supportEscapes The value of the setting {@code config.support_escapes}
++     * @param cve Config variable expander. Substitute variable with value in secret store, env, default config value
+      * @return Compiled {@link PipelineIR}
+      * @throws InvalidIRException if the the configuration contains errors
+      */
+     @SuppressWarnings("unchecked")
+     public static PipelineIR configToPipelineIR(final List<SourceWithMetadata> sourcesWithMetadata,
+-                                                final boolean supportEscapes) throws InvalidIRException {
+-        return compileSources(sourcesWithMetadata, supportEscapes);
++                                                final boolean supportEscapes, ConfigVariableExpander cve) throws InvalidIRException {
++        return compileSources(sourcesWithMetadata, supportEscapes, cve);
+     }
+ 
+-    public static PipelineIR compileSources(List<SourceWithMetadata> sourcesWithMetadata, boolean supportEscapes) throws InvalidIRException {
++    public static PipelineIR compileSources(List<SourceWithMetadata> sourcesWithMetadata, boolean supportEscapes, ConfigVariableExpander cve) throws InvalidIRException {
+         Map<PluginDefinition.Type, List<Graph>> groupedPipelineSections = sourcesWithMetadata.stream()
+-                .map(swm -> compileGraph(swm, supportEscapes))
++                .map(swm -> compileGraph(swm, supportEscapes, cve))
+                 .flatMap(m -> m.entrySet().stream())
+                 .filter(e -> e.getValue() != null)
+                 .collect(groupingBy(Map.Entry::getKey,
+@@ -108,15 +109,15 @@ private static Statement readStatementFromRubyHash(RubyHash hash, String key) {
+         return inputValue.toJava(Statement.class);
+     }
+ 
+-    private static Map<PluginDefinition.Type, Graph> compileGraph(SourceWithMetadata swm, boolean supportEscapes) {
++    private static Map<PluginDefinition.Type, Graph> compileGraph(SourceWithMetadata swm, boolean supportEscapes, ConfigVariableExpander cve) {
+         Map<PluginDefinition.Type, Statement> pluginStatements = compileImperative(swm, supportEscapes);
+         return pluginStatements.entrySet().stream()
+-                .collect(Collectors.toMap(Map.Entry::getKey, e -> toGraphWithUntypedException(e.getValue())));
++                .collect(Collectors.toMap(Map.Entry::getKey, e -> toGraphWithUntypedException(e.getValue(), cve)));
+     }
+ 
+-    private static Graph toGraphWithUntypedException(Statement s) {
++    private static Graph toGraphWithUntypedException(Statement s, ConfigVariableExpander cve) {
+         try {
+-            return s.toGraph();
++            return s.toGraph(cve);
+         } catch (InvalidIRException iirex) {
+             throw new IllegalArgumentException(iirex);
+         }
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/PipelineIR.java b/logstash-core/src/main/java/org/logstash/config/ir/PipelineIR.java
+index 0c0b15ef277..6c5ba2e52e4 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/PipelineIR.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/PipelineIR.java
+@@ -24,11 +24,7 @@
+ import java.util.stream.Collectors;
+ import java.util.stream.Stream;
+ import org.logstash.common.Util;
+-import org.logstash.config.ir.graph.Graph;
+-import org.logstash.config.ir.graph.PluginVertex;
+-import org.logstash.config.ir.graph.QueueVertex;
+-import org.logstash.config.ir.graph.Vertex;
+-import org.logstash.config.ir.graph.SeparatorVertex;
++import org.logstash.config.ir.graph.*;
+ 
+ public final class PipelineIR implements Hashable {
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/expression/ExpressionSubstitution.java b/logstash-core/src/main/java/org/logstash/config/ir/expression/ExpressionSubstitution.java
+new file mode 100644
+index 00000000000..adddd34e680
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/config/ir/expression/ExpressionSubstitution.java
+@@ -0,0 +1,50 @@
++package org.logstash.config.ir.expression;
++
++import com.google.common.collect.ImmutableMap;
++import org.logstash.common.SourceWithMetadata;
++import org.logstash.config.ir.CompiledPipeline;
++import org.logstash.config.ir.InvalidIRException;
++import org.logstash.plugins.ConfigVariableExpander;
++
++import java.lang.reflect.Constructor;
++import java.lang.reflect.InvocationTargetException;
++import java.util.Map;
++
++public class ExpressionSubstitution {
++    /**
++     * Replace ${VAR:defaultValue} in BinaryBooleanExpression, UnaryBooleanExpression and ValueExpression, excluding RegexValueExpression
++     * with the value in the following precedence: secret store, environment variable, default value
++     * @param cve The actual pattern matching take place
++     * @param expression The Expression to be substituted
++     * @return substituted Expression
++     */
++    public static Expression substituteBoolExpression(ConfigVariableExpander cve, Expression expression) {
++        try {
++            if (expression instanceof BinaryBooleanExpression) {
++                BinaryBooleanExpression binaryBoolExp = (BinaryBooleanExpression) expression;
++                Expression substitutedLeftExp = substituteBoolExpression(cve, binaryBoolExp.getLeft());
++                Expression substitutedRightExp = substituteBoolExpression(cve, binaryBoolExp.getRight());
++                if (substitutedLeftExp != binaryBoolExp.getLeft() || substitutedRightExp != binaryBoolExp.getRight()) {
++                    Constructor<? extends BinaryBooleanExpression> constructor = binaryBoolExp.getClass().getConstructor(SourceWithMetadata.class, Expression.class, Expression.class);
++                    return constructor.newInstance(binaryBoolExp.getSourceWithMetadata(), substitutedLeftExp, substitutedRightExp);
++                }
++            } else if (expression instanceof UnaryBooleanExpression) {
++                UnaryBooleanExpression unaryBoolExp = (UnaryBooleanExpression) expression;
++                Expression substitutedExp = substituteBoolExpression(cve, unaryBoolExp.getExpression());
++                if (substitutedExp != unaryBoolExp.getExpression()) {
++                    Constructor<? extends UnaryBooleanExpression> constructor = unaryBoolExp.getClass().getConstructor(SourceWithMetadata.class, Expression.class);
++                    return constructor.newInstance(unaryBoolExp.getSourceWithMetadata(), substitutedExp);
++                }
++            } else if (expression instanceof ValueExpression && !(expression instanceof RegexValueExpression) && (((ValueExpression) expression).get() != null)) {
++                final String key = "placeholder";
++                Map<String, Object> args = ImmutableMap.of(key, ((ValueExpression) expression).get());
++                Map<String, Object> substitutedArgs = CompiledPipeline.expandConfigVariables(cve, args);
++                return new ValueExpression(expression.getSourceWithMetadata(), substitutedArgs.get(key));
++            }
++
++            return expression;
++        } catch (NoSuchMethodException | InstantiationException | IllegalAccessException | InvocationTargetException | InvalidIRException e) {
++            throw new IllegalStateException("Unable to instantiate substituted condition expression", e);
++        }
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/imperative/ComposedParallelStatement.java b/logstash-core/src/main/java/org/logstash/config/ir/imperative/ComposedParallelStatement.java
+index f45a6981fd7..245cae07686 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/imperative/ComposedParallelStatement.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/imperative/ComposedParallelStatement.java
+@@ -23,6 +23,7 @@
+ import org.logstash.config.ir.InvalidIRException;
+ import org.logstash.common.SourceWithMetadata;
+ import org.logstash.config.ir.graph.Graph;
++import org.logstash.plugins.ConfigVariableExpander;
+ 
+ import java.util.List;
+ 
+@@ -37,11 +38,11 @@ protected String composeTypeString() {
+     }
+ 
+     @Override
+-    public Graph toGraph() throws InvalidIRException {
++    public Graph toGraph(ConfigVariableExpander cve) throws InvalidIRException {
+         Graph g = Graph.empty();
+ 
+         for (Statement s : getStatements()) {
+-            g = Graph.combine(g, s.toGraph()).graph;
++            g = Graph.combine(g, s.toGraph(cve)).graph;
+         }
+ 
+         return g;
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/imperative/ComposedSequenceStatement.java b/logstash-core/src/main/java/org/logstash/config/ir/imperative/ComposedSequenceStatement.java
+index 6cd2a44ac53..ef507b791be 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/imperative/ComposedSequenceStatement.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/imperative/ComposedSequenceStatement.java
+@@ -23,6 +23,7 @@
+ import org.logstash.config.ir.InvalidIRException;
+ import org.logstash.common.SourceWithMetadata;
+ import org.logstash.config.ir.graph.Graph;
++import org.logstash.plugins.ConfigVariableExpander;
+ 
+ import java.util.List;
+ 
+@@ -37,11 +38,11 @@ protected String composeTypeString() {
+     }
+ 
+     @Override
+-    public Graph toGraph() throws InvalidIRException {
++    public Graph toGraph(ConfigVariableExpander cve) throws InvalidIRException {
+         Graph g = Graph.empty();
+ 
+         for (Statement statement : getStatements()) {
+-            Graph sg = statement.toGraph();
++            Graph sg = statement.toGraph(cve);
+             g = g.chain(sg);
+         }
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/imperative/IfStatement.java b/logstash-core/src/main/java/org/logstash/config/ir/imperative/IfStatement.java
+index 15885960714..04d242d4bc5 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/imperative/IfStatement.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/imperative/IfStatement.java
+@@ -23,11 +23,12 @@
+ import org.logstash.config.ir.SourceComponent;
+ import org.logstash.config.ir.InvalidIRException;
+ import org.logstash.common.SourceWithMetadata;
+-import org.logstash.config.ir.expression.BooleanExpression;
++import org.logstash.config.ir.expression.*;
+ import org.logstash.config.ir.graph.BooleanEdge;
+ import org.logstash.config.ir.graph.Graph;
+ import org.logstash.config.ir.graph.IfVertex;
+ import org.logstash.config.ir.graph.Vertex;
++import org.logstash.plugins.ConfigVariableExpander;
+ 
+ import java.util.Collection;
+ import java.util.stream.Collectors;
+@@ -99,9 +100,9 @@ public String toString(int indent) {
+ 
+ 
+     @Override
+-    public Graph toGraph() throws InvalidIRException {
+-        Graph trueGraph = getTrueStatement().toGraph();
+-        Graph falseGraph = getFalseStatement().toGraph();
++    public Graph toGraph(ConfigVariableExpander cve) throws InvalidIRException {
++        Graph trueGraph = getTrueStatement().toGraph(cve);
++        Graph falseGraph = getFalseStatement().toGraph(cve);
+ 
+         // If there is nothing in the true or false sections of this if statement,
+         // we can omit the if statement altogether!
+@@ -114,7 +115,8 @@ public Graph toGraph() throws InvalidIRException {
+         Collection<Vertex> trueRoots = trueGraph.roots().map(combination.oldToNewVertices::get).collect(Collectors.toList());
+         Collection<Vertex> falseRoots = falseGraph.roots().map(combination.oldToNewVertices::get).collect(Collectors.toList());
+ 
+-        IfVertex ifVertex = new IfVertex(this.getSourceWithMetadata(), this.booleanExpression);
++        IfVertex ifVertex = new IfVertex(this.getSourceWithMetadata(),
++                (BooleanExpression) ExpressionSubstitution.substituteBoolExpression(cve, this.booleanExpression));
+         newGraph.addVertex(ifVertex);
+ 
+         for (Vertex v : trueRoots) {
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/imperative/NoopStatement.java b/logstash-core/src/main/java/org/logstash/config/ir/imperative/NoopStatement.java
+index 10f2eef6ae3..a8e7a433162 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/imperative/NoopStatement.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/imperative/NoopStatement.java
+@@ -23,6 +23,7 @@
+ import org.logstash.config.ir.SourceComponent;
+ import org.logstash.common.SourceWithMetadata;
+ import org.logstash.config.ir.graph.Graph;
++import org.logstash.plugins.ConfigVariableExpander;
+ 
+ public class NoopStatement extends Statement {
+ 
+@@ -43,7 +44,7 @@ public String toString(int indent) {
+     }
+ 
+     @Override
+-    public Graph toGraph() {
++    public Graph toGraph(ConfigVariableExpander cve) {
+         return Graph.empty();
+     }
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/imperative/PluginStatement.java b/logstash-core/src/main/java/org/logstash/config/ir/imperative/PluginStatement.java
+index 9eef4d651d4..bb34d53593f 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/imperative/PluginStatement.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/imperative/PluginStatement.java
+@@ -27,6 +27,7 @@
+ import org.logstash.config.ir.graph.Graph;
+ import org.logstash.config.ir.graph.PluginVertex;
+ import org.logstash.config.ir.graph.Vertex;
++import org.logstash.plugins.ConfigVariableExpander;
+ 
+ public class PluginStatement extends Statement {
+     private final PluginDefinition pluginDefinition;
+@@ -53,7 +54,7 @@ public String toString(int indent) {
+     }
+ 
+     @Override
+-    public Graph toGraph() throws InvalidIRException {
++    public Graph toGraph(ConfigVariableExpander cve) throws InvalidIRException {
+         Vertex pluginVertex = new PluginVertex(getSourceWithMetadata(), pluginDefinition);
+         Graph g = Graph.empty();
+         g.addVertex(pluginVertex);
+diff --git a/logstash-core/src/main/java/org/logstash/config/ir/imperative/Statement.java b/logstash-core/src/main/java/org/logstash/config/ir/imperative/Statement.java
+index 56a5f51ae79..cdd86519596 100644
+--- a/logstash-core/src/main/java/org/logstash/config/ir/imperative/Statement.java
++++ b/logstash-core/src/main/java/org/logstash/config/ir/imperative/Statement.java
+@@ -24,13 +24,14 @@
+ import org.logstash.config.ir.BaseSourceComponent;
+ import org.logstash.common.SourceWithMetadata;
+ import org.logstash.config.ir.graph.Graph;
++import org.logstash.plugins.ConfigVariableExpander;
+ 
+ public abstract class Statement extends BaseSourceComponent {
+     public Statement(SourceWithMetadata meta) {
+         super(meta);
+     }
+ 
+-    public abstract Graph toGraph() throws InvalidIRException;
++    public abstract Graph toGraph(ConfigVariableExpander cve) throws InvalidIRException;
+ 
+     public String toString() {
+         return toString(2);
+diff --git a/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java b/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
+index d08385be801..139648b72ff 100644
+--- a/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
++++ b/logstash-core/src/main/java/org/logstash/execution/AbstractPipelineExt.java
+@@ -51,6 +51,7 @@
+ import org.logstash.ackedqueue.ext.JRubyAckedQueueExt;
+ import org.logstash.ackedqueue.ext.JRubyWrappedAckedQueueExt;
+ import org.logstash.common.DeadLetterQueueFactory;
++import org.logstash.common.EnvironmentVariableProvider;
+ import org.logstash.common.SourceWithMetadata;
+ import org.logstash.config.ir.ConfigCompiler;
+ import org.logstash.config.ir.InvalidIRException;
+@@ -62,6 +63,7 @@
+ import org.logstash.instrument.metrics.AbstractNamespacedMetricExt;
+ import org.logstash.instrument.metrics.MetricKeys;
+ import org.logstash.instrument.metrics.NullMetricExt;
++import org.logstash.plugins.ConfigVariableExpander;
+ import org.logstash.secret.store.SecretStore;
+ import org.logstash.secret.store.SecretStoreExt;
+ 
+@@ -183,8 +185,8 @@ public final AbstractPipelineExt initialize(final ThreadContext context,
+             }
+         }
+         boolean supportEscapes = getSetting(context, "config.support_escapes").isTrue();
+-        try {
+-            lir = ConfigCompiler.configToPipelineIR(configParts, supportEscapes);
++        try (ConfigVariableExpander cve = new ConfigVariableExpander(getSecretStore(context), EnvironmentVariableProvider.defaultProvider())) {
++            lir = ConfigCompiler.configToPipelineIR(configParts, supportEscapes, cve);
+         } catch (InvalidIRException iirex) {
+             throw new IllegalArgumentException(iirex);
+         }
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java b/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java
+index bf93b73d18a..e834ec24bda 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/CompiledPipelineTest.java
+@@ -49,6 +49,7 @@
+ import org.logstash.ConvertedMap;
+ import org.logstash.Event;
+ import org.logstash.RubyUtil;
++import org.logstash.common.EnvironmentVariableProvider;
+ import org.logstash.common.SourceWithMetadata;
+ import org.logstash.config.ir.compiler.AbstractFilterDelegatorExt;
+ import org.logstash.config.ir.compiler.AbstractOutputDelegatorExt;
+@@ -56,6 +57,7 @@
+ import org.logstash.config.ir.compiler.FilterDelegatorExt;
+ import org.logstash.config.ir.compiler.RubyIntegration;
+ import org.logstash.ext.JrubyEventExtLibrary;
++import org.logstash.plugins.ConfigVariableExpander;
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+@@ -122,9 +124,10 @@ public void afterEach() {
+     @SuppressWarnings({"unchecked"})
+     @Test
+     public void buildsTrivialPipeline() throws Exception {
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+-                IRHelpers.toSourceWithMetadata("input {mockinput{}} output{mockoutput{}}"), false
+-        );
++                IRHelpers.toSourceWithMetadata("input {mockinput{}} output{mockoutput{}}"), false,
++                cve);
+         final JrubyEventExtLibrary.RubyEvent testEvent =
+             JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event());
+         new CompiledPipeline(pipelineIR,
+@@ -142,10 +145,11 @@ public void buildsTrivialPipeline() throws Exception {
+     @SuppressWarnings({"unchecked"})
+     @Test
+     public void buildsStraightPipeline() throws Exception {
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+                 IRHelpers.toSourceWithMetadata("input {mockinput{}} filter { mockfilter {} mockfilter {} mockfilter {}} output{mockoutput{}}"),
+-            false
+-        );
++            false,
++                cve);
+         final JrubyEventExtLibrary.RubyEvent testEvent =
+             JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event());
+         new CompiledPipeline(
+@@ -164,6 +168,7 @@ public void buildsStraightPipeline() throws Exception {
+     @SuppressWarnings({"unchecked"})
+     @Test
+     public void buildsForkedPipeline() throws Exception {
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(IRHelpers.toSourceWithMetadata(
+             "input {mockinput{}} filter { " +
+                 "if [foo] != \"bar\" { " +
+@@ -173,8 +178,8 @@ public void buildsForkedPipeline() throws Exception {
+                 "mockfilter {} " +
+                 "}} " +
+                 "} output {mockoutput{} }"),
+-            false
+-        );
++            false,
++                cve);
+         final JrubyEventExtLibrary.RubyEvent testEvent =
+             JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event());
+         final Map<String, Supplier<IRubyObject>> filters = new HashMap<>();
+@@ -295,13 +300,15 @@ private void verifyRegex(String operator, int expectedEvents)
+         final JrubyEventExtLibrary.RubyEvent testEvent =
+                 JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, event);
+ 
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
++
+         new CompiledPipeline(
+                 ConfigCompiler.configToPipelineIR(
+                         IRHelpers.toSourceWithMetadata("input {mockinput{}} output { " +
+                                 String.format("if \"z\" %s /z/ { ", operator) +
+                                 " mockoutput{} } }"),
+-                        false
+-                ),
++                        false,
++                        cve),
+                 new CompiledPipelineTest.MockPluginFactory(
+                         Collections.singletonMap("mockinput", () -> null),
+                         Collections.singletonMap("mockaddfilter", () -> null),
+@@ -318,10 +325,11 @@ private void verifyRegex(String operator, int expectedEvents)
+     @SuppressWarnings({"unchecked"})
+     @Test
+     public void equalityCheckOnCompositeField() throws Exception {
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+                 IRHelpers.toSourceWithMetadata("input {mockinput{}} filter { if 4 == [list] { mockaddfilter {} } if 5 == [map] { mockaddfilter {} } } output {mockoutput{} }"),
+-                false
+-        );
++                false,
++                cve);
+         final Collection<String> s = new ArrayList<>();
+         s.add("foo");
+         final Map<String, Object> m = new HashMap<>();
+@@ -350,10 +358,11 @@ public void equalityCheckOnCompositeField() throws Exception {
+     @SuppressWarnings({"unchecked"})
+     @Test
+     public void conditionalWithNullField() throws Exception {
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+                 IRHelpers.toSourceWithMetadata("input {mockinput{}} filter { if [foo] == [bar] { mockaddfilter {} } } output {mockoutput{} }"),
+-                false
+-        );
++                false,
++                cve);
+         final JrubyEventExtLibrary.RubyEvent testEvent =
+                 JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event());
+         final Map<String, Supplier<IRubyObject>> filters = new HashMap<>();
+@@ -375,10 +384,11 @@ public void conditionalWithNullField() throws Exception {
+     @SuppressWarnings({"unchecked"})
+     @Test
+     public void conditionalNestedMetaFieldPipeline() throws Exception {
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+                 IRHelpers.toSourceWithMetadata("input {mockinput{}} filter { if [@metadata][foo][bar] { mockaddfilter {} } } output {mockoutput{} }"),
+-            false
+-        );
++            false,
++                cve);
+         final JrubyEventExtLibrary.RubyEvent testEvent =
+             JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event());
+         final Map<String, Supplier<IRubyObject>> filters = new HashMap<>();
+@@ -401,6 +411,7 @@ public void conditionalNestedMetaFieldPipeline() throws Exception {
+     @SuppressWarnings({"unchecked"})
+     @Test
+     public void moreThan255Parents() throws Exception {
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+                 IRHelpers.toSourceWithMetadata("input {mockinput{}} filter { " +
+                 "if [foo] != \"bar\" { " +
+@@ -411,8 +422,8 @@ public void moreThan255Parents() throws Exception {
+                 Strings.repeat("} else if [foo] != \"bar\" {" +
+                     "mockfilter {} ", 300) + " } } " +
+                 "} output {mockoutput{} }"),
+-            false
+-        );
++            false,
++                cve);
+         final JrubyEventExtLibrary.RubyEvent testEvent =
+             JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event());
+         final Map<String, Supplier<IRubyObject>> filters = new HashMap<>();
+@@ -457,6 +468,7 @@ private void verifyComparison(final boolean expected, final String conditional,
+             throws InvalidIRException {
+         final JrubyEventExtLibrary.RubyEvent testEvent =
+             JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, event);
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+ 
+         new CompiledPipeline(
+             ConfigCompiler.configToPipelineIR(
+@@ -465,8 +477,8 @@ private void verifyComparison(final boolean expected, final String conditional,
+                     " mockaddfilter {} " +
+                     "} " +
+                     "} output {mockoutput{} }"),
+-                false
+-            ),
++                false,
++                    cve),
+             new CompiledPipelineTest.MockPluginFactory(
+                 Collections.singletonMap("mockinput", () -> null),
+                 Collections.singletonMap("mockaddfilter", () -> ADD_FIELD_FILTER),
+@@ -563,12 +575,13 @@ public void testCacheCompiledClassesWithDifferentId() throws IOException, Invali
+ 
+         final PipelineIR baselinePipeline = ConfigCompiler.configToPipelineIR(
+                 IRHelpers.toSourceWithMetadataFromPath("org/logstash/config/ir/cache/pipeline1.conf"),
+-                false);
++                false, null);
+         final CompiledPipeline cBaselinePipeline = new CompiledPipeline(baselinePipeline, pluginFactory);
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+ 
+         final PipelineIR pipelineWithDifferentId = ConfigCompiler.configToPipelineIR(
+                 IRHelpers.toSourceWithMetadataFromPath("org/logstash/config/ir/cache/pipeline2.conf"),
+-                false);
++                false, cve);
+         final CompiledPipeline cPipelineWithDifferentId = new CompiledPipeline(pipelineWithDifferentId, pluginFactory);
+ 
+         // actual test: compiling a pipeline with an extra filter should only create 1 extra class
+@@ -590,20 +603,21 @@ public void testReuseCompiledClasses() throws IOException, InvalidIRException {
+                 () -> IDENTITY_FILTER,
+                 mockOutputSupplier()
+         );
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+ 
+         // this pipeline generates 10 classes
+         // - 7 for the filters for the nested and leaf Datasets
+         // - 3 for the sequence of outputs with a conditional
+         final PipelineIR baselinePipeline = ConfigCompiler.configToPipelineIR(
+                 IRHelpers.toSourceWithMetadataFromPath("org/logstash/config/ir/cache/pipeline_reuse_baseline.conf"),
+-                false);
++                false, cve);
+         final CompiledPipeline cBaselinePipeline = new CompiledPipeline(baselinePipeline, pluginFactory);
+ 
+         // this pipeline is much bigger than the baseline
+         // but is carefully crafted to reuse the same classes as the baseline pipeline
+         final PipelineIR pipelineTwiceAsBig = ConfigCompiler.configToPipelineIR(
+                 IRHelpers.toSourceWithMetadataFromPath("org/logstash/config/ir/cache/pipeline_reuse_test.conf"),
+-                false);
++                false, cve);
+         final CompiledPipeline cPipelineTwiceAsBig = new CompiledPipeline(pipelineTwiceAsBig, pluginFactory);
+ 
+         // test: compiling a much bigger pipeline and asserting no additional classes are generated
+@@ -666,7 +680,8 @@ private long time(ChronoUnit seconds, Runnable r) {
+     private PipelineIR createPipelineIR(int numFilters) throws InvalidIRException {
+         final String pipelineConfig = createBigPipelineDefinition(numFilters);
+         final RubyArray swms = IRHelpers.toSourceWithMetadata(pipelineConfig);
+-        return ConfigCompiler.configToPipelineIR(swms,false);
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
++        return ConfigCompiler.configToPipelineIR(swms,false, cve);
+     }
+ 
+     private String createBigPipelineDefinition(int numFilters) {
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/ConfigCompilerTest.java b/logstash-core/src/test/java/org/logstash/config/ir/ConfigCompilerTest.java
+index 379a67d0efc..f8173f0ed1f 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/ConfigCompilerTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/ConfigCompilerTest.java
+@@ -31,9 +31,11 @@
+ import java.util.List;
+ 
+ import org.junit.Test;
++import org.logstash.common.EnvironmentVariableProvider;
+ import org.logstash.common.SourceWithMetadata;
+ import org.logstash.config.ir.graph.Graph;
+ import org.logstash.config.ir.graph.PluginVertex;
++import org.logstash.plugins.ConfigVariableExpander;
+ 
+ import static org.hamcrest.CoreMatchers.is;
+ import static org.hamcrest.MatcherAssert.assertThat;
+@@ -44,8 +46,9 @@ public class ConfigCompilerTest extends RubyEnvTestCase {
+     @Test
+     public void testConfigToPipelineIR() throws Exception {
+         SourceWithMetadata swm = new SourceWithMetadata("proto", "path", 1, 1, "input {stdin{}} output{stdout{}}");
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         final PipelineIR pipelineIR =
+-                ConfigCompiler.configToPipelineIR(Collections.singletonList(swm), false);
++                ConfigCompiler.configToPipelineIR(Collections.singletonList(swm), false, cve);
+         assertThat(pipelineIR.getOutputPluginVertices().size(), is(1));
+         assertThat(pipelineIR.getFilterPluginVertices().size(), is(0));
+     }
+@@ -95,7 +98,8 @@ public void testComplexConfigToPipelineIR() throws Exception {
+ 
+     private static String graphHash(final String config) throws InvalidIRException {
+         SourceWithMetadata swm = new SourceWithMetadata("proto", "path", 1, 1, config);
+-        return ConfigCompiler.configToPipelineIR(Collections.singletonList(swm), false).uniqueHash();
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
++        return ConfigCompiler.configToPipelineIR(Collections.singletonList(swm), false, cve).uniqueHash();
+     }
+ 
+     @Test
+@@ -106,7 +110,7 @@ public void testCompileWithAnEmptySource() throws InvalidIRException {
+                 new SourceWithMetadata("str", "<empty>", 0, 0, "     ")
+         );
+ 
+-        PipelineIR pipeline = ConfigCompiler.compileSources(sourcesWithMetadata, false);
++        PipelineIR pipeline = ConfigCompiler.compileSources(sourcesWithMetadata, false, null);
+ 
+         assertEquals("should compile only the text parts", 2L, pipeline.pluginVertices().count());
+     }
+@@ -119,7 +123,7 @@ public void testCompileWithFullyCommentedSource() throws InvalidIRException {
+                 new SourceWithMetadata("str","out_plugin",0,0,"output { output_0 {} } ")
+         );
+ 
+-        PipelineIR pipeline = ConfigCompiler.compileSources(sourcesWithMetadata, false);
++        PipelineIR pipeline = ConfigCompiler.compileSources(sourcesWithMetadata, false, null);
+ 
+         assertEquals("should compile only non commented text parts", 2L, pipeline.pluginVertices().count());
+     }
+@@ -138,7 +142,7 @@ public void testCompilingPipelineWithMultipleSources() throws InvalidIRException
+                 new SourceWithMetadata(sourceProtocol + "_" + 0, sourceId + "_" + 0, 0, 0, sources[0]),
+                 new SourceWithMetadata(sourceProtocol + "_" + 1, sourceId + "_" + 1, 0, 0, sources[1]));
+ 
+-        PipelineIR pipeline = ConfigCompiler.compileSources(sourcesWithMetadata, false);
++        PipelineIR pipeline = ConfigCompiler.compileSources(sourcesWithMetadata, false, null);
+ 
+         assertFalse("should generate a hash", pipeline.uniqueHash().isEmpty());
+         assertEquals("should provide the original source", String.join("\n", sources),
+@@ -179,7 +183,8 @@ private void verifyComplexConfig(Path path) {
+         PipelineIR pipelineIR = null;
+         try {
+             SourceWithMetadata sourceWithMetadata = new SourceWithMetadata("test_proto", "fake_sourcefile", 0, 0, source);
+-            pipelineIR = ConfigCompiler.compileSources(Collections.singletonList(sourceWithMetadata), false);
++            ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
++            pipelineIR = ConfigCompiler.compileSources(Collections.singletonList(sourceWithMetadata), false, cve);
+         } catch (InvalidIRException iirex) {
+             fail("error compiling " + configName + ": " + iirex.getMessage());
+         }
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/EventConditionTest.java b/logstash-core/src/test/java/org/logstash/config/ir/EventConditionTest.java
+index d65b526528c..329a1f2c7d6 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/EventConditionTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/EventConditionTest.java
+@@ -25,7 +25,9 @@
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.logstash.RubyUtil;
++import org.logstash.common.EnvironmentVariableProvider;
+ import org.logstash.ext.JrubyEventExtLibrary;
++import org.logstash.plugins.ConfigVariableExpander;
+ 
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -74,6 +76,7 @@ public void afterEach() {
+     @Test
+     @SuppressWarnings({"rawtypes", "unchecked"})
+     public void testInclusionWithFieldInField() throws Exception {
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+                 IRHelpers.toSourceWithMetadata("input {mockinput{}} filter { " +
+                         "mockfilter {} } " +
+@@ -81,8 +84,8 @@ public void testInclusionWithFieldInField() throws Exception {
+                         "  if [left] in [right] { " +
+                         "    mockoutput{}" +
+                         "  } }"),
+-                false
+-        );
++                false,
++                cve);
+ 
+         // left list values never match
+         RubyEvent leftIsList = RubyEvent.newRubyEvent(RubyUtil.RUBY);
+@@ -156,6 +159,7 @@ public void testConditionWithConstantEmptyStringValue() throws Exception {
+ 
+     @SuppressWarnings({"unchecked"})
+     private void testConditionWithConstantValue(String condition, int expectedMatches) throws Exception {
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         final PipelineIR pipelineIR = ConfigCompiler.configToPipelineIR(
+                 IRHelpers.toSourceWithMetadata("input {mockinput{}} filter { " +
+                         "mockfilter {} } " +
+@@ -163,8 +167,8 @@ private void testConditionWithConstantValue(String condition, int expectedMatche
+                         "  if " + condition + " { " +
+                         "    mockoutput{}" +
+                         "  } }"),
+-                false
+-        );
++                false,
++                cve);
+ 
+         new CompiledPipeline(
+                 pipelineIR,
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/IRHelpers.java b/logstash-core/src/test/java/org/logstash/config/ir/IRHelpers.java
+index c500a113b5f..5d784aff365 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/IRHelpers.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/IRHelpers.java
+@@ -26,6 +26,7 @@
+ import org.jruby.javasupport.JavaUtil;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.logstash.RubyUtil;
++import org.logstash.common.EnvironmentVariableProvider;
+ import org.logstash.common.IncompleteSourceWithMetadataException;
+ import org.logstash.common.SourceWithMetadata;
+ import org.logstash.config.ir.expression.BooleanExpression;
+@@ -35,6 +36,7 @@
+ import org.logstash.config.ir.graph.Graph;
+ import org.logstash.config.ir.graph.Vertex;
+ import org.logstash.config.ir.graph.algorithms.GraphDiff;
++import org.logstash.plugins.ConfigVariableExpander;
+ 
+ import java.io.File;
+ import java.io.IOException;
+@@ -148,16 +150,17 @@ public static PluginDefinition testPluginDefinition() {
+     public static PipelineIR samplePipeline() throws Exception {
+         Random rng = new Random(81892198);
+         Callable<SourceWithMetadata> meta = () -> randMeta(rng);
++        ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+ 
+-        Graph inputSection = iComposeParallel(iPlugin(meta.call(), INPUT, "generator"), iPlugin(meta.call(), INPUT, "stdin")).toGraph();
++        Graph inputSection = iComposeParallel(iPlugin(meta.call(), INPUT, "generator"), iPlugin(meta.call(), INPUT, "stdin")).toGraph(null);
+         Graph filterSection = iIf(meta.call(), eEq(eEventValue("[foo]"), eEventValue("[bar]")),
+                                     iPlugin(meta.call(), FILTER, "grok"),
+-                                    iPlugin(meta.call(), FILTER, "kv")).toGraph();
++                                    iPlugin(meta.call(), FILTER, "kv")).toGraph(cve);
+         Graph outputSection = iIf(meta.call(), eGt(eEventValue("[baz]"), eValue(1000)),
+                                     iComposeParallel(
+                                             iPlugin(meta.call(), OUTPUT, "s3"),
+                                             iPlugin(meta.call(), OUTPUT, "elasticsearch")),
+-                                    iPlugin(meta.call(), OUTPUT, "stdout")).toGraph();
++                                    iPlugin(meta.call(), OUTPUT, "stdout")).toGraph(cve);
+ 
+         return new PipelineIR(inputSection, filterSection, outputSection);
+     }
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/PipelineIRTest.java b/logstash-core/src/test/java/org/logstash/config/ir/PipelineIRTest.java
+index 914a2fca013..4e7545a3a6e 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/PipelineIRTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/PipelineIRTest.java
+@@ -21,8 +21,10 @@
+ package org.logstash.config.ir;
+ 
+ import org.junit.Test;
++import org.logstash.common.EnvironmentVariableProvider;
+ import org.logstash.common.Util;
+ import org.logstash.config.ir.graph.Graph;
++import org.logstash.plugins.ConfigVariableExpander;
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.logstash.config.ir.DSL.*;
+@@ -31,13 +33,15 @@
+ 
+ public class PipelineIRTest {
+     public Graph makeInputSection() throws InvalidIRException {
+-        return iComposeParallel(iPlugin(randMeta(), INPUT, "generator"), iPlugin(randMeta(), INPUT, "stdin")).toGraph();
++        return iComposeParallel(iPlugin(randMeta(), INPUT, "generator"), iPlugin(randMeta(), INPUT, "stdin"))
++                .toGraph(ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider()));
+     }
+ 
+     public Graph makeFilterSection() throws InvalidIRException {
+         return iIf(randMeta(), eEq(eEventValue("[foo]"), eEventValue("[bar]")),
+                                     iPlugin(randMeta(), FILTER, "grok"),
+-                                    iPlugin(randMeta(), FILTER, "kv")).toGraph();
++                                    iPlugin(randMeta(), FILTER, "kv"))
++                .toGraph(ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider()));
+     }
+ 
+     public Graph makeOutputSection() throws InvalidIRException {
+@@ -45,7 +49,8 @@ public Graph makeOutputSection() throws InvalidIRException {
+                                     iComposeParallel(
+                                             iPlugin(randMeta(), OUTPUT, "s3"),
+                                             iPlugin(randMeta(), OUTPUT, "elasticsearch")),
+-                                    iPlugin(randMeta(), OUTPUT, "stdout")).toGraph();
++                                    iPlugin(randMeta(), OUTPUT, "stdout"))
++                .toGraph(ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider()));
+     }
+ 
+     @Test
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/expression/ExpressionSubstitutionTest.java b/logstash-core/src/test/java/org/logstash/config/ir/expression/ExpressionSubstitutionTest.java
+new file mode 100644
+index 00000000000..10ce3552900
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/config/ir/expression/ExpressionSubstitutionTest.java
+@@ -0,0 +1,91 @@
++package org.logstash.config.ir.expression;
++
++import com.google.common.collect.ImmutableMap;
++import org.junit.Test;
++import org.logstash.common.EnvironmentVariableProvider;
++import org.logstash.common.SourceWithMetadata;
++import org.logstash.config.ir.InvalidIRException;
++import org.logstash.config.ir.expression.binary.And;
++import org.logstash.config.ir.expression.binary.Eq;
++import org.logstash.config.ir.expression.binary.Or;
++import org.logstash.config.ir.expression.unary.Not;
++import org.logstash.plugins.ConfigVariableExpander;
++
++import java.util.HashMap;
++import java.util.Map;
++
++import static org.junit.Assert.assertEquals;
++
++public class ExpressionSubstitutionTest {
++
++    @Test
++    public void basicBinaryBooleanSubstitution() throws InvalidIRException {
++        SourceWithMetadata swm = new SourceWithMetadata("proto", "path", 1, 8, "if \"${SMALL}\" == 1 { add_tag => \"pass\" }");
++        ValueExpression left = new ValueExpression(swm, "${SMALL}");
++        ValueExpression right = new ValueExpression(swm, "1");
++        BinaryBooleanExpression expression = new Eq(swm, left, right);
++
++        ConfigVariableExpander cve = getConfigVariableExpander();
++        BinaryBooleanExpression substituted = (BinaryBooleanExpression) ExpressionSubstitution.substituteBoolExpression(cve, expression);
++        assertEquals(((ValueExpression) substituted.getLeft()).get(), "1");
++    }
++
++    @Test
++    public void basicUnaryBooleanSubstitution() throws InvalidIRException {
++        SourceWithMetadata swm = new SourceWithMetadata("proto", "path", 1, 8, "if !(\"${BIG}\" == 100) { add_tag => \"not\" }");
++        ValueExpression valueExp = new ValueExpression(swm, "${BIG}");
++        UnaryBooleanExpression expression = new Not(swm, valueExp);
++
++        ConfigVariableExpander cve = getConfigVariableExpander();
++        UnaryBooleanExpression substituted = (UnaryBooleanExpression) ExpressionSubstitution.substituteBoolExpression(cve, expression);
++        assertEquals(((ValueExpression) substituted.getExpression()).get(), "100");
++    }
++
++    @Test
++    public void noRegexSubstitution() throws InvalidIRException {
++        SourceWithMetadata swm = new SourceWithMetadata("proto", "path", 1, 8, "if [version] =~ /${SMALL}/ { add_tag => \"regex\" }");
++        EventValueExpression left = new EventValueExpression(swm, "version");
++        RegexValueExpression right = new RegexValueExpression(swm, "${SMALL}");
++        BinaryBooleanExpression expression = new Eq(swm, left, right);
++
++        ConfigVariableExpander cve = getConfigVariableExpander();
++        BinaryBooleanExpression substituted = (BinaryBooleanExpression) ExpressionSubstitution.substituteBoolExpression(cve, expression);
++        assertEquals(substituted.getRight(), expression.getRight());
++    }
++
++    @Test
++    public void nestedBinaryBooleanSubstitution() throws InvalidIRException {
++        SourceWithMetadata swm = new SourceWithMetadata("proto", "path", 1, 8,
++                "if \"${SMALL}\" == 1 and 100 == \"${BIG}\" or [version] == 1 { add_tag => \"pass\" }");
++        ValueExpression smallLeft = new ValueExpression(swm, "${SMALL}");
++        ValueExpression smallRight = new ValueExpression(swm, "1");
++        BinaryBooleanExpression smallExp = new Eq(swm, smallLeft, smallRight);
++
++        ValueExpression bigLeft = new ValueExpression(swm, "100");
++        ValueExpression bigRight = new ValueExpression(swm, "${BIG}");
++        BinaryBooleanExpression bigExp = new Eq(swm, bigLeft, bigRight);
++
++        EventValueExpression versionLeft = new EventValueExpression(swm, "version");
++        ValueExpression versionRight = new ValueExpression(swm, "1");
++        BinaryBooleanExpression versionExp = new Eq(swm, versionLeft, versionRight);
++
++        And andExp = new And(swm, smallExp, bigExp);
++        Or orExp = new Or(swm, andExp, versionExp);
++
++        ConfigVariableExpander cve = getConfigVariableExpander();
++        BinaryBooleanExpression substituted = (BinaryBooleanExpression) ExpressionSubstitution.substituteBoolExpression(cve, orExp);
++        And subAnd = (And) substituted.getLeft();
++        BinaryBooleanExpression subSmallExp = (BinaryBooleanExpression) subAnd.getLeft();
++        BinaryBooleanExpression subBigExp = (BinaryBooleanExpression) subAnd.getRight();
++        assertEquals(((ValueExpression) subSmallExp.getLeft()).get(), "1");
++        assertEquals(((ValueExpression) subBigExp.getRight()).get(), "100");
++    }
++
++    public Map<String, String> envVar() {
++        return ImmutableMap.of("APP", "foobar", "SMALL", "1", "BIG", "100");
++    }
++
++    public ConfigVariableExpander getConfigVariableExpander() {
++        return ConfigVariableExpander.withoutSecret(envVar()::get);
++    }
++}
+\ No newline at end of file
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/imperative/IfStatementTest.java b/logstash-core/src/test/java/org/logstash/config/ir/imperative/IfStatementTest.java
+index 2f0631543ab..5c875723c47 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/imperative/IfStatementTest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/imperative/IfStatementTest.java
+@@ -25,15 +25,14 @@
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
+-import java.util.stream.Stream;
+ 
+-import org.logstash.common.SourceWithMetadata;
++import org.logstash.common.EnvironmentVariableProvider;
+ import org.logstash.config.ir.DSL;
+ import org.logstash.config.ir.InvalidIRException;
+ import org.logstash.config.ir.PluginDefinition;
+ import org.logstash.config.ir.expression.BooleanExpression;
+-import org.logstash.config.ir.expression.Expression;
+ import org.logstash.config.ir.graph.*;
++import org.logstash.plugins.ConfigVariableExpander;
+ 
+ import static org.logstash.config.ir.IRHelpers.*;
+ 
+@@ -41,6 +40,7 @@ public class IfStatementTest {
+ 
+     @Test
+     public void testEmptyIf() throws InvalidIRException {
++        ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         Statement trueStatement = new NoopStatement(randMeta());
+         Statement falseStatement = new NoopStatement(randMeta());
+         IfStatement ifStatement = new IfStatement(
+@@ -50,12 +50,13 @@ public void testEmptyIf() throws InvalidIRException {
+                 falseStatement
+         );
+ 
+-        Graph ifStatementGraph = ifStatement.toGraph();
++        Graph ifStatementGraph = ifStatement.toGraph(cve);
+         assertTrue(ifStatementGraph.isEmpty());
+     }
+ 
+     @Test
+     public void testIfWithOneTrueStatement() throws InvalidIRException {
++        ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         PluginDefinition pluginDef = testPluginDefinition();
+         Statement trueStatement = new PluginStatement(randMeta(), pluginDef);
+         Statement falseStatement = new NoopStatement(randMeta());
+@@ -67,7 +68,7 @@ public void testIfWithOneTrueStatement() throws InvalidIRException {
+                 falseStatement
+         );
+ 
+-        Graph ifStatementGraph = ifStatement.toGraph();
++        Graph ifStatementGraph = ifStatement.toGraph(cve);
+         assertFalse(ifStatementGraph.isEmpty());
+         
+         Graph expected = new Graph();
+@@ -82,6 +83,7 @@ public void testIfWithOneTrueStatement() throws InvalidIRException {
+ 
+     @Test
+     public void testIfWithOneFalseStatement() throws InvalidIRException {
++        ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         PluginDefinition pluginDef = testPluginDefinition();
+         Statement trueStatement = new NoopStatement(randMeta());
+         Statement falseStatement = new PluginStatement(randMeta(), pluginDef);
+@@ -93,7 +95,7 @@ public void testIfWithOneFalseStatement() throws InvalidIRException {
+                 falseStatement
+         );
+ 
+-        Graph ifStatementGraph = ifStatement.toGraph();
++        Graph ifStatementGraph = ifStatement.toGraph(cve);
+         assertFalse(ifStatementGraph.isEmpty());
+ 
+         Graph expected = new Graph();
+@@ -108,6 +110,7 @@ public void testIfWithOneFalseStatement() throws InvalidIRException {
+ 
+     @Test
+     public void testIfWithOneTrueOneFalseStatement() throws InvalidIRException {
++        ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         PluginDefinition pluginDef = testPluginDefinition();
+         Statement trueStatement = new PluginStatement(randMeta(), pluginDef);
+         Statement falseStatement = new PluginStatement(randMeta(), pluginDef);
+@@ -119,7 +122,7 @@ public void testIfWithOneTrueOneFalseStatement() throws InvalidIRException {
+                 falseStatement
+         );
+ 
+-        Graph ifStatementGraph = ifStatement.toGraph();
++        Graph ifStatementGraph = ifStatement.toGraph(cve);
+         assertFalse(ifStatementGraph.isEmpty());
+ 
+         Graph expected = new Graph();
+diff --git a/logstash-core/src/test/java/org/logstash/config/ir/imperative/ImperativeToGraphtest.java b/logstash-core/src/test/java/org/logstash/config/ir/imperative/ImperativeToGraphtest.java
+index ea644531b1e..7c537525707 100644
+--- a/logstash-core/src/test/java/org/logstash/config/ir/imperative/ImperativeToGraphtest.java
++++ b/logstash-core/src/test/java/org/logstash/config/ir/imperative/ImperativeToGraphtest.java
+@@ -21,10 +21,12 @@
+ package org.logstash.config.ir.imperative;
+ 
+ import org.junit.Test;
++import org.logstash.common.EnvironmentVariableProvider;
+ import org.logstash.config.ir.InvalidIRException;
+ import org.logstash.config.ir.graph.Graph;
+ import org.logstash.config.ir.graph.IfVertex;
+ import org.logstash.config.ir.graph.PluginVertex;
++import org.logstash.plugins.ConfigVariableExpander;
+ 
+ import static org.logstash.config.ir.DSL.*;
+ import static org.logstash.config.ir.IRHelpers.assertSyntaxEquals;
+@@ -35,7 +37,8 @@ public class ImperativeToGraphtest {
+ 
+     @Test
+     public void convertSimpleExpression() throws InvalidIRException {
+-        Graph imperative =  iComposeSequence(randMeta(), iPlugin(randMeta(), FILTER, "json"), iPlugin(randMeta(), FILTER, "stuff")).toGraph();
++        ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
++        Graph imperative =  iComposeSequence(randMeta(), iPlugin(randMeta(), FILTER, "json"), iPlugin(randMeta(), FILTER, "stuff")).toGraph(cve);
+         imperative.validate(); // Verify this is a valid graph
+ 
+         Graph regular = Graph.empty();
+@@ -46,10 +49,11 @@ public void convertSimpleExpression() throws InvalidIRException {
+ 
+     @Test
+     public void testIdsDontAffectSourceComponentEquality() throws InvalidIRException {
++        ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         Graph imperative =  iComposeSequence(
+                 iPlugin(randMeta(), FILTER, "json", "oneid"),
+                 iPlugin(randMeta(), FILTER, "stuff", "anotherid")
+-        ).toGraph();
++        ).toGraph(cve);
+         imperative.validate(); // Verify this is a valid graph
+ 
+         Graph regular = Graph.empty();
+@@ -63,6 +67,7 @@ public void testIdsDontAffectSourceComponentEquality() throws InvalidIRException
+ 
+     @Test
+     public void convertComplexExpression() throws InvalidIRException {
++        ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         Graph imperative = iComposeSequence(
+                 iPlugin(randMeta(), FILTER, "p1"),
+                 iPlugin(randMeta(), FILTER, "p2"),
+@@ -70,7 +75,7 @@ public void convertComplexExpression() throws InvalidIRException {
+                         iPlugin(randMeta(), FILTER, "p3"),
+                         iComposeSequence(iPlugin(randMeta(), FILTER, "p4"), iPlugin(randMeta(), FILTER, "p5"))
+                 )
+-        ).toGraph();
++        ).toGraph(cve);
+         imperative.validate(); // Verify this is a valid graph
+ 
+         PluginVertex p1 = gPlugin(randMeta(), FILTER, "p1");
+@@ -93,6 +98,7 @@ public void convertComplexExpression() throws InvalidIRException {
+     // partial leaves. This makes sure they all wire-up right
+     @Test
+     public void deepDanglingPartialLeaves() throws InvalidIRException {
++        ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         Graph imperative = iComposeSequence(
+                  iPlugin(randMeta(), FILTER, "p0"),
+                  iIf(randMeta(), eTruthy(eValue(1)),
+@@ -106,7 +112,7 @@ public void deepDanglingPartialLeaves() throws InvalidIRException {
+                  ),
+                  iPlugin(randMeta(), FILTER, "pLast")
+ 
+-         ).toGraph();
++         ).toGraph(cve);
+         imperative.validate(); // Verify this is a valid graph
+ 
+         IfVertex if1 = gIf(randMeta(), eTruthy(eValue(1)));
+@@ -141,6 +147,7 @@ public void deepDanglingPartialLeaves() throws InvalidIRException {
+     // single node
+     @Test
+     public void convertComplexExpressionWithTerminal() throws InvalidIRException {
++        ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
+         Graph imperative = iComposeSequence(
+             iPlugin(randMeta(), FILTER, "p1"),
+             iIf(randMeta(), eTruthy(eValue(1)),
+@@ -154,7 +161,7 @@ public void convertComplexExpressionWithTerminal() throws InvalidIRException {
+                 )
+             ),
+             iPlugin(randMeta(), FILTER, "terminal")
+-        ).toGraph();
++        ).toGraph(cve);
+         imperative.validate(); // Verify this is a valid graph
+ 
+         PluginVertex p1 = gPlugin(randMeta(), FILTER,"p1");
+diff --git a/logstash-core/src/test/java/org/logstash/plugins/factory/PluginFactoryExtTest.java b/logstash-core/src/test/java/org/logstash/plugins/factory/PluginFactoryExtTest.java
+index 1f621b90b85..28b5054a397 100644
+--- a/logstash-core/src/test/java/org/logstash/plugins/factory/PluginFactoryExtTest.java
++++ b/logstash-core/src/test/java/org/logstash/plugins/factory/PluginFactoryExtTest.java
+@@ -25,6 +25,7 @@
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.junit.Test;
+ import org.logstash.RubyUtil;
++import org.logstash.common.EnvironmentVariableProvider;
+ import org.logstash.common.SourceWithMetadata;
+ import org.logstash.config.ir.ConfigCompiler;
+ import org.logstash.config.ir.InvalidIRException;
+@@ -32,6 +33,7 @@
+ import org.logstash.config.ir.RubyEnvTestCase;
+ import org.logstash.execution.Engine;
+ import org.logstash.instrument.metrics.NamespacedMetricExt;
++import org.logstash.plugins.ConfigVariableExpander;
+ import org.logstash.plugins.MetricTestCase;
+ import org.logstash.plugins.PluginLookup;
+ 
+@@ -107,7 +109,8 @@ public void testPluginIdResolvedWithEnvironmentVariables() throws InvalidIRExcep
+     }
+ 
+     private static PipelineIR compilePipeline(SourceWithMetadata sourceWithMetadata) throws InvalidIRException {
+-        return ConfigCompiler.configToPipelineIR(Collections.singletonList(sourceWithMetadata), false);
++        final ConfigVariableExpander cve = ConfigVariableExpander.withoutSecret(EnvironmentVariableProvider.defaultProvider());
++        return ConfigCompiler.configToPipelineIR(Collections.singletonList(sourceWithMetadata), false, cve);
+     }
+ 
+     private static ExecutionContextFactoryExt createExecutionContextFactory() {
+diff --git a/qa/integration/fixtures/env_variables_condition_spec.yml b/qa/integration/fixtures/env_variables_condition_spec.yml
+new file mode 100644
+index 00000000000..c27999437d2
+--- /dev/null
++++ b/qa/integration/fixtures/env_variables_condition_spec.yml
+@@ -0,0 +1,77 @@
++---
++services:
++  - logstash
++config: |-
++ input {
++    generator {
++      lines => ['{"app": "foobar", "amount": "100", "version": 1, "tag1": "mytag1"}']
++      count => 1
++    }
++  }
++  filter {
++    json {
++       source => "message"
++    }
++
++    if ("${APP}") {
++       mutate { add_tag => ["Truthy"] }
++    }
++    if !([version] == "${BIG}") {
++       mutate { add_tag => ["Not"] }
++    }
++    if "${BIG}" > "${SMALL}" {
++       mutate { add_tag => [">"] }
++    }
++    if "${BIG}" >= "100" {
++       mutate { add_tag => [">="] }
++    }
++    if "${SMALL}" < "${BIG}" {
++       mutate { add_tag => ["<"] }
++    }
++    if "${SMALL}" <= "1" {
++       mutate { add_tag => ["<="] }
++    }
++    if [app] == "${APP}" {
++       mutate { add_tag => ["=="] }
++    }
++    if "${SMALL}" != "${BIG}" {
++       mutate { add_tag => ["!="] }
++    }
++    if [amount] in ["${SMALL}", "${BIG}"] {
++       mutate { add_tag => ["in"] }
++    }
++    if [amount] not in ["${SMALL}", "2", "3"] {
++       mutate { add_tag => ["not in"] }
++    }
++    if [amount] =~ /\d+/ {
++       mutate { add_tag => ["=~"] }
++    }
++    if [amount] =~ /${BIG}/ {
++       mutate { add_tag => ["wrong_regex_substitution"] }
++    }
++    if [amount] !~ /[a-z]+/ {
++       mutate { add_tag => ["!~"] }
++    }
++    if ([app] == "${APP}") and ([app] == "foobar") {
++       mutate { add_tag => ["and"] }
++    }
++    if ([app] == "${APP}") and ([amount] == "${BIG}") and ([version] == 1) and [tag1] == "${TAG1}" {
++       mutate { add_tag => ["more_and"] }
++    }
++    if (1 > 2) or ([app] == "${APP}") {
++       mutate { add_tag => ["or"] }
++    }
++    if ([app] == "${APP}") nand (1 > 2) {
++       mutate { add_tag => ["nand"] }
++    }
++    if (1 > 2) xor ([app] == "${APP}") {
++       mutate { add_tag => ["xor"] }
++    }
++  }
++  output {
++    file {
++      path => "${TEST_ENV_PATH}/env_variables_condition_output.log"
++      flush_interval => 0
++      codec => line { format => "%{message} %{tags}" }
++    }
++  }
+\ No newline at end of file
+diff --git a/qa/integration/specs/env_variables_condition_spec.rb b/qa/integration/specs/env_variables_condition_spec.rb
+new file mode 100644
+index 00000000000..0a9ec2dd57f
+--- /dev/null
++++ b/qa/integration/specs/env_variables_condition_spec.rb
+@@ -0,0 +1,98 @@
++# Licensed to Elasticsearch B.V. under one or more contributor
++# license agreements. See the NOTICE file distributed with
++# this work for additional information regarding copyright
++# ownership. Elasticsearch B.V. licenses this file to you under
++# the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#  http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++
++require_relative '../framework/fixture'
++require_relative '../framework/settings'
++require_relative '../services/logstash_service'
++require_relative '../framework/helpers'
++require "logstash/devutils/rspec/spec_helper"
++
++### Logstash Keystore notes #############
++# The logstash.keystore password is `keystore_pa9454w3rd` and contains the following entries:
++# input.count = 10
++# output.path = mypath
++# pipeline.id = mypipeline
++# tag1 = mytag1
++# tag2 = mytag2
++# tag3 = mytag3
++####################################
++describe "Support environment variable in condition" do
++  before(:all) {
++    @fixture = Fixture.new(__FILE__)
++  }
++
++  before(:each) {
++    @logstash = @fixture.get_service("logstash")
++    IO.write(File.join(settings_dir, "logstash.yml"), YAML.dump(settings))
++    FileUtils.cp(File.expand_path("../../logstash.keystore", __FILE__), settings_dir)
++  }
++
++  after(:all) {
++    @fixture.teardown
++  }
++
++  after(:each) {
++    @logstash.teardown
++  }
++  
++  let(:num_retries) { 50 }
++  let(:test_path) { Stud::Temporary.directory }
++  let(:test_env) {
++    env = Hash.new
++    env["BIG"] = "100"
++    env["SMALL"] = "1"
++    env["APP"] = 'foobar'
++    env
++  }
++  let(:settings_dir) { Stud::Temporary.directory }
++  let(:settings) {{"pipeline.id" => "${pipeline.id}"}}
++  let(:logstash_keystore_passowrd) { "keystore_pa9454w3rd" }
++
++  it "expands variables and evaluate expression successfully" do
++    test_env["TEST_ENV_PATH"] = test_path
++    test_env["LOGSTASH_KEYSTORE_PASS"] = logstash_keystore_passowrd
++
++    @logstash.env_variables = test_env
++    @logstash.start_background_with_config_settings(config_to_temp_file(@fixture.config), settings_dir)
++
++    Stud.try(num_retries.times, [StandardError, RSpec::Expectations::ExpectationNotMetError]) do
++      output = IO.read(File.join(test_path, "env_variables_condition_output.log")).gsub("\n", "")
++      expect(output).to match /Truthy,Not,>,>=,<,<=,==,!=,in,not in,=~,!~,and,more_and,or,nand,xor/
++    end
++  end
++
++  it "expands variables in secret store" do
++    test_env["LOGSTASH_KEYSTORE_PASS"] = logstash_keystore_passowrd
++    test_env['TAG1'] = "wrong_env" # secret store should take precedence
++    logstash = @logstash.run_cmd(["bin/logstash", "-e",
++                                  "input { generator { count => 1 } }
++                                    filter { if (\"${APP}\") { mutate { add_tag => \"${TAG1}\"} } }
++                                    output { stdout{} }",
++                                  "--path.settings", settings_dir],
++                                 true, test_env)
++    expect(logstash.stderr_and_stdout).to match(/mytag1/)
++    expect(logstash.stderr_and_stdout).not_to match(/wrong_env/)
++    expect(logstash.exit_code).to be(0)
++  end
++
++  it "exits with error when env variable is undefined" do
++    test_env["LOGSTASH_KEYSTORE_PASS"] = logstash_keystore_passowrd
++    logstash = @logstash.run_cmd(["bin/logstash","-e", "filter { if \"${NOT_EXIST}\" { mutate {add_tag => \"oh no\"} } }", "--path.settings", settings_dir], true, test_env)
++    expect(logstash.stderr_and_stdout).to match(/Cannot evaluate `\$\{NOT_EXIST\}`/)
++    expect(logstash.exit_code).to be(1)
++  end
++end  
+\ No newline at end of file
+diff --git a/qa/integration/specs/secret_store_spec.rb b/qa/integration/specs/secret_store_spec.rb
+index c25aa3202b2..79c9824d8ee 100644
+--- a/qa/integration/specs/secret_store_spec.rb
++++ b/qa/integration/specs/secret_store_spec.rb
+@@ -54,10 +54,11 @@
+   let(:test_env) {Hash.new}
+   let(:settings_dir) {Stud::Temporary.directory}
+   let(:settings) {{"pipeline.id" => "${pipeline.id}"}}
++  let(:logstash_keystore_passowrd) { "keystore_pa9454w3rd" }
+ 
+   it "expands secret store variables from config" do
+     test_env["TEST_ENV_PATH"] = test_path
+-    test_env["LOGSTASH_KEYSTORE_PASS"] = "keystore_pa9454w3rd"
++    test_env["LOGSTASH_KEYSTORE_PASS"] = logstash_keystore_passowrd
+     @logstash.env_variables = test_env
+     @logstash.start_background_with_config_settings(config_to_temp_file(@fixture.config), settings_dir)
+     Stud.try(num_retries.times, [StandardError, RSpec::Expectations::ExpectationNotMetError]) do
+@@ -67,7 +68,7 @@
+   end
+ 
+   it "expands secret store variables from settings" do
+-    test_env["LOGSTASH_KEYSTORE_PASS"] = "keystore_pa9454w3rd"
++    test_env["LOGSTASH_KEYSTORE_PASS"] = logstash_keystore_passowrd
+     @logstash.env_variables = test_env
+     @logstash.spawn_logstash("-e", "input {heartbeat {}} output { }", "--path.settings", settings_dir)
+     Stud.try(num_retries.times, [StandardError, RSpec::Expectations::ExpectationNotMetError]) do
+@@ -79,6 +80,13 @@
+     end
+   end
+ 
++  it "won't show secret value when pipeline definition is wrong" do
++    test_env["LOGSTASH_KEYSTORE_PASS"] = logstash_keystore_passowrd
++    logstash = @logstash.run_cmd(["bin/logstash","-e", "input { http { user => test password => \"${tag1}\" port = \"3333\" }}", "--path.settings", settings_dir], true, test_env)
++    expect(logstash.stderr_and_stdout).to match(/\[ERROR\]/)
++    expect(logstash.stderr_and_stdout).to match(/\\"\$\{tag1\}\\"/)
++  end
++
+   context "won't start" do
+     it "with the wrong password when variables are in settings" do
+       test_env["LOGSTASH_KEYSTORE_PASS"] = "WRONG_PASSWRD"
+@@ -94,7 +102,7 @@
+   context "won't start " do
+     let(:settings) {{"pipeline.id" => "${missing}"}}
+     it "with correct password, but invalid variable " do
+-      test_env["LOGSTASH_KEYSTORE_PASS"] = "keystore_pa9454w3rd"
++      test_env["LOGSTASH_KEYSTORE_PASS"] = logstash_keystore_passowrd
+       @logstash.env_variables = test_env
+       @logstash.spawn_logstash("-e", "input {stdin {}} output { }", "--path.settings", settings_dir)
+       try(num_retries) do
+diff --git a/x-pack/spec/monitoring/inputs/metrics/state_event/lir_serializer_spec.rb b/x-pack/spec/monitoring/inputs/metrics/state_event/lir_serializer_spec.rb
+index a89800fc26d..beafe3bd67c 100644
+--- a/x-pack/spec/monitoring/inputs/metrics/state_event/lir_serializer_spec.rb
++++ b/x-pack/spec/monitoring/inputs/metrics/state_event/lir_serializer_spec.rb
+@@ -21,10 +21,11 @@
+     [org.logstash.common.SourceWithMetadata.new("string", "spec", config)]
+   end
+ 
++  let(:cve) { org.logstash.plugins.ConfigVariableExpander.without_secret(org.logstash.common.EnvironmentVariableProvider.default_provider()) }
+   let(:lir_pipeline) do
+ #     ::LogStash::Compiler.compile_sources(config_source_with_metadata, true)
+     java_import org.logstash.config.ir.ConfigCompiler
+-    ConfigCompiler.compileSources(config_source_with_metadata, true)
++    ConfigCompiler.compileSources(config_source_with_metadata, true, cve)
+   end
+ 
+   describe "#serialize" do

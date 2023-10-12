@@ -1,0 +1,246 @@
+diff --git a/CHANGELOG b/CHANGELOG
+index 32eccb7a7f9..d4ce8bb5927 100644
+--- a/CHANGELOG
++++ b/CHANGELOG
+@@ -14,6 +14,12 @@
+     searching to not work. Added tests to ensure search behavior works as
+     expected with this template. (Aaron Mildenstein, Jordan Sissel)
+   - Update README.md to be consistent with Makefile use of JRuby 1.7.8
++  - Time parsing in things like the json codec (and other similar parts of
++    logstash) are *much* faster now. This fixes a speed regression that was
++    introduced in logstash 1.2.0.
++
++  # filters
++  - improvement: date: roughly 20% faster (Jordan Sissel)
+ 
+   # outputs
+   - new: csv: write csv format to files output. (Matt Gray)
+diff --git a/bin/logstash b/bin/logstash
+index 0feca343052..9b196c1fcd5 100755
+--- a/bin/logstash
++++ b/bin/logstash
+@@ -28,10 +28,10 @@ case $1 in
+   -*) 
+     # is the first argument a flag? If so, assume 'agent'
+     program="$basedir/lib/logstash/runner.rb"
+-    exec $RUBYCMD "$program" agent "$@"
++    exec $RUBYCMD -I$RUBYLIB "$program" agent "$@"
+     ;;
+   *)
+     program="$basedir/lib/logstash/runner.rb"
+-    exec $RUBYCMD "$program" "$@"
++    exec $RUBYCMD -I$RUBYLIB "$program" "$@"
+     ;;
+ esac
+diff --git a/bin/logstash.lib.sh b/bin/logstash.lib.sh
+index 60434881f5e..2c6a9965b7f 100644
+--- a/bin/logstash.lib.sh
++++ b/bin/logstash.lib.sh
+@@ -1,6 +1,7 @@
+ basedir=$(cd `dirname $0`/..; pwd)
+ 
+ setup_ruby() {
++  export RUBYLIB="$basedir/lib"
+   # Verify ruby works
+   if ! ruby -e 'puts "HURRAY"' 2> /dev/null | grep -q "HURRAY" ; then
+     echo "No ruby program found. Cannot start."
+@@ -9,21 +10,30 @@ setup_ruby() {
+ 
+   eval $(ruby -rrbconfig -e 'puts "RUBYVER=#{RbConfig::CONFIG["ruby_version"]}"; puts "RUBY=#{RUBY_ENGINE}"')
+   RUBYCMD="ruby"
++  export GEM_HOME="$basedir/vendor/bundle/${RUBY}/${RUBYVER}"
++  export GEM_PATH=
+ }
+ 
+ setup_java() {
+-  if [ -z "$JAVA_HOME/bin/java" ] ; then
+-    JAVA="$JAVA_HOME/bin/java"
+-  else
+-    JAVA=$(which java)
++  if [ -z "$JAVACMD" ] ; then
++    if [ -z "$JAVA_HOME/bin/java" ] ; then
++      JAVACMD="$JAVA_HOME/bin/java"
++    else
++      JAVACMD="java"
++    fi
++  elif [ "$(basename $JAVACMD)" = "drip" ] ; then
++    export DRIP_INIT_CLASS="org.jruby.main.DripMain"
++    export DRIP_INIT=
+   fi
+ 
+-  if [ ! -x "$JAVA" ] ; then
+-    echo "Could not find any executable java binary. Please install java in your PATH or set JAVA_HOME."
+-    exit 1
++  if [ ! -x "$JAVACMD" ] ; then
++    JAVACMD="$(which $JAVACMD 2> /dev/null)"
++    if [ ! -x "$JAVACMD" ] ; then
++      echo "Could not find any executable java binary (tried '$JAVACMD'). Please install java in your PATH or set JAVA_HOME."
++      exit 1
++    fi
+   fi
+ 
+-
+   JAVA_OPTS="$JAVA_OPTS -Xmx${LS_HEAP_SIZE}"
+   JAVA_OPTS="$JAVA_OPTS -XX:+UseParNewGC"
+   JAVA_OPTS="$JAVA_OPTS -XX:+UseConcMarkSweepGC"
+@@ -41,30 +51,25 @@ setup_java() {
+     JAVA_OPTS="$JAVA_OPTS -Xloggc:./logstash-gc.log"
+     echo "Writing garbage collection logs to ./logstash-gc.log"
+   fi
++
++  export JAVACMD
++  export JAVA_OPTS
++  export GEM_HOME="$basedir/vendor/bundle/jruby/1.9"
+ } 
+ 
+ setup_vendored_jruby() {
+   RUBYVER=1.9
+   RUBY=jruby
+-
+-  setup_java
+-
+-  RUBYCMD="$JAVA $JAVA_OPTS -jar $basedir/vendor/jar/jruby-complete-*.jar"
++  RUBYCMD="$JAVACMD $JAVA_OPTS -jar $basedir/vendor/jar/jruby-complete-*.jar"
+ }
+ 
+ setup() {
++  setup_java
+   if [ -z "$USE_JRUBY" -a \( -d "$basedir/.git" -o ! -z "$USE_RUBY" \) ] ; then
+     setup_ruby
+-    if [ "$RUBY" = "jruby" ] ; then
+-      setup_java
+-      export JAVA_OPTS
+-    fi
+   else
+     setup_vendored_jruby
+   fi
+-  export GEM_HOME="$basedir/vendor/bundle/${RUBY}/${RUBYVER}"
+-  export GEM_PATH=
+-  export RUBYLIB="$basedir/lib"
+ }
+ 
+ install_deps() {
+diff --git a/docs/repositories.md b/docs/repositories.md
+index b8abe4341b8..159d6301120 100644
+--- a/docs/repositories.md
++++ b/docs/repositories.md
+@@ -4,7 +4,7 @@ layout: content_right
+ ---
+ # LogStash repositories
+ 
+-We also have Logstash available als APT and YUM repositories.
++We also have Logstash available as APT and YUM repositories.
+ 
+ Our public signing key can be found [here](http://packages.elasticsearch.org/GPG-KEY-elasticsearch)
+ 
+diff --git a/lib/logstash/filters/base.rb b/lib/logstash/filters/base.rb
+index e3fa4841dff..7274e64ec28 100644
+--- a/lib/logstash/filters/base.rb
++++ b/lib/logstash/filters/base.rb
+@@ -56,7 +56,7 @@ class LogStash::Filters::Base < LogStash::Plugin
+   config :remove_tag, :validate => :array, :default => []
+ 
+   # If this filter is successful, add any arbitrary fields to this event.
+-  # Tags can be dynamic and include parts of the event using the %{field}
++  # Field names can be dynamic and include parts of the event using the %{field}
+   # Example:
+   #
+   #     filter {
+diff --git a/lib/logstash/time_addon.rb b/lib/logstash/time_addon.rb
+index 42592ec173b..a5970332dc3 100644
+--- a/lib/logstash/time_addon.rb
++++ b/lib/logstash/time_addon.rb
+@@ -1,13 +1,6 @@
+ # encoding: utf-8
+ require "logstash/namespace"
+ 
+-# Provide our own Time wrapper for ISO8601 support
+-# Example:
+-#   >> LogStash::Time.now.to_iso8601
+-#   => "2010-10-17 00:25:24.619014-0700"
+-#
+-#   >> LogStash::Time.now.utc.to_iso8601
+-#   => "2010-10-17 07:25:26.788704Z"
+ module LogStash::Time
+   ISO8601_STRFTIME = "%04d-%02d-%02dT%02d:%02d:%02d.%06d%+03d:00".freeze
+   def self.now
+@@ -15,9 +8,8 @@ def self.now
+   end
+ 
+   if RUBY_PLATFORM == "java"
+-    #JODA_ISO8601_PARSER = org.joda.time.format.ISODateTimeFormat.dateTimeParser
+-    #JODA_ISO8601_PARSER = org.joda.time.format.ISODateTimeFormat.dateTimeParser
+-    JODA_ISO8601_PARSER = org.joda.time.format.DateTimeFormat.forPattern("yyyy-MM-dd'T'HH:mm:ss.SSSZ")
++    JODA_ISO8601_PARSER = org.joda.time.format.ISODateTimeFormat.dateTimeParser
++    #JODA_ISO8601_PARSER = org.joda.time.format.DateTimeFormat.forPattern("yyyy-MM-dd'T'HH:mm:ss.SSSZ")
+     UTC = org.joda.time.DateTimeZone.forID("UTC")
+     def self.parse_iso8601(t)
+       millis = JODA_ISO8601_PARSER.parseMillis(t)
+diff --git a/pkg/build.sh b/pkg/build.sh
+index ad2b8db2536..5f60f2abdde 100755
+--- a/pkg/build.sh
++++ b/pkg/build.sh
+@@ -119,7 +119,7 @@ case $os in
+     fi
+ 
+     fpm -s dir -t deb -n logstash -v "$RELEASE" \
+-      -a all --iteration "1+${os}${DEB_REVISION}" \
++      -a all --iteration "1-${os}${DEB_REVISION}" \
+       --url "$URL" \
+       --description "$DESCRIPTION" \
+       -d "default-jre-headless" \
+diff --git a/spec/event.rb b/spec/event.rb
+index e65671f6958..a9c1ed2fa53 100644
+--- a/spec/event.rb
++++ b/spec/event.rb
+@@ -162,4 +162,38 @@
+     end
+     puts "event @timestamp parse rate: #{count / duration}/sec"
+   end
++
++  context "acceptable @timestamp formats" do
++    subject { LogStash::Event.new }
++
++    formats = [ 
++      "YYYY-MM-dd'T'HH:mm:ss.SSSZ",
++      "YYYY-MM-dd'T'HH:mm:ss.SSSSSSZ",
++      "YYYY-MM-dd'T'HH:mm:ss.SSS",
++      "YYYY-MM-dd'T'HH:mm:ss",
++      "YYYY-MM-dd'T'HH:mm:ssZ",
++    ]
++    formats.each do |format|
++      it "includes #{format}" do
++        time = subject.sprintf("%{+#{format}}")
++        begin
++          LogStash::Event.new("@timestamp" => time)
++        rescue => e
++          raise StandardError, "Time '#{time}' was rejected. #{e.class}: #{e.to_s}"
++        end
++      end
++    end
++
++    context "from LOGSTASH-1738" do
++      it "does not error" do
++        LogStash::Event.new("@timestamp" => "2013-12-29T23:12:52.371240+02:00")
++      end
++    end
++
++    context "from LOGSTASH-1732" do
++      it "does not error" do
++        LogStash::Event.new("@timestamp" => "2013-12-27T11:07:25+00:00")
++      end
++    end
++  end
+ end
+diff --git a/spec/support/date-http.rb b/spec/support/date-http.rb
+index 2e0f51cf5f7..f9fd883f1e8 100644
+--- a/spec/support/date-http.rb
++++ b/spec/support/date-http.rb
+@@ -7,6 +7,7 @@
+     filter {
+       date {
+         match => [ "timestamp", "dd/MMM/yyyy:HH:mm:ss Z" ]
++        locale => "en"
+       }
+     }
+   CONFIG

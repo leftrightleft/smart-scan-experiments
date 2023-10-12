@@ -1,0 +1,226 @@
+diff --git a/logstash-core/lib/logstash/bootstrap_check/default_config.rb b/logstash-core/lib/logstash/bootstrap_check/default_config.rb
+index 04e9039826b..8331c861fc7 100644
+--- a/logstash-core/lib/logstash/bootstrap_check/default_config.rb
++++ b/logstash-core/lib/logstash/bootstrap_check/default_config.rb
+@@ -8,6 +8,10 @@ def self.check(settings)
+         raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.missing-configuration")
+       end
+ 
++      if settings.get("config.string") && settings.get("path.config")
++        raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.config-string-path-exclusive")
++      end
++
+       if settings.get("config.reload.automatic") && settings.get("path.config").nil?
+         # there's nothing to reload
+         raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.reload-without-config-path")
+diff --git a/logstash-core/lib/logstash/config/source/local.rb b/logstash-core/lib/logstash/config/source/local.rb
+index 01ced14a891..9be94f9c8eb 100644
+--- a/logstash-core/lib/logstash/config/source/local.rb
++++ b/logstash-core/lib/logstash/config/source/local.rb
+@@ -132,20 +132,23 @@ def self.read(uri)
+     OUTPUT_BLOCK_RE = /output *{/
+ 
+     def pipeline_configs
+-      config_parts = []
+ 
+-      config_parts.concat(ConfigStringLoader.read(config_string)) if config_string?
+-      if local_config?
+-        local_config_parts = ConfigPathLoader.read(config_path)
+-        config_parts.concat(local_config_parts)
+-      else
+-        local_config_parts = []
++      unless mutually_exclusive(config_string?, local_config?, remote_config?)
++        raise ConfigurationError.new("Settings 'config.string' and 'path.config' can't be used simultaneously.")
+       end
+ 
+-      config_parts.concat(ConfigRemoteLoader.read(config_path)) if remote_config?
++      config_parts = if config_string?
++        ConfigStringLoader.read(config_string)
++      elsif local_config?
++        ConfigPathLoader.read(config_path)
++      elsif remote_config?
++        ConfigRemoteLoader.read(config_path)
++      else
++        []
++      end
+ 
+       return if config_parts.empty?
+-      return if config_string? && config_string.strip.empty? && local_config? && local_config_parts.empty?
++      return if config_string? && config_string.strip.empty?
+ 
+       add_missing_default_inputs_or_outputs(config_parts)
+ 
+@@ -211,5 +214,9 @@ def remote_config?
+         false
+       end
+     end
++
++    def mutually_exclusive(a, b, c)
++      (a ^ b ^ c) && !(a && b && c)
++    end
+   end
+ end end end
+diff --git a/logstash-core/locales/en.yml b/logstash-core/locales/en.yml
+index a5550b6ccb2..e1ae825c358 100644
+--- a/logstash-core/locales/en.yml
++++ b/logstash-core/locales/en.yml
+@@ -98,6 +98,8 @@ en:
+       missing-configuration: >-
+         No configuration file was specified. Perhaps you forgot to provide
+         the '-f yourlogstash.conf' flag?
++      config-string-path-exclusive:
++        Settings 'path.config' (-f) and 'config.string' (-e) can't be used simultaneously.
+       reload-without-config-path: >-
+         Configuration reloading also requires passing a configuration path with '-f yourlogstash.conf'
+       locked-data-path: >-
+diff --git a/logstash-core/spec/logstash/agent_spec.rb b/logstash-core/spec/logstash/agent_spec.rb
+index 6d3ab3525d8..aa1782dfcf5 100644
+--- a/logstash-core/spec/logstash/agent_spec.rb
++++ b/logstash-core/spec/logstash/agent_spec.rb
+@@ -100,13 +100,8 @@
+     end
+ 
+     context "when auto_reload is false" do
+-      let(:agent_args) do
+-        {
+-          "config.reload.automatic" => false,
+-          "path.config" => config_file
+-        }
+-      end
+-
++      let(:agent_settings) { mock_settings("config.reload.automatic" => false) }
++      let(:agent_args) { { "path.config" => config_file } }
+ 
+       context "if state is clean" do
+         before :each do
+@@ -222,16 +217,10 @@
+     end
+ 
+     context "when auto_reload is true" do
++      let(:agent_settings) { mock_settings("config.reload.automatic" => true, "config.reload.interval" => 0.01) }
+       subject { described_class.new(agent_settings, default_source_loader) }
+ 
+-      let(:agent_args) do
+-        {
+-          "config.string" => "",
+-          "config.reload.automatic" => true,
+-          "config.reload.interval" => 0.01,
+-          "path.config" => config_file
+-        }
+-      end
++      let(:agent_args) { { "path.config" => config_file } }
+ 
+       context "if state is clean" do
+         it "should periodically reload_state" do
+@@ -406,8 +395,9 @@
+   end
+ 
+   context "metrics after config reloading" do
++    let(:agent_settings) { mock_settings({}) }
+     let(:temporary_file) { Stud::Temporary.file.path }
+-    let(:config) { "input { generator { } } output { file { path => '#{temporary_file}' } }" }
++    let(:config) { "input { generator { count => #{initial_generator_threshold*2} } } output { file { path => '#{temporary_file}'} }" }
+ 
+     let(:config_path) do
+       f = Stud::Temporary.file
+@@ -460,8 +450,8 @@
+ 
+     context "when reloading a good config" do
+       let(:new_config_generator_counter) { 500 }
+-      let(:output_file) { Stud::Temporary.file.path }
+-      let(:new_config) { "input { generator { count => #{new_config_generator_counter} } } output { file { path => '#{output_file}'} }" }
++      let(:new_file) { Stud::Temporary.file.path }
++      let(:new_config) { "input { generator { count => #{new_config_generator_counter} } } output { file { path => '#{new_file}'} }" }
+ 
+       before :each do
+         File.open(config_path, "w") do |f|
+@@ -470,7 +460,7 @@
+         end
+ 
+         # wait until pipeline restarts
+-        sleep(1) if ::File.read(output_file).empty?
++        sleep(1) if ::File.read(new_file).empty?
+       end
+ 
+       it "resets the pipeline metric collector" do
+diff --git a/logstash-core/spec/logstash/config/source/local_spec.rb b/logstash-core/spec/logstash/config/source/local_spec.rb
+index 8b750276fb8..c54f2e6ded5 100644
+--- a/logstash-core/spec/logstash/config/source/local_spec.rb
++++ b/logstash-core/spec/logstash/config/source/local_spec.rb
+@@ -292,8 +292,9 @@
+       )
+     end
+ 
+-    it "returns a merged config" do
+-      expect(subject.pipeline_configs.first.config_string).to include(input_block, output_block, filter_block)
++    # this should be impossible as the bootstrap checks should catch this
++    it "raises an exception" do
++      expect { subject.pipeline_configs }.to raise_error
+     end
+   end
+ 
+@@ -353,8 +354,8 @@
+         )
+       end
+ 
+-      it "returns a merged config" do
+-        expect(subject.pipeline_configs.first.config_string).to include(input_block, filter_block)
++      it "raises an exception" do
++        expect { subject.pipeline_configs }.to raise_error
+       end
+     end
+   end
+diff --git a/qa/integration/specs/01_logstash_bin_smoke_spec.rb b/qa/integration/specs/01_logstash_bin_smoke_spec.rb
+index 840fdd3bfa3..7e55432c3ea 100644
+--- a/qa/integration/specs/01_logstash_bin_smoke_spec.rb
++++ b/qa/integration/specs/01_logstash_bin_smoke_spec.rb
+@@ -128,36 +128,13 @@
+     expect(@ls1.get_version.strip).to eq("logstash #{expected['logstash']}")
+   end
+ 
+-  it "should still merge when -e is specified and -f has no valid config files" do
++  it "should abort if both -f and -e are specified" do
+     config_string = "input { tcp { port => #{port1} } }"
+-    @ls1.spawn_logstash("-e", config_string, "-f" "/tmp/foobartest")
+-    @ls1.wait_for_logstash
+-
+-    try(20) do
+-      expect(is_port_open?(port1)).to be true
+-    end
+-  end
+-
+-  it "should not start when -e is not specified and -f has no valid config files" do
+-    @ls2.spawn_logstash("-e", "", "-f" "/tmp/foobartest")
+-    try(num_retries) do
+-      expect(is_port_open?(9600)).to be_falsey
+-    end
+-  end
+-
+-  it "should merge config_string when both -f and -e is specified" do
+-    config_string = "input { tcp { port => #{port1} } }"
+-    @ls1.spawn_logstash("-e", config_string, "-f", config3)
+-    @ls1.wait_for_logstash
+-
+-    # Both ports should be reachable
+-    try(20) do
+-      expect(is_port_open?(port1)).to be true
+-    end
+-
++    @ls1.spawn_logstash("-e", config_string, "-f", config2)
+     try(20) do
+-      expect(is_port_open?(port3)).to be true
++      expect(@ls1.exited?).to be(true)
+     end
++    expect(@ls1.exit_code).to be(1)
+   end
+ 
+   def get_id
+@@ -168,7 +145,7 @@ def get_id
+     config_string = "input { tcp { port => #{port1} } }"
+ 
+     start_ls = lambda {
+-      @ls1.spawn_logstash("-e", config_string, "-f", config3)
++      @ls1.spawn_logstash("-e", config_string)
+       @ls1.wait_for_logstash
+     }
+     start_ls.call()

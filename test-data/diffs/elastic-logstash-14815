@@ -1,0 +1,147 @@
+diff --git a/docker/data/logstash/env2yaml/env2yaml.go b/docker/data/logstash/env2yaml/env2yaml.go
+index 7038a85c70e..92de0fcea1b 100644
+--- a/docker/data/logstash/env2yaml/env2yaml.go
++++ b/docker/data/logstash/env2yaml/env2yaml.go
+@@ -95,7 +95,6 @@ func normalizeSetting(setting string) (string, error) {
+ 		"log.format",
+ 		"modules",
+ 		"metric.collect",
+-		"metric.timers",
+ 		"path.logs",
+ 		"path.plugins",
+ 		"api.auth.type",
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 648bf1df138..48306cdf86b 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -52,7 +52,6 @@ module Environment
+            Setting::Boolean.new("config.support_escapes", false),
+             Setting::String.new("config.field_reference.escape_style", "none", true, %w(none percent ampersand)),
+            Setting::Boolean.new("metric.collect", true),
+-            Setting::String.new("metric.timers", "delayed", true, %w(delayed live)),
+             Setting::String.new("pipeline.id", "main"),
+            Setting::Boolean.new("pipeline.system", false),
+    Setting::PositiveInteger.new("pipeline.workers", LogStash::Config::CpuCoreStrategy.maximum),
+@@ -128,7 +127,6 @@ module Environment
+     java.lang.System.setProperty("ls.log.format", settings.get("log.format"))
+     java.lang.System.setProperty("ls.log.level", settings.get("log.level"))
+     java.lang.System.setProperty("ls.pipeline.separate_logs", settings.get("pipeline.separate_logs").to_s)
+-    java.lang.System.setProperty("ls.metric.timers", settings.get("metric.timers"))
+     unless java.lang.System.getProperty("log4j.configurationFile")
+       log4j_config_location = ::File.join(settings.get("path.settings"), "log4j2.properties")
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/timer/AfterCompletionTimerMetric.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/timer/AfterCompletionTimerMetric.java
+deleted file mode 100644
+index e9979315a64..00000000000
+--- a/logstash-core/src/main/java/org/logstash/instrument/metrics/timer/AfterCompletionTimerMetric.java
++++ /dev/null
+@@ -1,62 +0,0 @@
+-package org.logstash.instrument.metrics.timer;
+-
+-import org.logstash.instrument.metrics.AbstractMetric;
+-
+-import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.atomic.LongAdder;
+-import java.util.function.LongSupplier;
+-
+-import static org.logstash.instrument.metrics.timer.Util.subMilliExcessNanos;
+-import static org.logstash.instrument.metrics.timer.Util.wholeMillisFromNanos;
+-
+-/**
+- * This {@code AfterCompletionTimerMetric} is based on a counter,
+- * which is incremented after tracked execution is complete.
+- */
+-public class AfterCompletionTimerMetric extends AbstractMetric<Long> implements TimerMetric {
+-    private final LongAdder millis = new LongAdder();
+-    private final LongAdder excessNanos = new LongAdder();
+-
+-    private final LongSupplier nanoTimeSupplier;
+-
+-    protected AfterCompletionTimerMetric(String name) {
+-        this(name, System::nanoTime);
+-    }
+-
+-    AfterCompletionTimerMetric(final String name,
+-                               final LongSupplier nanoTimeSupplier) {
+-        super(name);
+-        this.nanoTimeSupplier = nanoTimeSupplier;
+-    }
+-
+-    @Override
+-    public <T, E extends Throwable> T time(ExceptionalSupplier<T, E> exceptionalSupplier) throws E {
+-        final long startNanos = this.nanoTimeSupplier.getAsLong();
+-        try {
+-            return exceptionalSupplier.get();
+-        } finally {
+-            final long durationNanos = this.nanoTimeSupplier.getAsLong() - startNanos;
+-            this.reportNanosElapsed(durationNanos);
+-        }
+-    }
+-
+-    @Override
+-    public void reportUntrackedMillis(final long untrackedMillis) {
+-        this.millis.add(untrackedMillis);
+-    }
+-
+-    private void reportNanosElapsed(final long nanosElapsed) {
+-        long wholeMillis = wholeMillisFromNanos(nanosElapsed);
+-        long excessNanos = subMilliExcessNanos(nanosElapsed);
+-
+-        this.millis.add(wholeMillis);
+-        this.excessNanos.add(excessNanos);
+-    }
+-
+-    @Override
+-    public Long getValue() {
+-        final long wholeMillis = this.millis.sum();
+-        final long millisFromNanos = wholeMillisFromNanos(this.excessNanos.sum());
+-        return Math.addExact(wholeMillis, millisFromNanos);
+-    }
+-}
+diff --git a/logstash-core/src/main/java/org/logstash/instrument/metrics/timer/TimerMetricFactory.java b/logstash-core/src/main/java/org/logstash/instrument/metrics/timer/TimerMetricFactory.java
+index b67bc76ee7c..d2cb39be9e2 100644
+--- a/logstash-core/src/main/java/org/logstash/instrument/metrics/timer/TimerMetricFactory.java
++++ b/logstash-core/src/main/java/org/logstash/instrument/metrics/timer/TimerMetricFactory.java
+@@ -13,12 +13,6 @@ public TimerMetric create(final String name) {
+     }
+ 
+     TimerMetric create(final String name, final LongSupplier nanoTimeSupplier) {
+-        // INTERNAL-ONLY system property escape hatch, set with `metric.timers` config in logstash.yml
+-        final String timerType = System.getProperty("ls.metric.timers", "delayed");
+-        switch (timerType) {
+-            case "live"   : return new ConcurrentLiveTimerMetric(name, nanoTimeSupplier);
+-            case "delayed": return new AfterCompletionTimerMetric(name, nanoTimeSupplier);
+-            default       : throw new IllegalStateException(String.format("Unknown timer type `%s`", timerType));
+-        }
++        return new ConcurrentLiveTimerMetric(name, nanoTimeSupplier);
+     }
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/instrument/metrics/timer/AfterCompletionTimerMetricTest.java b/logstash-core/src/test/java/org/logstash/instrument/metrics/timer/AfterCompletionTimerMetricTest.java
+deleted file mode 100644
+index 700525ff976..00000000000
+--- a/logstash-core/src/test/java/org/logstash/instrument/metrics/timer/AfterCompletionTimerMetricTest.java
++++ /dev/null
+@@ -1,8 +0,0 @@
+-package org.logstash.instrument.metrics.timer;
+-
+-public class AfterCompletionTimerMetricTest extends TimerMetricTest {
+-    @Override
+-    TimerMetric initTimerMetric(final String name) {
+-        return testTimerMetricFactory.newAfterCompletionTimerMetric(name);
+-    }
+-}
+diff --git a/logstash-core/src/test/java/org/logstash/instrument/metrics/timer/TestTimerMetricFactory.java b/logstash-core/src/test/java/org/logstash/instrument/metrics/timer/TestTimerMetricFactory.java
+index 128cd548fe9..d7589e08564 100644
+--- a/logstash-core/src/test/java/org/logstash/instrument/metrics/timer/TestTimerMetricFactory.java
++++ b/logstash-core/src/test/java/org/logstash/instrument/metrics/timer/TestTimerMetricFactory.java
+@@ -23,10 +23,6 @@ public TestTimerMetricFactory(final LongSupplier nanoTimeSupplier) {
+         this.nanoTimeSupplier = nanoTimeSupplier;
+     }
+ 
+-    public AfterCompletionTimerMetric newAfterCompletionTimerMetric(final String name) {
+-        return new AfterCompletionTimerMetric(name, this.nanoTimeSupplier);
+-    }
+-
+     public ConcurrentLiveTimerMetric newConcurrentLiveTimerMetric(final String name) {
+         return new ConcurrentLiveTimerMetric(name, this.nanoTimeSupplier);
+     }

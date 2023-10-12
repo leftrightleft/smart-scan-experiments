@@ -1,0 +1,169 @@
+diff --git a/Gemfile b/Gemfile
+index d556b2db190..b83d8d9fc04 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -27,6 +27,7 @@ gem "xmpp4r", "~> 0.5" # outputs/xmpp, # License: As-Is
+ 
+ # For testing/dev
+ group :development do
++  gem "rake"
+   #gem "stompserver"
+   #gem "spoon"
+ end
+diff --git a/Gemfile.lock b/Gemfile.lock
+index 9c0353abeef..9aff6fbeee4 100644
+--- a/Gemfile.lock
++++ b/Gemfile.lock
+@@ -21,6 +21,7 @@ GEM
+     mongo (1.3.1)
+       bson (>= 1.3.1)
+     rack (1.3.2)
++    rake (0.9.2)
+     redis (2.2.2)
+     sass (3.1.7)
+     sinatra (1.2.6)
+@@ -50,6 +51,7 @@ DEPENDENCIES
+   mizuno
+   mongo
+   rack
++  rake
+   redis
+   sass
+   sinatra
+diff --git a/lib/logstash/filters/grep.rb b/lib/logstash/filters/grep.rb
+index 7c08b9c5009..df8f5ec5d2b 100644
+--- a/lib/logstash/filters/grep.rb
++++ b/lib/logstash/filters/grep.rb
+@@ -1,7 +1,8 @@
+ require "logstash/filters/base"
+ require "logstash/namespace"
+ 
+-# Grep filter. Useful for dropping events you don't want to pass.
++# Grep filter. Useful for dropping events you don't want to pass, or
++# adding tags or fields to events that match.
+ #
+ # Events not matched are dropped. If 'negate' is set to true (defaults false),
+ # then matching events are dropped.
+@@ -9,6 +10,13 @@ class LogStash::Filters::Grep < LogStash::Filters::Base
+ 
+   config_name "grep"
+ 
++  # Drop events that don't match
++  #
++  # If this is set to false, no events will be dropped at all. Rather, the
++  # requested tags and fields will be added to matching events, and
++  # non-matching events will be passed through unchanged.
++  config :drop, :validate => :boolean, :default => true
++
+   # Negate the match. Similar to 'grep -v'
+   #
+   # If this is set to true, then any positive matches will result in the
+@@ -31,7 +39,7 @@ def register
+       # TODO(sissel): 
+     @match.merge(@config).each do |field, pattern|
+       # Skip known config names
+-      next if ["add_tag", "add_field", "type", "negate", "match"].include?(field)
++      next if ["add_tag", "add_field", "type", "negate", "match", "drop"].include?(field)
+ 
+       re = Regexp.new(pattern)
+       @patterns[field] << re
+@@ -47,7 +55,7 @@ def filter(event)
+     end
+ 
+     @logger.debug(["Running grep filter", event.to_hash, config])
+-    matched = false
++    matches = 0
+     @patterns.each do |field, regexes|
+       if !event[field]
+         @logger.debug(["Skipping match object, field not present", field,
+@@ -83,23 +91,26 @@ def filter(event)
+       end # regexes.each
+ 
+       if match_count == match_want
+-        matched = true
++        matches += 1
+         @logger.debug("matched all fields (#{match_count})")
+       else
+         @logger.debug("match block failed " \
+                       "(#{match_count}/#{match_want} matches)")
+-        event.cancel
+       end # match["match"].each
+     end # @patterns.each
+ 
+-    if not matched || event.cancelled?
+-      @logger.debug("grep: dropping event, no matches")
+-      event.cancel
++    if matches == @patterns.length
++      filter_matched(event)
++    else
++      if @drop == true
++        @logger.debug("grep: dropping event, no matches")
++        event.cancel
++      else
++        @logger.debug("grep: no matches, but drop set to false")
++      end
+       return
+     end
+ 
+     @logger.debug(["Event after grep filter", event.to_hash])
+-
+-    filter_matched(event) if !event.cancelled?
+   end # def filter
+ end # class LogStash::Filters::Grep
+diff --git a/test/logstash/filters/test_grep.rb b/test/logstash/filters/test_grep.rb
+index 90a2a2901d9..0d951e72968 100644
+--- a/test/logstash/filters/test_grep.rb
++++ b/test/logstash/filters/test_grep.rb
+@@ -35,6 +35,17 @@ def config(cfg)
+     assert_equal(false, event.cancelled?)
+   end # testing a single match
+ 
++  test "single match failure does not cancel the event with drop set to false" do
++    config "str"  => "test",
++           "drop" => "false"
++
++    event = LogStash::Event.new
++    event.type = @typename
++    event["str"] = "foo: this should not be dropped"
++    @filter.filter(event)
++    assert_equal(false, event.cancelled?)
++  end
++
+   test "single match failure cancels the event" do
+     config "str" => "test"
+ 
+@@ -135,6 +146,34 @@ def __DISABLED_FOR_NOW_test_add_fields_multiple_match
+     assert_equal(["tag", "new_tag"], event.tags)
+   end # def test_add_tags
+ 
++  test "add tags with drop set to false tags matching events" do
++    config "str" => "test",
++           "drop" => "false",
++           "add_tag" => ["new_tag"]
++
++    event = LogStash::Event.new
++    event.tags << "tag"
++    event.type = @typename
++    event["str"] = "test"
++    @filter.filter(event)
++    assert_equal(["tag", "new_tag"], event.tags)
++    assert_equal(false, event.cancelled?)
++  end # def test_add_tags
++
++  test "add tags with drop set to false allows non-matching events through" do
++    config "str" => "test",
++           "drop" => "false",
++           "add_tag" => ["new_tag"]
++
++    event = LogStash::Event.new
++    event.tags << "tag"
++    event.type = @typename
++    event["str"] = "non-matching"
++    @filter.filter(event)
++    assert_equal(["tag"], event.tags)
++    assert_equal(false, event.cancelled?)
++  end # def test_add_tags
++
+   test "add tags with sprintf value" do
+     config "str" => "test",
+            "add_tag" => ["%{str}"]

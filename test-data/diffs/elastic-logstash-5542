@@ -1,0 +1,171 @@
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index 3bbbd73c58e..e619494799f 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -184,7 +184,11 @@ def create_pipeline(settings, config=nil)
+     begin
+       LogStash::Pipeline.new(config, settings, metric)
+     rescue => e
+-      @logger.error("fetched an invalid config", :config => config, :reason => e.message)
++      if @logger.debug?
++        @logger.error("fetched an invalid config", :config => config, :reason => e.message, :backtrace => e.backtrace)
++      else
++        @logger.error("fetched an invalid config", :config => config, :reason => e.message)
++      end
+       return
+     end
+   end
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index 024f75c7f1a..4ba7d2675a8 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -437,7 +437,9 @@ def plugin(plugin_type, name, *args)
+     elsif plugin_type == "filter"
+       LogStash::FilterDelegator.new(@logger, klass, pipeline_scoped_metric.namespace(:filters), *args)
+     else
+-      klass.new(*args)
++      new_plugin = klass.new(*args)
++      new_plugin.metric = pipeline_scoped_metric.namespace(:inputs)
++      new_plugin
+     end
+   end
+ 
+diff --git a/logstash-core/lib/logstash/plugin.rb b/logstash-core/lib/logstash/plugin.rb
+index 0c6ce147fa8..549291513c9 100644
+--- a/logstash-core/lib/logstash/plugin.rb
++++ b/logstash-core/lib/logstash/plugin.rb
+@@ -105,9 +105,15 @@ def metric=(new_metric)
+   end
+ 
+   def metric
+-    @metric_plugin ||= enable_metric ? @metric : LogStash::Instrument::NullMetric.new
++    # We can disable metric per plugin if we want in the configuration
++    # we will use the NullMetric in this case.
++    @metric_plugin ||= if @enable_metric
++                         # Fallback when testing plugin and no metric collector are correctly configured.
++                         @metric.nil? ? LogStash::Instrument::NullMetric.new : @metric
++                       else
++                         LogStash::Instrument::NullMetric.new
++                       end
+   end
+-
+   # return the configured name of this plugin
+   # @return [String] The name of the plugin defined by `config_name`
+   def config_name
+diff --git a/logstash-core/spec/logstash/inputs/metrics_spec.rb b/logstash-core/spec/logstash/inputs/metrics_spec.rb
+index 436d676f62d..842e8b48bfe 100644
+--- a/logstash-core/spec/logstash/inputs/metrics_spec.rb
++++ b/logstash-core/spec/logstash/inputs/metrics_spec.rb
+@@ -8,7 +8,7 @@
+   let(:queue) { [] }
+ 
+   before :each do
+-    allow(subject).to receive(:metric).and_return(metric)
++    subject.metric = metric
+   end
+ 
+   describe "#run" do
+diff --git a/logstash-core/spec/logstash/plugin_spec.rb b/logstash-core/spec/logstash/plugin_spec.rb
+index 2a5040551ff..5f0bde381f9 100644
+--- a/logstash-core/spec/logstash/plugin_spec.rb
++++ b/logstash-core/spec/logstash/plugin_spec.rb
+@@ -270,4 +270,77 @@ def register; end
+       end
+     end
+   end
++
++
++  context "When the plugin record a metric" do
++    let(:config) { {} }
++
++    [LogStash::Inputs::Base, LogStash::Filters::Base, LogStash::Outputs::Base].each do |base|
++      let(:plugin) do
++        Class.new(base) do
++          config_name "testing"
++
++          def register
++            metric.gauge("power_level", 9000)
++          end
++        end
++      end
++
++      subject { plugin.new(config) } 
++
++      context "when no metric is set to the plugin" do
++        context "when `enable_metric` is TRUE" do
++          it "recording metric should not raise an exception" do
++            expect { subject.register }.not_to raise_error
++          end
++
++          it "should use a `NullMetric`" do
++            expect(subject.metric).to be_kind_of(LogStash::Instrument::NullMetric)
++          end
++        end
++
++        context "when `enable_metric` is FALSE" do
++          let(:config) { { "enable_metric" => false } }
++
++          it "recording metric should not raise an exception" do
++            expect { subject.register }.not_to raise_error
++          end
++
++          it "should use a `NullMetric`" do
++            expect(subject.metric).to be_kind_of(LogStash::Instrument::NullMetric)
++          end
++        end
++      end
++
++      context "When a specific metric collector is configured" do
++        context "when `enable_metric` is TRUE" do
++          let(:metric) { LogStash::Instrument::Metric.new(LogStash::Instrument::Collector.new).namespace("dbz") }
++
++          before :each do
++            subject.metric = metric
++          end
++
++          it "recording metric should not raise an exception" do
++            expect { subject.register }.not_to raise_error
++          end
++
++          it "should use the configured metric" do
++            expect(subject.metric).to eq(metric)
++          end
++        end
++
++        context "when `enable_metric` is FALSE" do
++          let(:config) { { "enable_metric" => false } }
++
++          it "recording metric should not raise an exception" do
++            expect { subject.register }.not_to raise_error
++          end
++
++          it "should use a `NullMetric`" do
++            expect(subject.metric).to be_kind_of(LogStash::Instrument::NullMetric)
++          end
++        end
++      end
++    end
++  end
+ end
+diff --git a/spec/spec_helper.rb b/spec/spec_helper.rb
+index bb2ccba5c7d..2daa3e6937c 100644
+--- a/spec/spec_helper.rb
++++ b/spec/spec_helper.rb
+@@ -7,6 +7,9 @@
+ require "logstash/devutils/rspec/spec_helper"
+ require "logstash/logging/json"
+ 
++require "flores/rspec"
++require "flores/random"
++
+ class JSONIOThingy < IO
+   def initialize; end
+   def flush; end
+@@ -18,6 +21,7 @@ def puts(payload)
+ end
+ 
+ RSpec.configure do |c|
++  Flores::RSpec.configure(c)
+   c.before do
+     # Force Cabin to always have a JSON subscriber.  The main purpose of this
+     # is to catch crashes in json serialization for our logs. JSONIOThingy

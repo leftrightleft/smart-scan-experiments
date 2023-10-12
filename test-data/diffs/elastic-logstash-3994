@@ -1,0 +1,437 @@
+diff --git a/rakelib/test.rake b/rakelib/test.rake
+index db4083d1489..b5cddfeac00 100644
+--- a/rakelib/test.rake
++++ b/rakelib/test.rake
+@@ -36,13 +36,20 @@ namespace "test" do
+ 
+   desc "run all installed plugins specs"
+   task "plugins" => ["setup"] do
++    plugins_to_exclude = ENV.fetch("EXCLUDE_PLUGIN", "").split(",")
+     # grab all spec files using the live plugins gem specs. this allows correclty also running the specs
+     # of a local plugin dir added using the Gemfile :path option. before this, any local plugin spec would
+     # not be run because they were not under the vendor/bundle/jruby/1.9/gems path
+     test_files = LogStash::PluginManager.find_plugins_gem_specs.map do |spec|
+-      Rake::FileList[File.join(spec.gem_dir, "spec/{input,filter,codec,output}s/*_spec.rb")]
+-    end.flatten
+-
++      if plugins_to_exclude.size > 0
++        if !plugins_to_exclude.include?(Pathname.new(spec.gem_dir).basename.to_s)
++          Rake::FileList[File.join(spec.gem_dir, "spec/{input,filter,codec,output}s/*_spec.rb")]
++        end
++      else
++        Rake::FileList[File.join(spec.gem_dir, "spec/{input,filter,codec,output}s/*_spec.rb")]
++      end
++    end.flatten.compact
++	
+     # "--format=documentation"
+     exit(RSpec::Core::Runner.run(["--order", "rand", test_files]))
+   end
+diff --git a/test/windows/acceptance/logstash_release_acceptance.ps1 b/test/windows/acceptance/logstash_release_acceptance.ps1
+new file mode 100644
+index 00000000000..1c9a12df7e1
+--- /dev/null
++++ b/test/windows/acceptance/logstash_release_acceptance.ps1
+@@ -0,0 +1,71 @@
++# Created By: Gabriel Moskovicz
++#
++# To be run on Jenkins
++#
++# Requirements to run the test:
++# 
++# - Powershell 4
++# - Windows 7 or newer
++# - Java 7 or newer
++
++$LS_CONFIG="test.conf"
++$LS_BRANCH=$env:LS_BRANCH
++$Logstash_path = "C:\logstash"
++$Logstash_Snapshot_Directory = "$Logstash_path\logstash-latest-SNAPSHOT.zip"
++$Logstash_URL = "https://s3-eu-west-1.amazonaws.com/build-eu.elasticsearch.org/logstash/$LS_BRANCH/nightly/JDK7/logstash-latest-SNAPSHOT.zip"
++
++If (Test-Path $Logstash_path){
++	ri -Recurse -Force $Logstash_path
++}
++
++md -Path $Logstash_path
++(New-Object System.Net.WebClient).DownloadFile($Logstash_URL, $Logstash_Snapshot_Directory)
++
++#Unzip file
++$Destination = "$Logstash_path\logstash_" + $LS_BRANCH
++Add-Type -assembly "system.io.compression.filesystem"
++[io.compression.zipfile]::ExtractToDirectory($Logstash_Snapshot_Directory, $Destination)
++
++#Remove old files
++ri $Logstash_Snapshot_Directory
++
++#Move folder
++cd $Destination
++mv log* logstash
++cd logstash
++
++#Create Configuration
++ni $LS_CONFIG -it file
++sc -Path $LS_CONFIG -Encoding ascii -Value "input { 
++	tcp { 
++			port => "+ (Get-Random -minimum 2000 -maximum 3000) +" 
++		} 
++	} 
++
++output {  
++	stdout { } 
++}"
++
++#Start Process
++$app = start .\bin\logstash.bat -ArgumentList "-f $LS_CONFIG" -PassThru -NoNewWindow
++sleep 30
++
++$RUNNING_TEST = $app.Id
++
++$PORT_TEST = netstat -na | select-string 2000
++
++If ($RUNNING_TEST -le 0){
++  echo "Logstash not running"
++  exit 1
++}
++
++echo "Logstash running"
++
++echo "Port: $PORT_TEST"
++
++If ($PORT_TEST.length -le  0){
++  echo "Port test failed"
++  exit 1
++}
++
++taskkill /PID $app.Id /F /T
+\ No newline at end of file
+diff --git a/test/windows/acceptance/logstash_release_default_plugins.ps1 b/test/windows/acceptance/logstash_release_default_plugins.ps1
+new file mode 100644
+index 00000000000..14a1734da85
+--- /dev/null
++++ b/test/windows/acceptance/logstash_release_default_plugins.ps1
+@@ -0,0 +1,28 @@
++# Created By: Gabriel Moskovicz
++#
++# To be run on Jenkins
++#
++# Requirements to run the test:
++# 
++# - Powershell 4
++# - Windows 7 or newer
++# - Java 7 or newer
++# - Ruby 7 or newer
++
++$ruby = $env:RUBY_HOME  + "\jruby.exe"
++
++sleep 30
++
++cd rakelib
++
++$install_default = start $ruby -ArgumentList "-S rake test:install-default" -Passthru -NoNewWindow -Wait
++
++If ($install_default.exitCode -gt 0){
++     exit 1
++}
++
++$plugins = start $ruby -ArgumentList "-S rake test:plugins" -Passthru -NoNewWindow -Wait
++
++If ($plugins.exitCode -gt 0){
++     exit 1
++}
+\ No newline at end of file
+diff --git a/test/windows/event_log/logstash_event_log_plugin_integration.ps1 b/test/windows/event_log/logstash_event_log_plugin_integration.ps1
+new file mode 100644
+index 00000000000..45f2ae111b2
+--- /dev/null
++++ b/test/windows/event_log/logstash_event_log_plugin_integration.ps1
+@@ -0,0 +1,137 @@
++# Created By: Gabriel Moskovicz
++# 
++# This is a script to test integration between logstash and elasticsearch.
++# It uses a simple json filter to parse the content of a simple text file an then
++# verifying if the message has been found in elasticsearch
++#
++# Requirements to run the test:
++# 
++# - Powershell 4
++# - Windows 7 or newer
++# - Java 7 or newer
++
++Add-Type -assembly "system.io.compression.filesystem"
++
++
++$Main_path = "C:\integration_test"
++If (Test-Path $Main_path){
++	ri -Recurse -Force $Main_path
++}
++$Download_path  = "$Main_path\download"
++md -Path $Download_path
++
++## Logstash variables
++
++$LS_CONFIG="test.conf"
++$LS_BRANCH=$env:LS_BRANCH
++$Logstash_path = "$Main_path\logstash"
++$Logstash_zip_file = "$Download_path\logstash.zip"
++$Logstash_URL = "https://s3-eu-west-1.amazonaws.com/build-eu.elasticsearch.org/logstash/$LS_BRANCH/nightly/JDK7/logstash-latest-SNAPSHOT.zip"
++
++## ----------------------------------------
++
++## Elasticsearch variables
++
++$ES_Version = $env:ES_VERSION
++$ES_path = "$Main_path\elasticsearch"
++$ES_zip_file = "$Main_path\download\elasticsearch.zip"
++$ES_URL = "https://download.elastic.co/elasticsearch/elasticsearch/elasticsearch-$ES_Version.zip"
++
++## ----------------------------------------
++
++## Download and unzip Logstash
++
++md -Path $Logstash_path
++(New-Object System.Net.WebClient).DownloadFile($Logstash_URL, $Logstash_zip_file)
++[System.IO.Compression.ZipFile]::ExtractToDirectory($Logstash_zip_file, $Download_path)
++ri $Logstash_zip_file
++mv "$Download_path\log*\*" $Logstash_path
++
++## --------------------------------
++
++
++## Download and unzip Elasticsearch
++
++md -Path $ES_path
++(New-Object System.Net.WebClient).DownloadFile($ES_URL, $ES_zip_file)
++[System.IO.Compression.ZipFile]::ExtractToDirectory($ES_zip_file, $Download_path)
++ri $ES_zip_file
++mv "$Download_path\elastic*\*" "$ES_path"
++
++## --------------------------------
++
++
++# START ELASTICSEARCH
++
++echo "Starting Elasticsearch"
++$elasticsearchApp = start "$ES_path\bin\elasticsearch" -PassThru
++echo "Elasticsearch running"
++sleep 30
++
++# -------------------------------------------
++
++
++# Create logstash Configuration
++
++ni "$Logstash_path\$LS_CONFIG" -it file
++sc -Path "$Logstash_path\$LS_CONFIG" -Encoding ascii -Value "input { 
++    eventlog {
++        logfile  => 'Application'
++    }
++}
++
++filter {
++    mutate {
++        replace => { 'type' => '%{SourceName}' }
++        remove_field => [ 'Type', 'Message' ]
++    }
++}
++
++output {  
++	elasticsearch { 
++        protocol => http
++        index => 'windows_eventlog_test_index'
++    }
++    stdout { codec => rubydebug }
++}"
++
++# -------------------------------------------
++
++
++# START LOGSTASH
++
++echo "Starting Logstash"
++$logstashApp = start "$Logstash_path\bin\logstash" -ArgumentList "-f $Logstash_path\$LS_CONFIG" -PassThru
++echo "Logstash running"
++sleep 30
++
++# -------------------------------------------
++
++New-EventLog -LogName Application -Source ElasticsearchSource
++Write-EventLog -LogName Application -Source ElasticsearchSource -EntryType Information -EventId 1 -Message "Example log Entry"
++
++sleep 15
++
++$searchresponse = curl "http://localhost:9200/windows_eventlog_test_index/ElasticsearchSource/_search" -UseBasicParsing
++$json_response = ConvertFrom-Json $searchresponse.Content
++$hit_source = $json_response.hits.hits[0]._source
++
++If (!($hit_source.SourceName -eq "ElasticsearchSource")){
++    echo "ERROR: Message was not indexed. Wrong Source Name. Test unsuccessful. Expected 'ElasticsearchSource' Received " + $hit_source.SourceName
++    exit 1
++}
++
++If (!($hit_source.EventCode -eq 1)){
++    echo "ERROR: Wrong expected value: EventCode. Test unsuccessful. Expected 1 Received " + $hit_source.EventCode
++    exit 1
++}
++
++If (!($hit_source.message -eq "Example log Entry")){
++    echo "ERROR: Wrong expected value: Message. Text Test unsuccessful. Expected 'Example log Entry' Received " + $hit_source.message
++    exit 1
++}
++
++echo "Test Succeeded"
++
++taskkill /PID $logstashApp.Id
++taskkill /PID $elasticsearchApp.Id /T
+\ No newline at end of file
+diff --git a/test/windows/integration/logstash_simple_integration.ps1 b/test/windows/integration/logstash_simple_integration.ps1
+new file mode 100644
+index 00000000000..9e136bb0f7d
+--- /dev/null
++++ b/test/windows/integration/logstash_simple_integration.ps1
+@@ -0,0 +1,145 @@
++# Created By: Gabriel Moskovicz
++# 
++# This is a script to test integration between logstash and elasticsearch.
++# It uses a simple json filter to parse the content of a simple text file an then
++# verifying if the message has been found in elasticsearch
++#
++# Requirements to run the test:
++# 
++# - Powershell 4
++# - Windows 7 or newer
++# - Java 7 or newer
++
++Add-Type -assembly "system.io.compression.filesystem"
++
++
++$Main_path = "C:\integration_test"
++If (Test-Path $Main_path){
++	ri -Recurse -Force $Main_path
++}
++$Download_path  = "$Main_path\download"
++md -Path $Download_path
++
++## Logstash variables
++
++$LS_CONFIG="test.conf"
++$LS_BRANCH=$env:LS_BRANCH
++$Logstash_path = "$Main_path\logstash"
++$Logstash_zip_file = "$Download_path\logstash.zip"
++$Logstas_URL = "https://s3-eu-west-1.amazonaws.com/build-eu.elasticsearch.org/logstash/$LS_BRANCH/nightly/JDK7/logstash-latest-SNAPSHOT.zip"
++
++## ----------------------------------------
++
++## Elasticsearch variables
++
++$ES_Version =$env:ES_VERSION
++$ES_path = "$Main_path\elasticsearch"
++$ES_zip_file = "$Main_path\download\elasticsearch.zip"
++$ES_URL = "https://download.elastic.co/elasticsearch/elasticsearch/elasticsearch-$ES_Version.zip"
++
++## ----------------------------------------
++
++## Download and unzip Logstash
++
++md -Path $Logstash_path
++(New-Object System.Net.WebClient).DownloadFile($Logstas_URL, $Logstash_zip_file)
++[System.IO.Compression.ZipFile]::ExtractToDirectory($Logstash_zip_file, $Download_path)
++ri $Logstash_zip_file
++mv "$Download_path\log*\*" $Logstash_path
++
++## --------------------------------
++
++
++## Download and unzip Elasticsearch
++
++md -Path $ES_path
++(New-Object System.Net.WebClient).DownloadFile($ES_URL, $ES_zip_file)
++[System.IO.Compression.ZipFile]::ExtractToDirectory($ES_zip_file, $Download_path)
++ri $ES_zip_file
++mv "$Download_path\elastic*\*" "$ES_path"
++
++## --------------------------------
++
++
++# START ELASTICSEARCH
++
++echo "Starting Elasticsearch"
++$elasticsearchApp = start "$ES_path\bin\elasticsearch" -PassThru
++echo "Elasticsearch running"
++sleep 30
++
++# -------------------------------------------
++
++
++# Create logstash Configuration and Files
++
++ni "$Logstash_path\logs.txt" -it file
++sc -Path "$Logstash_path\logs.txt" -Encoding ascii -Value "{ ""ismessage"": true, ""day"": 2, ""text"": ""test message"" }"
++
++ni "$Logstash_path\$LS_CONFIG" -it file
++$logstash_config = "input { 
++	file { 
++			path => ['$Logstash_path\logs.txt']
++            start_position => 'beginning'
++		}
++}
++
++filter {
++    json { 
++        source => 'message'
++    }
++}
++
++output {  
++	elasticsearch { "
++
++if ( [convert]::ToDouble($LS_BRANCH) -lt 2 ) {
++    $logstash_config = $logstash_config + "
++        protocol => http"
++}
++
++$logstash_config = $logstash_config + "
++        index => 'windows_test_index'
++    }
++    stdout { codec => rubydebug }
++}"
++
++
++sc -Path "$Logstash_path\$LS_CONFIG" -Encoding ascii -Value $logstash_config
++
++# -------------------------------------------
++
++
++# START LOGSTASH
++
++echo "Starting Logstash"
++$logstashApp = start "$Logstash_path\bin\logstash" -ArgumentList "-f $Logstash_path\$LS_CONFIG" -PassThru
++echo "Logstash running"
++sleep 30
++
++# -------------------------------------------
++
++
++$searchresponse = curl "http://localhost:9200/windows_test_index/_search" -UseBasicParsing
++$json_response = ConvertFrom-Json $searchresponse.Content
++$hit_source = $json_response.hits.hits[0]._source
++
++If (!$hit_source.ismessage){
++    echo "ERROR: Message was not indexed. Test unsuccessful. Expected true, got false".
++    exit 1
++}
++
++If (!($hit_source.day -eq 2)){
++    echo "ERROR: Wrong expected value. Test unsuccessful. Expected 2, got " + $hit_source.day
++    exit 1
++}
++
++If (!($hit_source.text -eq "test message")){
++    echo "ERROR: Wrong expected value. Test unsuccessful. Expected 'test message', got " + $hit_source.text
++    exit 1
++}
++
++echo "Test Succeeded"
++
++taskkill /PID $logstashApp.Id
++taskkill /PID $elasticsearchApp.Id /T
+\ No newline at end of file

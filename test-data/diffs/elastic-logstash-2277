@@ -1,0 +1,3491 @@
+diff --git a/lib/logstash/runner.rb b/lib/logstash/runner.rb
+index 0d8b0cc12ed..181eaaecce0 100644
+--- a/lib/logstash/runner.rb
++++ b/lib/logstash/runner.rb
+@@ -52,6 +52,7 @@ module Cabin::Mixins::Logger
+ class LogStash::RSpecsRunner
+   def initialize(args)
+     @args = args
++    configure
+   end
+ 
+   def run
+@@ -61,6 +62,15 @@ def run
+   def wait
+     return @result
+   end
++
++  private
++
++  def configure
++    RSpec.configure do |config|
++      config.formatter = 'documentation'
++      config.color    = true
++    end if ENV['LOGSTASH_TEST']
++  end
+ end
+ 
+ class LogStash::Runner
+diff --git a/logstash-event.gemspec b/logstash-event.gemspec
+index 41286036830..48cf153ec5c 100644
+--- a/logstash-event.gemspec
++++ b/logstash-event.gemspec
+@@ -21,9 +21,8 @@ Gem::Specification.new do |gem|
+   gem.name          = "logstash-event"
+   gem.require_paths = ["lib"]
+   gem.version       = "1.2.02"
+-  
++
+   gem.add_development_dependency "rspec"
+   gem.add_development_dependency "guard"
+   gem.add_development_dependency "guard-rspec"
+-  gem.add_development_dependency "insist", "1.0.0"
+ end
+diff --git a/logstash.gemspec b/logstash.gemspec
+index 5c24b675a5b..d4d55eb1017 100644
+--- a/logstash.gemspec
++++ b/logstash.gemspec
+@@ -67,13 +67,13 @@ Gem::Specification.new do |gem|
+   end
+ 
+   # These are runtime-deps so you can do 'java -jar logstash.jar rspec <test>'
+-  gem.add_runtime_dependency "rspec", "~> 2.14.0" #(MIT license)
++  gem.add_runtime_dependency "rspec", "~> 3.1.0"   #(MIT license)
+   gem.add_runtime_dependency "insist", "1.0.0"    #(Apache 2.0 license)
+ 
+   gem.add_runtime_dependency "logstash-devutils"
+ 
+   # Jenkins Deps
+-  gem.add_runtime_dependency "ci_reporter", "1.9.3"
++  gem.add_runtime_dependency "ci_reporter_rspec", "1.0.0"
+ 
+   # Development Deps
+   # coveralls temporarily disabled because of Bundler bug with "without development" and gemspec
+diff --git a/rakelib/test.rake b/rakelib/test.rake
+index b276d6c4d92..68bd8d8ebd7 100644
+--- a/rakelib/test.rake
++++ b/rakelib/test.rake
+@@ -1,4 +1,3 @@
+-
+ namespace "test" do
+   task "default" => [ "bootstrap:test", "test:prep" ] do
+     Gem.clear_paths
+diff --git a/spec/config_factory.rb b/spec/config_factory.rb
+new file mode 100644
+index 00000000000..24b05391658
+--- /dev/null
++++ b/spec/config_factory.rb
+@@ -0,0 +1,85 @@
++require 'pp'
++
++## Example
++##
++## ConfigFactory.filter.
++#               add_field("always" => "awesome").
++#               if("[foo] == 'bar'").
++#               add_field("hello" => "world").
++#               elseif("[bar] == 'baz'").
++#               add_field("fancy" => "pants").
++#               else.
++#               add_field("free" => "hugs")
++#
++#  ConfigFactory.filter.
++#                if("[foo] in [foobar]").add_tag("field in field").
++#                if("[foo] in 'foo'").add_tag("field in string").
++#                if("'hello' in [greeting]").add_tag("string in field")
++#                if("!('foo' in ['hello', 'world'])").add_tag("shouldexist")
++#
++
++module Conditionals
++
++  def if(criteria)
++    stack.push "if #{criteria} {"
++    self
++  end
++
++  def elseif(criteria)
++    stack.push "} else if #{criteria} {"
++    self
++  end
++
++  def else
++    stack.push "} else {"
++    self
++  end
++
++  def endif
++    stack.push "}"
++    self
++  end
++end
++
++class Filter
++
++  include Conditionals
++
++  attr_reader :stack
++
++  def initialize
++    @stack = []
++  end
++
++
++  def clones(*fields)
++    stack.push "clone { clones => #{fields} }"
++    self
++  end
++
++  def add_field(field)
++    stack.push "mutate { add_field => #{field} }"
++    self
++  end
++
++  def add_tag(tag)
++    stack.push "mutate { add_tag => '#{tag}'  }"
++    self
++  end
++
++  def %(patterns)
++    to_s % patterns
++  end
++
++  def to_s
++    "filter { #{stack.join(' ')} }"
++  end
++end
++
++class ConfigFactory
++
++  def self.filter
++    Filter.new
++  end
++
++end
+diff --git a/spec/core/conditionals_spec.rb b/spec/core/conditionals_spec.rb
+index 576851ae484..edd0e69b10b 100644
+--- a/spec/core/conditionals_spec.rb
++++ b/spec/core/conditionals_spec.rb
+@@ -1,396 +1,160 @@
+-require "logstash/devutils/rspec/spec_helper"
++require 'spec_helper'
+ 
+-module ConditionalFanciness
+-  def description
+-    return example.metadata[:example_group][:description_args][0]
+-  end
++describe "conditionals" do
+ 
+-  def conditional(expression, &block)
+-    describe(expression) do
+-      config <<-CONFIG
+-        filter {
+-          if #{expression} {
+-            mutate { add_tag => "success" }
+-          } else {
+-            mutate { add_tag => "failure" }
+-          }
+-        }
+-      CONFIG
+-      instance_eval(&block)
+-    end
+-  end
+-end
++  let(:pipeline) { LogStash::Pipeline.new(config.to_s) }
+ 
+-describe "conditionals in output" do
+-  extend ConditionalFanciness
++  context "within outputs" do
+ 
+-  describe "simple" do
+-    config <<-CONFIG
+-      input {
+-        generator {
+-          message => '{"foo":{"bar"},"baz": "quux"}'
+-          count => 1
+-        }
+-      }
+-      output {
+-        if [foo] == "bar" {
+-          stdout { }
++    describe "having a simple conditional" do
++      let(:config) {
++        <<-CONFIG
++          input {
++            generator {
++              message => '{"foo":{"bar"},"baz": "quux"}'
++              count => 1
++            }
++          }
++          output {
++             if [foo] == "bar" {
++             stdout { }
++          }
+         }
++      CONFIG
+       }
+-    CONFIG
+ 
+-    agent do
+-      #LOGSTASH-2288, should not fail raising an exception
++      context"when starting an agent" do
++        it "doesn't not fail" do
++          expect { pipeline.run }.to_not raise_error
++        end
++      end
++
+     end
+   end
+-end
+ 
+-describe "conditionals in filter" do
+-  extend ConditionalFanciness
+-
+-  describe "simple" do
+-    config <<-CONFIG
+-      filter {
+-        mutate { add_field => { "always" => "awesome" } }
+-        if [foo] == "bar" {
+-          mutate { add_field => { "hello" => "world" } }
+-        } else if [bar] == "baz" {
+-          mutate { add_field => { "fancy" => "pants" } }
+-        } else {
+-          mutate { add_field => { "free" => "hugs" } }
+-        }
+-      }
+-    CONFIG
++  context "within filters" do
+ 
+-    sample({"foo" => "bar"}) do
+-      insist { subject["always"] } == "awesome"
+-      insist { subject["hello"] } == "world"
+-      insist { subject["fancy"] }.nil?
+-      insist { subject["free"] }.nil?
+-    end
++    describe "having a simple conditional" do
++      let(:config) { ConfigFactory.filter.add_field("always" => "awesome").
++                      if("[foo] == 'bar'").
++                        add_field("hello" => "world").
++                      elseif("[bar] == 'baz'").
++                        add_field("fancy" => "pants").
++                      else.
++                        add_field("free" => "hugs").
++                      endif }
+ 
+-    sample({"notfoo" => "bar"}) do
+-      insist { subject["always"] } == "awesome"
+-      insist { subject["hello"] }.nil?
+-      insist { subject["fancy"] }.nil?
+-      insist { subject["free"] } == "hugs"
+-    end
++      it "include the default field" do include("always" => "awesome") end
+ 
+-    sample({"bar" => "baz"}) do
+-      insist { subject["always"] } == "awesome"
+-      insist { subject["hello"] }.nil?
+-      insist { subject["fancy"] } == "pants"
+-      insist { subject["free"] }.nil?
+-    end
+-  end
++      context "when the if is true" do
+ 
+-  describe "nested" do
+-    config <<-CONFIG
+-      filter {
+-        if [nest] == 123 {
+-          mutate { add_field => { "always" => "awesome" } }
+-          if [foo] == "bar" {
+-            mutate { add_field => { "hello" => "world" } }
+-          } else if [bar] == "baz" {
+-            mutate { add_field => { "fancy" => "pants" } }
+-          } else {
+-            mutate { add_field => { "free" => "hugs" } }
+-          }
+-        }
+-      }
+-    CONFIG
++        subject      {  sample("foo" => "bar") }
+ 
+-    sample("foo" => "bar", "nest" => 124) do
+-      insist { subject["always"] }.nil?
+-      insist { subject["hello"] }.nil?
+-      insist { subject["fancy"] }.nil?
+-      insist { subject["free"] }.nil?
+-    end
++        it "include the if field"  do include("hello" => "world") end
++        it "not include the elseif field" do should_not include("fancy", "hugs") end
++      end
+ 
+-    sample("foo" => "bar", "nest" => 123) do
+-      insist { subject["always"] } == "awesome"
+-      insist { subject["hello"] } == "world"
+-      insist { subject["fancy"] }.nil?
+-      insist { subject["free"] }.nil?
+-    end
++      context "when the else is true" do
+ 
+-    sample("notfoo" => "bar", "nest" => 123) do
+-      insist { subject["always"] } == "awesome"
+-      insist { subject["hello"] }.nil?
+-      insist { subject["fancy"] }.nil?
+-      insist { subject["free"] } == "hugs"
+-    end
++        subject      {  sample("notfoo" => "bar") }
+ 
+-    sample("bar" => "baz", "nest" => 123) do
+-      insist { subject["always"] } == "awesome"
+-      insist { subject["hello"] }.nil?
+-      insist { subject["fancy"] } == "pants"
+-      insist { subject["free"] }.nil?
+-    end
+-  end
++        it "include the else field" do include("free" => "hugs" ) end
++        it "not include the elseif field" do should_not include("hello", "fancy") end
++      end
+ 
+-  describe "comparing two fields" do
+-    config <<-CONFIG
+-      filter {
+-        if [foo] == [bar] {
+-          mutate { add_tag => woot }
+-        }
+-      }
+-    CONFIG
+ 
+-    sample("foo" => 123, "bar" => 123) do
+-      insist { subject["tags"] }.include?("woot")
+-    end
+-  end
++      context "when the elseif is true" do
+ 
+-  describe "the 'in' operator" do
+-    config <<-CONFIG
+-      filter {
+-        if [foo] in [foobar] {
+-          mutate { add_tag => "field in field" }
+-        }
+-        if [foo] in "foo" {
+-          mutate { add_tag => "field in string" }
+-        }
+-        if "hello" in [greeting] {
+-          mutate { add_tag => "string in field" }
+-        }
+-        if [foo] in ["hello", "world", "foo"] {
+-          mutate { add_tag => "field in list" }
+-        }
+-        if [missing] in [alsomissing] {
+-          mutate { add_tag => "shouldnotexist" }
+-        }
+-        if !("foo" in ["hello", "world"]) {
+-          mutate { add_tag => "shouldexist" }
+-        }
+-      }
+-    CONFIG
+-
+-    sample("foo" => "foo", "foobar" => "foobar", "greeting" => "hello world") do
+-      insist { subject["tags"] }.include?("field in field")
+-      insist { subject["tags"] }.include?("field in string")
+-      insist { subject["tags"] }.include?("string in field")
+-      insist { subject["tags"] }.include?("field in list")
+-      reject { subject["tags"] }.include?("shouldnotexist")
+-      insist { subject["tags"] }.include?("shouldexist")
+-    end
+-  end
++        subject      {  sample("bar" => "baz") }
+ 
+-  describe "the 'not in' operator" do
+-    config <<-CONFIG
+-      filter {
+-        if "foo" not in "baz" { mutate { add_tag => "baz" } }
+-        if "foo" not in "foo" { mutate { add_tag => "foo" } }
+-        if !("foo" not in "foo") { mutate { add_tag => "notfoo" } }
+-        if "foo" not in [somelist] { mutate { add_tag => "notsomelist" } }
+-        if "one" not in [somelist] { mutate { add_tag => "somelist" } }
+-        if "foo" not in [alsomissing] { mutate { add_tag => "no string in missing field" } }
+-      }
+-    CONFIG
+-
+-    sample("foo" => "foo", "somelist" => [ "one", "two" ], "foobar" => "foobar", "greeting" => "hello world", "tags" => [ "fancypantsy" ]) do
+-      # verify the original exists
+-      insist { subject["tags"] }.include?("fancypantsy")
+-
+-      insist { subject["tags"] }.include?("baz")
+-      reject { subject["tags"] }.include?("foo")
+-      insist { subject["tags"] }.include?("notfoo")
+-      insist { subject["tags"] }.include?("notsomelist")
+-      reject { subject["tags"] }.include?("somelist")
+-      insist { subject["tags"] }.include?("no string in missing field")
+-    end
+-  end
++        it "include the elseif field" do include("fancy" => "pants") end
++        it "not include the if field" do should_not include("hello", "free") end
++      end
+ 
+-  describe "operators" do
+-    conditional "[message] == 'sample'" do
+-      sample("sample") { insist { subject["tags"] }.include?("success") }
+-      sample("different") { insist { subject["tags"] }.include?("failure") }
+     end
+ 
+-    conditional "[message] != 'sample'" do
+-      sample("sample") { insist { subject["tags"] }.include?("failure") }
+-      sample("different") { insist { subject["tags"] }.include?("success") }
+-    end
++    describe "having nested conditionals" do
++      let(:config) { ConfigFactory.filter.
++                             if("[nest] == 123").add_field("always" => "awesome").
++                             if("[foo] == 'bar'").add_field("hello" => "world").
++                             elseif("[bar] == 'baz'").add_field("fancy" => "pants").
++                             else.add_field("free" => "hugs").endif.
++                             endif }
+ 
+-    conditional "[message] < 'sample'" do
+-      sample("apple") { insist { subject["tags"] }.include?("success") }
+-      sample("zebra") { insist { subject["tags"] }.include?("failure") }
+-    end
++      context "when the main if is not true" do
+ 
+-    conditional "[message] > 'sample'" do
+-      sample("zebra") { insist { subject["tags"] }.include?("success") }
+-      sample("apple") { insist { subject["tags"] }.include?("failure") }
+-    end
++        subject { sample(["foo" => "bar", "nest" => 124])  }
+ 
+-    conditional "[message] <= 'sample'" do
+-      sample("apple") { insist { subject["tags"] }.include?("success") }
+-      sample("zebra") { insist { subject["tags"] }.include?("failure") }
+-      sample("sample") { insist { subject["tags"] }.include?("success") }
+-    end
++        it "add no field" do should_not include("always", "hello", "fancy", "free") end
++      end
+ 
+-    conditional "[message] >= 'sample'" do
+-      sample("zebra") { insist { subject["tags"] }.include?("success") }
+-      sample("sample") { insist { subject["tags"] }.include?("success") }
+-      sample("apple") { insist { subject["tags"] }.include?("failure") }
+-    end
++      context "if the main if is true" do
+ 
+-    conditional "[message] =~ /sample/" do
+-      sample("apple") { insist { subject["tags"] }.include?("failure") }
+-      sample("sample") { insist { subject["tags"] }.include?("success") }
+-      sample("some sample") { insist { subject["tags"] }.include?("success") }
+-    end
++        it "include the primary if field" do include("always" => "awesome") end
+ 
+-    conditional "[message] !~ /sample/" do
+-      sample("apple") { insist { subject["tags"] }.include?("success") }
+-      sample("sample") { insist { subject["tags"] }.include?("failure") }
+-      sample("some sample") { insist { subject["tags"] }.include?("failure") }
+-    end
++        context "when the nested if is true" do
+ 
+-  end
++          subject { sample(["foo" => "bar", "nest" => 123])  }
+ 
+-  describe "negated expressions" do
+-    conditional "!([message] == 'sample')" do
+-      sample("sample") { reject { subject["tags"] }.include?("success") }
+-      sample("different") { reject { subject["tags"] }.include?("failure") }
+-    end
++          it "not include the elseif field" do should_not include("fancy", "free") end
++          it "include the nested if field"  do include("hello" => "world") end
++        end
+ 
+-    conditional "!([message] != 'sample')" do
+-      sample("sample") { reject { subject["tags"] }.include?("failure") }
+-      sample("different") { reject { subject["tags"] }.include?("success") }
+-    end
++        context "when the nested else is true" do
++          subject { sample(["notfoo" => "bar", "nest" => 123])  }
+ 
+-    conditional "!([message] < 'sample')" do
+-      sample("apple") { reject { subject["tags"] }.include?("success") }
+-      sample("zebra") { reject { subject["tags"] }.include?("failure") }
+-    end
++          it "not include the if field" do should_not include("hello") end
++          it "not include the elseif field" do should_not include("fancy") end
++          it "include the else field" do include("free" => "hugs") end
++        end
+ 
+-    conditional "!([message] > 'sample')" do
+-      sample("zebra") { reject { subject["tags"] }.include?("success") }
+-      sample("apple") { reject { subject["tags"] }.include?("failure") }
+-    end
++        context "when the nested elseif is true" do
+ 
+-    conditional "!([message] <= 'sample')" do
+-      sample("apple") { reject { subject["tags"] }.include?("success") }
+-      sample("zebra") { reject { subject["tags"] }.include?("failure") }
+-      sample("sample") { reject { subject["tags"] }.include?("success") }
+-    end
++          subject { sample(["bar" => "baz", "nest" => 123])  }
+ 
+-    conditional "!([message] >= 'sample')" do
+-      sample("zebra") { reject { subject["tags"] }.include?("success") }
+-      sample("sample") { reject { subject["tags"] }.include?("success") }
+-      sample("apple") { reject { subject["tags"] }.include?("failure") }
++          it "not include the else field" do should_not include("free") end
++          it "not include the if field" do should_not include("hello") end
++          it "add the elseif field" do include("fancy" => "pants") end
++        end
++      end
+     end
+ 
+-    conditional "!([message] =~ /sample/)" do
+-      sample("apple") { reject { subject["tags"] }.include?("failure") }
+-      sample("sample") { reject { subject["tags"] }.include?("success") }
+-      sample("some sample") { reject { subject["tags"] }.include?("success") }
+-    end
++      describe "when comparing two fields" do
++        let(:config) { ConfigFactry.filter.if("[foo] == [bar]").
++                       add_tag("woot").
++                       endif }
+ 
+-    conditional "!([message] !~ /sample/)" do
+-      sample("apple") { reject { subject["tags"] }.include?("success") }
+-      sample("sample") { reject { subject["tags"] }.include?("failure") }
+-      sample("some sample") { reject { subject["tags"] }.include?("failure") }
+-    end
++        subject { sample(["foo" => 123, "bar" => 123])  }
+ 
+-  end
+-
+-  describe "value as an expression" do
+-    # testing that a field has a value should be true.
+-    conditional "[message]" do
+-      sample("apple") { insist { subject["tags"] }.include?("success") }
+-      sample("sample") { insist { subject["tags"] }.include?("success") }
+-      sample("some sample") { insist { subject["tags"] }.include?("success") }
+-    end
++        context "when the if is true" do
++          it "include the if tag" do
++            include("tags" => ["woot"])
++          end
++        end
++      end
+ 
+-    # testing that a missing field has a value should be false.
+-    conditional "[missing]" do
+-      sample("apple") { insist { subject["tags"] }.include?("failure") }
+-      sample("sample") { insist { subject["tags"] }.include?("failure") }
+-      sample("some sample") { insist { subject["tags"] }.include?("failure") }
+-    end
+-  end
++    describe "when a new events is created" do
+ 
+-  describe "logic operators" do
+-    describe "and" do
+-      conditional "[message] and [message]" do
+-        sample("whatever") { insist { subject["tags"] }.include?("success") }
+-      end
+-      conditional "[message] and ![message]" do
+-        sample("whatever") { insist { subject["tags"] }.include?("failure") }
+-      end
+-      conditional "![message] and [message]" do
+-        sample("whatever") { insist { subject["tags"] }.include?("failure") }
+-      end
+-      conditional "![message] and ![message]" do
+-        sample("whatever") { insist { subject["tags"] }.include?("failure") }
+-      end
+-    end
++      let(:config)  { ConfigFactory.filter.if("[type] == 'original'").
++                                           clones('clone').
++                                           add_field("cond1" => "true").
++                                           else.add_field("cond2" => "true").
++                                           endif }
+ 
+-    describe "or" do
+-      conditional "[message] or [message]" do
+-        sample("whatever") { insist { subject["tags"] }.include?("success") }
+-      end
+-      conditional "[message] or ![message]" do
+-        sample("whatever") { insist { subject["tags"] }.include?("success") }
+-      end
+-      conditional "![message] or [message]" do
+-        sample("whatever") { insist { subject["tags"] }.include?("success") }
+-      end
+-      conditional "![message] or ![message]" do
+-        sample("whatever") { insist { subject["tags"] }.include?("failure") }
+-      end
+-    end
+-  end
++      subject { sample("type" => "original").to_a }
+ 
+-  describe "field references" do
+-    conditional "[field with space]" do
+-      sample("field with space" => "hurray") do
+-        insist { subject["tags"].include?("success") }
++      it "the first message has type original" do
++        expect(subject[0]).to include("type" => "original")
+       end
+-    end
+ 
+-    conditional "[field with space] == 'hurray'" do
+-      sample("field with space" => "hurray") do
+-        insist { subject["tags"].include?("success") }
++      it "the first message has a new field" do
++        expect(subject[0]).to include("cond1" => "true")
+       end
+-    end
+ 
+-    conditional "[nested field][reference with][some spaces] == 'hurray'" do
+-      sample({"nested field" => { "reference with" => { "some spaces" => "hurray" } } }) do
+-        insist { subject["tags"].include?("success") }
++      it "has a message with type clone" do
++        expect(subject[1]).to include("type" => "clone")
+       end
+-    end
+-  end
+-
+-  describe "new events from root" do
+-    config <<-CONFIG
+-      filter {
+-        if [type] == "original" {
+-          clone {
+-            clones => ["clone"]
+-          }
+-        }
+-        if [type] == "original" {
+-          mutate { add_field => { "cond1" => "true" } }
+-        } else {
+-          mutate { add_field => { "cond2" => "true" } }
+-        }
+-      }
+-    CONFIG
+-
+-    sample({"type" => "original"}) do
+-      insist { subject }.is_a?(Array)
+-      insist { subject.length } == 2
+-
+-      insist { subject[0]["type"] } == "original"
+-      insist { subject[0]["cond1"] } == "true"
+-      insist { subject[0]["cond2"] } == nil
+ 
+-      insist { subject[1]["type"] } == "clone"
+-      # insist { subject[1]["cond1"] } == nil
+-      # insist { subject[1]["cond2"] } == "true"
+     end
+   end
+ end
+diff --git a/spec/core/config_spec.rb b/spec/core/config_spec.rb
+index 2221540536b..614b62bbc77 100644
+--- a/spec/core/config_spec.rb
++++ b/spec/core/config_spec.rb
+@@ -1,31 +1,29 @@
+-# config syntax tests
+-#
++require "spec_helper"
+ 
+ require "logstash/config/grammar"
+ require "logstash/config/config_ast"
+ 
+ describe LogStashConfigParser do
+-  it "should permit single-quoted attribute names" do
+-    parser = LogStashConfigParser.new
+-    config = parser.parse(%q(
+-      input {
+-        example {
+-          'foo' => 'bar'
+-          test => { 'bar' => 'baz' }
+-        }
+-      }
+-    ))
+ 
+-    reject { config }.nil?
+-  end
++  let(:parser) { LogStashConfigParser.new }
++  let(:single_quote_config) { <<-CONFIG
++                              input {
++                                  example {
++                                    'foo' => 'bar'
++                                    test => { 'bar' => 'baz' }
++                                  }
++                              }
++                              CONFIG
++  }
++  let(:empty_config)        { 'filter {}' }
+ 
+-  it "should permit empty plugin sections" do
+-    parser = LogStashConfigParser.new
+-    config = parser.parse(%q(
+-      filter {
+-      }
+-    ))
++  it "permits single-quoted attribute names" do
++    config = parser.parse(single_quote_config)
++    expect(config).not_to be_nil
++  end
+ 
+-    reject { config }.nil?
++  it "permits empty plugin sections" do
++    config = parser.parse(empty_config)
++    expect(config).not_to be_nil
+   end
+ end
+diff --git a/spec/core/event_spec.rb b/spec/core/event_spec.rb
+index 388d102bb24..8dea002b01a 100644
+--- a/spec/core/event_spec.rb
++++ b/spec/core/event_spec.rb
+@@ -1,121 +1,132 @@
+ # encoding: utf-8
++require 'spec_helper'
+ 
+ require "logstash/event"
+-require "insist"
+ 
+ describe LogStash::Event do
+-  subject do
+-    LogStash::Event.new(
+-      "@timestamp" => Time.iso8601("2013-01-01T00:00:00.000Z"),
+-      "type" => "sprintf",
+-      "message" => "hello world",
+-      "tags" => [ "tag1" ],
+-      "source" => "/home/foo",
+-      "a" => "b",
+-      "c" => {
+-        "d" => "f",
+-        "e" => {"f" => "g"}
+-      },
+-      "f" => { "g" => { "h" => "i" } },
+-      "j" => {
+-          "k1" => "v",
+-          "k2" => [ "w", "x" ],
+-          "k3" => {"4" => "m"},
+-          5 => 6,
+-          "5" => 7
+-      },
+-      "@metadata" => { "fancy" => "pants", "have-to-go" => { "deeper" => "inception" } }
+-    )
+-  end
++
++  subject { sample_logstash_event }
+ 
+   context "[]=" do
++
+     it "should raise an exception if you attempt to set @timestamp to a value type other than a Time object" do
+-      insist { subject["@timestamp"] = "crash!" }.raises(TypeError)
++      expect { subject["@timestamp"] = "crash!" }.to raise_error(TypeError)
+     end
+ 
+-    it "should assign simple fields" do
+-      insist { subject["foo"] }.nil?
+-      insist { subject["foo"] = "bar" } == "bar"
+-      insist { subject["foo"] } == "bar"
+-    end
++    context "simple fields" do
++      it "access values" do
++        expect(subject["foo"]).to be_nil
++      end
+ 
+-    it "should overwrite simple fields" do
+-      insist { subject["foo"] }.nil?
+-      insist { subject["foo"] = "bar"} == "bar"
+-      insist { subject["foo"] } == "bar"
++      it "assign values" do
++        expect(subject["foo"] = "bar").to eq("bar")
++      end
+ 
+-      insist { subject["foo"] = "baz"} == "baz"
+-      insist { subject["foo"] } == "baz"
+-    end
++      it "change values" do
++        subject["foo"] = "bar"
++        expect(subject["foo"]).to eq("bar")
++      end
++
++      it "overrite values" do
++        subject["foo"] = "bar"
++        subject["foo"] = "baz"
++        expect(subject["foo"]).to eq("baz")
++      end
+ 
+-    it "should assign deep fields" do
+-      insist { subject["[foo][bar]"] }.nil?
+-      insist { subject["[foo][bar]"] = "baz"} == "baz"
+-      insist { subject["[foo][bar]"] } == "baz"
+     end
+ 
+-    it "should overwrite deep fields" do
+-      insist { subject["[foo][bar]"] }.nil?
+-      insist { subject["[foo][bar]"] = "baz"} == "baz"
+-      insist { subject["[foo][bar]"] } == "baz"
++    context "deep fields" do
++
++      it "access nil values" do
++        expect(subject["[foo][bar]"]).to be_nil
++      end
++
++      it "assign values" do
++        expect(subject["[foo][bar]"] = "baz").to eq("baz")
++      end
++
++      it "change values" do
++        subject["[foo][bar]"] = "baz"
++        expect(subject["[foo][bar]"]).to eq("baz")
++      end
++
++      it "overwrite values" do
++        subject["[foo][bar]"] = "baz"
++        subject["[foo][bar]"] = "zab"
++        expect(subject["[foo][bar]"]).to eq("zab")
++      end
+ 
+-      insist { subject["[foo][bar]"] = "zab"} == "zab"
+-      insist { subject["[foo][bar]"] } == "zab"
+     end
+   end
+ 
+   context "#sprintf" do
+-    it "should report a unix timestamp for %{+%s}" do
+-      insist { subject.sprintf("%{+%s}") } == "1356998400"
++
++    it "reports a unix timestamp for %{+%s}" do
++      expect(subject.sprintf("%{+%s}")).to eq("1356998400")
+     end
+ 
+-    it "should report a time with %{+format} syntax", :if => RUBY_ENGINE == "jruby" do
+-      insist { subject.sprintf("%{+YYYY}") } == "2013"
+-      insist { subject.sprintf("%{+MM}") } == "01"
+-      insist { subject.sprintf("%{+HH}") } == "00"
++    it "reports a time with %{+format} syntax", :if => RUBY_ENGINE == "jruby" do
++      expect(subject.sprintf("%{+DD/MM/YYYY}")).to eq("01/01/2013")
+     end
+ 
+-    it "should report fields with %{field} syntax" do
+-      insist { subject.sprintf("%{type}") } == "sprintf"
+-      insist { subject.sprintf("%{message}") } == subject["message"]
++    it "reports fields with %{field} syntax" do
++      expect(subject.sprintf("%{message}")).to eq(subject["message"])
+     end
+ 
+-    it "should print deep fields" do
+-      insist { subject.sprintf("%{[j][k1]}") } == "v"
+-      insist { subject.sprintf("%{[j][k2][0]}") } == "w"
++    it "prints deep fields" do
++      expect(subject.sprintf("%{[j][k2][0]}")).to eq("w")
+     end
+ 
+-    it "should be able to take a non-string for the format" do
+-      insist { subject.sprintf(2) } == "2"
++    it "is able to take a non-string for the format" do
++      expect(subject.sprintf(2)).to eq("2")
+     end
+ 
+-    it "should allow to use the metadata when calling #sprintf" do
++    it "allows to use the metadata" do
+       expect(subject.sprintf("super-%{[@metadata][fancy]}")).to eq("super-pants")
+     end
+ 
+-    it "should allow to use nested hash from the metadata field" do
++    it "allows to use nested hash from the metadata field" do
+       expect(subject.sprintf("%{[@metadata][have-to-go][deeper]}")).to eq("inception")
+     end
+   end
+ 
+   context "#[]" do
+-    it "should fetch data" do
+-      insist { subject["type"] } == "sprintf"
++
++    it "fetch data" do
++      expect(subject["type"]).to eq("sprintf")
+     end
+-    it "should fetch fields" do
+-      insist { subject["a"] } == "b"
+-      insist { subject['c']['d'] } == "f"
++
++    it "fetch single fields" do
++      expect(subject["a"]).to  eq("b")
+     end
+-    it "should fetch deep fields" do
+-      insist { subject["[j][k1]"] } == "v"
+-      insist { subject["[c][d]"] } == "f"
+-      insist { subject['[f][g][h]'] } == "i"
+-      insist { subject['[j][k3][4]'] } == "m"
+-      insist { subject['[j][5]'] } == 7
+ 
++    it "fecth inner fields" do
++      expect(subject['c']['d']).to eq("f")
+     end
+ 
+-    it "should be fast?", :performance => true do
++    context "deep fields" do
++
++      it "fetch values by name" do
++        expect(subject["[j][k1]"]).to eq("v")
++      end
++
++      it "fetch values by index" do
++        expect(subject['[j][5]']).to eq(7)
++      end
++
++      context "multilevel" do
++        it "fetch values by name" do
++          expect(subject['[f][g][h]']).to eq("i")
++        end
++
++        it "fetch values by index" do
++          expect(subject['[j][k3][4]']).to eq("m")
++        end
++      end
++    end
++
++    # have to be move somewhere else more relevant.
++    xit "is fast enough", :performance => true do
+       count = 1000000
+       2.times do
+         start = Time.now
+@@ -127,83 +138,102 @@
+   end
+ 
+   context "#overwrite" do
+-    it "should swap data with new content" do
+-      new_event = LogStash::Event.new(
+-        "type" => "new",
+-        "message" => "foo bar",
+-      )
++    let(:new_event) { LogStash::Event.new("type" => "new", "message" => "foo bar")}
++
++    before(:each) do
+       subject.overwrite(new_event)
++    end
+ 
+-      insist { subject["message"] } == "foo bar"
+-      insist { subject["type"] } == "new"
++    it "swap the data with new content" do
++      expect(subject["message"]).to eq("foo bar")
++    end
+ 
++    it "remove old values from the event" do
+       ["tags", "source", "a", "c", "f", "j"].each do |field|
+-        insist { subject[field] } == nil
++        expect(subject[field]).to be_nil
+       end
+     end
++
+   end
+ 
+   context "#append" do
+-    it "should append strings to an array" do
++
++    it "append strings to an array" do
+       subject.append(LogStash::Event.new("message" => "another thing"))
+-      insist { subject["message"] } == [ "hello world", "another thing" ]
++      expect(subject["message"]).to include("hello world", "another thing")
+     end
+ 
+-    it "should concatenate tags" do
++    it "concatenate tags" do
+       subject.append(LogStash::Event.new("tags" => [ "tag2" ]))
+-      insist { subject["tags"] } == [ "tag1", "tag2" ]
++      expect(subject["tags"]).to include("tag1", "tag2")
+     end
+ 
+     context "when event field is nil" do
+-      it "should add single value as string" do
++
++      it "add single value as string" do
+         subject.append(LogStash::Event.new({"field1" => "append1"}))
+-        insist { subject[ "field1" ] } == "append1"
++        expect(subject[ "field1" ]).to eq("append1")
+       end
+-      it "should add multi values as array" do
++
++      it "add multi values as array" do
+         subject.append(LogStash::Event.new({"field1" => [ "append1","append2" ]}))
+-        insist { subject[ "field1" ] } == [ "append1","append2" ]
++        expect(subject[ "field1" ]).to include("append1","append2")
+       end
++
+     end
+ 
+     context "when event field is a string" do
+-      before { subject[ "field1" ] = "original1" }
+ 
+-      it "should append string to values, if different from current" do
++      before(:each) do
++        subject[ "field1" ] = "original1"
++      end
++
++      it "append string to values, if different from current" do
+         subject.append(LogStash::Event.new({"field1" => "append1"}))
+-        insist { subject[ "field1" ] } == [ "original1", "append1" ]
++        expect(subject[ "field1" ]).to include("original1", "append1")
+       end
+-      it "should not change value, if appended value is equal current" do
++
++      it "not change value, if appended value is equal current" do
+         subject.append(LogStash::Event.new({"field1" => "original1"}))
+-        insist { subject[ "field1" ] } == "original1"
++        expect(subject[ "field1" ]).to eq("original1")
+       end
+-      it "should concatenate values in an array" do
++
++      it "concatenate values in an array" do
+         subject.append(LogStash::Event.new({"field1" => [ "append1" ]}))
+-        insist { subject[ "field1" ] } == [ "original1", "append1" ]
++        expect(subject[ "field1" ]).to include("original1", "append1")
+       end
+-      it "should join array, removing duplicates" do
++
++      it "join array, removing duplicates" do
+         subject.append(LogStash::Event.new({"field1" => [ "append1","original1" ]}))
+-        insist { subject[ "field1" ] } == [ "original1", "append1" ]
++        expect(subject[ "field1" ]).to include("original1", "append1")
+       end
+     end
++
+     context "when event field is an array" do
+-      before { subject[ "field1" ] = [ "original1", "original2" ] }
+ 
+-      it "should append string values to array, if not present in array" do
++      before(:each) do
++        subject[ "field1" ] = [ "original1", "original2" ]
++      end
++
++      it "append string values to array, if not present in array" do
+         subject.append(LogStash::Event.new({"field1" => "append1"}))
+-        insist { subject[ "field1" ] } == [ "original1", "original2", "append1" ]
++        expect(subject[ "field1" ]).to include("original1", "original2", "append1")
+       end
+-      it "should not append string values, if the array already contains it" do
++
++      it "not append string values, if the array already contains it" do
+         subject.append(LogStash::Event.new({"field1" => "original1"}))
+-        insist { subject[ "field1" ] } == [ "original1", "original2" ]
++        expect(subject[ "field1" ]).to include("original1", "original2")
+       end
+-      it "should join array, removing duplicates" do
++
++      it "join array, removing duplicates" do
+         subject.append(LogStash::Event.new({"field1" => [ "append1","original1" ]}))
+-        insist { subject[ "field1" ] } == [ "original1", "original2", "append1" ]
++        expect(subject[ "field1" ]).to include("original1", "original2", "append1")
+       end
+     end
+   end
+ 
+-  it "timestamp parsing speed", :performance => true do
++  # Should be move somewhere else more relevant
++  xit "timestamp parsing speed", :performance => true do
+     warmup = 10000
+     count = 1000000
+ 
+@@ -223,36 +253,31 @@
+     puts "event @timestamp parse rate: #{"%02.0f/sec" % (count / duration)}, elapsed: #{duration}s"
+   end
+ 
+-  context "acceptable @timestamp formats" do
++  context "@timestamp formats" do
++
+     subject { LogStash::Event.new }
+ 
+-    formats = [
+-      "YYYY-MM-dd'T'HH:mm:ss.SSSZ",
+-      "YYYY-MM-dd'T'HH:mm:ss.SSSSSSZ",
+-      "YYYY-MM-dd'T'HH:mm:ss.SSS",
+-      "YYYY-MM-dd'T'HH:mm:ss",
+-      "YYYY-MM-dd'T'HH:mm:ssZ",
+-    ]
++    formats = [ "YYYY-MM-dd'T'HH:mm:ss.SSSZ", "YYYY-MM-dd'T'HH:mm:ss.SSSSSSZ",
++                "YYYY-MM-dd'T'HH:mm:ss.SSS", "YYYY-MM-dd'T'HH:mm:ss", "YYYY-MM-dd'T'HH:mm:ssZ"]
++
+     formats.each do |format|
+-      it "includes #{format}" do
++      it "includes #{format} as a valid format" do
+         time = subject.sprintf("%{+#{format}}")
+-        begin
+-          LogStash::Event.new("@timestamp" => time)
+-        rescue => e
+-          raise StandardError, "Time '#{time}' was rejected. #{e.class}: #{e.to_s}"
+-        end
++        expect{LogStash::Event.new("@timestamp" => time)}.not_to raise_error
+       end
+     end
+ 
+     context "from LOGSTASH-1738" do
+       it "does not error" do
+-        LogStash::Event.new("@timestamp" => "2013-12-29T23:12:52.371240+02:00")
++        timestamp = "2013-12-29T23:12:52.371240+02:00"
++        expect{LogStash::Event.new("@timestamp" => timestamp)}.not_to raise_error
+       end
+     end
+ 
+     context "from LOGSTASH-1732" do
+       it "does not error" do
+-        LogStash::Event.new("@timestamp" => "2013-12-27T11:07:25+00:00")
++        timestamp = "2013-12-27T11:07:25+00:00"
++        expect{LogStash::Event.new("@timestamp" => timestamp)}.not_to raise_error
+       end
+     end
+   end
+@@ -260,85 +285,126 @@
+   context "timestamp initialization" do
+     let(:logger) { double("logger") }
+ 
+-    it "should coerce timestamp" do
+-      t = Time.iso8601("2014-06-12T00:12:17.114Z")
+-      expect(LogStash::Timestamp).to receive(:coerce).exactly(3).times.and_call_original
+-      insist{LogStash::Event.new("@timestamp" => t).timestamp.to_i} == t.to_i
+-      insist{LogStash::Event.new("@timestamp" => LogStash::Timestamp.new(t)).timestamp.to_i} == t.to_i
+-      insist{LogStash::Event.new("@timestamp" => "2014-06-12T00:12:17.114Z").timestamp.to_i} == t.to_i
++    context "time coercion" do
++      let(:t) { Time.iso8601("2014-06-12T00:12:17.114Z") }
++
++      before(:each) do
++        expect(LogStash::Timestamp).to receive(:coerce).exactly(1).times.and_call_original
++      end
++
++      it "match with time" do
++        event = LogStash::Event.new("@timestamp" => t)
++        expect(event.timestamp.to_i).to eq(t.to_i)
++      end
++
++      it "match with a new timestamp" do
++        event = LogStash::Event.new("@timestamp" => LogStash::Timestamp.new(t))
++        expect(event.timestamp.to_i).to eq(t.to_i)
++      end
++
++      it "match with a string" do
++        event = LogStash::Event.new("@timestamp" => "2014-06-12T00:12:17.114Z")
++        expect(event.timestamp.to_i).to eq(t.to_i)
++      end
+     end
+ 
+-    it "should assign current time when no timestamp" do
++    it "assign current time when no timestamp" do
+       ts = LogStash::Timestamp.now
+-      expect(LogStash::Timestamp).to receive(:now).and_return(ts)
+-      insist{LogStash::Event.new({}).timestamp.to_i} == ts.to_i
++      event = LogStash::Event.new({})
++      expect(event.timestamp.to_i).to eq(ts.to_i)
+     end
+ 
+-    it "should tag and warn for invalid value" do
+-      ts = LogStash::Timestamp.now
+-      expect(LogStash::Timestamp).to receive(:now).twice.and_return(ts)
+-      expect(Cabin::Channel).to receive(:get).twice.and_return(logger)
+-      expect(logger).to receive(:warn).twice
++    context "invalid values" do
+ 
+-      event = LogStash::Event.new("@timestamp" => :foo)
+-      insist{event.timestamp.to_i} == ts.to_i
+-      insist{event["tags"]} == [LogStash::Event::TIMESTAMP_FAILURE_TAG]
+-      insist{event[LogStash::Event::TIMESTAMP_FAILURE_FIELD]} == :foo
++      let(:ts) { LogStash::Timestamp.now }
+ 
+-      event = LogStash::Event.new("@timestamp" => 666)
+-      insist{event.timestamp.to_i} == ts.to_i
+-      insist{event["tags"]} == [LogStash::Event::TIMESTAMP_FAILURE_TAG]
+-      insist{event[LogStash::Event::TIMESTAMP_FAILURE_FIELD]} == 666
+-    end
++      before(:each) do
++        expect(Cabin::Channel).to receive(:get).and_return(logger)
++        expect(logger).to receive(:warn)
++      end
+ 
+-    it "should tag and warn for invalid string format" do
+-      ts = LogStash::Timestamp.now
+-      expect(LogStash::Timestamp).to receive(:now).and_return(ts)
+-      expect(Cabin::Channel).to receive(:get).and_return(logger)
+-      expect(logger).to receive(:warn)
++      context "timestamp as an invalid sym" do
++        let(:event) { LogStash::Event.new("@timestamp" => :foo) }
++
++        it "return the current time" do
++          expect(event.timestamp.to_i).to eq(ts.to_i)
++        end
++
++        it "add a faliure tag" do
++          expect(event["tags"]).to include(LogStash::Event::TIMESTAMP_FAILURE_TAG)
++        end
++
++        it "add track the invalid value" do
++          expect(event[LogStash::Event::TIMESTAMP_FAILURE_FIELD]).to eq(:foo)
++        end
++      end
++
++      context "timestamp as an invalid number" do
++        let(:event) { LogStash::Event.new("@timestamp" => 666) }
++
++        it "return the current time" do
++          expect(event.timestamp.to_i).to eq(ts.to_i)
++        end
++
++        it "add a faliure tag" do
++          expect(event["tags"]).to include(LogStash::Event::TIMESTAMP_FAILURE_TAG)
++        end
++
++        it "add track the invalid value" do
++          expect(event[LogStash::Event::TIMESTAMP_FAILURE_FIELD]).to eq(666)
++        end
++      end
++
++      context "timestamp as an invalid string" do
++        let(:event) { LogStash::Event.new("@timestamp" => "foo") }
++
++        it "return the current time" do
++          expect(event.timestamp.to_i).to eq(ts.to_i)
++        end
++
++        it "add a faliure tag" do
++          expect(event["tags"]).to include(LogStash::Event::TIMESTAMP_FAILURE_TAG)
++        end
++
++        it "add track the invalid value" do
++          expect(event[LogStash::Event::TIMESTAMP_FAILURE_FIELD]).to eq("foo")
++        end
++      end
+ 
+-      event = LogStash::Event.new("@timestamp" => "foo")
+-      insist{event.timestamp.to_i} == ts.to_i
+-      insist{event["tags"]} == [LogStash::Event::TIMESTAMP_FAILURE_TAG]
+-      insist{event[LogStash::Event::TIMESTAMP_FAILURE_FIELD]} == "foo"
+     end
+   end
+ 
+   context "to_json" do
+-    it "should support to_json" do
+-      new_event = LogStash::Event.new(
+-        "@timestamp" => Time.iso8601("2014-09-23T19:26:15.832Z"),
+-        "message" => "foo bar",
+-      )
+-      json = new_event.to_json
++    let (:timestamp) { Time.iso8601("2014-09-23T19:26:15.832Z") }
++    let (:new_event) { LogStash::Event.new("@timestamp" => timestamp, "message" => "foo bar")}
+ 
+-      insist { json } ==  "{\"@timestamp\":\"2014-09-23T19:26:15.832Z\",\"message\":\"foo bar\",\"@version\":\"1\"}"
++    it "support to_json" do
++      json = new_event.to_json
++      expect(json).to eq("{\"@timestamp\":\"2014-09-23T19:26:15.832Z\",\"message\":\"foo bar\",\"@version\":\"1\"}")
+     end
+ 
+-    it "should support to_json and ignore arguments" do
+-      new_event = LogStash::Event.new(
+-        "@timestamp" => Time.iso8601("2014-09-23T19:26:15.832Z"),
+-        "message" => "foo bar",
+-      )
++    it "support to ignore arguments" do
+       json = new_event.to_json(:foo => 1, :bar => "baz")
+-
+-      insist { json } ==  "{\"@timestamp\":\"2014-09-23T19:26:15.832Z\",\"message\":\"foo bar\",\"@version\":\"1\"}"
++      expect(json).to eq("{\"@timestamp\":\"2014-09-23T19:26:15.832Z\",\"message\":\"foo bar\",\"@version\":\"1\"}")
+     end
+   end
+ 
+   context "metadata" do
++
+     context "with existing metadata" do
+-      subject { LogStash::Event.new("hello" => "world", "@metadata" => { "fancy" => "pants" }) }
+ 
+-      it "should not include metadata in to_hash" do
+-        reject { subject.to_hash.keys }.include?("@metadata")
++      subject { LogStash::Event.new("hello" => "world", "@metadata" => { "fancy" => "pants" }).to_hash }
+ 
+-        # 'hello', '@timestamp', and '@version'
+-        insist { subject.to_hash.keys.count } == 3
++      it "not include in to_hash" do
++        expect(subject).not_to include("@metadata")
+       end
+ 
+-      it "should still allow normal field access" do
+-        insist { subject["hello"] } == "world"
++      it "have expected keys" do
++        expect(subject).to include("hello", "@timestamp", "@version")
++      end
++
++      it "allow normal field access" do
++        expect(subject).to include("hello" => "world")
+       end
+     end
+ 
+@@ -346,46 +412,45 @@
+       let(:fieldref) { "[@metadata][foo][bar]" }
+       let(:value) { "bar" }
+       subject { LogStash::Event.new("normal" => "normal") }
+-      before do
+-        # Verify the test is configured correctly.
+-        insist { fieldref }.start_with?("[@metadata]")
+ 
+-        # Set it.
++      before(:each) do
+         subject[fieldref] = value
+       end
+ 
+-      it "should still allow normal field access" do
+-        insist { subject["normal"] } == "normal"
++      it "allow normal field access" do
++        expect(subject.to_hash).to include("normal" => "normal")
+       end
+ 
+-      it "should allow getting" do
+-        insist { subject[fieldref] } == value
++      it "allow getting" do
++        expect(subject[fieldref]).to eq(value)
+       end
+ 
+-      it "should be hidden from .to_json" do
++      it "is hidden from .to_json" do
+         require "json"
+         obj = JSON.parse(subject.to_json)
+-        reject { obj }.include?("@metadata")
++        expect(obj).not_to include("@metadata")
+       end
+ 
+-      it "should be hidden from .to_hash" do
+-        reject { subject.to_hash }.include?("@metadata")
++      it "is hidden from .to_hash" do
++        expect(subject.to_hash).not_to include("@metadata")
+       end
+ 
+-      it "should be accessible through #to_hash_with_metadata" do
++      it "is accessible through #to_hash_with_metadata" do
+         obj = subject.to_hash_with_metadata
+-        insist { obj }.include?("@metadata")
+-        insist { obj["@metadata"]["foo"]["bar"] } == value
++        expect(obj["@metadata"]["foo"]["bar"]).to eq(value)
+       end
+     end
+-    
++
+     context "with no metadata" do
++
+       subject { LogStash::Event.new("foo" => "bar") }
+-      it "should have no metadata" do
+-        insist { subject["@metadata"] }.empty?
++
++      it "is hidden from to_hash" do
++        expect(subject.to_hash).not_to include("@metadata")
+       end
+-      it "should still allow normal field access" do
+-        insist { subject["foo"] } == "bar"
++
++      it "allow normal field access" do
++        expect(subject["foo"]).to eq("bar")
+       end
+     end
+ 
+diff --git a/spec/core/expressions_spec.rb b/spec/core/expressions_spec.rb
+new file mode 100644
+index 00000000000..4cac0e3d256
+--- /dev/null
++++ b/spec/core/expressions_spec.rb
+@@ -0,0 +1,87 @@
++require 'spec_helper'
++
++describe "operators" do
++
++  let(:defs)   { ConfigFactory.filter.if("%s").add_tag("success").
++                                else.add_tag("failure").
++                                endif
++                }
++  describe "value as expression" do
++
++    context "with a placeholder message" do
++      it "add the success tag to any message" do
++        config    = defs % ["[message]"]
++        expect(sample_from("apple", config)).to include("tags" => ["success"])
++      end
++
++      it "add the failure tag to any message" do
++        config    = defs % ["[missing]"]
++        expect(sample_from("apple", config)).to include("tags" => ["failure"])
++      end
++    end
++
++    context "when using logic operators" do
++
++      describe "and" do
++        it "add the success tag for true expressions" do
++          config    = defs % ["[message] and [message]" ]
++          expect(sample_from("apple", config)).to include("tags" => ["success"])
++        end
++
++        it "add the failure tag for false expressions" do
++          config    = defs % ["[message] and ![message]" ]
++          expect(sample_from("apple", config)).to include("tags" => ["failure"])
++        end
++
++        it "add the failure tag for double negated expressions" do
++          config    = defs % ["![message] and ![message]" ]
++          expect(sample_from("apple", config)).to include("tags" => ["failure"])
++        end
++      end
++
++      describe "or" do
++        it "add the success tag for true expressions" do
++          config    = defs % ["[message] or [message]" ]
++          expect(sample_from("apple", config)).to include("tags" => ["success"])
++        end
++
++        it "add the success tag for one negated term expressions" do
++          config    = defs % ["[message] or ![message]" ]
++          expect(sample_from("apple", config)).to include("tags" => ["success"])
++        end
++
++        it "add the failure tag for double negated expressions" do
++          config    = defs % ["![message] or ![message]" ]
++          expect(sample_from("apple", config)).to include("tags" => ["failure"])
++        end
++      end
++
++    end
++
++    context "with field references" do
++
++      context "having spaces in the criteria" do
++
++        it "add the success tag when using a field" do
++          config    = defs % ["[field with space]"]
++          expect(sample_from({"field with space" => "hurray"}, config)).to include("tags" => ["success"])
++        end
++
++        it "add the success tag when using an eq comparison" do
++          patterns = ["[field with space] == 'hurray'"]
++          config   = defs % patterns
++          expect(sample_from({"field with space" => "hurray"}, config)).to include("tags" => ["success"])
++        end
++
++        it "add the success tag when using nested fields" do
++          patterns = ["[nested field][reference with][some spaces] == 'hurray'"]
++          config   = defs % patterns
++          event    = {"nested field" => { "reference with" => { "some spaces" => "hurray" } } }
++          expect(sample_from(event, config)).to include("tags" => ["success"])
++        end
++
++      end
++    end
++
++  end
++  end
+diff --git a/spec/core/operators_spec.rb b/spec/core/operators_spec.rb
+new file mode 100644
+index 00000000000..95fcdb28d75
+--- /dev/null
++++ b/spec/core/operators_spec.rb
+@@ -0,0 +1,165 @@
++require 'spec_helper'
++
++describe "operators" do
++
++  let(:pipeline) {LogStash::Pipeline.new(config.to_s)}
++
++  describe "the in operator" do
++    let(:config) { ConfigFactory.filter.if("[foo] in [foobar]").add_tag("field in field").endif.
++                                        if('[foo] in "foo"').add_tag("field in string").endif.
++                                        if('"hello" in [greeting]').add_tag("string in field").endif.
++                                        if('[foo] in ["hello", "world", "foo"]').add_tag("field in list").endif.
++                                        if('[missing] in [alsomissing]').add_tag("shouldnotexist").endif.
++                                        if('!("foo" in ["hello", "world"])').add_tag("shouldexist").endif }
++    subject      {   sample("foo" => "foo", "foobar" => "foobar", "greeting" => "hello world") }
++
++    it "add the filds that meet the filter crieria" do
++      is_expected.to include("tags" => ["field in field", "field in string", "string in field", "field in list", "shouldexist"])
++    end
++
++    it "does not add values or cretiras not meet" do
++      is_expected.not_to include("tags" => ["shouldnotexist"])
++    end
++  end
++
++  describe "the not in operator" do
++    let(:event)  { {"foo" => "foo", "somelist" => [ "one", "two" ],
++                    "foobar" => "foobar", "greeting" => "hello world",
++                    "tags" => [ "fancypantsy" ]} }
++    let(:config) { ConfigFactory.filter.if('"foo" not in "baz"').add_tag("baz").endif.
++                                        if('"foo" not in "foo"').add_tag("foo").endif.
++                                        if('!("foo" not in "foo")').add_tag("notfoo").endif.
++                                        if('"foo" not in [somelist]').add_tag("notsomelist").endif.
++                                        if('"one" not in [somelist]').add_tag("somelist").endif.
++                                        if('"foo" not in [alsomissing]').add_tag("no string in missing field").endif }
++    subject      { sample(event) }
++
++    it "add the filds that meet the filter crieria" do
++       include("tags" => ["fancypantsy", "baz", "notfoo", "notsomelist", "no string in missing field"])
++    end
++
++    it "does not add values or cretiras not meet" do
++      should_not include("tags" => ["somelist", "foo"])
++    end
++  end
++
++    describe "operators" do
++      let(:defs)   { ConfigFactory.filter.if("%s").add_tag("success").
++                                          else.add_tag("failure").
++                                          endif }
++      let(:config) { defs % [expression]}
++
++      context "operator equal" do
++      let (:expression) { "[message] == 'sample'"}
++
++      it "add the success tag if the critieria is meet" do
++        expect(sample("sample")).to include("tags" => ["success"])
++      end
++
++      it "add the failure tag if the critieria is not meet" do
++        expect(sample("different")).to include("tags" => ["failure"])
++      end
++    end
++
++    context "operator not equal" do
++      let (:expression) { "[message] != 'sample'"}
++
++      it "add the success tag if the critieria is meet" do
++        expect(sample("different")).to include("tags" => ["success"])
++      end
++
++      it "add the failure tag if the critieria is not meet" do
++        expect(sample("sample")).to include("tags" => ["failure"])
++      end
++    end
++
++    context "operator lt" do
++      let (:expression) { "[message] < 'sample'"}
++
++      it "add the success tag if the critieria is meet" do
++        expect(sample("apple")).to include("tags" => ["success"])
++      end
++
++      it "add the failure tag if the critieria is not meet" do
++        expect(sample("zebra")).to include("tags" => ["failure"])
++      end
++    end
++
++    context "operator gt" do
++      let (:expression) { "[message] > 'sample'"}
++
++      it "add the success tag if the critieria is meet" do
++        expect(sample("zebra")).to include("tags" => ["success"])
++      end
++
++      it "add the failure tag if the critieria is not meet" do
++        expect(sample("apple")).to include("tags" => ["failure"])
++      end
++    end
++
++    context "operator lte" do
++      let (:expression) { "[message] <= 'sample'"}
++
++      it "add the success tag if the critieria is meet" do
++        expect(sample("apple")).to include("tags" => ["success"])
++      end
++
++      it "add the sucess tag if the message is equal" do
++        expect(sample("sample")).to include("tags" => ["success"])
++      end
++
++      it "add the failure tag if the critieria is not meet" do
++        expect(sample("zebra")).to include("tags" => ["failure"])
++      end
++    end
++
++    context "operator gte" do
++      let (:expression) { "[message] >= 'sample'"}
++
++      it "add the success tag if the critieria is meet" do
++        expect(sample("zebra")).to include("tags" => ["success"])
++      end
++
++      it "add the sucess tag if the message is equal" do
++        expect(sample("sample")).to include("tags" => ["success"])
++      end
++
++      it "add the failure tag if the critieria is not meet" do
++        expect(sample("apple")).to include("tags" => ["failure"])
++      end
++    end
++
++    context "operator match" do
++      let (:expression) { "[message] =~ /sample/ "}
++
++      it "add the success tag if the critieria is meet" do
++        expect(sample("some sample")).to include("tags" => ["success"])
++      end
++
++      it "add the sucess tag if the message is equal" do
++        expect(sample("sample")).to include("tags" => ["success"])
++      end
++
++      it "add the failure tag if the critieria is not meet" do
++        expect(sample("apple")).to include("tags" => ["failure"])
++      end
++    end
++
++    context "operator not match" do
++      let (:expression) { "[message] !~ /sample/ "}
++
++      it "add the success tag if the critieria is meet" do
++        expect(sample("apple")).to include("tags" => ["success"])
++      end
++
++      it "add the failure tag for the exact message" do
++        expect(sample("sample")).to include("tags" => ["failure"])
++      end
++
++      it "add the failure tag if the critieria is containt in the message" do
++        expect(sample("some sample")).to include("tags" => ["failure"])
++      end
++    end
++
++  end
++end
+diff --git a/spec/core/pipeline_spec.rb b/spec/core/pipeline_spec.rb
+index 127b8326665..5ef14ad6874 100644
+--- a/spec/core/pipeline_spec.rb
++++ b/spec/core/pipeline_spec.rb
+@@ -1,70 +1,11 @@
+-require "logstash/devutils/rspec/spec_helper"
+-
+-class DummyInput < LogStash::Inputs::Base
+-  config_name "dummyinput"
+-  milestone 2
+-
+-  def register
+-  end
+-
+-  def run(queue)
+-  end
+-
+-  def teardown
+-  end
+-end
+-
+-class DummyCodec < LogStash::Codecs::Base
+-  config_name "dummycodec"
+-  milestone 2
+-
+-  def decode(data) 
+-    data
+-  end
+-
+-  def encode(event) 
+-    event
+-  end
+-
+-  def teardown
+-  end
+-end
+-
+-class DummyOutput < LogStash::Outputs::Base
+-  config_name "dummyoutput"
+-  milestone 2
+-  
+-  attr_reader :num_teardowns
+-
+-  def initialize(params={})
+-    super
+-    @num_teardowns = 0
+-  end
+-
+-  def register
+-  end
+-
+-  def receive(event)
+-  end
+-
+-  def teardown
+-    @num_teardowns += 1
+-  end
+-end
+-
+-class TestPipeline < LogStash::Pipeline
+-  attr_reader :outputs
+-end
++require "spec_helper"
+ 
+ describe LogStash::Pipeline do
+ 
+   before(:each) do
+-    LogStash::Plugin.stub(:lookup)
+-      .with("input", "dummyinput").and_return(DummyInput)
+-    LogStash::Plugin.stub(:lookup)
+-      .with("codec", "plain").and_return(DummyCodec)
+-    LogStash::Plugin.stub(:lookup)
+-      .with("output", "dummyoutput").and_return(DummyOutput)
++    allow(LogStash::Plugin).to receive(:lookup).with("input", "dummyinput").and_return(DummyInput)
++    allow(LogStash::Plugin).to receive(:lookup).with("codec", "plain").and_return(DummyCodec)
++    allow(LogStash::Plugin).to receive(:lookup).with("output", "dummyoutput").and_return(DummyOutput)
+   end
+ 
+   let(:test_config_without_output_workers) {
+@@ -72,7 +13,7 @@ class TestPipeline < LogStash::Pipeline
+     input {
+       dummyinput {}
+     }
+-  
++
+     output {
+       dummyoutput {}
+     }
+@@ -84,7 +25,7 @@ class TestPipeline < LogStash::Pipeline
+     input {
+       dummyinput {}
+     }
+-  
++
+     output {
+       dummyoutput {
+         workers => 2
+@@ -94,24 +35,48 @@ class TestPipeline < LogStash::Pipeline
+   }
+ 
+   context "output teardown" do
+-    it "should call teardown of output without output-workers" do
+-      pipeline = TestPipeline.new(test_config_without_output_workers)
+-      pipeline.run
+ 
+-      insist { pipeline.outputs.size } == 1
+-      insist { pipeline.outputs.first.worker_plugins.size } == 1
+-      insist { pipeline.outputs.first.worker_plugins.first.num_teardowns } == 1
++    context "without output-workers" do
++      let(:pipeline) { TestPipeline.new(test_config_without_output_workers) }
++
++      before(:each) do
++        pipeline.run
++      end
++
++      it "have one output" do
++        expect(pipeline.outputs.size).to eq(1)
++      end
++
++      it "have one worker plugins" do
++        worker_plugins = pipeline.outputs.first.worker_plugins
++        expect(worker_plugins.size).to eq(1)
++      end
++
++      it "have one teardown" do
++        worker_plugins = pipeline.outputs.first.worker_plugins
++        expect(worker_plugins.first.num_teardowns).to eq(1)
++      end
++
+     end
+ 
+-    it "should call output teardown correctly with output workers" do
+-      pipeline = TestPipeline.new(test_config_with_output_workers)
+-      pipeline.run
++    context "with output-workers" do
++
++      let(:pipeline) { TestPipeline.new(test_config_with_output_workers) }
+ 
+-      insist { pipeline.outputs.size } == 1
+-      insist { pipeline.outputs.first.num_teardowns } == 0
+-      pipeline.outputs.first.worker_plugins.each do |plugin|
+-        insist { plugin.num_teardowns } == 1
++      before(:each) do
++        pipeline.run
+       end
++
++      it "have one output" do
++        expect(pipeline.outputs.size).to eq(1)
++      end
++
++      it "have one teardown" do
++        outputs = pipeline.outputs.first
++        expect(outputs.num_teardowns).to eq(0)
++      end
++
+     end
++
+   end
+ end
+diff --git a/spec/core/runner_spec.rb b/spec/core/runner_spec.rb
+index 01c7587f63e..d36dcc46003 100644
+--- a/spec/core/runner_spec.rb
++++ b/spec/core/runner_spec.rb
+@@ -1,54 +1,69 @@
++require 'spec_helper'
++
+ require "logstash/runner"
+ require "logstash/agent"
+ require "logstash/kibana"
+ require "stud/task"
+ 
+-class NullRunner
+-  def run(args); end
+-end
+ 
+ describe LogStash::Runner do
+ 
+   context "argument parsing" do
+-    it "should run agent" do
+-      expect(Stud::Task).to receive(:new).once.and_return(nil)
+-      args = ["agent", "-e", ""]
+-      expect(subject.run(args)).to eq(nil)
+-    end
+ 
+-    it "should run agent help" do
+-      expect(subject).to receive(:show_help).once.and_return(nil)
+-      args = ["agent", "-h"]
+-      expect(subject.run(args).wait).to eq(0)
+-    end
++    context "show help" do
+ 
+-    it "should show help with no arguments" do
+-      expect($stderr).to receive(:puts).once.and_return("No command given")
+-      expect($stderr).to receive(:puts).once
+-      args = []
+-      expect(subject.run(args).wait).to eq(1)
+-    end
++      before(:each) do
++        expect(subject).to receive(:show_help).once.and_return(nil)
++      end
++
++      it "run agent help" do
++        args = ["agent", "-h"]
++        expect(subject.run(args).wait).to eq(0)
++      end
+ 
+-    it "should show help for unknown commands" do
+-      expect($stderr).to receive(:puts).once.and_return("No such command welp")
+-      expect($stderr).to receive(:puts).once
+-      args = ["welp"]
+-      expect(subject.run(args).wait).to eq(1)
++      it "run agent help and not run following commands" do
++        args = ["agent", "-h", "web"]
++        expect(subject.run(args).wait).to eq(0)
++      end
+     end
+ 
+-    it "should run agent help and not run following commands" do
+-      expect(subject).to receive(:show_help).once.and_return(nil)
+-      args = ["agent", "-h", "web"]
+-      expect(subject.run(args).wait).to eq(0)
++    context "with wrong arguments" do
++
++      before(:each) do
++        expect($stderr).to receive(:puts).once
++      end
++
++      it "show help with no arguments" do
++        expect($stderr).to receive(:puts).once.and_return("No command given")
++        expect(subject.run([]).wait).to eq(1)
++      end
++
++      it "show help for unknown commands" do
++        expect($stderr).to receive(:puts).once.and_return("No such command welp")
++        expect(subject.run(["welp"]).wait).to eq(1)
++      end
+     end
+ 
+-    it "should not run agent and web" do
+-      expect(Stud::Task).to receive(:new).once
+-      args = ["agent", "-e", "", "web"]
+-      args = subject.run(args)
+-      expect(args).to eq(nil)
+ 
+-      expect(LogStash::Kibana::Runner).to_not receive(:new)
++
++    context "with agent run" do
++
++      before(:each) do
++        expect(Stud::Task).to receive(:new).once.and_return(nil)
++      end
++
++      it "run agent" do
++        args = ["agent", "-e", ""]
++        expect(subject.run(args)).to be_nil
++      end
++
++
++      it "not run agent and web" do
++        expect(LogStash::Kibana::Runner).to_not receive(:new)
++        args = subject.run(["agent", "-e", "", "web"])
++        expect(args).to be_nil
++      end
++
+     end
+   end
+ end
+diff --git a/spec/core/timestamp_spec.rb b/spec/core/timestamp_spec.rb
+index 01bc3fb8250..8364a2d073d 100644
+--- a/spec/core/timestamp_spec.rb
++++ b/spec/core/timestamp_spec.rb
+@@ -1,83 +1,111 @@
+-require "logstash/devutils/rspec/spec_helper"
++require "spec_helper"
+ require "logstash/timestamp"
+ 
+ describe LogStash::Timestamp do
+ 
+-  it "should parse its own iso8601 output" do
+-    t = Time.now
+-    ts = LogStash::Timestamp.new(t)
+-    expect(LogStash::Timestamp.parse_iso8601(ts.to_iso8601).to_i).to eq(t.to_i)
+-  end
++  let(:t)  { Time.now }
++  let(:ts) { LogStash::Timestamp.new(t) }
+ 
+-  it "should coerce iso8601 string" do
+-    t = Time.now
+-    ts = LogStash::Timestamp.new(t)
+-    expect(LogStash::Timestamp.coerce(ts.to_iso8601).to_i).to eq(t.to_i)
++  it "parse its own iso8601 output" do
++    timestamp = LogStash::Timestamp.parse_iso8601(ts.to_iso8601)
++    expect(timestamp.to_i).to eq(t.to_i)
+   end
+ 
+-  it "should coerce Time" do
+-    t = Time.now
+-    expect(LogStash::Timestamp.coerce(t).to_i).to eq(t.to_i)
+-  end
++  context "coerce" do
+ 
+-  it "should coerce Timestamp" do
+-    t = LogStash::Timestamp.now
+-    expect(LogStash::Timestamp.coerce(t).to_i).to eq(t.to_i)
+-  end
++    it "iso8601 string" do
++      timestamp = LogStash::Timestamp.coerce(ts.to_iso8601)
++      expect(timestamp.to_i).to eq(t.to_i)
++    end
+ 
+-  it "should raise on invalid string coerce" do
+-    expect{LogStash::Timestamp.coerce("foobar")}.to raise_error LogStash::TimestampParserError
+-  end
++    it "Time" do
++      timestamp = LogStash::Timestamp.coerce(t)
++      expect(timestamp.to_i).to eq(t.to_i)
++    end
+ 
+-  it "should return nil on invalid object coerce" do
+-    expect(LogStash::Timestamp.coerce(:foobar)).to be_nil
+-  end
++    it "Timestamp" do
++      now = LogStash::Timestamp.now
++      timestamp = LogStash::Timestamp.coerce(now)
++      expect(timestamp.to_i).to eq(now.to_i)
++    end
+ 
+-  it "should support to_json" do
+-    expect(LogStash::Timestamp.parse_iso8601("2014-09-23T00:00:00-0800").to_json).to eq("\"2014-09-23T08:00:00.000Z\"")
+-  end
++    context "with invalid data" do
++      it "raise on invalid string" do
++        expect{LogStash::Timestamp.coerce("foobar")}.to raise_error LogStash::TimestampParserError
++      end
+ 
+-  it "should support to_json and ignore arguments" do
+-    expect(LogStash::Timestamp.parse_iso8601("2014-09-23T00:00:00-0800").to_json(:some => 1, :argumnents => "test")).to eq("\"2014-09-23T08:00:00.000Z\"")
++      it "return nil on invalid object" do
++        expect(LogStash::Timestamp.coerce(:foobar)).to be_nil
++      end
++    end
+   end
+ 
+-  it "should support timestamp comparaison" do
+-   current = LogStash::Timestamp.new(Time.now) 
+-   future = LogStash::Timestamp.new(Time.now + 100)
++  context "to_json" do
+ 
+-   expect(future > current).to eq(true)
+-   expect(future < current).to eq(false)
+-   expect(current == current).to eq(true)
++    it "transform data without errors" do
++      timestamp = LogStash::Timestamp.parse_iso8601("2014-09-23T00:00:00-0800")
++      expect(timestamp.to_json).to eq("\"2014-09-23T08:00:00.000Z\"")
++    end
+ 
+-   expect(current <=> current).to eq(0)
+-   expect(current <=> future).to eq(-1)
+-   expect(future <=> current).to eq(1)
++    it "can use ignore arguments" do
++      timestamp = LogStash::Timestamp.parse_iso8601("2014-09-23T00:00:00-0800")
++      expect(timestamp.to_json(:some => 1, :argumnents => "test")).to eq("\"2014-09-23T08:00:00.000Z\"")
++    end
+   end
+ 
+-  it "should allow unary operation +" do
+-    current = Time.now
+-    t = LogStash::Timestamp.new(current) + 10
+-    expect(t).to eq(current + 10)
+-  end
++  context "comparison" do
+ 
+-  describe "subtraction" do
+-    it "should work on a timestamp object" do
+-      t = Time.now
+-      current = LogStash::Timestamp.new(t)
+-      future = LogStash::Timestamp.new(t + 10)
+-      expect(future - current).to eq(10)
++    let(:current) { LogStash::Timestamp.new(Time.now)  }
++    let(:future) { LogStash::Timestamp.new(Time.now + 100) }
++
++    it "support the gt operator" do
++      expect(future > current).to eq(true)
++    end
++    it "support the lt operator" do
++      expect(future < current).to eq(false)
++    end
++    it "support the eq operator" do
++      expect(current == current).to eq(true)
++    end
++    it "support the comparison operator with equal pairs" do
++      expect(current <=> current).to eq(0)
++    end
++    it "support the comparison operator with lt pairs" do
++      expect(current <=> future).to eq(-1)
++    end
++    it "support the comparison operator with gt pairs" do
++      expect(future <=> current).to eq(1)
+     end
++  end
++
++  context "operators" do
++
++    let(:now) { Time.now }
+ 
+-    it "should work on with time object" do
+-      current = Time.now
+-      t = LogStash::Timestamp.new(current + 10)
+-      expect(t - current).to eq(10)
++    context "addition" do
++      it "allow unary operation +" do
++        timestamp = LogStash::Timestamp.new(now) + 10
++        expect(timestamp).to eq(now + 10)
++      end
+     end
+ 
+-    it "should work with numeric value" do
+-      current = Time.now
+-      t = LogStash::Timestamp.new(current + 10)
+-      expect(t - 10).to eq(current)
++    context "subtraction" do
++
++      it "work on a timestamp object" do
++        current = LogStash::Timestamp.new(now)
++        future = LogStash::Timestamp.new(now + 10)
++        expect(future - current).to eq(10)
++      end
++
++      it "work on with time object" do
++        t = LogStash::Timestamp.new(now + 10)
++        expect(t - now).to eq(10)
++      end
++
++      it "work with numeric value" do
++        timestamp = LogStash::Timestamp.new(now + 10)
++        expect(timestamp - 10).to eq(now)
++      end
+     end
+   end
+ end
+diff --git a/spec/core/web_spec.rb b/spec/core/web_spec.rb
+index 2a5947546a2..d07463ee6ea 100644
+--- a/spec/core/web_spec.rb
++++ b/spec/core/web_spec.rb
+@@ -1,4 +1,4 @@
+-require "insist"
++require 'spec_helper'
+ 
+ describe "web tests" do
+   context "rack rubygem" do
+diff --git a/spec/fixtures/conditionals/in_filter.conf b/spec/fixtures/conditionals/in_filter.conf
+new file mode 100644
+index 00000000000..491833e0893
+--- /dev/null
++++ b/spec/fixtures/conditionals/in_filter.conf
+@@ -0,0 +1,10 @@
++filter {
++  mutate { add_field => { "always" => "awesome" } }
++  if [foo] == "bar" {
++    mutate { add_field => { "hello" => "world" } }
++  } else if [bar] == "baz" {
++    mutate { add_field => { "fancy" => "pants" } }
++  } else {
++    mutate { add_field => { "free" => "hugs" } }
++  }
++}
+diff --git a/spec/fixtures/conditionals/in_operator.conf b/spec/fixtures/conditionals/in_operator.conf
+new file mode 100644
+index 00000000000..3503a3887ea
+--- /dev/null
++++ b/spec/fixtures/conditionals/in_operator.conf
+@@ -0,0 +1,20 @@
++filter {
++  if [foo] in [foobar] {
++    mutate { add_tag => "field in field" }
++  }
++  if [foo] in "foo" {
++    mutate { add_tag => "field in string" }
++  }
++  if "hello" in [greeting] {
++    mutate { add_tag => "string in field" }
++  }
++  if [foo] in ["hello", "world", "foo"] {
++    mutate { add_tag => "field in list" }
++  }
++  if [missing] in [alsomissing] {
++    mutate { add_tag => "shouldnotexist" }
++  }
++  if !("foo" in ["hello", "world"]) {
++    mutate { add_tag => "shouldexist" }
++  }
++}
+diff --git a/spec/fixtures/conditionals/in_output.conf b/spec/fixtures/conditionals/in_output.conf
+new file mode 100644
+index 00000000000..d99989b806f
+--- /dev/null
++++ b/spec/fixtures/conditionals/in_output.conf
+@@ -0,0 +1,11 @@
++input {
++  generator {
++    message => '{"foo":{"bar"},"baz": "quux"}'
++      count => 1
++  }
++}
++output {
++  if [foo] == "bar" {
++    stdout { }
++  }
++}
+diff --git a/spec/fixtures/conditionals/mutate.conf b/spec/fixtures/conditionals/mutate.conf
+new file mode 100644
+index 00000000000..d073c87377f
+--- /dev/null
++++ b/spec/fixtures/conditionals/mutate.conf
+@@ -0,0 +1,7 @@
++filter {
++  if %s {
++    mutate { add_tag => "success" }
++  } else {
++    mutate { add_tag => "failure" }
++  }
++}
+diff --git a/spec/fixtures/conditionals/nested.conf b/spec/fixtures/conditionals/nested.conf
+new file mode 100644
+index 00000000000..5c2eea56dbb
+--- /dev/null
++++ b/spec/fixtures/conditionals/nested.conf
+@@ -0,0 +1,12 @@
++filter {
++  if [nest] == 123 {
++    mutate { add_field => { "always" => "awesome" } }
++    if [foo] == "bar" {
++      mutate { add_field => { "hello" => "world" } }
++    } else if [bar] == "baz" {
++      mutate { add_field => { "fancy" => "pants" } }
++    } else {
++      mutate { add_field => { "free" => "hugs" } }
++    }
++  }
++}
+diff --git a/spec/fixtures/conditionals/not_in_operator.conf b/spec/fixtures/conditionals/not_in_operator.conf
+new file mode 100644
+index 00000000000..c20c4485140
+--- /dev/null
++++ b/spec/fixtures/conditionals/not_in_operator.conf
+@@ -0,0 +1,8 @@
++filter {
++  if "foo" not in "baz" { mutate { add_tag => "baz" } }
++  if "foo" not in "foo" { mutate { add_tag => "foo" } }
++  if !("foo" not in "foo") { mutate { add_tag => "notfoo" } }
++  if "foo" not in [somelist] { mutate { add_tag => "notsomelist" } }
++  if "one" not in [somelist] { mutate { add_tag => "somelist" } }
++  if "foo" not in [alsomissing] { mutate { add_tag => "no string in missing field" } }
++}
+diff --git a/spec/fixtures/conditionals/two_fields.conf b/spec/fixtures/conditionals/two_fields.conf
+new file mode 100644
+index 00000000000..8a5b6267a7d
+--- /dev/null
++++ b/spec/fixtures/conditionals/two_fields.conf
+@@ -0,0 +1,5 @@
++filter {
++  if [foo] == [bar] {
++    mutate { add_tag => woot }
++  }
++}
+diff --git a/spec/fixtures/events/new_events_from_root.conf b/spec/fixtures/events/new_events_from_root.conf
+new file mode 100644
+index 00000000000..a5e12c5fda1
+--- /dev/null
++++ b/spec/fixtures/events/new_events_from_root.conf
+@@ -0,0 +1,8 @@
++filter {
++  if [type] == "original" {
++    clone  { clones    => ["clone"] }
++    mutate { add_field => { "cond1" => "true" } }
++  } else {
++    mutate { add_field => { "cond2" => "true" } }
++  }
++}
+diff --git a/spec/fixtures/parser/empty.conf b/spec/fixtures/parser/empty.conf
+new file mode 100644
+index 00000000000..474060e1460
+--- /dev/null
++++ b/spec/fixtures/parser/empty.conf
+@@ -0,0 +1,2 @@
++filter {
++}
+diff --git a/spec/fixtures/parser/single_quote.conf b/spec/fixtures/parser/single_quote.conf
+new file mode 100644
+index 00000000000..5955e73fb6b
+--- /dev/null
++++ b/spec/fixtures/parser/single_quote.conf
+@@ -0,0 +1,6 @@
++input {
++  example {
++    'foo' => 'bar'
++      test => { 'bar' => 'baz' }
++  }
++}
+diff --git a/spec/inputs/base_spec.rb b/spec/inputs/base_spec.rb
+index e53280f86a0..00073904821 100644
+--- a/spec/inputs/base_spec.rb
++++ b/spec/inputs/base_spec.rb
+@@ -1,13 +1,17 @@
+ # encoding: utf-8
+-require "logstash/devutils/rspec/spec_helper"
++require "spec_helper"
++require "logstash/inputs/tcp"
++require "logstash/codecs/plain"
++
+ 
+ describe "LogStash::Inputs::Base#fix_streaming_codecs" do
+-  it "should carry the charset setting along when switching" do
+-    require "logstash/inputs/tcp"
+-    require "logstash/codecs/plain"
+-    plain = LogStash::Codecs::Plain.new("charset" => "CP1252")
+-    tcp = LogStash::Inputs::Tcp.new("codec" => plain, "port" => 3333)
++
++  let(:plain) { LogStash::Codecs::Plain.new("charset" => "CP1252") }
++  let(:tcp)   { LogStash::Inputs::Tcp.new("codec" => plain, "port" => 3333) }
++
++  it "carry the charset setting along when switching" do
+     tcp.instance_eval { fix_streaming_codecs }
+-    insist { tcp.codec.charset } == "CP1252"
++    expect(tcp.codec.charset).to eq("CP1252")
+   end
++
+ end
+diff --git a/spec/spec_helper.rb b/spec/spec_helper.rb
+new file mode 100644
+index 00000000000..5f94c8a313d
+--- /dev/null
++++ b/spec/spec_helper.rb
+@@ -0,0 +1,146 @@
++require 'config_factory'
++require "logstash/devutils/rspec/spec_helper"
++require "logstash/agent"
++require "logstash/event"
++require "logstash/pipeline"
++
++
++RSpec.configure do |config|
++  config.formatter = 'documentation'
++  config.color    = true
++end if ENV['LOGSTASH_TEST']
++
++module ConditionalFanciness
++  def description
++    return example.metadata[:example_group][:description_args][0]
++  end
++
++  def conditional(expression, &block)
++    describe(expression) do
++      config <<-CONFIG
++        filter {
++          if #{expression} {
++            mutate { add_tag => "success" }
++          } else {
++            mutate { add_tag => "failure" }
++          }
++        }
++      CONFIG
++      instance_eval(&block)
++    end
++  end
++end
++
++def load_fixtures(name, *pattern)
++  content = File.read(File.join('spec', 'fixtures', name))
++  content = content % pattern if !pattern.empty?
++  content
++end
++
++def sample_logstash_event
++  LogStash::Event.new(
++    "@timestamp" => Time.iso8601("2013-01-01T00:00:00.000Z"),
++    "type" => "sprintf",
++    "message" => "hello world",
++    "tags" => [ "tag1" ],
++    "source" => "/home/foo",
++    "a" => "b",
++    "c" => {
++      "d" => "f",
++      "e" => {"f" => "g"}
++    },
++    "f" => { "g" => { "h" => "i" } },
++    "j" => {
++      "k1" => "v",
++      "k2" => [ "w", "x" ],
++      "k3" => {"4" => "m"},
++      5 => 6,
++      "5" => 7
++    },
++    "@metadata" => { "fancy" => "pants", "have-to-go" => { "deeper" => "inception" } }
++  )
++end
++
++def sample_from(events, config)
++  pipeline = LogStash::Pipeline.new(config)
++  sample_with(events, pipeline)
++end
++
++def sample(events)
++  sample_with(events, pipeline)
++end
++
++def sample_with(events, pipeline)
++  events = [events] unless events.is_a?(Array)
++  events.map! do |e|
++    e = { "message" => e } if e.is_a?(String)
++    LogStash::Event.new(e)
++  end
++  results = []
++  pipeline.instance_eval { @filters.each(&:register) }
++
++  events.each do |e|
++    pipeline.filter(e) {|new_event| results << new_event }
++  end
++  pipeline.flush_filters(:final => true) do |e|
++    results << e unless e.cancelled?
++  end
++  results.to_a.map! { |m| m.to_hash }
++  (results.count == 1 ? results.first : results)
++end
++
++class DummyInput < LogStash::Inputs::Base
++  config_name "dummyinput"
++  milestone 2
++
++  def register
++  end
++
++  def run(queue)
++  end
++
++  def teardown
++  end
++end
++
++class DummyCodec < LogStash::Codecs::Base
++  config_name "dummycodec"
++  milestone 2
++
++  def decode(data) 
++    data
++  end
++
++  def encode(event) 
++    event
++  end
++
++  def teardown
++  end
++end
++
++class DummyOutput < LogStash::Outputs::Base
++  config_name "dummyoutput"
++  milestone 2
++
++  attr_reader :num_teardowns
++
++  def initialize(params={})
++    super
++    @num_teardowns = 0
++  end
++
++  def register
++  end
++
++  def receive(event)
++  end
++
++  def teardown
++    @num_teardowns += 1
++  end
++end
++
++class TestPipeline < LogStash::Pipeline
++  attr_reader :outputs
++end
+diff --git a/spec/util/accessors_spec.rb b/spec/util/accessors_spec.rb
+index bd5e96cff95..ddd7e570984 100644
+--- a/spec/util/accessors_spec.rb
++++ b/spec/util/accessors_spec.rb
+@@ -1,205 +1,265 @@
+ # encoding: utf-8
+ 
+-require "logstash/devutils/rspec/spec_helper"
++require "spec_helper"
+ require "logstash/util/accessors"
+ 
+ describe LogStash::Util::Accessors, :if => true do
+ 
++  let(:data)      { {} }
++  let(:accessors) { LogStash::Util::Accessors.new(data)}
++
+   context "using simple field" do
+ 
+-    it "should get value of word key" do
+-      str = "hello"
+-      data = { "hello" => "world" }
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.get(str) } == data[str]
+-    end
++    context "get value" do
++      it "accepts with a word key" do
++        data = { "hello" => "world" }
++        accessors = LogStash::Util::Accessors.new(data)
++        expect(accessors.get("hello")).to eq(data["hello"])
++      end
+ 
+-    it "should get value of key with spaces" do
+-      str = "hel lo"
+-      data = { "hel lo" => "world" }
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.get(str) } == data[str]
+-    end
++      it "accepts a key with spaces" do
++        data = { "hel lo" => "world" }
++        accessors = LogStash::Util::Accessors.new(data)
++        expect(accessors.get("hel lo")).to eq(data["hel lo"])
++      end
+ 
+-    it "should get value of numeric key string" do
+-      str = "1"
+-      data = { "1" => "world" }
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.get(str) } == data[str]
++      it "accepts a numeric key string" do
++        data = { "1" => "world" }
++        accessors = LogStash::Util::Accessors.new(data)
++        expect(accessors.get("1")).to eq(data["1"])
++      end
+     end
+ 
+-    it "should handle delete" do
+-      str = "simple"
+-      data = { "simple" => "things" }
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.del(str) } == "things"
+-      insist { data }.empty?
+-    end
++    context "deletion" do
++
++      let(:data) { { "simple" => "things"} }
++
++      it "return the deleted value" do
++        expect(accessors.del("simple")).to eq("things")
++      end
+ 
+-    it "should set string value" do
+-      str = "simple"
+-      data = {}
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.set(str, "things") } == "things"
+-      insist { data } == { "simple" => "things" }
++      it "handle deletion" do
++        accessors.del("simple")
++        expect(data).to be_empty
++      end
+     end
+ 
+-    it "should set array value" do
+-      str = "simple"
+-      data = {}
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.set(str, ["foo", "bar"]) } == ["foo", "bar"]
+-      insist { data } == { "simple" => ["foo", "bar"]}
++    context "set" do
++
++      let(:str)  { "simple" }
++
++      context "string value" do
++        it "return the value field" do
++          expect( accessors.set(str, "things")).to eq("things")
++        end
++        it "update the hash value" do
++          accessors.set(str, "things")
++          expect(data).to include("simple" => "things")
++        end
++      end
++
++      context "array value" do
++        it "return the value field" do
++          expect(accessors.set(str, ["foo", "bar"])).to eq(["foo", "bar"])
++        end
++        it "update the hash value" do
++          accessors.set(str, ["foo", "bar"])
++          expect(data).to include("simple" => ["foo", "bar"])
++        end
++      end
+     end
+   end
+ 
+   context "using field path" do
+ 
+-    it "should get shallow string value of word key" do
+-      str = "[hello]"
+-      data = { "hello" =>  "world" }
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.get(str) } == "world"
+-    end
++    context "get value" do
+ 
+-    it "should get shallow string value of key with spaces" do
+-      str = "[hel lo]"
+-      data = { "hel lo" =>  "world" }
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.get(str) } == "world"
+-    end
++      it "accepts string value of word key" do
++        data = { "hello" =>  "world" }
++        accessors = LogStash::Util::Accessors.new(data)
++        expect(accessors.get("[hello]")).to eq("world")
++      end
+ 
+-    it "should get shallow string value of numeric key string" do
+-      str = "[1]"
+-      data = { "1" =>  "world" }
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.get(str) } == "world"
+-    end
++      it "accepts string value of key with spaces" do
++        data = { "hel lo" =>  "world" }
++        accessors = LogStash::Util::Accessors.new(data)
++        expect(accessors.get("[hel lo]")).to eq("world")
++      end
+ 
+-    it "should get deep string value" do
+-      str = "[hello][world]"
+-      data = { "hello" => { "world" => "foo", "bar" => "baz" } }
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.get(str) } == data["hello"]["world"]
+-    end
++      it "accepts string value of numeric key string" do
++        data = { "1" =>  "world" }
++        accessors = LogStash::Util::Accessors.new(data)
++        expect(accessors.get("[1]")).to eq("world")
++      end
+ 
+-    it "should return nil when getting a non-existant field (with no side-effects on original data)" do
+-      str = "[hello][world]"
+-      data = {}
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.get(str) }.nil?
+-      insist { data } == {}
+-      insist { accessors.set(str, "foo") } == "foo"
+-      insist { data } == { "hello" => {"world" => "foo"} }
+-    end
++      it "accepts deep string value" do
++        data = { "hello" => { "world" => "foo", "bar" => "baz" } }
++        accessors = LogStash::Util::Accessors.new(data)
++        expect(accessors.get("[hello][world]")).to eq(data["hello"]["world"])
++      end
+ 
+-    it "should handle delete" do
+-      str = "[hello][world]"
+-      data = { "hello" => { "world" => "foo", "bar" => "baz" } }
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.del(str) } ==  "foo"
++      it "return nil when getting a non-existant field (no side effects)" do
++        data = { }
++        accessors = LogStash::Util::Accessors.new(data)
++        accessors.get("[hello][world]")
++        expect(data).to be_empty
++      end
++   end
+ 
+-      # Make sure the "world" key is removed.
+-      insist { data["hello"] } == { "bar" => "baz" }
+-    end
++    context "delete" do
+ 
+-    it "should set shallow string value" do
+-      str = "[hello]"
+-      data = {}
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.set(str, "foo") } == "foo"
+-      insist { data } == { "hello" => "foo" }
+-    end
++      let(:key)  { "[hello][world]" }
++      let(:data) { { "hello" => { "world" => "foo", "bar" => "baz" } } }
+ 
+-    it "should strict_set shallow string value" do
+-      str = "[hello]"
+-      data = {}
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.strict_set(str, "foo") } == "foo"
+-      insist { data } == { "hello" => "foo" }
+-    end
++      it "return the value object" do
++        expect(accessors.del(key)).to eq("foo")
++      end
+ 
+-    it "should set deep string value" do
+-      str = "[hello][world]"
+-      data = {}
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.set(str, "foo") } == "foo"
+-      insist { data } == { "hello" => { "world" => "foo" } }
++      it "remove the kv pair" do
++        accessors.del(key)
++        expect(data["hello"]).to include("bar" => "baz")
++      end
+     end
+ 
+-    it "should set deep array value" do
+-      str = "[hello][world]"
+-      data = {}
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.set(str, ["foo", "bar"]) } == ["foo", "bar"]
+-      insist { data } == { "hello" => { "world" => ["foo", "bar"] } }
+-    end
++    context "set" do
++      let(:key)  { "[hello]" }
+ 
+-    it "should strict_set deep array value" do
+-      str = "[hello][world]"
+-      data = {}
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.strict_set(str, ["foo", "bar"]) } == ["foo", "bar"]
+-      insist { data } == { "hello" => { "world" => ["foo", "bar"] } }
+-    end
++      it "returns the set value" do
++        expect(accessors.set(key, "foo")).to eq("foo")
++      end
+ 
+-    it "should set element within array value" do
+-      str = "[hello][0]"
+-      data = {"hello" => ["foo", "bar"]}
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.set(str, "world") } == "world"
+-      insist { data } == {"hello" => ["world", "bar"]}
+-    end
++      it "adds the new pair to the hash" do
++        accessors.set(key, "foo")
++        expect(data).to include("hello" => "foo")
++      end
+ 
+-    it "should retrieve array item" do
+-      data = { "hello" => { "world" => ["a", "b"], "bar" => "baz" } }
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.get("[hello][world][0]") } == data["hello"]["world"][0]
+-      insist { accessors.get("[hello][world][1]") } == data["hello"]["world"][1]
+-    end
++      context "with strict set" do
++
++        it "returns the set value" do
++          expect(accessors.strict_set(key, "foo")).to eq("foo")
++        end
++
++        it "adds the new pair to the hash" do
++          accessors.strict_set(key, "foo")
++          expect(data).to include("hello" => "foo")
++        end
++      end
++
++      context "with a deep value" do
+ 
+-    it "should retrieve array item containing hash" do
+-      data = { "hello" => { "world" => [ { "a" => 123 }, { "b" => 345 } ], "bar" => "baz" } }
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.get("[hello][world][0][a]") } == data["hello"]["world"][0]["a"]
+-      insist { accessors.get("[hello][world][1][b]") } == data["hello"]["world"][1]["b"]
++        let(:key)  { "[hello][world]" }
++
++        it "returns the set value" do
++          expect(accessors.set(key, "foo")).to eq("foo")
++        end
++
++        it "adds the new pair to the hash" do
++          accessors.set(key, "foo")
++          expect(data).to include("hello" => { "world" => "foo" })
++        end
++
++        context "with an array value" do
++
++          it "returns the set value" do
++            expect(accessors.set(key, ["foo", "bar"])).to include("foo", "bar")
++          end
++
++          it "adds the new pair to the hash" do
++            accessors.set(key, ["foo", "bar"])
++            expect(data).to include("hello" => { "world" => ["foo", "bar"] })
++          end
++
++          context "using strict_set" do
++            it "returns the set value" do
++              expect(accessors.strict_set(key, ["foo", "bar"])).to include("foo", "bar")
++            end
++
++            it "adds the new pair to the hash" do
++              accessors.strict_set(key, ["foo", "bar"])
++              expect(data).to include("hello" => { "world" => ["foo", "bar"] })
++            end
++          end
++
++          context "elements within array value" do
++            let(:key)  {  "[hello][0]" }
++            let(:data) { {"hello" => ["foo", "bar"]} }
++
++            it "returns the set value" do
++              expect(accessors.set(key, "world")).to eq("world")
++            end
++
++            it "adds the new pair to the hash" do
++              accessors.strict_set(key, "world")
++              expect(data).to include("hello" => ["world", "bar"])
++            end
++
++          end
++        end
++      end
+     end
+ 
+-    it "should handle delete of array element" do
+-      str = "[geocoords][0]"
+-      data = { "geocoords" => [4, 2] }
+-      accessors = LogStash::Util::Accessors.new(data)
+-      insist { accessors.del(str) } == 4
+-      insist { data } == { "geocoords" => [2] }
+-    end  end
++    context "with array items" do
++
++      let(:data) { { "hello" => { "world" => ["a", "b"], "bar" => "baz" } } }
++
++      it "retrieve the first item" do
++        expect(accessors.get("[hello][world][0]")).to eq("a")
++      end
++
++      it "retrieve the second item" do
++        expect(accessors.get("[hello][world][1]")).to eq("b")
++      end
++
++      context "when containing a hash" do
++        let(:data) { { "hello" => { "world" => [ { "a" => 123 }, { "b" => 345 } ], "bar" => "baz" } } }
++
++        it "retrieve the first item" do
++          expect(accessors.get("[hello][world][0][a]")).to eq(123)
++        end
++
++        it "retrieve the second item" do
++          expect(accessors.get("[hello][world][1][b]")).to eq(345)
++        end
++      end
++
++      context "handle delete" do
++
++        let(:key)  { "[geocoords][0]" }
++        let(:data) { { "geocoords" => [4, 2] } }
++
++        it "returns the deleted value" do
++          expect(accessors.del(key)).to eq(4)
++        end
++
++        it "remove the value from the hash" do
++          accessors.del(key)
++          expect(data).to include("geocoords" => [2])
++        end
++      end
++    end
++  end
+ 
+   context "using invalid encoding" do
+-    it "strinct_set should raise on non UTF-8 string encoding" do
+-      str = "[hello]"
+-      data = {}
+-      accessors = LogStash::Util::Accessors.new(data)
+-      expect { accessors.strict_set(str, "foo".encode("US-ASCII")) }.to raise_error
++    let(:key) { "[hello]" }
++
++    it "strinct_set raise on non UTF-8 string encoding" do
++      value = "foo".encode("US-ASCII")
++      expect { accessors.strict_set(key, value) }.to raise_error
+     end
+ 
+-    it "strinct_set should raise on non UTF-8 string encoding in array" do
+-      str = "[hello]"
+-      data = {}
+-      accessors = LogStash::Util::Accessors.new(data)
+-      expect { accessors.strict_set(str, ["foo", "bar".encode("US-ASCII")]) }.to raise_error
++    it "strinct_set raise on non UTF-8 string encoding in array" do
++      value = ["foo", "bar".encode("US-ASCII")]
++      expect { accessors.strict_set(key, value) }.to raise_error
+     end
+ 
+-    it "strinct_set should raise on invalid UTF-8 string encoding" do
+-      str = "[hello]"
+-      data = {}
+-      accessors = LogStash::Util::Accessors.new(data)
+-      expect { accessors.strict_set(str, "foo \xED\xB9\x81\xC3") }.to raise_error
++    it "strinct_set raise on invalid UTF-8 string encoding" do
++      value = "foo \xED\xB9\x81\xC3"
++      expect { accessors.strict_set(key, value ) }.to raise_error
+     end
+ 
+-    it "strinct_set should raise on invalid UTF-8 string encoding in array" do
+-      str = "[hello]"
+-      data = {}
+-      accessors = LogStash::Util::Accessors.new(data)
+-      expect { accessors.strict_set(str, ["foo", "bar \xED\xB9\x81\xC3"]) }.to raise_error
++    it "strinct_set raise on invalid UTF-8 string encoding in array" do
++      value = ["foo", "bar \xED\xB9\x81\xC3"]
++      expect { accessors.strict_set(key, value) }.to raise_error
+     end
+   end
+ end
+diff --git a/spec/util/charset_spec.rb b/spec/util/charset_spec.rb
+index 97d85494bf7..3ba0484be80 100644
+--- a/spec/util/charset_spec.rb
++++ b/spec/util/charset_spec.rb
+@@ -1,75 +1,177 @@
+ # encoding: utf-8
+ 
+-require "logstash/devutils/rspec/spec_helper"
++require "spec_helper"
+ require "logstash/util/charset"
+ 
+ describe LogStash::Util::Charset do
+-  let(:logger) { double("logger") }
++
++  let(:logger)   { double("logger") }
++  let(:encoding) { "UTF-8" }
++  let(:charset)  { LogStash::Util::Charset.new(encoding) }
++  let(:data)    { "" }
++
++  subject { charset.convert(data) }
+ 
+   context "with valid UTF-8 source encoding" do
+-    subject {LogStash::Util::Charset.new("UTF-8")}
+ 
+-    it "should return untouched data" do
+-      ["foobar", "κόσμε"].each do |data|
+-        insist { data.encoding.name } == "UTF-8"
+-        insist { subject.convert(data) } == data
+-        insist { subject.convert(data).encoding.name } == "UTF-8"
++    context "when using regular characters" do
++
++      let(:data) { "foobar" }
++
++      it "returns the encoded data" do eq(data) end
++
++      it "returns the encoding name used" do
++        expect(subject.encoding.name).to eq("UTF-8")
+       end
+     end
++
++    context "when using non common characters" do
++
++      let(:data) { "κόσμε" }
++
++      it "returns the encoded data" do eq(data) end
++
++      it "returns the encoding name used" do
++        expect(subject.encoding.name).to eq("UTF-8")
++      end
++    end
++
+   end
+ 
+   context "with invalid UTF-8 source encoding" do
+-    subject do
+-      LogStash::Util::Charset.new("UTF-8").tap do |charset|
+-        charset.logger = logger
++
++    let(:charset) do
++      LogStash::Util::Charset.new(encoding).tap do |object|
++        object.logger = logger
++      end
++    end
++
++    context "when the invalid value is long" do
++
++      let(:data) { "foo \xED\xB9\x81\xC3" }
++
++      it "return the encoding name" do
++        expect(data.encoding.name).to eq("UTF-8")
++      end
++
++      it "return invalid encoding" do
++        expect(data.valid_encoding?).to eq(false)
++      end
++
++      it "scapes invalid sequence" do eq("foo") end
++
++      it "return the converted encoding name" do
++        expect(logger).to receive(:warn)
++        expect(subject.encoding.name).to eq("UTF-8")
+       end
+     end
+ 
+-    it "should escape invalid sequences" do
+-      ["foo \xED\xB9\x81\xC3", "bar \xAD"].each do |data|
+-        insist { data.encoding.name } == "UTF-8"
+-        insist { data.valid_encoding? } == false
+-        expect(logger).to receive(:warn).exactly(2).times
+-#logger.should_receive(:warn).twice
+-        insist { subject.convert(data) } == data.inspect[1..-2]
+-        insist { subject.convert(data).encoding.name } == "UTF-8"
++    context "when the invalid value is short" do
++
++      let(:data) { "bar \xAD" }
++
++      it "return the encoding name" do
++        expect(data.encoding.name).to eq("UTF-8")
+       end
++
++      it "return invalid encoding" do
++        expect(data.valid_encoding?).to eq(false)
++      end
++
++      it "scapes invalid sequence" do eq("foo") end
++
++      it "return the converted encoding name" do
++        expect(logger).to receive(:warn)
++        expect(subject.encoding.name).to eq("UTF-8")
++      end
++
+     end
+ 
+   end
+ 
+-  context "with valid non UTF-8 source encoding" do
+-    subject {LogStash::Util::Charset.new("ISO-8859-1")}
+-
+-    it "should encode to UTF-8" do
+-      samples = [
+-        ["foobar", "foobar"],
+-        ["\xE0 Montr\xE9al", "à Montréal"],
+-      ]
+-      samples.map{|(a, b)| [a.force_encoding("ISO-8859-1"), b]}.each do |(a, b)|
+-        insist { a.encoding.name } == "ISO-8859-1"
+-        insist { b.encoding.name } == "UTF-8"
+-        insist { a.valid_encoding? } == true
+-        insist { subject.convert(a).encoding.name } == "UTF-8"
+-        insist { subject.convert(a) } == b
++  context "with a valid non UTF-8 encoding" do
++
++    let(:encoding) { "ISO-8859-1" }
++
++    context "when using regular characters" do
++
++      let(:original) { "foobar" }
++      let(:data)     { original.force_encoding(encoding) }
++
++      it "return the encoding name" do
++        expect(data.encoding.name).to eq("ISO-8859-1")
++      end
++
++      it "return a valid encoding" do
++        expect(data.valid_encoding?).to eq(true)
++      end
++
++      it "return the converted value encoding name as UTF-8" do
++        expect(subject.encoding.name).to eq("UTF-8")
+       end
++
++      it "converts without any loss" do eq(original) end
++
++    end
++
++    context "when using extended characters" do
++
++      let(:original) {  "à Montréal" }
++      let(:data)     { "\xE0 Montr\xE9al".force_encoding(encoding) }
++
++      it "return the encoding name" do
++        expect(data.encoding.name).to eq("ISO-8859-1")
++      end
++
++      it "return a valid encoding" do
++        expect(data.valid_encoding?).to eq(true)
++      end
++
++      it "return the converted value encoding name as UTF-8" do
++        expect(subject.encoding.name).to eq("UTF-8")
++      end
++
++      it "converts without any loss" do eq(original) end
++
+     end
+   end
+ 
+-  context "with invalid non UTF-8 source encoding" do
+-    subject {LogStash::Util::Charset.new("ASCII-8BIT")}
++  context "with an invalid non UTF-8 encoding" do
++
++    let(:encoding) { "ASCII-8BIT" }
++
++    context "when using some regular characters" do
+ 
+-    it "should encode to UTF-8 and replace invalid chars" do
+-      samples = [
+-        ["\xE0 Montr\xE9al", "� Montr�al"],
+-        ["\xCE\xBA\xCF\x8C\xCF\x83\xCE\xBC\xCE\xB5", "����������"],
+-      ]
+-      samples.map{|(a, b)| [a.force_encoding("ASCII-8BIT"), b]}.each do |(a, b)|
+-        insist { a.encoding.name } == "ASCII-8BIT"
+-        insist { b.encoding.name } == "UTF-8"
+-        insist { subject.convert(a).encoding.name } == "UTF-8"
+-        insist { subject.convert(a) } == b
++      let(:original) { "� Montr�al" }
++      let(:data)     { "\xE0 Montr\xE9al".force_encoding(encoding) }
++
++      it "return the encoding name" do
++        expect(data.encoding.name).to eq("ASCII-8BIT")
+       end
++
++      it "return the converted value encoding name as UTF-8" do
++        expect(subject.encoding.name).to eq("UTF-8")
++      end
++
++      it "converts without any loss" do eq(original) end
++
++    end
++
++    context "when using extended characters" do
++
++      let(:original) {  "����������" }
++      let(:data)     { "\xCE\xBA\xCF\x8C\xCF\x83\xCE\xBC\xCE\xB5".force_encoding(encoding) }
++
++      it "return the encoding name" do
++        expect(data.encoding.name).to eq("ASCII-8BIT")
++      end
++
++      it "return the converted value encoding name as UTF-8" do
++        expect(subject.encoding.name).to eq("UTF-8")
++      end
++
++      it "converts without any loss" do eq(original) end
++
+     end
+   end
+ end
+diff --git a/spec/util/fieldeval_spec.rb b/spec/util/fieldeval_spec.rb
+index 1b8d5304211..2927ad8d49a 100644
+--- a/spec/util/fieldeval_spec.rb
++++ b/spec/util/fieldeval_spec.rb
+@@ -1,96 +1,137 @@
+-require "logstash/devutils/rspec/spec_helper"
++require "spec_helper"
+ require "logstash/util/fieldreference"
+ 
+ describe LogStash::Util::FieldReference, :if => true do
+ 
+   context "using simple accessor" do
+ 
+-    it "should retrieve value" do
+-      str = "hello"
+-      m = eval(subject.compile(str))
+-      data = { "hello" => "world" }
+-      insist { m.call(data) } == data[str]
++    let(:key)  { "hello" }
++    let(:data) { { "hello" => "world" } }
++
++    let(:m)    { eval(subject.compile(key)) }
++
++    it "retrieve value" do
++      expect(m.call(data)).to eq("world")
+     end
+ 
+-    it "should handle delete in block" do
+-      str = "simple"
+-      m = eval(subject.compile(str))
+-      data = { "simple" => "things" }
++    it "handle delete in block" do
+       m.call(data) { |obj, key| obj.delete(key) }
+-      insist { data }.empty?
++      expect(data).to be_empty
+     end
+ 
+-    it "should handle assignment in block" do
+-      str = "simple"
+-      m = eval(subject.compile(str))
+-      data = {}
+-      insist { m.call(data) { |obj, key| obj[key] = "things" }} == "things"
+-      insist { data } == { "simple" => "things" }
+-    end
++    context "in assignment" do
++
++      let(:data) { {} }
++
++      it "return the assigned value in blocks" do
++        assign = m.call(data) { |obj, key| obj[key] = "things" }
++        expect(assign).to eq("things")
++      end
++
++      it "updates the internal hash" do
++        m.call(data) { |obj, key| obj[key] = "things" }
++        expect(data).to include("hello" => "things")
++      end
++
++      context "using set" do
++
++        it "return the assigned value" do
++          assigned =  subject.set(key, "things", data)
++          expect(assigned).to eq("things")
++        end
++
++        it "udpates the internal hash" do
++          subject.set(key, "things", data)
++          expect(data).to include("hello" => "things")
++        end
++      end
+ 
+-    it "should handle assignment using set" do
+-      str = "simple"
+-      data = {}
+-      insist { subject.set(str, "things", data) } == "things"
+-      insist { data } == { "simple" => "things" }
+     end
+   end
+ 
+   context "using accessor path" do
+ 
+-    it "should retrieve shallow value" do
+-      str = "[hello]"
+-      m = eval(subject.compile(str))
+-      data = { "hello" =>  "world" }
+-      insist { m.call(data) } == "world"
+-    end
++    let(:key) { "[hello]" }
++    let(:m)   { eval(subject.compile(key)) }
++    let(:data) { { "hello" =>  "world" } }
+ 
+-    it "should retrieve deep value" do
+-      str = "[hello][world]"
+-      m = eval(subject.compile(str))
+-      data = { "hello" => { "world" => "foo", "bar" => "baz" } }
+-      insist { m.call(data) } == data["hello"]["world"]
++    it "retrieve shallow value" do
++      expect(m.call(data)).to eq("world")
+     end
+ 
+-    it "should handle delete in block" do
+-      str = "[hello][world]"
+-      m = eval(subject.compile(str))
+-      data = { "hello" => { "world" => "foo", "bar" => "baz" } }
+-      m.call(data) { |obj, key| obj.delete(key) }
++    context "using set" do
+ 
+-      # Make sure the "world" key is removed.
+-      insist { data["hello"] } == { "bar" => "baz" }
+-    end
++      let(:data) {{}}
+ 
+-    it "should not handle assignment in block" do
+-      str = "[hello][world]"
+-      m = eval(subject.compile(str))
+-      data = {}
+-      insist { m.call(data) { |obj, key| obj[key] = "things" }}.nil?
+-      insist { data } == { }
+-    end
++      it "return the assigned value" do
++        assigned = subject.set(key, "foo", data)
++        expect(assigned).to eq("foo")
++      end
++
++      it "update the internal hash" do
++        subject.set(key, "foo", data)
++        expect(data).to include("hello" => "foo")
++      end
+ 
+-    it "should set shallow value" do
+-      str = "[hello]"
+-      data = {}
+-      insist { subject.set(str, "foo", data) } == "foo"
+-      insist { data } == { "hello" => "foo" }
+     end
+ 
+-    it "should set deep value" do
+-      str = "[hello][world]"
+-      data = {}
+-      insist { subject.set(str, "foo", data) } == "foo"
+-      insist { data } == { "hello" => { "world" => "foo" } }
++    context "with deep values" do
++
++      let(:key) { "[hello][world]" }
++      let(:data) { { "hello" => { "world" => "foo", "bar" => "baz" } } }
++
++      it "retrieve deep value" do
++        expect(m.call(data)).to eq("foo")
++      end
++
++      it "handle delete in block" do
++        m.call(data) { |obj, key| obj.delete(key) }
++        expect(data["hello"]).to_not include("world" => "foo")
++      end
++
++      context "using set" do
++        let(:data) {{}}
++
++        it "return the assigned value" do
++          assigned = subject.set(key, "foo", data)
++          expect(assigned).to eq("foo")
++        end
++        it "update the internal hash" do
++          subject.set(key, "foo", data)
++          expect(data).to include( "hello" => { "world" => "foo" } )
++        end
++      end
++
++      context "with assignment" do
++
++        let(:data) {{}}
++
++        it "not handle assignment in block" do
++          assign = m.call(data) { |obj, key| obj[key] = "things" }
++          expect(assign).to be_nil
++        end
++
++        it "doesn't not affect the data hash" do
++          m.call(data) { |obj, key| obj[key] = "things" }
++          expect(data).to be_empty
++        end
++      end
+     end
+ 
+-    it "should retrieve array item" do
+-      data = { "hello" => { "world" => ["a", "b"], "bar" => "baz" } }
+-      m = eval(subject.compile("[hello][world][0]"))
+-      insist { m.call(data) } == data["hello"]["world"][0]
++    context "with arrays" do
++
++      let(:data) { { "hello" => { "world" => ["a", "b"], "bar" => "baz" } } }
++      let(:base_key) { "[hello][world]" }
++
++      it "retrieve the first array item" do
++        m = eval(subject.compile("#{base_key}[0]"))
++        expect(m.call(data)).to eq("a")
++      end
+ 
+-      m = eval(subject.compile("[hello][world][1]"))
+-      insist { m.call(data) } == data["hello"]["world"][1]
++      it "retrieve the second array item" do
++        m = eval(subject.compile("#{base_key}[1]"))
++        expect(m.call(data)).to eq("b")
++      end
+     end
+   end
+ end
+diff --git a/spec/util/jar_spec.rb b/spec/util/jar_spec.rb
+index b644580bda5..e0c6b1d72de 100644
+--- a/spec/util/jar_spec.rb
++++ b/spec/util/jar_spec.rb
+@@ -1,20 +1,23 @@
+-require "insist"
++require "spec_helper"
+ 
+ describe "logstash jar features", :if => (__FILE__ =~ /file:.*!/) do
++
+   let(:jar_root) { __FILE__.split("!").first + "!" }
+ 
+-  it "must be only run from a jar" do
+-    insist { __FILE__ } =~ /file:.*!/
++  it "is only run from a jar" do
++    expect(__FILE__).to match(/file:.*!/)
+   end
+ 
+-  it "must contain GeoLiteCity.dat" do
+-    path = File.join(jar_root, "GeoLiteCity.dat")
+-    insist { File }.exists?(path)
+-  end
++  context "dependencies" do
++    it "contains the GeoLiteCity.dat" do
++      path = File.join(jar_root, "GeoLiteCity.dat")
++      expect(File.exists?(path)).to be_true
++    end
+ 
+-  it "must contain vendor/ua-parser/regexes.yaml" do
+-    path = File.join(jar_root, "vendor/ua-parser/regexes.yaml")
+-    insist { File }.exists?(path)
++    it "contais vendor/ua-parser/regexes.yaml" do
++      path = File.join(jar_root, "vendor/ua-parser/regexes.yaml")
++      expect(File.exists?(path)).to be_true
++    end
+   end
+ 
+   it "must successfully load aws-sdk (LOGSTASH-1718)" do
+diff --git a/spec/util/json_spec.rb b/spec/util/json_spec.rb
+index a745f91a1e8..1b10f6e8afa 100644
+--- a/spec/util/json_spec.rb
++++ b/spec/util/json_spec.rb
+@@ -1,4 +1,5 @@
+ # encoding: utf-8
++require "spec_helper"
+ require "logstash/json"
+ require "logstash/environment"
+ require "logstash/util"
+@@ -35,24 +36,20 @@
+ 
+     context "jruby deserialize" do
+       it "should respond to load and deserialize object" do
+-        expect(JrJackson::Raw).to receive(:parse_raw).with(json_hash).and_call_original
+         expect(LogStash::Json.load(json_hash)).to eql(hash)
+       end
+     end
+ 
+     context "jruby serialize" do
+       it "should respond to dump and serialize object" do
+-        expect(JrJackson::Json).to receive(:dump).with(string).and_call_original
+         expect(LogStash::Json.dump(string)).to eql(json_string)
+       end
+ 
+       it "should call JrJackson::Raw.generate for Hash" do
+-        expect(JrJackson::Raw).to receive(:generate).with(hash).and_call_original
+         expect(LogStash::Json.dump(hash)).to eql(json_hash)
+       end
+ 
+       it "should call JrJackson::Raw.generate for Array" do
+-        expect(JrJackson::Raw).to receive(:generate).with(array).and_call_original
+         expect(LogStash::Json.dump(array)).to eql(json_array)
+       end
+ 
+diff --git a/tools/Gemfile.jruby-1.9.lock b/tools/Gemfile.jruby-1.9.lock
+index e369d492cff..25e7ca4ab19 100644
+--- a/tools/Gemfile.jruby-1.9.lock
++++ b/tools/Gemfile.jruby-1.9.lock
+@@ -1,9 +1,9 @@
+ PATH
+-  remote: /Users/ph/es/logstash
++  remote: /Users/purbon/work/logstash
+   specs:
+     logstash (2.0.0.dev-java)
+       cabin (>= 0.6.0)
+-      ci_reporter (= 1.9.3)
++      ci_reporter_rspec (= 1.0.0)
+       clamp
+       ftw (~> 0.0.40)
+       i18n (= 0.6.9)
+@@ -17,7 +17,7 @@ PATH
+       minitar
+       pry
+       rack
+-      rspec (~> 2.14.0)
++      rspec (~> 3.1.0)
+       ruby-maven
+       sinatra
+       stud
+@@ -34,8 +34,11 @@ GEM
+     backports (3.6.4)
+     builder (3.2.2)
+     cabin (0.6.1)
+-    ci_reporter (1.9.3)
++    ci_reporter (2.0.0)
+       builder (>= 2.1.2)
++    ci_reporter_rspec (1.0.0)
++      ci_reporter (~> 2.0)
++      rspec (>= 2.14, < 4)
+     clamp (0.6.3)
+     coderay (1.1.0)
+     coercible (1.0.0)
+@@ -78,14 +81,18 @@ GEM
+     rack-protection (1.5.3)
+       rack
+     rake (10.4.2)
+-    rspec (2.14.1)
+-      rspec-core (~> 2.14.0)
+-      rspec-expectations (~> 2.14.0)
+-      rspec-mocks (~> 2.14.0)
+-    rspec-core (2.14.8)
+-    rspec-expectations (2.14.5)
+-      diff-lcs (>= 1.1.3, < 2.0)
+-    rspec-mocks (2.14.6)
++    rspec (3.1.0)
++      rspec-core (~> 3.1.0)
++      rspec-expectations (~> 3.1.0)
++      rspec-mocks (~> 3.1.0)
++    rspec-core (3.1.7)
++      rspec-support (~> 3.1.0)
++    rspec-expectations (3.1.2)
++      diff-lcs (>= 1.2.0, < 2.0)
++      rspec-support (~> 3.1.0)
++    rspec-mocks (3.1.3)
++      rspec-support (~> 3.1.0)
++    rspec-support (3.1.2)
+     ruby-maven (3.1.1.0.8)
+       maven-tools (~> 1.0.1)
+       ruby-maven-libs (= 3.1.1)
+diff --git a/tools/Gemfile.plugins.jruby-1.9.lock b/tools/Gemfile.plugins.jruby-1.9.lock
+index df2a456beaa..809f013b3be 100644
+--- a/tools/Gemfile.plugins.jruby-1.9.lock
++++ b/tools/Gemfile.plugins.jruby-1.9.lock
+@@ -7,7 +7,6 @@ PATH
+       clamp
+       ftw (~> 0.0.40)
+       i18n (= 0.6.9)
+-      insist (= 1.0.0)
+       jar-dependencies (= 0.1.2)
+       jrjackson
+       jruby-httpclient
+@@ -88,7 +87,6 @@ GEM
+     http_parser.rb (0.6.0-java)
+     i18n (0.6.9)
+     ice_nine (0.11.1)
+-    insist (1.0.0)
+     jar-dependencies (0.1.2)
+     jbundler (0.5.5)
+       bundler (~> 1.5)
+diff --git a/tools/Gemfile.plugins.test.jruby-1.9.lock b/tools/Gemfile.plugins.test.jruby-1.9.lock
+index a103392c772..02f40bdc1c5 100644
+--- a/tools/Gemfile.plugins.test.jruby-1.9.lock
++++ b/tools/Gemfile.plugins.test.jruby-1.9.lock
+@@ -3,7 +3,7 @@ PATH
+   specs:
+     logstash (2.0.0.dev-java)
+       cabin (>= 0.6.0)
+-      ci_reporter (= 1.9.3)
++      ci_reporter_rspec (= 1.0.0)
+       clamp
+       ftw (~> 0.0.40)
+       i18n (= 0.6.9)
+@@ -17,7 +17,7 @@ PATH
+       minitar
+       pry
+       rack
+-      rspec (~> 2.14.0)
++      rspec (~> 3.1.0)
+       ruby-maven
+       sinatra
+       stud
+@@ -34,8 +34,11 @@ GEM
+     backports (3.6.4)
+     builder (3.2.2)
+     cabin (0.6.1)
+-    ci_reporter (1.9.3)
++    ci_reporter (2.0.0)
+       builder (>= 2.1.2)
++    ci_reporter_rspec (1.0.0)
++      ci_reporter (~> 2.0)
++      rspec (>= 2.14, < 4)
+     clamp (0.6.3)
+     coderay (1.1.0)
+     coercible (1.0.0)
+@@ -119,14 +122,18 @@ GEM
+     rack-protection (1.5.3)
+       rack
+     rake (10.4.2)
+-    rspec (2.14.1)
+-      rspec-core (~> 2.14.0)
+-      rspec-expectations (~> 2.14.0)
+-      rspec-mocks (~> 2.14.0)
+-    rspec-core (2.14.8)
+-    rspec-expectations (2.14.5)
+-      diff-lcs (>= 1.1.3, < 2.0)
+-    rspec-mocks (2.14.6)
++    rspec (3.1.0)
++      rspec-core (~> 3.1.0)
++      rspec-expectations (~> 3.1.0)
++      rspec-mocks (~> 3.1.0)
++    rspec-core (3.1.7)
++      rspec-support (~> 3.1.0)
++    rspec-expectations (3.1.2)
++      diff-lcs (>= 1.2.0, < 2.0)
++      rspec-support (~> 3.1.0)
++    rspec-mocks (3.1.3)
++      rspec-support (~> 3.1.0)
++    rspec-support (3.1.2)
+     ruby-maven (3.1.1.0.8)
+       maven-tools (~> 1.0.1)
+       ruby-maven-libs (= 3.1.1)

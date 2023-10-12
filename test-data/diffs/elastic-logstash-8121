@@ -1,0 +1,1371 @@
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 00000000000..050dcd0d326
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,5 @@
++**/.git
++build
++logs
++.gradle
++ci/docker_tool
+diff --git a/.travis.yml b/.travis.yml
+index 64bfb548ae4..593d662ead3 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -1,6 +1,4 @@
+-sudo: required
+-services:
+-  - docker
++sudo: false
+ language: ruby
+ cache:
+   directories:
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 00000000000..31f96192aab
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,72 @@
++FROM ubuntu:xenial
++
++RUN apt-get update && \
++    apt-get dist-upgrade && \
++    apt-get install -y zlib1g-dev build-essential git curl libssl-dev libreadline-dev libyaml-dev  \
++      libxml2-dev libxslt-dev openjdk-8-jdk-headless curl iputils-ping netcat && \
++    apt-get clean
++
++WORKDIR /root
++
++RUN adduser --disabled-password --gecos "" --home /home/logstash logstash && \
++    mkdir -p /usr/local/share/ruby-build && \
++    mkdir -p /opt/logstash && \
++    mkdir -p /mnt/host && \
++    chown logstash:logstash /opt/logstash
++
++USER logstash
++WORKDIR /home/logstash
++
++RUN git clone https://github.com/sstephenson/rbenv.git .rbenv && \
++    git clone https://github.com/sstephenson/ruby-build.git .rbenv/plugins/ruby-build && \
++    echo 'export PATH=/home/logstash/.rbenv/bin:$PATH' >> /home/logstash/.bashrc
++
++ENV PATH "/home/logstash/.rbenv/bin:$PATH"
++
++RUN echo 'eval "$(rbenv init -)"' >> .bashrc && \
++    rbenv install jruby-9.1.12.0 && \
++    rbenv global jruby-9.1.12.0 && \
++    bash -i -c 'gem install bundler' && \
++    rbenv local jruby-9.1.12.0 && \
++    mkdir -p /opt/logstash/data
++
++ADD gradlew /opt/logstash/gradlew
++ADD gradle/wrapper /opt/logstash/gradle/wrapper
++RUN /opt/logstash/gradlew wrapper
++
++ADD versions.yml /opt/logstash/versions.yml
++ADD LICENSE /opt/logstash/LICENSE
++ADD CONTRIBUTORS /opt/logstash/CONTRIBUTORS
++ADD NOTICE.TXT /opt/logstash/NOTICE.TXT
++ADD Gemfile.template /opt/logstash/Gemfile
++ADD Rakefile /opt/logstash/Rakefile
++ADD build.gradle /opt/logstash/build.gradle
++ADD rakelib /opt/logstash/rakelib
++ADD config /opt/logstash/config
++ADD spec /opt/logstash/spec
++ADD lib /opt/logstash/lib
++ADD pkg /opt/logstash/pkg
++ADD tools /opt/logstash/tools
++ADD logstash-core /opt/logstash/logstash-core
++ADD logstash-core-plugin-api /opt/logstash/logstash-core-plugin-api
++ADD bin /opt/logstash/bin
++ADD modules /opt/logstash/modules
++ADD CHANGELOG.md /opt/logstash/CHANGELOG.md
++ADD settings.gradle /opt/logstash/settings.gradle
++
++USER root
++RUN rm -rf build && \
++    mkdir -p build && \
++    chown -R logstash:logstash /opt/logstash
++USER logstash
++WORKDIR /opt/logstash
++RUN bash -i -c 'rake compile:all && rake artifact:tar && cd build && tar -xzf logstash-*.tar.gz'
++
++USER root
++ADD ci /opt/logstash/ci
++ADD qa /opt/logstash/qa
++RUN chown -R logstash:logstash /opt/logstash/ci /opt/logstash/qa
++
++USER logstash
++RUN bash -i -c 'cd qa/integration && bundle install'
++
+diff --git a/ci/ci_integration.sh b/ci/ci_integration.sh
+deleted file mode 100755
+index d8b6fa6b886..00000000000
+--- a/ci/ci_integration.sh
++++ /dev/null
+@@ -1,24 +0,0 @@
+-#!/usr/bin/env bash
+-set -e
+-
+-# Since we are using the system jruby, we need to make sure our jvm process
+-# uses at least 1g of memory, If we don't do this we can get OOM issues when
+-# installing gems. See https://github.com/elastic/logstash/issues/5179
+-export JRUBY_OPTS="-J-Xmx1g"
+-
+-echo "Running integration tests from qa/integration"
+-if [[ ! -d "build" ]]; then
+-  mkdir build
+-fi  
+-rm -rf build/*  
+-echo "Building logstash tar file in build/"
+-rake artifact:tar
+-cd build
+-echo "Extracting logstash tar file in build/"
+-tar xf *.tar.gz
+-
+-cd ../qa/integration
+-# to install test dependencies
+-bundle install
+-# runs all tests
+-rspec
+diff --git a/ci/ci_setup.sh b/ci/ci_setup.sh
+deleted file mode 100755
+index 9974055658d..00000000000
+--- a/ci/ci_setup.sh
++++ /dev/null
+@@ -1,28 +0,0 @@
+-#!/usr/bin/env bash
+-set -e
+-
+-##
+-# Note this setup needs a system ruby to be available, this can not
+-# be done here as is highly system dependant.
+-##
+-
+-#squid proxy work, so if there is a proxy it can be cached.
+-sed -i.bak 's/https:/http:/' Gemfile
+-
+-# Clean up some  possible stale directories
+-rm -rf vendor       # make sure there are no vendorized dependencies
+-rm -rf .bundle
+-rm -rf spec/reports # no stale spec reports from previous executions
+-
+-# Since we are using the system jruby, we need to make sure our jvm process
+-# uses at least 1g of memory, If we don't do this we can get OOM issues when
+-# installing gems. See https://github.com/elastic/logstash/issues/5179
+-export JRUBY_OPTS="-J-Xmx1g"
+-
+-# Setup the environment
+-rake bootstrap # Bootstrap your logstash instance
+-
+-# Set up some general options for the rspec runner
+-echo "--order rand" > .rspec
+-echo "--format progress" >> .rspec
+-echo "--format CI::Reporter::RSpecFormatter" >> .rspec
+diff --git a/ci/ci_test.sh b/ci/ci_test.sh
+index a7f62d151bb..cdac3b732ca 100755
+--- a/ci/ci_test.sh
++++ b/ci/ci_test.sh
+@@ -9,7 +9,9 @@ set -e
+ # Since we are using the system jruby, we need to make sure our jvm process
+ # uses at least 1g of memory, If we don't do this we can get OOM issues when
+ # installing gems. See https://github.com/elastic/logstash/issues/5179
+-export JRUBY_OPTS="-J-Xmx1g"
++#if [[ "$JRUBY_OPTS" != *Xmx* ]]; then
++  export JRUBY_OPTS="-J-Xmx1g"
++#fi
+ 
+ SELECTED_TEST_SUITE=$1
+ 
+diff --git a/ci/docker_tool b/ci/docker_tool
+new file mode 100755
+index 00000000000..c70478f5bd5
+--- /dev/null
++++ b/ci/docker_tool
+@@ -0,0 +1,143 @@
++#!/bin/bash
++
++IMAGE_NAME=lsinteg
++
++if [[ -z "$PROJECT" ]]; then 
++  PROJECT="ls_integ"
++fi
++
++echo "Using docker-compose project '$PROJECT'"
++
++RUN_PREFIX=docker
++LOGSTASH_VERSION=$(cat versions.yml  | egrep '^logstash:' | cut -d' ' -f 2)
++
++function startdev {
++  # If container exists, start it
++  docker ps -a | awk '{print $NF}' | grep lsdev
++  if [[ $? -eq 0 ]]; then
++    docker start lsdev
++  else # Otherwise run it
++    #-agentlib:jdwp=transport=dt_socket,server=y,address=8000,suspend=n
++    docker run \
++      -v "$PWD:/mnt/host:delegated" \
++      -e 'LS_JAVA_OPTS=-Xmx1500M -Xms1500M' \
++      -e 'INTEGRATION=true' \
++      -e "JRUBY_OPTS=-Xcompile.invokedynamic=false" \
++      -d \
++      --name lsdev \
++      $IMAGE_NAME \
++      bash -c ' tail -f /dev/null'
++  fi
++  # Speeds up gem install etc.
++  docker exec lsdev rsync /mnt/host/vendor /opt/logstash/vendor
++}
++
++function rsyncdev {
++  docker exec lsdev rsync --delete --exclude .git --exclude logs --exclude build --exclude .gradle --exclude vendor -r /mnt/host/ /opt/logstash/ 
++}
++
++function build {
++  docker build -t $IMAGE_NAME .
++}
++
++INTEGRATION_COMMAND="time $RUN_PREFIX run -t --rm $IMAGE_NAME ci/integration_run.sh"
++
++case "$1" in
++  "build") 
++    docker stop lsdev && \
++    docker rm lsdev && \
++    build
++  ;;
++  "ci_integration")
++    echo "Rebuilding images just in case"
++    build && \
++    $INTEGRATION_COMMAND ${@:2}
++  ;;
++  "ci_integration_parallel")
++    if [[ "$4" != "false" ]]; then # Build skip flag
++      build
++    fi
++    pushd qa/integration
++    spec_find_cmd='find specs -name *_spec.rb'
++    total_specs=$(expr $($spec_find_cmd | wc -l))
++    parallelism=$2
++    parallelism_index=$3
++
++    if [[ -z "$parallelism" || -z "$parallelism_index" ]]; then
++      echo "You must invoke with parallelism and index parameters. ex: ci/docker_tool ci_parallel_integration 4 1"
++      exit 1
++    fi
++
++    run_num_specs=$(expr $total_specs / $(expr $parallelism))
++    start_point=$(expr $run_num_specs \* $(expr $parallelism_index))
++    tail_back=$(expr $total_specs - $start_point)
++
++    if expr $(expr $parallelism_index + 1) = $parallelism; then
++      tail_back=$(expr $run_num_specs + $(expr $total_specs % $(expr $parallelism)))
++      run_num_specs=$tail_back
++    fi
++
++    echo "Running $run_num_specs specs for index "$parallelism_index" in $parallelism containers simultaneously"
++    echo "Total Specs: $total_specs"
++
++    matched_specs=$($spec_find_cmd | sort | tail -n $tail_back | head -n $run_num_specs | xargs -n 999999 echo)
++    popd
++    $INTEGRATION_COMMAND $matched_specs
++  ;;
++  "ci_integration_2x")
++    build
++    ci/docker_tool ci_integration_parallel 2 0 false &
++    ci/docker_tool ci_integration_parallel 2 1 false &
++
++    FAILED=0
++    for job in `jobs -p`
++    do
++    echo $job
++      wait $job || let "FAIL+=1"
++    done
++
++    if [[ "$FAILED" != "0" ]]; then
++      exit 1
++    fi
++    echo "Both jobs succeeded!"
++  ;;
++  "ci_cli")
++    build
++    $RUN_PREFIX run -it --rm $IMAGE_NAME bash -l
++  ;;
++  "dev_stop")
++    $RUN_PREFIX stop lsdev
++   ;; 
++  "dev_cli")
++    startdev && \
++    echo "Don't forget to rsync" && \
++    #TODO: This should search for running containers and connect to them, starting a new one only if needed
++    time $RUN_PREFIX exec -it lsdev bash -c "$INTEGRATION_SETUP && mkdir -p build && ln -sf /opt/logstash build/logstash-$LOGSTASH_VERSION-SNAPSHOT && bash -l"
++  ;;
++  "dev_rsync")
++    rsyncdev
++  ;;
++  "dev_cleanup")
++    docker stop lsdev
++    docker rm $(docker ps -aq)
++    build
++  ;;
++  *)
++    echo "Commands prefixed with 'ci' run in unnamed containers and are intended to be used on the CI server or on a dev box to simulate the CI server as accurately as possible."
++    echo "Example commands: "
++    echo "# Run integration test as it would be run on CI server"
++    echo "ci/docker_tool ci_integration"
++    echo "# Start a CLI prompt with the container setup as it would be for ci_integration"
++    echo "ci/docker_run ci_cli"
++    echo "# Start a container named '$DEV_CONTAINER_NAME' that sticks around for experimenting with tests"
++    echo "ci/docker_run ci_cli"
++    echo "# Rsync the folder contents to the dev container. Must be done to synchronize any local changes"
++    echo "ci/docker_run rsync"
++    echo "# Destroy the dev container to achieve a clean state"
++    echo "ci/docker_run dev_cleanup"
++    echo "# Run the full CI suite in 2 threads"
++    echo "ci/docker_run ci_integration_2x"
++    echo "# Run the CI suite in three parts. Useful for splitting up tests among jenkins build jobs"
++    echo "ci/docker_run ci_parallel 3 0; ci/docker_run ci_parallel 3 1; ci/docker_run ci_parallel 3 2"
++  ;;
++esac
+\ No newline at end of file
+diff --git a/ci/integration_run.sh b/ci/integration_run.sh
+new file mode 100755
+index 00000000000..8adf8af2061
+--- /dev/null
++++ b/ci/integration_run.sh
+@@ -0,0 +1,6 @@
++#!/bin/bash -iex
++
++cd qa/integration
++echo "Running spec files $@"
++bundle exec rspec -fd --tag ~offline $@
++bundle exec rspec -fd --tag offline $@
+\ No newline at end of file
+diff --git a/ci/travis_integration_install.sh b/ci/travis_integration_install.sh
+deleted file mode 100755
+index 27d3a097f6e..00000000000
+--- a/ci/travis_integration_install.sh
++++ /dev/null
+@@ -1,26 +0,0 @@
+-#!/usr/bin/env bash
+-set -e
+-
+-# This file sets up the environment for travis integration tests
+-
+-
+-if [[ "$INTEGRATION" != "true" ]]; then
+-    exit
+-fi
+-
+-echo "Setting up integration tests"
+-if [[ ! -d "build" ]]; then
+-    mkdir build
+-fi
+-rm -rf build/*
+-echo "Building logstash tar file in build/"
+-rake artifact:tar
+-cd build
+-echo "Extracting logstash tar file in build/"
+-tar xf *.tar.gz
+-
+-cd ../qa/integration
+-pwd
+-echo $BUNDLE_GEMFILE
+-# to install test dependencies
+-bundle install --gemfile="./Gemfile"
+diff --git a/ci/travis_integration_run.sh b/ci/travis_integration_run.sh
+deleted file mode 100755
+index 28b8cc9f760..00000000000
+--- a/ci/travis_integration_run.sh
++++ /dev/null
+@@ -1,16 +0,0 @@
+-#!/usr/bin/env bash
+-set -e
+-
+-if [[ "$INTEGRATION" != "true" ]]; then
+-    exit
+-fi
+-
+-echo "Running integration tests from qa/integration directory"
+-cd qa/integration
+-
+-# The offline specs can break the online ones
+-# due to some sideeffects of the seccomp policy interfering with
+-# the docker daemon
+-# See prepare_offline_pack_spec.rb for details
+-rspec --tag ~offline
+-rspec --tag offline
+diff --git a/qa/integration/fixtures/logstash-dummy-pack/spec/outputs/secret_spec.rb b/qa/integration/fixtures/logstash-dummy-pack/spec/outputs/secret_spec.rb
+index 341b7a2501d..d19b45e0749 100644
+--- a/qa/integration/fixtures/logstash-dummy-pack/spec/outputs/secret_spec.rb
++++ b/qa/integration/fixtures/logstash-dummy-pack/spec/outputs/secret_spec.rb
+@@ -1,5 +1,4 @@
+ # encoding: utf-8
+-require "logstash/devutils/rspec/spec_helper"
+ require "logstash/outputs/secret"
+ require "logstash/codecs/plain"
+ require "logstash/event"
+diff --git a/qa/integration/fixtures/offline_wrapper/offline b/qa/integration/fixtures/offline_wrapper/offline
+new file mode 100755
+index 00000000000..a982572791d
+Binary files /dev/null and b/qa/integration/fixtures/offline_wrapper/offline differ
+diff --git a/qa/integration/fixtures/offline_wrapper/offline.o b/qa/integration/fixtures/offline_wrapper/offline.o
+new file mode 100644
+index 00000000000..25b570eed2e
+Binary files /dev/null and b/qa/integration/fixtures/offline_wrapper/offline.o differ
+diff --git a/qa/integration/integration_tests.gemspec b/qa/integration/integration_tests.gemspec
+index 7ef75c1cd13..c8424b1cbc1 100644
+--- a/qa/integration/integration_tests.gemspec
++++ b/qa/integration/integration_tests.gemspec
+@@ -18,8 +18,6 @@ Gem::Specification.new do |s|
+   s.add_development_dependency 'manticore'
+   s.add_development_dependency 'stud'
+   s.add_development_dependency 'pry'
+-  s.add_development_dependency 'logstash-devutils'
+   s.add_development_dependency 'flores'
+   s.add_development_dependency 'rubyzip'
+-  s.add_development_dependency 'docker-api'
+ end
+diff --git a/qa/integration/services/dockerized/Dockerfile b/qa/integration/services/dockerized/Dockerfile
+deleted file mode 100644
+index 045ba94de2c..00000000000
+--- a/qa/integration/services/dockerized/Dockerfile
++++ /dev/null
+@@ -1,32 +0,0 @@
+-FROM debian:stretch
+-##
+-# Define a base image for all service images.
+-##
+-
+-ENV _JAVA_OPTIONS "-Djava.net.preferIPv4Stack=true"
+-ENV TERM=linux
+-
+-RUN apt-get update && apt-get install -y curl openjdk-8-jre-headless netcat
+-
+-RUN adduser --disabled-password --gecos '' tester
+-USER tester
+-
+-# Define the work directory. Use this variable in derivated images and
+-# shell scripts.
+-ENV WORKDIR /home/tester
+-WORKDIR $WORKDIR
+-
+-# Script with routines that can be used in derived images.
+-ADD helpers.sh .
+-
+-# Expect this script in the context directory of a derived image. It should
+-# contain the service setup instructions, and is going to be the first executed
+-# command when a derived image is built.
+-ONBUILD ADD setup.sh .
+-ONBUILD RUN ./setup.sh
+-
+-# Expect this script in the context directory of a derived image. It should
+-# contain the service start up instructions, and is going to be executed when
+-# a container is started.
+-ONBUILD ADD run.sh .
+-CMD ["./run.sh"]
+diff --git a/qa/integration/services/dockerized/elasticsearch/Dockerfile b/qa/integration/services/dockerized/elasticsearch/Dockerfile
+deleted file mode 100644
+index 55451ac9680..00000000000
+--- a/qa/integration/services/dockerized/elasticsearch/Dockerfile
++++ /dev/null
+@@ -1,3 +0,0 @@
+-FROM logstash:ci_sandbox
+-
+-expose 9200 9300
+diff --git a/qa/integration/services/dockerized/elasticsearch/run.sh b/qa/integration/services/dockerized/elasticsearch/run.sh
+deleted file mode 100755
+index fcf0005bf37..00000000000
+--- a/qa/integration/services/dockerized/elasticsearch/run.sh
++++ /dev/null
+@@ -1,6 +0,0 @@
+-#!/bin/bash
+-
+-ES_HOME=${WORKDIR}/elasticsearch
+-
+-# Set "http.host" to make the service visible from outside the container.
+-${ES_HOME}/bin/elasticsearch -E http.host=0.0.0.0
+diff --git a/qa/integration/services/dockerized/elasticsearch/setup.sh b/qa/integration/services/dockerized/elasticsearch/setup.sh
+deleted file mode 100755
+index f2db6fd3bb3..00000000000
+--- a/qa/integration/services/dockerized/elasticsearch/setup.sh
++++ /dev/null
+@@ -1,15 +0,0 @@
+-#!/bin/bash
+-
+-if [ -n "${ES_VERSION+1}" ]; then
+-  echo "Elasticsearch version is $ES_VERSION"
+-  version=$ES_VERSION
+-else
+-   version=5.0.1
+-fi
+-
+-ES_HOME=${WORKDIR}/elasticsearch
+-
+-download_url=https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-$version.tar.gz
+-curl -s -o elasticsearch.tar.gz $download_url
+-mkdir -p $ES_HOME
+-tar -xzf elasticsearch.tar.gz --strip-components=1 -C $ES_HOME/.
+diff --git a/qa/integration/services/dockerized/helpers.sh b/qa/integration/services/dockerized/helpers.sh
+deleted file mode 100644
+index 7f3e9c0ffd2..00000000000
+--- a/qa/integration/services/dockerized/helpers.sh
++++ /dev/null
+@@ -1,23 +0,0 @@
+-#!/bin/bash
+-
+-##
+-# Add routines and/or variables that can be shared between the
+-# service containers.
+-##
+-
+-PORT_WAIT_COUNT=20
+-
+-# Check service responds on given port.
+-# Parameters:
+-#   - the port number.
+-wait_for_port() {
+-    count=$PORT_WAIT_COUNT
+-    port=$1
+-    while ! nc -z localhost $port && [[ $count -ne 0 ]]; do
+-        count=$(( $count - 1 ))
+-        [[ $count -eq 0 ]] && return 1
+-        sleep 0.5
+-    done
+-    # just in case, one more time
+-    nc -z localhost $port
+-}
+diff --git a/qa/integration/services/elasticsearch_service.rb b/qa/integration/services/elasticsearch_service.rb
+index 3b45feb3688..66963aca5de 100644
+--- a/qa/integration/services/elasticsearch_service.rb
++++ b/qa/integration/services/elasticsearch_service.rb
+@@ -1,21 +1,12 @@
+-require_relative "service_container"
+ require 'elasticsearch'
+-require 'docker'
+ 
+-class ElasticsearchService < ServiceContainer
++class ElasticsearchService < Service
+   def initialize(settings)
+     super("elasticsearch", settings)
+-
+-    # Binding container to host ports.
+-    @container_create_opts[:HostConfig] = {
+-                                            :PortBindings => {
+-                                              '9200/tcp' => [{ :HostPort => '9200' }],
+-                                              '9300/tcp' => [{ :HostPort => '9300' }]
+-                                          }}
+   end
+ 
+   def get_client
+     Elasticsearch::Client.new(:hosts => "localhost:9200")
+   end
+ 
+-end
++end
+\ No newline at end of file
+diff --git a/qa/integration/services/elasticsearch_setup.sh b/qa/integration/services/elasticsearch_setup.sh
+new file mode 100755
+index 00000000000..0f916c9cce0
+--- /dev/null
++++ b/qa/integration/services/elasticsearch_setup.sh
+@@ -0,0 +1,43 @@
++#!/bin/bash
++set -ex
++current_dir="$(dirname "$0")"
++
++source "$current_dir/helpers.sh"
++
++if [ -n "${ES_VERSION+1}" ]; then
++  echo "Elasticsearch version is $ES_VERSION"
++  version=$ES_VERSION
++else
++   version=5.0.1
++fi
++
++ES_HOME=$INSTALL_DIR/elasticsearch
++
++setup_es() {
++  if [ ! -d $ES_HOME ]; then
++      local version=$1
++      download_url=https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-$version.tar.gz
++      curl -sL $download_url > $INSTALL_DIR/elasticsearch.tar.gz
++      mkdir $ES_HOME
++      tar -xzf $INSTALL_DIR/elasticsearch.tar.gz --strip-components=1 -C $ES_HOME/.
++      rm $INSTALL_DIR/elasticsearch.tar.gz
++  fi
++}
++
++start_es() {
++  es_args=$@
++  $ES_HOME/bin/elasticsearch $es_args -p $ES_HOME/elasticsearch.pid > /tmp/elasticsearch.log 2>/dev/null &
++  count=120
++  echo "Waiting for elasticsearch to respond..."
++  while ! curl --silent localhost:9200 && [[ $count -ne 0 ]]; do
++      count=$(( $count - 1 ))
++      [[ $count -eq 0 ]] && return 1
++      sleep 1
++  done
++  echo "Elasticsearch is Up !"
++  return 0
++}
++
++setup_install_dir
++setup_es $version
++start_es
+diff --git a/qa/integration/services/elasticsearch_teardown.sh b/qa/integration/services/elasticsearch_teardown.sh
+new file mode 100755
+index 00000000000..f8e4dd51139
+--- /dev/null
++++ b/qa/integration/services/elasticsearch_teardown.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++set -e
++current_dir="$(dirname "$0")"
++
++source "$current_dir/helpers.sh"
++
++ES_HOME=$INSTALL_DIR/elasticsearch
++
++stop_es() {
++    pid=$(cat $ES_HOME/elasticsearch.pid)
++    [ "x$pid" != "x" ] && [ "$pid" -gt 0 ]
++    kill -SIGTERM $pid
++}
++
++stop_es
+\ No newline at end of file
+diff --git a/qa/integration/services/kafka_dockerized/Dockerfile b/qa/integration/services/kafka_dockerized/Dockerfile
+deleted file mode 100644
+index 63abf910301..00000000000
+--- a/qa/integration/services/kafka_dockerized/Dockerfile
++++ /dev/null
+@@ -1,18 +0,0 @@
+-FROM debian:stretch
+-
+-ENV KAFKA_HOME /kafka
+-ENV KAFKA_LOGS_DIR="/kafka-logs"
+-ENV KAFKA_VERSION 0.10.2.1
+-ENV _JAVA_OPTIONS "-Djava.net.preferIPv4Stack=true"
+-ENV TERM=linux
+-
+-RUN apt-get update && apt-get install -y curl openjdk-8-jre-headless netcat
+-
+-RUN mkdir -p ${KAFKA_LOGS_DIR} && mkdir -p ${KAFKA_HOME} && curl -s -o $INSTALL_DIR/kafka.tgz \
+-    "http://ftp.wayne.edu/apache/kafka/${KAFKA_VERSION}/kafka_2.11-${KAFKA_VERSION}.tgz" && \
+-    tar xzf ${INSTALL_DIR}/kafka.tgz -C ${KAFKA_HOME} --strip-components 1
+-    
+-ADD run.sh /run.sh
+-
+-EXPOSE 9092
+-EXPOSE 2181
+diff --git a/qa/integration/services/kafka_dockerized/run.sh b/qa/integration/services/kafka_dockerized/run.sh
+deleted file mode 100644
+index a01ffe32153..00000000000
+--- a/qa/integration/services/kafka_dockerized/run.sh
++++ /dev/null
+@@ -1,34 +0,0 @@
+-#!/bin/bash
+-
+-KAFKA_TOPIC=logstash_topic_plain
+-
+-wait_for_port() {
+-    count=20
+-    port=$1
+-    while ! nc -z localhost $port && [[ $count -ne 0 ]]; do
+-        count=$(( $count - 1 ))
+-        [[ $count -eq 0 ]] && return 1
+-        sleep 0.5
+-    done
+-    # just in case, one more time
+-    nc -z localhost $port
+-}
+-
+-echo "Starting ZooKeeper"
+-${KAFKA_HOME}/bin/zookeeper-server-start.sh ${KAFKA_HOME}/config/zookeeper.properties &
+-wait_for_port 2181
+-echo "Starting Kafka broker"
+-mkdir -p ${KAFKA_LOGS_DIR}
+-${KAFKA_HOME}/bin/kafka-server-start.sh ${KAFKA_HOME}/config/server.properties \
+-    --override delete.topic.enable=true --override advertised.host.name=127.0.0.1 \
+-    --override logs.dir=${KAFKA_LOGS_DIR} --override log.flush.interval.ms=200 &
+-
+-wait_for_port 9092
+-
+-${KAFKA_HOME}/bin/kafka-topics.sh --create --partitions 1 --replication-factor 1 --topic ${KAFKA_TOPIC} --zookeeper 127.0.0.1:2181
+-
+-${KAFKA_HOME}/bin/kafka-console-producer.sh --topic ${KAFKA_TOPIC} --broker-list 127.0.0.1:9092 < /how_sample.input
+-
+-echo "Kafka load status code $?"
+-
+-tail -f /dev/null
+diff --git a/qa/integration/services/kafka_service.rb b/qa/integration/services/kafka_service.rb
+index 0c550515560..71908f9acbb 100644
+--- a/qa/integration/services/kafka_service.rb
++++ b/qa/integration/services/kafka_service.rb
+@@ -1,35 +1,7 @@
+ require_relative "service"
+-require "docker"
+-require "logstash/devutils/rspec/logstash_helpers"
+ 
+ class KafkaService < Service
+-  include LogStashHelper
+-
+   def initialize(settings)
+     super("kafka", settings)
+   end
+-
+-  def setup
+-    try(20) do
+-      @kafka_image = Docker::Image.build_from_dir(File.expand_path("../kafka_dockerized", __FILE__))
+-                       .insert_local(
+-                         'localPath' => File.join(TestSettings::FIXTURES_DIR, "how_sample.input"),
+-                         'outputPath' => '/')
+-    end
+-    @kafka_container = Docker::Container.create(:Image => @kafka_image.id,
+-                                                :HostConfig => {
+-                                                  :PortBindings => {
+-                                                    '9092/tcp' => [{ :HostPort => '9092' }],
+-                                                    '2181/tcp' => [{ :HostPort => '2181' }]
+-                                                  }
+-                                                }, :Cmd => ["/bin/bash", "-l", "/run.sh"])
+-    @kafka_container.start
+-    super()
+-  end
+-
+-  def teardown
+-    @kafka_container.kill(:signal => "SIGHUP")
+-    @kafka_container.delete(:force => true, :volumes => true)
+-    super()
+-  end
+ end
+diff --git a/qa/integration/services/kafka_setup.sh b/qa/integration/services/kafka_setup.sh
+new file mode 100755
+index 00000000000..9b4b1ca955d
+--- /dev/null
++++ b/qa/integration/services/kafka_setup.sh
+@@ -0,0 +1,72 @@
++#!/bin/bash
++set -ex
++current_dir="$(dirname "$0")"
++
++export _JAVA_OPTIONS="-Djava.net.preferIPv4Stack=true"
++
++source "$current_dir/helpers.sh"
++
++if [ -n "${KAFKA_VERSION+1}" ]; then
++    echo "KAFKA_VERSION is $KAFKA_VERSION"
++    version=$KAFKA_VERSION
++else
++    version=0.10.2.1
++fi
++
++KAFKA_HOME=$INSTALL_DIR/kafka
++KAFKA_TOPIC=logstash_topic_plain
++KAFKA_MESSAGES=37
++KAFKA_LOGS_DIR=/tmp/ls_integration/kafka-logs
++
++setup_kafka() {
++    local version=$1
++    if [ ! -d $KAFKA_HOME ]; then
++        echo "Downloading Kafka version $version"
++        curl -s -o $INSTALL_DIR/kafka.tgz "http://ftp.wayne.edu/apache/kafka/$version/kafka_2.11-$version.tgz"
++        mkdir $KAFKA_HOME && tar xzf $INSTALL_DIR/kafka.tgz -C $KAFKA_HOME --strip-components 1
++        rm $INSTALL_DIR/kafka.tgz
++    fi
++}
++
++start_kafka() {
++    echo "Starting ZooKeeper"
++    $KAFKA_HOME/bin/zookeeper-server-start.sh -daemon $KAFKA_HOME/config/zookeeper.properties
++    wait_for_port 2181
++    echo "Starting Kafka broker"
++    rm -rf ${KAFKA_LOGS_DIR}
++    mkdir -p ${KAFKA_LOGS_DIR}
++    $KAFKA_HOME/bin/kafka-server-start.sh -daemon $KAFKA_HOME/config/server.properties --override delete.topic.enable=true --override advertised.host.name=127.0.0.1 --override log.dir=${KAFKA_LOGS_DIR} --override log.flush.interval.ms=200
++    wait_for_port 9092
++}
++
++wait_for_messages() {
++    local count=10
++    local read_lines=0
++    
++    echo "Checking if Kafka topic has been populated with data"
++    while [[ $read_lines -ne $KAFKA_MESSAGES ]] && [[ $count -ne 0 ]]; do
++        read_lines=`$KAFKA_HOME/bin/kafka-console-consumer.sh --topic $KAFKA_TOPIC --new-consumer --bootstrap-server localhost:9092 --from-beginning --max-messages $KAFKA_MESSAGES --timeout-ms 10000 | wc -l`
++        count=$(( $count - 1 ))
++        [[ $count -eq 0 ]] && return 1
++        sleep 0.5
++        #ls -lrt $KAFKA_LOGS_DIR/$KAFKA_TOPIC-0/
++    done
++    echo "Kafka topic has been populated with test data"
++}
++
++setup_install_dir
++setup_kafka $version
++start_kafka
++# Set up topics
++$KAFKA_HOME/bin/kafka-topics.sh --create --partitions 1 --replication-factor 1 --topic $KAFKA_TOPIC --zookeeper localhost:2181
++# check topic got created
++num_topic=`$KAFKA_HOME/bin/kafka-topics.sh --list --zookeeper localhost:2181 | grep $KAFKA_TOPIC | wc -l`
++[[ $num_topic -eq 1 ]]
++# Add test messages to the newly created topic
++cp $current_dir/../fixtures/how_sample.input $KAFKA_HOME
++[[ ! -s  how_sample.input ]]
++$KAFKA_HOME/bin/kafka-console-producer.sh --topic $KAFKA_TOPIC --broker-list localhost:9092 < $KAFKA_HOME/how_sample.input
++echo "Kafka load status code $?"
++# Wait until broker has all messages
++wait_for_messages
++echo "Kafka Setup complete"
+diff --git a/qa/integration/services/kafka_teardown.sh b/qa/integration/services/kafka_teardown.sh
+new file mode 100755
+index 00000000000..0d10cffe844
+--- /dev/null
++++ b/qa/integration/services/kafka_teardown.sh
+@@ -0,0 +1,22 @@
++#!/bin/bash
++set -ex
++current_dir="$(dirname "$0")"
++
++source "$current_dir/helpers.sh"
++
++KAFKA_HOME=$INSTALL_DIR/kafka
++
++stop_kafka() {
++    echo "Stopping Kafka broker"
++    $KAFKA_HOME/bin/kafka-server-stop.sh
++    echo "Stopping zookeeper"
++    $KAFKA_HOME/bin/zookeeper-server-stop.sh
++}
++
++# delete test topic
++echo "Deleting test topic in Kafka"
++$KAFKA_HOME/bin/kafka-topics.sh --delete --topic logstash_topic_plain --zookeeper localhost:2181 --if-exists
++stop_kafka
++rm -rf /tmp/ls_integration/kafka-logs
++rm -rf /tmp/zookeeper
++
+diff --git a/qa/integration/services/logstash_service.rb b/qa/integration/services/logstash_service.rb
+index d00252b4e52..15b12b6161a 100644
+--- a/qa/integration/services/logstash_service.rb
++++ b/qa/integration/services/logstash_service.rb
+@@ -37,7 +37,7 @@ def initialize(settings)
+       ls_file = "logstash-" + ls_version_file["logstash"]
+       # First try without the snapshot if it's there
+       @logstash_home = File.expand_path(File.join(LS_BUILD_DIR, ls_file), __FILE__)
+-      @logstash_home += "-SNAPSHOT" unless Dir.exists?(@logstash_home)
++      @logstash_home += "-SNAPSHOT" unless Dir.exist?(@logstash_home)
+ 
+       puts "Using #{@logstash_home} as LS_HOME"
+       @logstash_bin = File.join("#{@logstash_home}", LS_BIN)
+diff --git a/qa/integration/services/service.rb b/qa/integration/services/service.rb
+index ab171ebff89..63b898d30d9 100644
+--- a/qa/integration/services/service.rb
++++ b/qa/integration/services/service.rb
+@@ -22,7 +22,7 @@ def setup
+ 
+   def teardown
+     puts "Tearing down #{@name} service"
+-    if File.exists?(@teardown_script)
++    if File.exists?(@setup_script)
+       `#{@teardown_script}`
+     else
+       puts "Teardown script not found for #{@name}"
+diff --git a/qa/integration/services/service_container.rb b/qa/integration/services/service_container.rb
+deleted file mode 100644
+index 598cd04fa4c..00000000000
+--- a/qa/integration/services/service_container.rb
++++ /dev/null
+@@ -1,67 +0,0 @@
+-require_relative "service"
+-require "docker"
+-require "logstash/devutils/rspec/logstash_helpers"
+-
+-# Represents a service running within a container.
+-class ServiceContainer < Service
+-  include LogStashHelper
+-
+-  def initialize(name, settings)
+-    super(name, settings)
+-
+-    @base_image_context = File.expand_path("../dockerized", __FILE__)
+-
+-    @image_context = File.join(@base_image_context, @name)
+-
+-    # Options to create the container.
+-    @container_create_opts = {}
+-  end
+-
+-  def setup
+-    puts "Setting up #{@name} service."
+-
+-    puts "Building the base container image."
+-    @base_image = Docker::Image.build_from_dir(@base_image_context)
+-    # Tag the base image.
+-    #Caution: change this tag can cause failure to build the service container.
+-    @base_image.tag('repo' => 'logstash', 'tag' => 'ci_sandbox', force: true)
+-    puts "Finished building the base image."
+-
+-    puts "Building the container image."
+-    self.build_image
+-    puts "Finished building the image."
+-
+-    puts "Starting the container."
+-    self.start_container
+-    puts "Finished starting the container."
+-
+-    puts "Finished setting up #{@name} service."
+-  end
+-
+-  def teardown
+-    puts "Tearing down #{@name} service."
+-
+-    puts "Stop the container."
+-    self.stop_container
+-    puts "Finished stopping the container."
+-
+-    puts "Finished tearing down of #{@name} service."
+-  end
+-
+-  def build_image
+-    try(20) do
+-      @image = Docker::Image.build_from_dir(@image_context)
+-    end
+-  end
+-
+-  def start_container
+-    @container_create_opts[:Image] = @image.id
+-    @container = Docker::Container.create(@container_create_opts)
+-    @container.start
+-  end
+-
+-  def stop_container
+-    @container.stop
+-    @container.delete(:force => true, :volumes => true)
+-  end
+-end
+diff --git a/qa/integration/specs/01_logstash_bin_smoke_spec.rb b/qa/integration/specs/01_logstash_bin_smoke_spec.rb
+index b3647f00ebd..334b4b294ca 100644
+--- a/qa/integration/specs/01_logstash_bin_smoke_spec.rb
++++ b/qa/integration/specs/01_logstash_bin_smoke_spec.rb
+@@ -3,10 +3,10 @@
+ require_relative '../framework/settings'
+ require_relative '../services/logstash_service'
+ require_relative '../framework/helpers'
+-require "logstash/devutils/rspec/spec_helper"
+ require "yaml"
+ require 'json'
+ require 'open-uri'
++require 'rspec/wait'
+ 
+ describe "Test Logstash instance" do
+   before(:all) {
+@@ -41,9 +41,9 @@
+ 
+   it "can start the embedded http server on default port 9600" do
+     @ls1.start_with_stdin
+-    try(num_retries) do
+-      expect(is_port_open?(9600)).to be(true)
+-    end
++    wait(60).for do
++      is_port_open?(9600)
++    end.to be true
+   end
+ 
+   context "multiple instances" do
+@@ -56,9 +56,9 @@
+       expect(is_port_open?(9600)).to be true
+ 
+       @ls2.spawn_logstash("-f", config2, "--path.data", tmp_data_path)
+-      try(num_retries) do
+-        expect(@ls2.exited?).to be(true)
+-      end
++      wait(60).for do
++        @ls2.exited?
++      end.to be true
+       expect(@ls2.exit_code).to be(1)
+     end
+ 
+@@ -131,9 +131,9 @@
+   it "should abort if both -f and -e are specified" do
+     config_string = "input { tcp { port => #{port1} } }"
+     @ls1.spawn_logstash("-e", config_string, "-f", config2)
+-    try(num_retries) do
+-      expect(@ls1.exited?).to be(true)
+-    end
++    wait(60).for do
++      @ls1.exited?
++    end.to be true
+     expect(@ls1.exit_code).to be(1)
+   end
+ 
+diff --git a/qa/integration/specs/cli/http_proxy_install_spec.rb b/qa/integration/specs/cli/http_proxy_install_spec.rb
+index 92c5675f508..667c0abb167 100644
+--- a/qa/integration/specs/cli/http_proxy_install_spec.rb
++++ b/qa/integration/specs/cli/http_proxy_install_spec.rb
+@@ -4,7 +4,6 @@
+ require_relative "../../services/logstash_service"
+ require_relative "../../services/http_proxy_service"
+ require_relative "../../framework/helpers"
+-require "logstash/devutils/rspec/spec_helper"
+ require "stud/temporary"
+ require "fileutils"
+ 
+diff --git a/qa/integration/specs/cli/install_spec.rb b/qa/integration/specs/cli/install_spec.rb
+index d1c02037c54..f51eef13f1d 100644
+--- a/qa/integration/specs/cli/install_spec.rb
++++ b/qa/integration/specs/cli/install_spec.rb
+@@ -3,7 +3,6 @@
+ require_relative "../../framework/settings"
+ require_relative "../../services/logstash_service"
+ require_relative "../../framework/helpers"
+-require "logstash/devutils/rspec/spec_helper"
+ require "stud/temporary"
+ require "fileutils"
+ 
+diff --git a/qa/integration/specs/cli/prepare_offline_pack_spec.rb b/qa/integration/specs/cli/prepare_offline_pack_spec.rb
+index bae0469f28d..4d3722b641a 100644
+--- a/qa/integration/specs/cli/prepare_offline_pack_spec.rb
++++ b/qa/integration/specs/cli/prepare_offline_pack_spec.rb
+@@ -3,8 +3,6 @@
+ require_relative "../../framework/settings"
+ require_relative "../../services/logstash_service"
+ require_relative "../../framework/helpers"
+-require "logstash/devutils/rspec/spec_helper"
+-
+ 
+ # These are segmented into a separate tag that MUST be run separately from any docker tests
+ # The reason they break the Docker API and that in turn even breaks tests not using Docker 
+diff --git a/qa/integration/specs/cli/remove_spec.rb b/qa/integration/specs/cli/remove_spec.rb
+index 95981265d5a..e1dfa7ec352 100644
+--- a/qa/integration/specs/cli/remove_spec.rb
++++ b/qa/integration/specs/cli/remove_spec.rb
+@@ -3,7 +3,6 @@
+ require_relative '../../framework/settings'
+ require_relative '../../services/logstash_service'
+ require_relative '../../framework/helpers'
+-require "logstash/devutils/rspec/spec_helper"
+ 
+ describe "CLI > logstash-plugin remove" do
+   before(:all) do
+diff --git a/qa/integration/specs/env_variables_config_spec.rb b/qa/integration/specs/env_variables_config_spec.rb
+index d7594c90166..e9ba9ff2851 100644
+--- a/qa/integration/specs/env_variables_config_spec.rb
++++ b/qa/integration/specs/env_variables_config_spec.rb
+@@ -2,7 +2,7 @@
+ require_relative '../framework/settings'
+ require_relative '../services/logstash_service'
+ require_relative '../framework/helpers'
+-require "logstash/devutils/rspec/spec_helper"
++require 'rspec/wait'
+ 
+ describe "Test Logstash configuration" do
+   before(:all) {
+@@ -30,19 +30,19 @@
+     logstash_service.env_variables = test_env
+     logstash_service.start_background(@fixture.config)
+     # check if TCP port env variable was resolved
+-    try(num_retries) do
+-      expect(is_port_open?(test_tcp_port)).to be true
+-    end
++    wait(60).for do
++      is_port_open?(test_tcp_port)
++    end.to be true
+     
+     #send data and make sure all env variables are expanded by checking each stage
+     send_data(test_tcp_port, sample_data)
+     output_file = File.join(test_path, "logstash_env_test.log")
+-    try(num_retries) do
+-      expect(File.exists?(output_file)).to be true
+-    end
++    wait(60).for do
++      File.exists?(output_file)
++    end.to be true
+     # should have created the file using env variable with filters adding a tag based on env variable
+-    try(num_retries) do
+-      expect(IO.read(output_file).gsub("\n", "")).to eq("#{sample_data} blah,environment_variables_are_evil")
+-    end
++    wait(60).for do
++      IO.read(output_file).gsub("\n", "")
++    end.to eq("#{sample_data} blah,environment_variables_are_evil")
+   end
+ end  
+\ No newline at end of file
+diff --git a/qa/integration/specs/kafka_input_spec.rb b/qa/integration/specs/kafka_input_spec.rb
+index bcd26fad0a5..661f78d1e1d 100644
+--- a/qa/integration/specs/kafka_input_spec.rb
++++ b/qa/integration/specs/kafka_input_spec.rb
+@@ -1,8 +1,8 @@
+ require_relative '../framework/fixture'
+ require_relative '../framework/settings'
+ require_relative '../services/logstash_service'
++require "stud/try"
+ require "rspec/wait"
+-require "logstash/devutils/rspec/spec_helper"
+ 
+ describe "Test Kafka Input" do
+   let(:num_retries) { 60 }
+@@ -13,21 +13,20 @@
+   }
+ 
+   after(:all) {
+-    @fixture.teardown
++    @fixture.teardown if @fixture
+   }
+ 
+   it "can ingest 37 apache log lines from Kafka broker" do
+     logstash_service = @fixture.get_service("logstash")
+     logstash_service.start_background(@fixture.config)
+ 
+-    try(num_retries) do
+-      expect(@fixture.output_exists?).to be true
+-    end
++    wait(60).for do
++      @fixture.output_exists?
++    end.to be true
+ 
+-    try(num_retries) do
+-      count = File.foreach(@fixture.actual_output).inject(0) {|c, _| c+1}
+-      expect(count).to eq(num_events)
+-    end
++    wait(60).for do
++      File.foreach(@fixture.actual_output).inject(0) {|c, line| c+1}
++    end.to eq(num_events)
+   end
+ 
+ end
+diff --git a/qa/integration/specs/monitoring_api_spec.rb b/qa/integration/specs/monitoring_api_spec.rb
+index 05c320158a9..f36664f46ae 100644
+--- a/qa/integration/specs/monitoring_api_spec.rb
++++ b/qa/integration/specs/monitoring_api_spec.rb
+@@ -1,8 +1,7 @@
+ require_relative '../framework/fixture'
+ require_relative '../framework/settings'
+ require_relative '../services/logstash_service'
+-require "logstash/devutils/rspec/spec_helper"
+-require "stud/try"
++require"stud/try"
+ 
+ describe "Test Monitoring API" do
+   before(:all) {
+diff --git a/qa/integration/specs/multiple_pipeline_spec.rb b/qa/integration/specs/multiple_pipeline_spec.rb
+index 55e1dd48dc4..e01d140c81a 100644
+--- a/qa/integration/specs/multiple_pipeline_spec.rb
++++ b/qa/integration/specs/multiple_pipeline_spec.rb
+@@ -2,9 +2,9 @@
+ require_relative '../framework/settings'
+ require_relative '../services/logstash_service'
+ require_relative '../framework/helpers'
+-require "logstash/devutils/rspec/spec_helper"
+ require "socket"
+ require "yaml"
++require 'rspec/wait'
+ 
+ describe "Test Logstash service when multiple pipelines are used" do
+   before(:all) {
+@@ -46,9 +46,9 @@
+   it "executes the multiple pipelines" do
+     logstash_service = @fixture.get_service("logstash")
+     logstash_service.spawn_logstash("--path.settings", settings_dir, "--log.level=debug")
+-    try(retry_attempts) do
+-      expect(logstash_service.exited?).to be(true)
+-    end
++    wait(60).for do
++      logstash_service.exited?
++    end.to be true
+     expect(logstash_service.exit_code).to eq(0)
+     expect(File.exist?(temporary_out_file_1)).to be(true)
+     expect(IO.readlines(temporary_out_file_1).size).to eq(1)
+diff --git a/qa/integration/specs/reload_config_spec.rb b/qa/integration/specs/reload_config_spec.rb
+index 3c88a5ee753..18fd85d08cb 100644
+--- a/qa/integration/specs/reload_config_spec.rb
++++ b/qa/integration/specs/reload_config_spec.rb
+@@ -2,9 +2,9 @@
+ require_relative '../framework/settings'
+ require_relative '../services/logstash_service'
+ require_relative '../framework/helpers'
+-require "logstash/devutils/rspec/spec_helper"
+ require "socket"
+ require "json"
++require 'rspec/wait'
+ 
+ describe "Test Logstash service when config reload is enabled" do
+   before(:all) {
+@@ -34,9 +34,9 @@
+     
+     # try sending events with this
+     send_data(initial_port, sample_data)
+-    Stud.try(retry_attempts.times, RSpec::Expectations::ExpectationNotMetError) do
+-      expect(IO.read(output_file1).gsub("\n", "")).to eq(sample_data)
+-    end
++    wait(60).for do
++      IO.read(output_file1).gsub("\n", "")
++    end.to eq(sample_data)
+     
+     # check metrics
+     result = logstash_service.monitoring_api.event_stats
+@@ -53,9 +53,9 @@
+     expect(is_port_open?(initial_port)).to be false
+     
+     send_data(reload_port, sample_data)
+-    Stud.try(retry_attempts.times, RSpec::Expectations::ExpectationNotMetError) do
+-      expect(IO.read(output_file2).blank?).to be false
+-    end
++    wait(60).for do
++      IO.read(output_file2).empty?
++    end.to be false
+     
+     # check instance metrics. It should not be reset
+     instance_event_stats = logstash_service.monitoring_api.event_stats
+@@ -72,7 +72,7 @@
+     instance_reload_stats = logstash_service.monitoring_api.node_stats["reloads"]
+     expect(pipeline_reload_stats["successes"]).to eq(1)
+     expect(pipeline_reload_stats["failures"]).to eq(0)
+-    expect(pipeline_reload_stats["last_success_timestamp"].blank?).to be false
++    expect(pipeline_reload_stats["last_success_timestamp"].empty?).to be false
+     expect(pipeline_reload_stats["last_error"]).to eq(nil)
+     
+     expect(instance_reload_stats["successes"]).to eq(1)
+diff --git a/qa/integration/specs/settings_spec.rb b/qa/integration/specs/settings_spec.rb
+index 959f968ad13..5c607e71170 100644
+--- a/qa/integration/specs/settings_spec.rb
++++ b/qa/integration/specs/settings_spec.rb
+@@ -2,8 +2,8 @@
+ require_relative '../framework/settings'
+ require_relative '../services/logstash_service'
+ require_relative '../framework/helpers'
+-require "logstash/devutils/rspec/spec_helper"
+ require "yaml"
++require 'rspec/wait'
+ 
+ describe "Test Logstash instance whose default settings are overridden" do
+   before(:all) {
+@@ -48,9 +48,9 @@ def overwrite_settings(settings)
+     @logstash_service.spawn_logstash("-e", tcp_config)
+     @logstash_service.wait_for_logstash
+     # check LS is up and running with new data path
+-    try(num_retries) do
+-      expect(is_port_open?(test_port)).to be true
+-    end
++    wait(60).for do
++      is_port_open?(test_port)
++    end.to be true
+   end
+   
+   it "should write logs to a new dir" do
+@@ -58,9 +58,9 @@ def overwrite_settings(settings)
+     @logstash_service.spawn_logstash("-e", tcp_config)
+     @logstash_service.wait_for_logstash
+     # check LS is up and running with new data path
+-    try(num_retries) do
+-      expect(is_port_open?(test_port)).to be true
+-    end
++    wait(60).for do
++      is_port_open?(test_port)
++    end.to be true
+     expect(File.exists?("#{temp_dir}/logstash-plain.log")).to be true
+   end
+   
+@@ -72,9 +72,9 @@ def overwrite_settings(settings)
+     @logstash_service.spawn_logstash
+     @logstash_service.wait_for_logstash
+     # check LS is up and running with new data path
+-    try(num_retries) do
+-      expect(is_port_open?(test_port)).to be true
+-    end
++    wait(60).for do
++      is_port_open?(test_port)
++    end.to be true
+   end
+   
+   it "should exit when config test_and_exit is set" do
+@@ -87,18 +87,18 @@ def overwrite_settings(settings)
+     s["path.logs"] = temp_dir
+     overwrite_settings(s)
+     @logstash_service.spawn_logstash
+-    try(num_retries) do
+-      expect(@logstash_service.exited?).to be true
+-    end
++    wait(60).for do
++      @logstash_service.exited?
++    end.to be true
+     expect(@logstash_service.exit_code).to eq(0)
+     
+     # now with bad config
+     IO.write(test_config_path, "#{tcp_config} filters {} ")
+     expect(File.exists?(test_config_path)).to be true
+     @logstash_service.spawn_logstash
+-    try(num_retries) do
+-      expect(@logstash_service.exited?).to be true
+-    end
++    wait(60).for do
++      @logstash_service.exited?
++    end.to be true
+     expect(@logstash_service.exit_code).to eq(1)
+   end
+ 
+@@ -112,9 +112,9 @@ def overwrite_settings(settings)
+     @logstash_service.spawn_logstash("-e", tcp_config)
+     @logstash_service.wait_for_logstash
+     # check LS is up and running with new data path
+-    try(num_retries) do
+-      expect(is_port_open?(test_port)).to be true
+-    end
++    wait(60).for do
++      is_port_open?(test_port)
++    end.to be true
+ 
+     # now check monitoring API to validate
+     node_info = @logstash_service.monitoring_api.node_info
+@@ -129,13 +129,13 @@ def overwrite_settings(settings)
+     @logstash_service.spawn_logstash("-e", tcp_config)
+     @logstash_service.wait_for_logstash
+     
+-    try(num_retries) do
+-      expect(is_port_open?(http_port)).to be true
+-    end
++    wait(60).for do
++      is_port_open?(http_port)
++    end.to be true
+     # check LS is up and running with new data path
+-    try(num_retries) do
+-      expect(is_port_open?(test_port)).to be true
+-    end
++    wait(60).for do
++      is_port_open?(test_port)
++    end.to be true
+     
+     expect(File.exists?(@logstash_default_logs)).to be true
+ 
+@@ -149,13 +149,13 @@ def overwrite_settings(settings)
+     @logstash_service.spawn_logstash("-e", tcp_config, "--path.settings", "/tmp/fooooobbaaar")
+     @logstash_service.wait_for_logstash
+     http_port = 9600
+-    try(num_retries) do
+-      expect(is_port_open?(http_port)).to be true
+-    end
++    wait(60).for do
++      is_port_open?(http_port)
++    end.to be true
+ 
+-    try(num_retries) do
+-      expect(is_port_open?(test_port)).to be true
+-    end
++    wait(60).for do
++      is_port_open?(test_port)
++    end.to be true
+ 
+     resp = Manticore.get("http://localhost:#{http_port}/_node").body
+     node_info = JSON.parse(resp)
+diff --git a/qa/integration/specs/slowlog_spec.rb b/qa/integration/specs/slowlog_spec.rb
+index c27f09adfae..08f6372c3e1 100644
+--- a/qa/integration/specs/slowlog_spec.rb
++++ b/qa/integration/specs/slowlog_spec.rb
+@@ -2,7 +2,6 @@
+ require_relative '../framework/settings'
+ require_relative '../services/logstash_service'
+ require_relative '../framework/helpers'
+-require "logstash/devutils/rspec/spec_helper"
+ require "yaml"
+ 
+ describe "Test Logstash Slowlog" do

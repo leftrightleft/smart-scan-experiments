@@ -1,0 +1,212 @@
+diff --git a/docs/static/command-line-flags.asciidoc b/docs/static/command-line-flags.asciidoc
+index 881face8027..3f17579ed0d 100644
+--- a/docs/static/command-line-flags.asciidoc
++++ b/docs/static/command-line-flags.asciidoc
+@@ -41,6 +41,11 @@ Logstash has the following flags. You can use the `--help` flag to display this
+ --debug
+  Increase verbosity to the last level (trace), more verbose.
+ 
++--debug-config
++ Print the compiled config ruby code out as a debug log (you must also have --debug enabled).
++ WARNING: This will include any 'password' options passed to plugin configs as plaintext, and may result
++ in plaintext passwords appearing in your logs!
++
+ -V, --version
+   Display the version of Logstash.
+ 
+diff --git a/logstash-core/lib/logstash/agent.rb b/logstash-core/lib/logstash/agent.rb
+index adc688898c5..a9e0cf85cd7 100644
+--- a/logstash-core/lib/logstash/agent.rb
++++ b/logstash-core/lib/logstash/agent.rb
+@@ -11,7 +11,7 @@
+ 
+ class LogStash::Agent < Clamp::Command
+ 
+-  attr_reader :pipelines
++  attr_reader :pipelines, :config_loader
+ 
+   DEFAULT_INPUT = "input { stdin { type => stdin } }"
+   DEFAULT_OUTPUT = "output { stdout { codec => rubydebug } }"
+@@ -58,6 +58,10 @@ class LogStash::Agent < Clamp::Command
+   option "--verbose", :flag, I18n.t("logstash.agent.flag.verbose")
+   option "--debug", :flag, I18n.t("logstash.agent.flag.debug")
+ 
++  option ["--debug-config"], :flag,
++         I18n.t("logstash.runner.flag.debug_config"),
++         :attribute_name => :debug_config, :default => false
++
+   option ["-V", "--version"], :flag,
+     I18n.t("logstash.agent.flag.version")
+ 
+@@ -104,6 +108,11 @@ def pipeline_batch_delay=(pipeline_batch_delay_value)
+     @pipeline_settings[:pipeline_batch_delay] = validate_positive_integer(pipeline_batch_delay_value)
+   end
+ 
++  def debug_config=(debug_config)
++    @config_loader.debug_config = debug_config
++    @debug_config = true
++  end
++
+   def validate_positive_integer(str_arg)
+     int_arg = str_arg.to_i
+     if str_arg !~ /^\d+$/ || int_arg < 1
+@@ -180,7 +189,8 @@ def execute
+ 
+     register_pipeline("main", @pipeline_settings.merge({
+                           :config_string => config_string,
+-                          :config_path => config_path
++                          :config_path => config_path,
++                          :debug_config => debug_config?
+                           }))
+ 
+     sigint_id = trap_sigint()
+diff --git a/logstash-core/lib/logstash/config/loader.rb b/logstash-core/lib/logstash/config/loader.rb
+index 37179518ed5..64e45aac53c 100644
+--- a/logstash-core/lib/logstash/config/loader.rb
++++ b/logstash-core/lib/logstash/config/loader.rb
+@@ -1,8 +1,11 @@
+ require "logstash/config/defaults"
+ 
+ module LogStash; module Config; class Loader
+-  def initialize(logger)
++  attr_accessor :debug_config
++
++  def initialize(logger, debug_config=false)
+     @logger = logger
++    @debug_config = debug_config
+   end
+ 
+   def format_config(config_path, config_string)
+@@ -69,14 +72,18 @@ def local_config(path)
+         encoding_issue_files << file
+       end
+       config << cfg + "\n"
+-      @logger.debug? && @logger.debug("\nThe following is the content of a file", :config_file => file.to_s)
+-      @logger.debug? && @logger.debug("\n" + cfg + "\n\n")
++      if @debug_config
++        @logger.debug? && @logger.debug("\nThe following is the content of a file", :config_file => file.to_s)
++        @logger.debug? && @logger.debug("\n" + cfg + "\n\n")
++      end
+     end
+     if encoding_issue_files.any?
+       fail("The following config files contains non-ascii characters but are not UTF-8 encoded #{encoding_issue_files}")
+     end
+-    @logger.debug? && @logger.debug("\nThe following is the merged configuration")
+-    @logger.debug? && @logger.debug("\n" + config + "\n\n")
++    if @debug_config
++      @logger.debug? && @logger.debug("\nThe following is the merged configuration")
++      @logger.debug? && @logger.debug("\n" + config + "\n\n")
++    end
+     return config
+   end # def load_config
+ 
+diff --git a/logstash-core/lib/logstash/pipeline.rb b/logstash-core/lib/logstash/pipeline.rb
+index fad68a0b2f8..b682bd37588 100644
+--- a/logstash-core/lib/logstash/pipeline.rb
++++ b/logstash-core/lib/logstash/pipeline.rb
+@@ -26,7 +26,8 @@ module LogStash; class Pipeline
+     :pipeline_batch_size => 125,
+     :pipeline_batch_delay => 5, # in milliseconds
+     :flush_interval => 5, # in seconds
+-    :flush_timeout_interval => 60 # in seconds
++    :flush_timeout_interval => 60, # in seconds
++    :debug_config => false
+   }
+   MAX_INFLIGHT_WARN_THRESHOLD = 10_000
+ 
+@@ -60,7 +61,9 @@ def initialize(config_str, settings = {})
+     code = @config.compile
+     # The config code is hard to represent as a log message...
+     # So just print it.
+-    @logger.debug? && @logger.debug("Compiled pipeline code:\n#{code}")
++    if @settings[:debug_config]
++      @logger.debug? && @logger.debug("Compiled pipeline code:\n#{code}")
++    end
+     begin
+       eval(code)
+     rescue => e
+@@ -488,4 +491,17 @@ def non_reloadable_plugins
+     end
+   end
+ 
++  # Sometimes we log stuff that will dump the pipeline which may contain
++  # sensitive information (like the raw syntax tree which can contain passwords)
++  # We want to hide most of what's in here
++  def inspect
++    {
++      :pipeline_id => @pipeline_id,
++      :settings => @settings.inspect,
++      :ready => @ready,
++      :running => @running,
++      :flushing => @flushing
++    }
++  end
++
+ end end
+diff --git a/logstash-core/locales/en.yml b/logstash-core/locales/en.yml
+index 3da1afff9f9..9a39f02f5fe 100644
+--- a/logstash-core/locales/en.yml
++++ b/logstash-core/locales/en.yml
+@@ -209,8 +209,12 @@ en:
+         debug: |+
+           Most verbose logging. This causes 'debug'
+           level logs to be emitted.
++        debug-config: |+
++          Print the compiled config ruby code out as a debug log (you must also have --debug enabled).
++          WARNING: This will include any 'password' options passed to plugin configs as plaintext, and may result
++          in plaintext passwords appearing in your logs!
+         unsafe_shutdown: |+
+           Force logstash to exit during shutdown even
+           if there are still inflight events in memory.
+           By default, logstash will refuse to quit until all
+-          received events have been pushed to the outputs.
++          received events have been pushed to the outputs.
+\ No newline at end of file
+diff --git a/logstash-core/spec/logstash/agent_spec.rb b/logstash-core/spec/logstash/agent_spec.rb
+index 85ca45f5d5c..675b07ec7ae 100644
+--- a/logstash-core/spec/logstash/agent_spec.rb
++++ b/logstash-core/spec/logstash/agent_spec.rb
+@@ -343,5 +343,25 @@
+     end
+   end
+ 
++  describe "debug_config" do
++    let(:pipeline_string) { "input {} output {}" }
++    let(:pipeline) { double("pipeline") }
++
++    it "should set 'debug_config' to false by default" do
++      expect(LogStash::Pipeline).to receive(:new).and_return(pipeline)
++      args = ["--debug", "-e", pipeline_string]
++      subject.run(args)
++
++      expect(subject.config_loader.debug_config).to be_falsey
++    end
++
++    it "should allow overriding debug_config" do
++      expect(LogStash::Pipeline).to receive(:new).and_return(pipeline)
++      args = ["--debug", "--debug-config",  "-e", pipeline_string]
++      subject.run(args)
++
++      expect(subject.config_loader.debug_config).to be_truthy
++    end
++  end
+ end
+ 
+diff --git a/logstash-core/spec/logstash/runner_spec.rb b/logstash-core/spec/logstash/runner_spec.rb
+index a5755634984..00f078bedc0 100644
+--- a/logstash-core/spec/logstash/runner_spec.rb
++++ b/logstash-core/spec/logstash/runner_spec.rb
+@@ -16,7 +16,6 @@ def run(args); end
+     allow(Cabin::Channel).to receive(:get).with(LogStash).and_return(channel)
+   end
+ 
+-
+   context "argument parsing" do
+     it "should run agent" do
+       expect(Stud::Task).to receive(:new).once.and_return(nil)
+@@ -55,5 +54,4 @@ def run(args); end
+       end
+     end
+   end
+-
+ end

@@ -1,0 +1,175 @@
+diff --git a/tools/ingest-converter/src/main/resources/ingest-to-grok.js b/tools/ingest-converter/src/main/resources/ingest-to-grok.js
+index 6cc7ddc7b17..a6738bf729c 100644
+--- a/tools/ingest-converter/src/main/resources/ingest-to-grok.js
++++ b/tools/ingest-converter/src/main/resources/ingest-to-grok.js
+@@ -23,6 +23,15 @@ function json_to_grok(json) {
+         return name + " " + wrap_in_curly(content);
+     }
+ 
++    /**
++     * All hash fields in Grok start on a new line.
++     * @param fields Array of Strings of Serialized Hash Fields
++     * @returns {string} Joined Serialization of Hash Fields
++     */
++    function join_hash_fields(fields) {
++        return fields.join("\n");
++    }
++
+     /**
+      * Converts Ingest/JSON style pattern array to Grok pattern array, performing necessary variable
+      * name and quote escaping adjustments.
+@@ -65,6 +74,16 @@ function json_to_grok(json) {
+         return "[\n" + patterns.map(dots_to_square_brackets).map(quote_string).join(",\n") + "\n]";
+     }
+ 
++    function create_pattern_definition_hash(definitions) {
++        var content = [];
++        for (var key in definitions) {
++            if (definitions.hasOwnProperty(key)) {
++                content.push(create_field(quote_string(key), quote_string(definitions[key])));
++            }
++        }
++        return create_hash_field("pattern_definitions", content);
++    }
++
+     /**
+      * Fixes indentation in Grok string.
+      * @param string Grok string to fix indentation in, that has no indentation intentionally with 
+@@ -87,30 +106,42 @@ function json_to_grok(json) {
+             } else if (lines[i].match(/(\}|\])$/)) {
+                 --count;
+                 lines[i] = indent(lines[i], count);
+-            } else {
++            // Only indent line if previous line ended on relevant control char.
++            } else if (i > 0 && lines[i - 1].match(/(,|\{|\}|\[|\])$/)) {
+                 lines[i] = indent(lines[i], count);
+             }
+         }
+         return lines.join("\n");
+     }
+-
+-    var parsed = JSON.parse(json);
+-    var processors = parsed["processors"];
+-    return processors.map(function (filter) {
++    
++    function grok_hash(processor) {
++        var grok_data = processor["grok"];
++        var grok_contents = create_hash_field(
++            "match",
++            create_field(
++                quote_string(grok_data["field"]),
++                create_pattern_array(grok_data["patterns"])
++            )
++        );
++        if (grok_data["pattern_definitions"]) {
++            grok_contents = join_hash_fields([
++                    grok_contents, 
++                    create_pattern_definition_hash(grok_data["pattern_definitions"])
++            ])
++        }
++        return grok_contents;
++    }
++    
++    function map_processor (processor) {
+         return fix_indent(
+             create_hash(
+                 "filter",
+                 create_hash(
+-                    "grok",
+-                    create_hash_field(
+-                        "match",
+-                        create_field(
+-                            quote_string(filter["grok"]["field"]),
+-                            create_pattern_array(filter["grok"]["patterns"])
+-                        )
+-                    )
++                    "grok", grok_hash(processor)
+                 )
+             )
+         )
+-    }).join("\n\n") + "\n";
++    }
++
++    return JSON.parse(json)["processors"].map(map_processor).join("\n\n") + "\n";
+ }
+diff --git a/tools/ingest-converter/src/test/java/org/logstash/ingest/GrokTest.java b/tools/ingest-converter/src/test/java/org/logstash/ingest/GrokTest.java
+index c4953bd2fa3..d661f02bc19 100644
+--- a/tools/ingest-converter/src/test/java/org/logstash/ingest/GrokTest.java
++++ b/tools/ingest-converter/src/test/java/org/logstash/ingest/GrokTest.java
+@@ -1,6 +1,5 @@
+ package org.logstash.ingest;
+ 
+-import java.io.File;
+ import java.io.IOException;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+@@ -18,15 +17,23 @@ public final class GrokTest {
+     public final TemporaryFolder temp = new TemporaryFolder();
+ 
+     @Test
+-    public void convertsCorrectly() throws Exception {
+-        final File testdir = temp.newFolder();
+-        final String grok = testdir.toPath().resolve("converted.grok").toString();
++    public void convertsFieldPatternsCorrectly() throws Exception {
++        final String grok = temp.newFolder().toPath().resolve("converted.grok").toString();
+         Grok.main(resourcePath("ingestTestConfig.json"), grok);
+         assertThat(
+             utf8File(grok), is(utf8File(resourcePath("ingestTestConfig.grok")))
+         );
+     }
+ 
++    @Test
++    public void convertsFieldDefinitionsCorrectly() throws Exception {
++        final String grok = temp.newFolder().toPath().resolve("converted.grok").toString();
++        Grok.main(resourcePath("ingestTestPatternDefinition.json"), grok);
++        assertThat(
++            utf8File(grok), is(utf8File(resourcePath("ingestTestPatternDefinition.grok")))
++        );
++    }
++
+     private static String utf8File(final String path) throws IOException {
+         return new String(Files.readAllBytes(Paths.get(path)), StandardCharsets.UTF_8);
+     }
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestTestPatternDefinition.grok b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestTestPatternDefinition.grok
+new file mode 100644
+index 00000000000..686f7dc9afc
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestTestPatternDefinition.grok
+@@ -0,0 +1,13 @@
++filter {
++   grok {
++      match => {
++         "message" => [
++            "%{SYSLOGTIMESTAMP:[system][syslog][timestamp]} %{SYSLOGHOST:[system][syslog][hostname]} %{DATA:[system][syslog][program]}(?:\[%{POSINT:[system][syslog][pid]}\])?: %{GREEDYMULTILINE:[system][syslog][message]}",
++            "%{SYSLOGTIMESTAMP:[system][syslog][timestamp]} %{GREEDYMULTILINE:[system][syslog][message]}"
++         ]
++      }
++      pattern_definitions => {
++         "GREEDYMULTILINE" => "(.|\n)*"
++      }
++   }
++}
+diff --git a/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestTestPatternDefinition.json b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestTestPatternDefinition.json
+new file mode 100644
+index 00000000000..bb123eed1b5
+--- /dev/null
++++ b/tools/ingest-converter/src/test/resources/org/logstash/ingest/ingestTestPatternDefinition.json
+@@ -0,0 +1,18 @@
++{
++  "description":"Syslog",
++  "processors":[
++    {
++      "grok":{
++        "field":"message",
++        "patterns":[
++          "%{SYSLOGTIMESTAMP:system.syslog.timestamp} %{SYSLOGHOST:system.syslog.hostname} %{DATA:system.syslog.program}(?:\\[%{POSINT:system.syslog.pid}\\])?: %{GREEDYMULTILINE:system.syslog.message}",
++          "%{SYSLOGTIMESTAMP:system.syslog.timestamp} %{GREEDYMULTILINE:system.syslog.message}"
++        ],
++        "pattern_definitions":{
++          "GREEDYMULTILINE":"(.|\\n)*"
++        },
++        "ignore_missing":true
++      }
++    }
++  ]
++}

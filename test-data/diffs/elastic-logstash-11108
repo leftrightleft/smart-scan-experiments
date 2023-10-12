@@ -1,0 +1,573 @@
+diff --git a/config/jvm.options b/config/jvm.options
+index 2d743c8b32b..cebdf798486 100644
+--- a/config/jvm.options
++++ b/config/jvm.options
+@@ -79,3 +79,6 @@
+ 
+ # Copy the logging context from parent threads to children
+ -Dlog4j2.isThreadContextMapInheritable=true
++
++# Avoid Nashorn deprecation logs in JDK > 11
++-Dnashorn.args=--no-deprecation-warning
+\ No newline at end of file
+diff --git a/config/log4j2.properties b/config/log4j2.properties
+index 9a6af06e0e9..e9cb7517e8a 100644
+--- a/config/log4j2.properties
++++ b/config/log4j2.properties
+@@ -26,6 +26,11 @@ appender.rolling.policies.size.type = SizeBasedTriggeringPolicy
+ appender.rolling.policies.size.size = 100MB
+ appender.rolling.strategy.type = DefaultRolloverStrategy
+ appender.rolling.strategy.max = 30
++appender.rolling.avoid_pipelined_filter.type = ScriptFilter
++appender.rolling.avoid_pipelined_filter.script.type = Script
++appender.rolling.avoid_pipelined_filter.script.name = filter_no_pipelined
++appender.rolling.avoid_pipelined_filter.script.language = JavaScript
++appender.rolling.avoid_pipelined_filter.script.value = ${sys:ls.pipeline.separate_logs} == false || !(logEvent.getContextData().containsKey("pipeline.id"))
+ 
+ appender.json_rolling.type = RollingFile
+ appender.json_rolling.name = json_rolling
+@@ -42,10 +47,39 @@ appender.json_rolling.policies.size.type = SizeBasedTriggeringPolicy
+ appender.json_rolling.policies.size.size = 100MB
+ appender.json_rolling.strategy.type = DefaultRolloverStrategy
+ appender.json_rolling.strategy.max = 30
++appender.json_rolling.avoid_pipelined_filter.type = ScriptFilter
++appender.json_rolling.avoid_pipelined_filter.script.type = Script
++appender.json_rolling.avoid_pipelined_filter.script.name = filter_no_pipelined
++appender.json_rolling.avoid_pipelined_filter.script.language = JavaScript
++appender.json_rolling.avoid_pipelined_filter.script.value = ${sys:ls.pipeline.separate_logs} == false || !(logEvent.getContextData().containsKey("pipeline.id"))
++
++appender.routing.type = Routing
++appender.routing.name = pipeline_routing_appender
++appender.routing.routes.type = Routes
++appender.routing.routes.script.type = Script
++appender.routing.routes.script.name = routing_script
++appender.routing.routes.script.language = JavaScript
++appender.routing.routes.script.value = logEvent.getContextData().containsKey("pipeline.id") ? logEvent.getContextData().getValue("pipeline.id") : "sink";
++appender.routing.routes.route_pipelines.type = Route
++appender.routing.routes.route_pipelines.rolling.type = RollingFile
++appender.routing.routes.route_pipelines.rolling.name = appender-${ctx:pipeline.id}
++appender.routing.routes.route_pipelines.rolling.fileName = ${sys:ls.logs}/pipeline_${ctx:pipeline.id}.log
++appender.routing.routes.route_pipelines.rolling.filePattern = ${sys:ls.logs}/pipeline_${ctx:pipeline.id}.%i.log.gz
++appender.routing.routes.route_pipelines.rolling.layout.type = PatternLayout
++appender.routing.routes.route_pipelines.rolling.layout.pattern = [%d{ISO8601}][%-5p][%-25c] %-.10000m%n
++appender.routing.routes.route_pipelines.rolling.policy.type = SizeBasedTriggeringPolicy
++appender.routing.routes.route_pipelines.rolling.policy.size = 100MB
++appender.routing.routes.route_pipelines.strategy.type = DefaultRolloverStrategy
++appender.routing.routes.route_pipelines.strategy.max = 30
++appender.routing.routes.route_sink.type = Route
++appender.routing.routes.route_sink.key = sink
++appender.routing.routes.route_sink.null.type = Null
++appender.routing.routes.route_sink.null.name = drop-appender
+ 
+ rootLogger.level = ${sys:ls.log.level}
+ rootLogger.appenderRef.console.ref = ${sys:ls.log.format}_console
+ rootLogger.appenderRef.rolling.ref = ${sys:ls.log.format}_rolling
++rootLogger.appenderRef.routing.ref = pipeline_routing_appender
+ 
+ # Slowlog
+ 
+diff --git a/config/logstash.yml b/config/logstash.yml
+index db8ca3cd00e..8ca9602aaf6 100644
+--- a/config/logstash.yml
++++ b/config/logstash.yml
+@@ -212,6 +212,10 @@
+ # Where to find custom plugins
+ # path.plugins: []
+ #
++# Flag to output log lines of each pipeline in its separate log file. Each log filename contains the pipeline.name
++# Default is false
++# pipeline.separate_logs: false
++#
+ # ------------ X-Pack Settings (not applicable for OSS build)--------------
+ #
+ # X-Pack Monitoring
+diff --git a/logstash-core/benchmarks/build.gradle b/logstash-core/benchmarks/build.gradle
+index 7261b40cbf3..99efbd90427 100644
+--- a/logstash-core/benchmarks/build.gradle
++++ b/logstash-core/benchmarks/build.gradle
+@@ -63,13 +63,16 @@ task jmh(type: JavaExec, dependsOn: [':logstash-core-benchmarks:clean', ':logsta
+ 
+   main = "-jar"
+ 
++  def include = project.properties.get('include', '')
++
+   doFirst {
+     args = [
+-      "-Djava.io.tmpdir=${buildDir.absolutePath}",
+-      "-XX:+UseParNewGC", "-XX:+UseConcMarkSweepGC", "-XX:CMSInitiatingOccupancyFraction=75",
+-      "-XX:+UseCMSInitiatingOccupancyOnly", "-XX:+DisableExplicitGC",
+-      "-XX:+HeapDumpOnOutOfMemoryError", "-Xms2g", "-Xmx2g",
+-      shadowJar.archivePath,
++            "-Djava.io.tmpdir=${buildDir.absolutePath}",
++            "-XX:+UseParNewGC", "-XX:+UseConcMarkSweepGC", "-XX:CMSInitiatingOccupancyFraction=75",
++            "-XX:+UseCMSInitiatingOccupancyOnly", "-XX:+DisableExplicitGC",
++            "-XX:+HeapDumpOnOutOfMemoryError", "-Xms2g", "-Xmx2g",
++            shadowJar.archivePath,
++            include
+     ]
+   }
+ }
+diff --git a/logstash-core/benchmarks/src/main/java/org/logstash/benchmark/LogPerPipelineBenchmark.java b/logstash-core/benchmarks/src/main/java/org/logstash/benchmark/LogPerPipelineBenchmark.java
+new file mode 100644
+index 00000000000..d86566254b2
+--- /dev/null
++++ b/logstash-core/benchmarks/src/main/java/org/logstash/benchmark/LogPerPipelineBenchmark.java
+@@ -0,0 +1,60 @@
++package org.logstash.benchmark;
++
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import org.apache.logging.log4j.ThreadContext;
++import org.apache.logging.log4j.core.LoggerContext;
++import org.openjdk.jmh.annotations.*;
++
++import java.util.concurrent.TimeUnit;
++
++@Warmup(iterations = 3, time = 100, timeUnit = TimeUnit.MILLISECONDS)
++@Measurement(iterations = 10, time = 100, timeUnit = TimeUnit.MILLISECONDS)
++@Fork(1)
++@BenchmarkMode(Mode.Throughput)
++@OutputTimeUnit(TimeUnit.MILLISECONDS)
++@State(Scope.Thread)
++public class LogPerPipelineBenchmark {
++
++    private static final int EVENTS_PER_INVOCATION = 10_000_000;
++
++    @Setup
++    public void setUp() {
++        System.setProperty("ls.log.format", "plain");
++    }
++
++    @Benchmark
++    @OperationsPerInvocation(EVENTS_PER_INVOCATION)
++    public final void logWithScriptingCodeToExecuteAndOneLogPerPipelineEnabled() {
++        System.setProperty("log4j.configurationFile", "log4j2-with-script.properties");
++        System.setProperty("ls.pipeline.separate_logs", "true");
++        logManyLines();
++    }
++
++    @Benchmark
++    @OperationsPerInvocation(EVENTS_PER_INVOCATION)
++    public final void logWithScriptingCodeToExecuteAndOneLogPerPipelineDisabled() {
++        System.setProperty("log4j.configurationFile", "log4j2-with-script.properties");
++        System.setProperty("ls.pipeline.separate_logs", "false");
++        logManyLines();
++    }
++
++    @Benchmark
++    @OperationsPerInvocation(EVENTS_PER_INVOCATION)
++    public final void logWithoutScriptingCodeToExecute() {
++        System.setProperty("log4j.configurationFile", "log4j2-without-script.properties");
++
++        logManyLines();
++    }
++
++    private void logManyLines() {
++        LoggerContext context = LoggerContext.getContext(false);
++        context.reconfigure();
++        ThreadContext.put("pipeline.id", "pipeline_1");
++        Logger logger = LogManager.getLogger(LogPerPipelineBenchmark.class);
++
++        for (int i = 0; i < EVENTS_PER_INVOCATION; ++i) {
++            logger.info("log for pipeline 1");
++        }
++    }
++}
+diff --git a/logstash-core/benchmarks/src/main/resources/log4j2-with-script.properties b/logstash-core/benchmarks/src/main/resources/log4j2-with-script.properties
+new file mode 100644
+index 00000000000..10f087d9682
+--- /dev/null
++++ b/logstash-core/benchmarks/src/main/resources/log4j2-with-script.properties
+@@ -0,0 +1,49 @@
++status = error
++name = LogstashPropertiesConfig
++
++appender.rolling.type = RollingFile
++appender.rolling.name = plain_rolling
++appender.rolling.fileName = ${sys:ls.logs}/logstash-${sys:ls.log.format}.log
++appender.rolling.filePattern = ${sys:ls.logs}/logstash-${sys:ls.log.format}-%d{yyyy-MM-dd}-%i.log.gz
++appender.rolling.policies.type = Policies
++appender.rolling.policies.time.type = TimeBasedTriggeringPolicy
++appender.rolling.policies.time.interval = 1
++appender.rolling.policies.time.modulate = true
++appender.rolling.layout.type = PatternLayout
++appender.rolling.layout.pattern = [%d{ISO8601}][%-5p][%-25c]%notEmpty{[%X{pipeline.id}]} %-.10000m%n
++appender.rolling.policies.size.type = SizeBasedTriggeringPolicy
++appender.rolling.policies.size.size = 100MB
++appender.rolling.strategy.type = DefaultRolloverStrategy
++appender.rolling.strategy.max = 30
++appender.rolling.avoid_pipelined_filter.type = ScriptFilter
++appender.rolling.avoid_pipelined_filter.script.type = Script
++appender.rolling.avoid_pipelined_filter.script.name = filter_no_pipelined
++appender.rolling.avoid_pipelined_filter.script.language = JavaScript
++appender.rolling.avoid_pipelined_filter.script.value = ${sys:ls.pipeline.separate_logs} == false || !(logEvent.getContextData().containsKey("pipeline.id"))
++
++appender.routing.type = Routing
++appender.routing.name = pipeline_routing_appender
++appender.routing.routes.type = Routes
++appender.routing.routes.script.type = Script
++appender.routing.routes.script.name = routing_script
++appender.routing.routes.script.language = JavaScript
++appender.routing.routes.script.value = logEvent.getContextData().containsKey("pipeline.id") ? logEvent.getContextData().getValue("pipeline.id") : "sink";
++appender.routing.routes.route_pipelines.type = Route
++appender.routing.routes.route_pipelines.rolling.type = RollingFile
++appender.routing.routes.route_pipelines.rolling.name = appender-${ctx:pipeline.id}
++appender.routing.routes.route_pipelines.rolling.fileName = ${sys:ls.logs}/pipeline_${ctx:pipeline.id}.log
++appender.routing.routes.route_pipelines.rolling.filePattern = ${sys:ls.logs}/pipeline_${ctx:pipeline.id}.%i.log.gz
++appender.routing.routes.route_pipelines.rolling.layout.type = PatternLayout
++appender.routing.routes.route_pipelines.rolling.layout.pattern = [%d{ISO8601}][%-5p][%-25c] %-.10000m%n
++appender.routing.routes.route_pipelines.rolling.policy.type = SizeBasedTriggeringPolicy
++appender.routing.routes.route_pipelines.rolling.policy.size = 100MB
++appender.routing.routes.route_pipelines.strategy.type = DefaultRolloverStrategy
++appender.routing.routes.route_pipelines.strategy.max = 30
++appender.routing.routes.route_sink.type = Route
++appender.routing.routes.route_sink.key = sink
++appender.routing.routes.route_sink.null.type = Null
++appender.routing.routes.route_sink.null.name = drop-appender
++
++rootLogger.level = INFO
++rootLogger.appenderRef.rolling.ref = ${sys:ls.log.format}_rolling
++rootLogger.appenderRef.routing.ref = pipeline_routing_appender
+diff --git a/logstash-core/benchmarks/src/main/resources/log4j2-without-script.properties b/logstash-core/benchmarks/src/main/resources/log4j2-without-script.properties
+new file mode 100644
+index 00000000000..ea5a09542e0
+--- /dev/null
++++ b/logstash-core/benchmarks/src/main/resources/log4j2-without-script.properties
+@@ -0,0 +1,21 @@
++status = error
++name = LogstashPropertiesConfig
++
++appender.rolling.type = RollingFile
++appender.rolling.name = plain_rolling
++appender.rolling.fileName = ${sys:ls.logs}/logstash-${sys:ls.log.format}.log
++appender.rolling.filePattern = ${sys:ls.logs}/logstash-${sys:ls.log.format}-%d{yyyy-MM-dd}-%i.log.gz
++appender.rolling.policies.type = Policies
++appender.rolling.policies.time.type = TimeBasedTriggeringPolicy
++appender.rolling.policies.time.interval = 1
++appender.rolling.policies.time.modulate = true
++appender.rolling.layout.type = PatternLayout
++appender.rolling.layout.pattern = [%d{ISO8601}][%-5p][%-25c]%notEmpty{[%X{pipeline.id}]} %-.10000m%n
++appender.rolling.policies.size.type = SizeBasedTriggeringPolicy
++appender.rolling.policies.size.size = 100MB
++appender.rolling.strategy.type = DefaultRolloverStrategy
++appender.rolling.strategy.max = 30
++
++rootLogger.level = INFO
++rootLogger.appenderRef.rolling.ref = ${sys:ls.log.format}_rolling
++rootLogger.appenderRef.routing.ref = pipeline_routing_appender
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 8e8dd22ec9d..24f00ab200e 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -44,6 +44,7 @@ module Environment
+            Setting::Boolean.new("pipeline.java_execution", true),
+            Setting::Boolean.new("pipeline.reloadable", true),
+            Setting::Boolean.new("pipeline.plugin_classloaders", false),
++           Setting::Boolean.new("pipeline.separate_logs", false),
+                     Setting.new("path.plugins", Array, []),
+     Setting::NullableString.new("interactive", nil, false),
+            Setting::Boolean.new("config.debug", false),
+diff --git a/logstash-core/lib/logstash/runner.rb b/logstash-core/lib/logstash/runner.rb
+index e89b2a9d5f2..24a9a68a777 100644
+--- a/logstash-core/lib/logstash/runner.rb
++++ b/logstash-core/lib/logstash/runner.rb
+@@ -254,6 +254,7 @@ def execute
+     java.lang.System.setProperty("ls.logs", setting("path.logs"))
+     java.lang.System.setProperty("ls.log.format", setting("log.format"))
+     java.lang.System.setProperty("ls.log.level", setting("log.level"))
++    java.lang.System.setProperty("ls.pipeline.separate_logs", setting("pipeline.separate_logs").to_s)
+     unless java.lang.System.getProperty("log4j.configurationFile")
+       log4j_config_location = ::File.join(setting("path.settings"), "log4j2.properties")
+ 
+diff --git a/logstash-core/src/main/java/org/logstash/log/LogstashConfigurationFactory.java b/logstash-core/src/main/java/org/logstash/log/LogstashConfigurationFactory.java
+new file mode 100644
+index 00000000000..024c64e395a
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/log/LogstashConfigurationFactory.java
+@@ -0,0 +1,50 @@
++package org.logstash.log;
++
++import org.apache.logging.log4j.core.LoggerContext;
++import org.apache.logging.log4j.core.config.ConfigurationException;
++import org.apache.logging.log4j.core.config.ConfigurationFactory;
++import org.apache.logging.log4j.core.config.ConfigurationSource;
++import org.apache.logging.log4j.core.config.Order;
++import org.apache.logging.log4j.core.config.plugins.Plugin;
++import org.apache.logging.log4j.core.config.properties.PropertiesConfiguration;
++import org.apache.logging.log4j.core.config.properties.PropertiesConfigurationBuilder;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.Properties;
++
++@Plugin(name = "LogstashConfigurationFactory", category = ConfigurationFactory.CATEGORY)
++@Order(9)
++public class LogstashConfigurationFactory extends ConfigurationFactory {
++
++    static final String PIPELINE_ROUTING_APPENDER_NAME = "pipeline_routing_appender";
++    public static final String PIPELINE_SEPARATE_LOGS = "ls.pipeline.separate_logs";
++
++    @Override
++    protected String[] getSupportedTypes() {
++        return new String[] {".properties"};
++    }
++
++    @Override
++    public PropertiesConfiguration getConfiguration(final LoggerContext loggerContext, final ConfigurationSource source) {
++        final Properties properties = new Properties();
++        try (final InputStream configStream = source.getInputStream()) {
++            properties.load(configStream);
++        } catch (final IOException ioe) {
++            throw new ConfigurationException("Unable to load " + source.toString(), ioe);
++        }
++        PropertiesConfiguration propertiesConfiguration = new PropertiesConfigurationBuilder()
++                .setConfigurationSource(source)
++                .setRootProperties(properties)
++                .setLoggerContext(loggerContext)
++                .build();
++
++        if (System.getProperty(PIPELINE_SEPARATE_LOGS, "false").equals("false")) {
++            // force init to avoid overwrite of appenders section
++            propertiesConfiguration.initialize();
++            propertiesConfiguration.removeAppender(PIPELINE_ROUTING_APPENDER_NAME);
++        }
++
++        return propertiesConfiguration;
++    }
++}
+diff --git a/logstash-core/src/test/java/org/logstash/log/LogstashConfigurationFactoryTest.java b/logstash-core/src/test/java/org/logstash/log/LogstashConfigurationFactoryTest.java
+new file mode 100644
+index 00000000000..edc3f048085
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/log/LogstashConfigurationFactoryTest.java
+@@ -0,0 +1,130 @@
++package org.logstash.log;
++
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import org.apache.logging.log4j.ThreadContext;
++import org.apache.logging.log4j.core.Appender;
++import org.apache.logging.log4j.core.LogEvent;
++import org.apache.logging.log4j.core.appender.routing.RoutingAppender;
++import org.apache.logging.log4j.core.config.AppenderControl;
++import org.apache.logging.log4j.core.config.Configuration;
++
++import org.apache.logging.log4j.core.LoggerContext;
++import org.apache.logging.log4j.test.appender.ListAppender;
++import org.junit.*;
++
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import static junit.framework.TestCase.assertNotNull;
++import static junit.framework.TestCase.assertNull;
++import static junit.framework.TestCase.assertEquals;
++
++public class LogstashConfigurationFactoryTest {
++
++    private static final String CONFIG = "log4j2-log-pipeline-test.properties";
++
++    private static Map<String, String> systemPropertiesDump = new HashMap<>();
++    private static Map<String, String> dumpedLog4jThreadContext;
++
++    @BeforeClass
++    public static void beforeClass() {
++        dumpSystemProperty("log4j.configurationFile");
++        dumpSystemProperty("ls.log.format");
++        dumpSystemProperty("ls.logs");
++        dumpSystemProperty(LogstashConfigurationFactory.PIPELINE_SEPARATE_LOGS);
++
++        dumpedLog4jThreadContext = ThreadContext.getImmutableContext();
++    }
++
++    private static void dumpSystemProperty(String propertyName) {
++        systemPropertiesDump.put(propertyName, System.getProperty(propertyName));
++    }
++
++    @AfterClass
++    public static void afterClass() {
++        ThreadContext.putAll(dumpedLog4jThreadContext);
++
++        restoreSystemProperty("log4j.configurationFile");
++        restoreSystemProperty("ls.log.format");
++        restoreSystemProperty("ls.logs");
++        restoreSystemProperty(LogstashConfigurationFactory.PIPELINE_SEPARATE_LOGS);
++    }
++
++    private static void restoreSystemProperty(String propertyName) {
++        if (systemPropertiesDump.get(propertyName) == null) {
++            System.clearProperty(propertyName);
++        } else {
++            System.setProperty(propertyName, systemPropertiesDump.get(propertyName));
++        }
++    }
++
++    @Before
++    public void setUp() {
++        System.setProperty("log4j.configurationFile", CONFIG);
++        System.setProperty("ls.log.format", "plain");
++        System.setProperty("ls.logs", "build/logs");
++        System.setProperty(LogstashConfigurationFactory.PIPELINE_SEPARATE_LOGS, "true");
++
++        ThreadContext.clearAll();
++    }
++
++    @Test
++    public void testAppenderPerPipelineIsCreatedAfterLogLine() {
++        forceLog4JContextRefresh();
++
++        Logger logger = LogManager.getLogger(LogstashConfigurationFactoryTest.class);
++        ThreadContext.put("pipeline.id", "pipeline_1");
++        logger.info("log for pipeline 1");
++
++        ThreadContext.remove("pipeline_1");
++        ThreadContext.put("pipeline.id", "pipeline_2");
++        logger.info("log for pipeline 2");
++
++        verifyPipelineReceived("pipeline_1", "log for pipeline 1");
++        verifyPipelineReceived("pipeline_2", "log for pipeline 2");
++    }
++
++    private void verifyPipelineReceived(String pipelineSubAppenderName, String expectedMessage) {
++        LoggerContext context = LoggerContext.getContext(false);
++        final Configuration config = context.getConfiguration();
++        RoutingAppender routingApp = config.getAppender(LogstashConfigurationFactory.PIPELINE_ROUTING_APPENDER_NAME);
++        Map<String, AppenderControl> appenders = routingApp.getAppenders();
++        assertNotNull("Routing appenders MUST be defined", appenders);
++        AppenderControl appenderControl = appenders.get(pipelineSubAppenderName);
++        assertNotNull("sub-appender for pipeline " + pipelineSubAppenderName + " MUST be defined", appenderControl);
++        Appender appender = appenderControl.getAppender();
++        assertNotNull("Appender for pipeline " + pipelineSubAppenderName + " can't be NULL", appender);
++        ListAppender pipeline1Appender = (ListAppender) appender;
++        List<LogEvent> pipeline1LogEvents = pipeline1Appender.getEvents();
++        assertEquals(1, pipeline1LogEvents.size());
++        assertEquals(expectedMessage, pipeline1LogEvents.get(0).getMessage().getFormattedMessage());
++    }
++
++    @Test
++    public void testDisableAppenderPerPipelineIsCreatedAfterLogLine() {
++        System.setProperty(LogstashConfigurationFactory.PIPELINE_SEPARATE_LOGS, Boolean.FALSE.toString());
++        forceLog4JContextRefresh();
++
++        Logger logger = LogManager.getLogger(LogstashConfigurationFactoryTest.class);
++
++        ThreadContext.put("pipeline.id", "pipeline_1");
++        logger.info("log for pipeline 1");
++
++        ThreadContext.remove("pipeline_1");
++        ThreadContext.put("pipeline.id", "pipeline_2");
++        logger.info("log for pipeline 2");
++
++        LoggerContext context = LoggerContext.getContext(false);
++        final Configuration config = context.getConfiguration();
++        RoutingAppender routingApp = config.getAppender(LogstashConfigurationFactory.PIPELINE_ROUTING_APPENDER_NAME);
++        assertNull("No routing appender should be present", routingApp);
++    }
++
++    private void forceLog4JContextRefresh() {
++        LoggerContext context = LoggerContext.getContext(false);
++        context.reconfigure();
++    }
++
++}
+\ No newline at end of file
+diff --git a/logstash-core/src/test/resources/log4j2-log-pipeline-test.properties b/logstash-core/src/test/resources/log4j2-log-pipeline-test.properties
+new file mode 100644
+index 00000000000..ca06848e2a3
+--- /dev/null
++++ b/logstash-core/src/test/resources/log4j2-log-pipeline-test.properties
+@@ -0,0 +1,31 @@
++status = error
++name = LogstashPropertiesConfig
++
++appender.rolling.type = RollingFile
++appender.rolling.name = plain_rolling
++appender.rolling.fileName = ${sys:ls.logs}/logstash-${sys:ls.log.format}.log
++appender.rolling.filePattern = ${sys:ls.logs}/logstash-${sys:ls.log.format}-%d{yyyy-MM-dd}-%i.log.gz
++appender.rolling.policies.type = Policies
++appender.rolling.policies.time.type = TimeBasedTriggeringPolicy
++appender.rolling.policies.time.interval = 1
++appender.rolling.policies.time.modulate = true
++appender.rolling.layout.type = PatternLayout
++appender.rolling.layout.pattern = [%d{ISO8601}][%-5p][%-25c]%notEmpty{[%X{plugin.name}]} %-.10000m%n
++appender.rolling.policies.size.type = SizeBasedTriggeringPolicy
++appender.rolling.policies.size.size = 100MB
++appender.rolling.strategy.type = DefaultRolloverStrategy
++appender.rolling.strategy.max = 30
++
++appender.routing.type = Routing
++appender.routing.name = pipeline_routing_appender
++appender.routing.routes.type = Routes
++appender.routing.routes.script.type = Script
++appender.routing.routes.script.name = routing_script
++appender.routing.routes.script.language = JavaScript
++appender.routing.routes.script.value = logEvent.getContextMap().get("pipeline.id")
++appender.routing.routes.route1.type = Route
++appender.routing.routes.route1.list.type = List
++appender.routing.routes.route1.list.name = appender-${mdc:pipeline.id}
++
++rootLogger.level = DEBUG
++rootLogger.appenderRef.routing.ref = pipeline_routing_appender
+diff --git a/qa/integration/specs/pipeline_log_spec.rb b/qa/integration/specs/pipeline_log_spec.rb
+index a8da84eed30..fcc18a39500 100644
+--- a/qa/integration/specs/pipeline_log_spec.rb
++++ b/qa/integration/specs/pipeline_log_spec.rb
+@@ -73,6 +73,57 @@
+     expect(IO.read(plainlog_file) =~ /Starting pipeline.*"pipeline.sources"=>\["#{initial_config_file}"\]/).to be > 0
+   end
+ 
++  it "should separate pipeline output in its own log file" do
++    pipeline_name = "custom_pipeline"
++    settings = {
++      "path.logs" => temp_dir,
++      "pipeline.id" => pipeline_name,
++      "pipeline.separate_logs" => true
++    }
++    IO.write(@ls.application_settings_file, settings.to_yaml)
++    @ls.spawn_logstash("-w", "1" , "-e", config)
++    wait_logstash_process_terminate()
++
++    pipeline_log_file = "#{temp_dir}/pipeline_#{pipeline_name}.log"
++    expect(File.exists?(pipeline_log_file)).to be true
++    content = IO.read(pipeline_log_file)
++    expect(content =~ /Pipeline started {"pipeline.id"=>"#{pipeline_name}"}/).to be > 0
++
++    plainlog_file = "#{temp_dir}/logstash-plain.log"
++    expect(File.exists?(plainlog_file)).to be true
++    plaing_log_content = IO.read(plainlog_file)
++    expect(plaing_log_content =~ /Pipeline started {"pipeline.id"=>"#{pipeline_name}"}/).to be_nil
++  end
++
++  it "should not create separate pipelines log files if not enabled" do
++    pipeline_name = "custom_pipeline"
++    settings = {
++      "path.logs" => temp_dir,
++      "pipeline.id" => pipeline_name,
++      "pipeline.separate_logs" => false
++    }
++    IO.write(@ls.application_settings_file, settings.to_yaml)
++    @ls.spawn_logstash("-w", "1" , "-e", config)
++    wait_logstash_process_terminate()
++
++    pipeline_log_file = "#{temp_dir}/pipeline_#{pipeline_name}.log"
++    expect(File.exists?(pipeline_log_file)).to be false
++
++    plainlog_file = "#{temp_dir}/logstash-plain.log"
++    expect(File.exists?(plainlog_file)).to be true
++    plaing_log_content = IO.read(plainlog_file)
++    expect(plaing_log_content =~ /Pipeline started {"pipeline.id"=>"#{pipeline_name}"}/).to be > 0
++  end
++
++  @private
++  def wait_logstash_process_terminate
++    num_retries = 100
++    try(num_retries) do
++      expect(@ls.exited?).to be(true)
++    end
++    expect(@ls.exit_code).to be >= 0
++  end
++
+   @private
+   def wait_logstash_process_terminate
+     num_retries = 100

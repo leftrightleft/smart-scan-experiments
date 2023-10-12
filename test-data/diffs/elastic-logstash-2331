@@ -1,0 +1,367 @@
+diff --git a/lib/logstash/config/mixin.rb b/lib/logstash/config/mixin.rb
+index f4b0314db2d..bc328e8e892 100644
+--- a/lib/logstash/config/mixin.rb
++++ b/lib/logstash/config/mixin.rb
+@@ -6,6 +6,8 @@
+ require "logstash/util/password"
+ require "logstash/version"
+ require "logstash/environment"
++require "logstash/util/plugin_version"
++
+ LogStash::Environment.load_locale!
+ 
+ # This module is meant as a mixin to classes wishing to be configurable from
+@@ -39,6 +41,9 @@ module LogStash::Config::Mixin
+     Regexp => 100,
+   }
+ 
++  PLUGIN_VERSION_1_0_0 = LogStash::Util::PluginVersion.new(1, 0, 0)
++  PLUGIN_VERSION_0_9_0 = LogStash::Util::PluginVersion.new(0, 9, 0)
++
+   # This method is called when someone does 'include LogStash::Config'
+   def self.included(base)
+     # Add the DSL methods to the 'base' given.
+@@ -115,19 +120,23 @@ module DSL
+ 
+     # If name is given, set the name and return it.
+     # If no name given (nil), return the current name.
+-    def config_name(name=nil)
++    def config_name(name = nil)
+       @config_name = name if !name.nil?
+       LogStash::Config::Registry.registry[@config_name] = self
+       return @config_name
+     end
+ 
+-    def plugin_status(status=nil)
++    # Deprecated: Declare the version of the plugin
++    # inside the gemspec.
++    def plugin_status(status = nil)
+       milestone(status)
+     end
+ 
+-    def milestone(m=nil)
+-      @milestone = m if !m.nil?
+-      return @milestone
++    # Deprecated: Declare the version of the plugin
++    # inside the gemspec.
++    def milestone(m = nil)
++      @logger = Cabin::Channel.get(LogStash)
++      @logger.error(I18n.t('logstash.plugin.deprecated_milestone', :plugin => config_name))
+     end
+ 
+     # Define a new configuration setting
+@@ -184,7 +193,7 @@ def inherited(subclass)
+         end
+       end
+       subclass.instance_variable_set("@config", subconfig)
+-      @@milestone_notice_given = false
++      @@version_notice_given = false
+     end # def inherited
+ 
+     def validate(params)
+@@ -193,7 +202,8 @@ def validate(params)
+       @logger = Cabin::Channel.get(LogStash)
+       is_valid = true
+ 
+-      is_valid &&= validate_milestone
++      print_version_notice
++
+       is_valid &&= validate_check_invalid_parameter_names(params)
+       is_valid &&= validate_check_required_parameter_names(params)
+       is_valid &&= validate_check_parameter_values(params)
+@@ -201,24 +211,36 @@ def validate(params)
+       return is_valid
+     end # def validate
+ 
+-    def validate_milestone
+-      return true if @@milestone_notice_given
+-      docmsg = "For more information about plugin milestones, see http://logstash.net/docs/#{LOGSTASH_VERSION}/plugin-milestones "
+-      plugin_type = ancestors.find { |a| a.name =~ /::Base$/ }.config_name
+-      case @milestone
+-        when 0,1,2
+-          @logger.warn(I18n.t("logstash.plugin.milestone.#{@milestone}", 
+-                              :type => plugin_type, :name => @config_name,
+-                              :LOGSTASH_VERSION => LOGSTASH_VERSION))
+-        when 3
+-          # No message to log for milestone 3 plugins.
+-        when nil
+-          raise "#{@config_name} must set a milestone. #{docmsg}"
+-        else
+-          raise "#{@config_name} set an invalid plugin status #{@milestone}. Valid values are 0, 1, 2, or 3. #{docmsg}"
++    def print_version_notice
++      return if @@version_notice_given
++
++      begin
++        plugin_version = LogStash::Util::PluginVersion.find_plugin_version!(@plugin_type, @config_name)
++
++        if plugin_version < PLUGIN_VERSION_1_0_0
++          if plugin_version < PLUGIN_VERSION_0_9_0
++            @logger.warn(I18n.t("logstash.plugin.version.0-1-x", 
++                                :type => @plugin_type,
++                                :name => @config_name,
++                                :LOGSTASH_VERSION => LOGSTASH_VERSION))
++          else
++            @logger.warn(I18n.t("logstash.plugin.version.0-9-x", 
++                                :type => @plugin_type,
++                                :name => @config_name,
++                                :LOGSTASH_VERSION => LOGSTASH_VERSION))
++          end
++        end
++      rescue LogStash::PluginNoVersionError
++        # If we cannot find a version in the currently installed gems we
++        # will display this message. This could happen in the test, if you 
++        # create an anonymous class to test a plugin.
++        @logger.warn(I18n.t("logstash.plugin.no_version",
++                                :type => @plugin_type,
++                                :name => @config_name,
++                                :LOGSTASH_VERSION => LOGSTASH_VERSION))
++      ensure 
++        @@version_notice_given = true
+       end
+-      @@milestone_notice_given = true
+-      return true
+     end
+ 
+     def validate_check_invalid_parameter_names(params)
+diff --git a/lib/logstash/errors.rb b/lib/logstash/errors.rb
+index f91d4774209..8960a7f12bc 100644
+--- a/lib/logstash/errors.rb
++++ b/lib/logstash/errors.rb
+@@ -5,6 +5,7 @@ class EnvironmentError < Error; end
+   class ConfigurationError < Error; end
+   class PluginLoadingError < Error; end
+   class ShutdownSignal < StandardError; end
++  class PluginNoVersionError < Error; end
+ 
+   class Bug < Error; end
+   class ThisMethodWasRemoved < Bug; end
+diff --git a/lib/logstash/util/plugin_version.rb b/lib/logstash/util/plugin_version.rb
+new file mode 100644
+index 00000000000..ed6cb154304
+--- /dev/null
++++ b/lib/logstash/util/plugin_version.rb
+@@ -0,0 +1,43 @@
++require 'logstash/errors'
++require 'rubygems/version'
++require 'forwardable'
++
++module LogStash::Util
++  class PluginVersion
++    extend Forwardable
++    include Comparable
++
++    GEM_NAME_PREFIX = 'logstash'
++
++    def_delegators :@version, :to_s
++    attr_reader :version
++
++    def initialize(*options)
++      if options.size == 1 && options.first.is_a?(Gem::Version)
++        @version = options.first
++      else
++        @version = Gem::Version.new(options.join('.'))
++      end
++    end
++
++    def self.find_version!(name)
++      begin
++        specification = Gem::Specification.find_by_name(name)
++        new(specification.version)
++      rescue Gem::LoadError
++        # Rescuing the LoadError and raise a Logstash specific error.
++        # Likely we can't find the gem in the current GEM_PATH
++        raise LogStash::PluginNoVersionError
++      end
++    end
++
++    def self.find_plugin_version!(type, name)
++      plugin_name = [GEM_NAME_PREFIX, type, name].join('-')
++      find_version!(plugin_name)
++    end
++
++    def <=>(other)
++      version <=> other.version
++    end
++  end
++end
+diff --git a/locales/en.yml b/locales/en.yml
+index a5e9028113b..2af6d739ec4 100644
+--- a/locales/en.yml
++++ b/locales/en.yml
+@@ -34,23 +34,21 @@ en:
+         supported by this plugin. I will continue working as if you had not set
+         this setting.
+     plugin:
+-      milestone:
+-        "0": >-
+-          Using milestone 0 %{type} plugin '%{name}'. This plugin isn't well
+-          supported by the community and likely has no maintainer. For more
+-          information on plugin milestones, see
+-          http://logstash.net/docs/%{LOGSTASH_VERSION}/plugin-milestones
+-        "1": >-
+-          Using milestone 1 %{type} plugin '%{name}'. This plugin should work,
+-          but would benefit from use by folks like you. Please let us know if you
+-          find bugs or have suggestions on how to improve this plugin.  For more
+-          information on plugin milestones, see
+-          http://logstash.net/docs/%{LOGSTASH_VERSION}/plugin-milestones
+-        "2": >-
+-          Using milestone 2 %{type} plugin '%{name}'. This plugin should be
+-          stable, but if you see strange behavior, please let us know!
+-          For more information on plugin milestones, see
+-          http://logstash.net/docs/%{LOGSTASH_VERSION}/plugin-milestones
++      deprecated_milestone: >-
++        %{plugin} plugin is using the 'milestone' method to declare the version
++        of the plugin this method is deprecated in favor of declaring the
++        version inside the gemspec.
++      no_version: >-
++        %{name} plugin doesn't have a version. This plugin isn't well
++         supported by the community and likely has no maintainer.
++      version:
++        0-9-x:
++         Using version 0.9.x %{type} plugin '%{name}'. This plugin should work but
++         would benefit from use by folks like you. Please let us know if you
++         find bugs or have suggestions on how to improve this plugin.
++        0-1-x: >-
++         Using version 0.1.x %{type} plugin '%{name}'. This plugin isn't well
++         supported by the community and likely has no maintainer.
+     agent:
+       sighup: >-
+         SIGHUP received.
+diff --git a/spec/core/plugin_spec.rb b/spec/core/plugin_spec.rb
+index 76498129503..75c0fdb8191 100644
+--- a/spec/core/plugin_spec.rb
++++ b/spec/core/plugin_spec.rb
+@@ -29,4 +29,79 @@ class LogStash::Filters::LadyGaga < LogStash::Filters::Base
+     end
+     expect(LogStash::Plugin.lookup("filter", "lady_gaga")).to eq(LogStash::Filters::LadyGaga)
+   end
++
++  context "when validating the plugin version" do
++    let(:plugin_name) { 'logstash-filter-stromae' }
++    subject do
++      Class.new(LogStash::Filters::Base) do
++        config_name 'stromae'
++      end
++    end
++
++    it "doesn't warn the user if the version is superior or equal to 1.0.0" do
++      allow(Gem::Specification).to receive(:find_by_name)
++        .with(plugin_name)
++        .and_return(double(:version => Gem::Version.new('1.0.0')))
++
++      expect_any_instance_of(Cabin::Channel).not_to receive(:warn)
++      subject.validate({})
++    end
++
++    it 'warns the user if the plugin version is between 0.9.x and 1.0.0' do
++      allow(Gem::Specification).to receive(:find_by_name)
++        .with(plugin_name)
++        .and_return(double(:version => Gem::Version.new('0.9.1')))
++
++      expect_any_instance_of(Cabin::Channel).to receive(:warn)
++        .with(/Using version 0.9.x/)
++
++      subject.validate({})
++    end
++
++    it 'warns the user if the plugin version is inferior to 0.9.x' do
++      allow(Gem::Specification).to receive(:find_by_name)
++        .with(plugin_name)
++        .and_return(double(:version => Gem::Version.new('0.1.1')))
++
++      expect_any_instance_of(Cabin::Channel).to receive(:warn)
++        .with(/Using version 0.1.x/)
++      subject.validate({})
++    end
++
++    it "doesnt show the version notice more than once" do
++      one_notice = Class.new(LogStash::Filters::Base) do
++        config_name "stromae"
++      end
++
++      allow(Gem::Specification).to receive(:find_by_name)
++        .with(plugin_name)
++        .and_return(double(:version => Gem::Version.new('0.1.1')))
++
++      expect_any_instance_of(Cabin::Channel).to receive(:warn)
++        .once
++        .with(/Using version 0.1.x/)
++
++      one_notice.validate({})
++      one_notice.validate({})
++    end
++
++    it "warns the user if we can't find a defined version" do
++      expect_any_instance_of(Cabin::Channel).to receive(:warn)
++        .once
++        .with(/plugin doesn't have a version/)
++
++      subject.validate({})
++    end
++    
++
++    it 'logs an error if the plugin use the milestone option' do
++      expect_any_instance_of(Cabin::Channel).to receive(:error)
++        .with(/stromae plugin is using the 'milestone' method/)
++
++      class LogStash::Filters::Stromae < LogStash::Filters::Base
++        config_name "stromae"
++        milestone 2
++      end
++    end
++  end
+ end
+diff --git a/spec/util/plugin_version_spec.rb b/spec/util/plugin_version_spec.rb
+new file mode 100644
+index 00000000000..f7e4152e089
+--- /dev/null
++++ b/spec/util/plugin_version_spec.rb
+@@ -0,0 +1,48 @@
++require "logstash/util/plugin_version"
++require "logstash/errors"
++
++describe LogStash::Util::PluginVersion do
++  subject { LogStash::Util::PluginVersion }
++
++  context "#find_version!" do
++    it 'raises an PluginNoVersionError if we cant find the plugin in the gem path' do
++      dummy_name ='this-character-doesnt-exist-in-the-marvel-universe'
++      expect { subject.find_version!(dummy_name) }.to raise_error(LogStash::PluginNoVersionError)
++    end
++
++    it 'returns the version of the gem' do
++      expect { subject.find_version!('bundler') }.not_to raise_error
++    end
++  end
++
++  context "#new" do
++    it 'accepts a Gem::Version instance as argument' do
++      version = Gem::Version.new('1.0.1')
++      expect(subject.new(version).to_s).to eq(version.to_s)
++    end
++
++    it 'accepts an array for defining the version' do
++      version = subject.new(1, 0, 2)
++      expect(version.to_s).to eq('1.0.2')
++    end
++  end
++
++  context "When comparing instances" do
++    it 'allow to check if the version is newer or older' do
++      old_version = subject.new(0, 1, 0)
++      new_version = subject.new(1, 0, 1)
++
++      expect(old_version).to be < new_version
++      expect(old_version).to be <= new_version
++      expect(new_version).to be > old_version
++      expect(new_version).to be >= old_version
++    end
++
++    it 'return true if the version are equal' do
++      version1 = subject.new(0, 1, 0)
++      version2 = subject.new(0, 1, 0)
++
++      expect(version1).to eq(version2)
++    end
++  end
++end

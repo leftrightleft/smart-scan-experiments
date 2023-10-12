@@ -1,0 +1,184 @@
+diff --git a/logstash-core/src/main/java/org/logstash/ConvertedMap.java b/logstash-core/src/main/java/org/logstash/ConvertedMap.java
+index 6f08f1b6068..ec7fc242a97 100644
+--- a/logstash-core/src/main/java/org/logstash/ConvertedMap.java
++++ b/logstash-core/src/main/java/org/logstash/ConvertedMap.java
+@@ -98,6 +98,6 @@ public Object unconvert() {
+      * @return Interned String
+      */
+     private static String convertKey(final RubyString key) {
+-        return FieldReference.from(key.getByteList()).getKey();
++        return FieldReference.from(key).getKey();
+     }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/FieldReference.java b/logstash-core/src/main/java/org/logstash/FieldReference.java
+index b9547fa6271..dcb2ce0f497 100644
+--- a/logstash-core/src/main/java/org/logstash/FieldReference.java
++++ b/logstash-core/src/main/java/org/logstash/FieldReference.java
+@@ -1,5 +1,7 @@
+ package org.logstash;
+ 
++import org.jruby.RubyString;
++
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.HashMap;
+@@ -41,9 +43,15 @@ public final class FieldReference {
+         new FieldReference(EMPTY_STRING_ARRAY, Event.METADATA, META_PARENT);
+ 
+     /**
+-     * Cache of all existing {@link FieldReference}.
++     * Cache of all existing {@link FieldReference} by their {@link RubyString} source.
+      */
+-    private static final Map<CharSequence, FieldReference> CACHE =
++    private static final Map<RubyString, FieldReference> RUBY_CACHE =
++            new ConcurrentHashMap<>(64, 0.2F, 1);
++
++    /**
++     * Cache of all existing {@link FieldReference} by their {@link String} source.
++     */
++    private static final Map<String, FieldReference> CACHE =
+         new ConcurrentHashMap<>(64, 0.2F, 1);
+ 
+     private final String[] path;
+@@ -65,7 +73,16 @@ private FieldReference(final String[] path, final String key, final int type) {
+         hash = calculateHash(this.key, this.path, this.type);
+     }
+ 
+-    public static FieldReference from(final CharSequence reference) {
++    public static FieldReference from(final RubyString reference) {
++        // atomicity between the get and put is not important
++        final FieldReference result = RUBY_CACHE.get(reference);
++        if (result != null) {
++            return result;
++        }
++        return RUBY_CACHE.computeIfAbsent(reference.newFrozen(), ref -> from(ref.asJavaString()));
++    }
++
++    public static FieldReference from(final String reference) {
+         // atomicity between the get and put is not important
+         final FieldReference result = CACHE.get(reference);
+         if (result != null) {
+@@ -138,7 +155,7 @@ private static int calculateHash(final String key, final String[] path, final in
+         return prime * hash + type;
+     }
+ 
+-    private static FieldReference parseToCache(final CharSequence reference) {
++    private static FieldReference parseToCache(final String reference) {
+         final FieldReference result = parse(reference);
+         CACHE.put(reference, result);
+         return result;
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java b/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java
+index 9ee8e17db81..30b8e40373c 100644
+--- a/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java
++++ b/logstash-core/src/main/java/org/logstash/ext/JrubyEventExtLibrary.java
+@@ -78,14 +78,14 @@ public IRubyObject ruby_get_field(ThreadContext context, RubyString reference)
+         {
+             return Rubyfier.deep(
+                 context.runtime,
+-                this.event.getUnconvertedField(FieldReference.from(reference.getByteList()))
++                this.event.getUnconvertedField(FieldReference.from(reference))
+             );
+         }
+ 
+         @JRubyMethod(name = "set", required = 2)
+         public IRubyObject ruby_set_field(ThreadContext context, RubyString reference, IRubyObject value)
+         {
+-            final FieldReference r = FieldReference.from(reference.getByteList());
++            final FieldReference r = FieldReference.from(reference);
+             if (r  == FieldReference.TIMESTAMP_REFERENCE) {
+                 if (!(value instanceof JrubyTimestampExtLibrary.RubyTimestamp)) {
+                     throw context.runtime.newTypeError("wrong argument type " + value.getMetaClass() + " (expected LogStash::Timestamp)");
+@@ -120,7 +120,7 @@ public IRubyObject ruby_cancelled(ThreadContext context)
+         @JRubyMethod(name = "include?", required = 1)
+         public IRubyObject ruby_includes(ThreadContext context, RubyString reference) {
+             return RubyBoolean.newBoolean(
+-                context.runtime, this.event.includes(FieldReference.from(reference.getByteList()))
++                context.runtime, this.event.includes(FieldReference.from(reference))
+             );
+         }
+ 
+@@ -128,7 +128,7 @@ public IRubyObject ruby_includes(ThreadContext context, RubyString reference) {
+         public IRubyObject ruby_remove(ThreadContext context, RubyString reference) {
+             return Rubyfier.deep(
+                 context.runtime,
+-                this.event.remove(FieldReference.from(reference.getByteList()))
++                this.event.remove(FieldReference.from(reference))
+             );
+         }
+ 
+diff --git a/logstash-core/src/test/java/org/logstash/AccessorsTest.java b/logstash-core/src/test/java/org/logstash/AccessorsTest.java
+index 9906b9e741b..7a9c2467b65 100644
+--- a/logstash-core/src/test/java/org/logstash/AccessorsTest.java
++++ b/logstash-core/src/test/java/org/logstash/AccessorsTest.java
+@@ -187,20 +187,20 @@ public void testListIndexOutOfBounds() {
+         assertEquals(0, Accessors.listIndex(-10, 10));
+     }
+ 
+-    private static Object get(final ConvertedMap data, final CharSequence reference) {
++    private static Object get(final ConvertedMap data, final String reference) {
+         return Accessors.get(data, FieldReference.from(reference));
+     }
+ 
+-    private static Object set(final ConvertedMap data, final CharSequence reference,
++    private static Object set(final ConvertedMap data, final String reference,
+         final Object value) {
+         return Accessors.set(data, FieldReference.from(reference), value);
+     }
+ 
+-    private static Object del(final ConvertedMap data, final CharSequence reference) {
++    private static Object del(final ConvertedMap data, final String reference) {
+         return Accessors.del(data, FieldReference.from(reference));
+     }
+ 
+-    private static boolean includes(final ConvertedMap data, final CharSequence reference) {
++    private static boolean includes(final ConvertedMap data, final String reference) {
+         return Accessors.includes(data, FieldReference.from(reference));
+     }
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/FieldReferenceTest.java b/logstash-core/src/test/java/org/logstash/FieldReferenceTest.java
+index 9097dcf1006..287521ed907 100644
+--- a/logstash-core/src/test/java/org/logstash/FieldReferenceTest.java
++++ b/logstash-core/src/test/java/org/logstash/FieldReferenceTest.java
+@@ -47,7 +47,7 @@ public void testParseEmptyString() {
+         final FieldReference emptyReference = FieldReference.from("");
+         assertNotNull(emptyReference);
+         assertEquals(
+-            emptyReference, FieldReference.from(RubyUtil.RUBY.newString("").getByteList())
++            emptyReference, FieldReference.from(RubyUtil.RUBY.newString(""))
+         );
+     }
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/ext/JrubyEventExtLibraryTest.java b/logstash-core/src/test/java/org/logstash/ext/JrubyEventExtLibraryTest.java
+new file mode 100644
+index 00000000000..a42f2afe82c
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/ext/JrubyEventExtLibraryTest.java
+@@ -0,0 +1,28 @@
++package org.logstash.ext;
++
++import org.assertj.core.api.Assertions;
++import org.jruby.RubyString;
++import org.jruby.runtime.ThreadContext;
++import org.jruby.runtime.builtin.IRubyObject;
++import org.junit.Test;
++import org.logstash.Event;
++import org.logstash.RubyUtil;
++
++public class JrubyEventExtLibraryTest {
++
++    @Test
++    public void correctlyHandlesNonAsciiKeys() {
++        final RubyString key = rubyString("[テストフィールド]");
++        final RubyString value = rubyString("someValue");
++        final ThreadContext context = RubyUtil.RUBY.getCurrentContext();
++        final JrubyEventExtLibrary.RubyEvent event =
++            JrubyEventExtLibrary.RubyEvent.newRubyEvent(context.runtime, new Event());
++        event.ruby_set_field(context, key, value);
++        Assertions.assertThat(event.ruby_to_json(context, new IRubyObject[0]).asJavaString())
++            .contains("\"テストフィールド\":\"someValue\"");
++        }
++
++    private static RubyString rubyString(final String java) {
++        return RubyUtil.RUBY.newString(java);
++    }
++}

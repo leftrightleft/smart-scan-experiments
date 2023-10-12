@@ -1,0 +1,471 @@
+diff --git a/lib/logstash/event_v0.rb b/lib/logstash/event_v0.rb
+index fc6fbe329cc..9d0d8638e6a 100644
+--- a/lib/logstash/event_v0.rb
++++ b/lib/logstash/event_v0.rb
+@@ -49,12 +49,7 @@ def cancelled?
+   # Create a deep-ish copy of this event.
+   public
+   def clone
+-    newdata = @data.clone
+-    newdata["@fields"] = {}
+-    fields.each do |k,v|
+-      newdata["@fields"][k] = v.clone
+-    end
+-    return LogStash::Event.new(newdata)
++    return LogStash::Event.new(Marshal.load(Marshal.dump(@data)))
+   end # def clone
+ 
+   public
+diff --git a/spec/filters/clone.rb b/spec/filters/clone.rb
+new file mode 100644
+index 00000000000..47139018006
+--- /dev/null
++++ b/spec/filters/clone.rb
+@@ -0,0 +1,65 @@
++require "test_utils"
++require "logstash/filters/clone"
++
++describe LogStash::Filters::Clone do
++  extend LogStash::RSpec
++
++  describe "all defaults" do
++    type "original"
++    config <<-CONFIG
++      filter {
++        clone {
++          type => "original"
++          clones => ["clone", "clone", "clone"]
++        }
++      }
++    CONFIG
++
++    sample "hello world" do
++      insist { subject}.is_a? Array
++      insist { subject.length } == 4
++      subject.each_with_index do |s,i|
++        if i == 0
++          insist { s.type } == "original"
++        else
++          insist { s.type } == "clone"
++        end
++        insist { s["@message"] } == "hello world"
++      end
++    end
++  end
++
++  describe "Complex use" do
++    config <<-CONFIG
++      filter {
++        clone {
++          type => "nginx-access"
++          tags => ['TESTLOG']
++          clones => ["nginx-access-clone1", "nginx-access-clone2"]
++          add_tag => ['RABBIT','NO_ES']
++          remove_tag => ["TESTLOG"]
++        }
++      }
++    CONFIG
++
++    sample ({"@type" => "nginx-access", "@tags" => ['TESTLOG'], "@message" => "hello world"}) do
++      insist { subject }.is_a? Array
++      insist { subject.length } == 3
++      insist { subject[0].type } == "nginx-access"
++      #Initial event remains unchanged
++      insist { subject[0].tags }.include? "TESTLOG"
++      reject { subject[0].tags }.include? "RABBIT"
++      reject { subject[0].tags }.include? "NO_ES"
++      #All clones go through filter_matched
++      insist { subject[1].type } == "nginx-access-clone1"
++      reject { subject[1].tags }.include? "TESTLOG"
++      insist { subject[1].tags }.include? "RABBIT"
++      insist { subject[1].tags }.include? "NO_ES"
++
++      insist { subject[2].type } == "nginx-access-clone2"
++      reject { subject[2].tags }.include? "TESTLOG"
++      insist { subject[2].tags }.include? "RABBIT"
++      insist { subject[2].tags }.include? "NO_ES"
++    end
++  end
++end
+diff --git a/spec/filters/multiline.rb b/spec/filters/multiline.rb
+index a6e91cada9a..4781c1cf416 100644
+--- a/spec/filters/multiline.rb
++++ b/spec/filters/multiline.rb
+@@ -33,8 +33,8 @@
+     CONFIG
+ 
+     sample [ "120913 12:04:33 first line", "second line", "third line" ] do
+-      insist { subject.length } == 1
+-      insist { subject[0].message } ==  "120913 12:04:33 first line\nsecond line\nthird line"
++      reject { subject}.is_a? Array
++      insist { subject.message } ==  "120913 12:04:33 first line\nsecond line\nthird line"
+     end
+   end
+ 
+diff --git a/spec/filters/split.rb b/spec/filters/split.rb
+new file mode 100644
+index 00000000000..906328c1a0a
+--- /dev/null
++++ b/spec/filters/split.rb
+@@ -0,0 +1,58 @@
++require "test_utils"
++require "logstash/filters/split"
++
++describe LogStash::Filters::Split do
++  extend LogStash::RSpec
++
++  describe "all defaults" do
++    config <<-CONFIG
++      filter {
++        split { }
++      }
++    CONFIG
++
++    sample "big\nbird\nsesame street" do
++      insist { subject.length } == 3
++      insist { subject[0]["@message"] } == "big"
++      insist { subject[1]["@message"] } == "bird"
++      insist { subject[2]["@message"] } == "sesame street"
++    end
++  end
++
++  describe "custome terminator" do
++    config <<-CONFIG
++      filter {
++        split { 
++          terminator => "\t"
++        }
++      }
++    CONFIG
++
++    sample "big\tbird\tsesame street" do
++      insist { subject.length } == 3
++      insist { subject[0]["@message"] } == "big"
++      insist { subject[1]["@message"] } == "bird"
++      insist { subject[2]["@message"] } == "sesame street"
++    end
++  end
++
++  describe "custom field" do
++    config <<-CONFIG
++      filter {
++        split { 
++          field => "custom"
++        }
++      }
++    CONFIG
++
++    sample ({"@fields" => { "custom" => "big\nbird\nsesame street", "do_not_touch" => "1\n2\n3"}}) do
++      insist { subject.length } == 3
++      subject.each do |s|
++         insist { s["do_not_touch"] } == "1\n2\n3"
++      end
++      insist { subject[0]["custom"] } == "big"
++      insist { subject[1]["custom"] } == "bird"
++      insist { subject[2]["custom"] } == "sesame street"
++    end
++  end
++end
+diff --git a/spec/inputs/file.rb b/spec/inputs/file.rb
+new file mode 100644
+index 00000000000..78500661b33
+--- /dev/null
++++ b/spec/inputs/file.rb
+@@ -0,0 +1,182 @@
++require "test_utils"
++require "tempfile"
++
++describe "inputs/file" do
++  extend LogStash::RSpec
++
++  @@END_OF_TEST_DATA = "byebye"
++
++  describe "starts at the end of an existing file" do
++    tmp_file = Tempfile.new('logstash-spec-input-file')
++
++    config <<-CONFIG
++      input {
++        file {
++          type => "blah"
++          path => "#{tmp_file.path}"
++          sincedb_path => "/dev/null"
++        }
++      }
++    CONFIG
++
++    #This first part of the file should not be read
++    expected_lines = 20
++    File.open(tmp_file, "w") do |f|
++      expected_lines.times do |i|
++        f.write("Not Expected Sample event #{i}")
++        f.write("\n")
++      end
++    end
++
++    input do |plugins|
++      sequence = 0
++      file = plugins.first
++      output = Shiftback.new do |event|
++        if event.message == @@END_OF_TEST_DATA
++          file.teardown
++          insist {sequence } == expected_lines
++        else
++          sequence += 1
++          #Test data
++          insist { event.message }.start_with?("Expected")
++        end
++      end
++      file.register
++      #Launch the input in separate thread
++      thread = Thread.new(file, output) do |*args|
++        file.run(output)
++      end
++      # Need to be sure the input is started, any idea?
++      sleep(2)
++      # Append to the file
++      File.open(tmp_file, "a") do |f|
++        expected_lines.times do |i|
++          f.write("Expected Sample event #{i}")
++          f.write("\n")
++        end
++        f.write(@@END_OF_TEST_DATA)
++        f.write("\n")
++      end
++      thread.join
++    end # input
++  end
++
++  describe "starts at the beginning of an existing file" do
++    tmp_file = Tempfile.new('logstash-spec-input-file')
++
++    config <<-CONFIG
++      input {
++        file {
++          type => "blah"
++          path => "#{tmp_file.path}"
++          start_position => "beginning"
++          sincedb_path => "/dev/null"
++        }
++      }
++    CONFIG
++
++    #This first part of the file should be read
++    expected_lines = 20
++    File.open(tmp_file, "w") do |f|
++      expected_lines.times do |i|
++        f.write("Expected Sample event #{i}")
++        f.write("\n")
++      end
++    end
++
++    input do |plugins|
++      sequence = 0
++      file = plugins.first
++      output = Shiftback.new do |event|
++        if event.message == @@END_OF_TEST_DATA
++          file.teardown
++          insist {sequence } == expected_lines*2
++        else
++          sequence += 1
++          #Test data
++          insist { event.message }.start_with?("Expected")
++        end
++      end
++      file.register
++      #Launch the input in separate thread
++      thread = Thread.new(file, output) do |*args|
++        file.run(output)
++      end
++      # Need to be sure the input is started, any idea?
++      sleep(2)
++      # Append to the file
++      File.open(tmp_file, "a") do |f|
++        expected_lines.times do |i|
++          f.write("Expected Sample event #{i}")
++          f.write("\n")
++        end
++        f.write(@@END_OF_TEST_DATA)
++        f.write("\n")
++      end
++      thread.join
++    end # input
++  end
++
++  describe "restarts at the sincedb value" do
++    tmp_file = Tempfile.new('logstash-spec-input-file')
++    tmp_sincedb = Tempfile.new('logstash-spec-input-file-sincedb')
++
++    config <<-CONFIG
++      input {
++        file {
++          type => "blah"
++          path => "#{tmp_file.path}"
++          start_position => "beginning"
++          sincedb_path => "#{tmp_sincedb.path}"
++        }
++      }
++    CONFIG
++
++    #This first part of the file should NOT be read
++    expected_lines = 20
++    File.open(tmp_file, "w") do |f|
++      expected_lines.times do |i|
++        f.write("UnExpected Sample event #{i}")
++        f.write("\n")
++      end
++    end
++    #Manually write the sincedb
++    stat = File::Stat.new(tmp_file)
++    File.open(tmp_sincedb, "w") do |f|
++      f.write("#{stat.ino} #{stat.dev_major} #{stat.dev_minor} #{stat.size}")
++      f.write("\n")
++    end
++
++    input do |plugins|
++      sequence = 0
++      file = plugins.first
++      output = Shiftback.new do |event|
++        if event.message == @@END_OF_TEST_DATA
++          file.teardown
++          insist { sequence } == expected_lines
++        else
++          sequence += 1
++          #Test data
++          insist { event.message }.start_with?("Expected")
++        end
++      end
++      file.register
++      #Launch the input in separate thread
++      thread = Thread.new(file, output) do |*args|
++        file.run(output)
++      end
++      # Need to be sure the input is started, any idea?
++      sleep(2)
++      # Append to the file
++      File.open(tmp_file, "a") do |f|
++        expected_lines.times do |i|
++          f.write("Expected SaMple event #{i}")
++          f.write("\n")
++        end
++        f.write(@@END_OF_TEST_DATA)
++        f.write("\n")
++      end
++      thread.join
++    end # input
++  end
++end
+diff --git a/spec/outputs/file.rb b/spec/outputs/file.rb
+new file mode 100644
+index 00000000000..a7dea813f1e
+--- /dev/null
++++ b/spec/outputs/file.rb
+@@ -0,0 +1,72 @@
++require "test_utils"
++require "logstash/outputs/file"
++require "tempfile"
++
++describe LogStash::Outputs::File do
++  extend LogStash::RSpec
++
++  describe "ship lots of events to a file" do
++    event_count = 10000 + rand(500)
++    tmp_file = Tempfile.new('logstash-spec-output-file')
++    
++    config <<-CONFIG
++      input {
++        generator {
++          message => "hello world"
++          count => #{event_count}
++          type => "generator"
++        }
++      }
++      output {
++        file {
++          path => "#{tmp_file.path}"
++        }
++      }
++    CONFIG
++
++    agent do
++      line_num = 0
++      # Now check all events for order and correctness.
++      File.foreach(tmp_file) do |line|
++        event = LogStash::Event.from_json(line)
++        insist {event.message} == "hello world"
++        insist {event["sequence"]} == line_num
++        line_num += 1
++      end
++      insist {line_num} == event_count
++    end # agent
++  end
++
++  describe "ship lots of events to a file gzipped" do
++    event_count = 10000 + rand(500)
++    tmp_file = Tempfile.new('logstash-spec-output-file')
++
++    config <<-CONFIG
++      input {
++        generator {
++          message => "hello world"
++          count => #{event_count}
++          type => "generator"
++        }
++      }
++      output {
++        file {
++          path => "#{tmp_file.path}"
++          gzip => true
++        }
++      }
++    CONFIG
++
++    agent do
++      line_num = 0
++      # Now check all events for order and correctness.
++      Zlib::GzipReader.new(File.open(tmp_file)).each_line do |line|
++        event = LogStash::Event.from_json(line)
++        insist {event.message} == "hello world"
++        insist {event["sequence"]} == line_num
++        line_num += 1
++      end
++      insist {line_num} == event_count
++    end # agent
++  end
++end
+diff --git a/spec/test_utils.rb b/spec/test_utils.rb
+index ebf9c482573..4620090104e 100644
+--- a/spec/test_utils.rb
++++ b/spec/test_utils.rb
+@@ -54,8 +54,6 @@ def sample(event, &block)
+         plugin.register
+       end
+ 
+-      multiple_events = event.is_a?(Array)
+-
+       filters = @filters
+       name = event.to_s
+       name = name[0..50] + "..." if name.length > 50
+@@ -76,7 +74,9 @@ def sample(event, &block)
+           event.each do |e|
+             filters.each do |filter|
+               next if e.cancelled?
+-              filter.filter(e)
++              filter.filter(e) do |newevent|
++                event << newevent
++              end
+             end
+             results << e unless e.cancelled?
+           end
+@@ -100,11 +100,7 @@ def sample(event, &block)
+           @results = results
+         end # before :all
+ 
+-        if multiple_events
+-          subject { @results }
+-        else
+-          subject { @results.first }
+-        end
++        subject { @results.length > 1 ? @results: @results.first }
+         it("when processed", &block)
+       end
+     end # def sample

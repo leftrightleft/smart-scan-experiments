@@ -1,0 +1,108 @@
+diff --git a/docs/static/breaking-changes.asciidoc b/docs/static/breaking-changes.asciidoc
+index d1a0a220a43..d4d56f7e314 100644
+--- a/docs/static/breaking-changes.asciidoc
++++ b/docs/static/breaking-changes.asciidoc
+@@ -6,6 +6,8 @@ This section discusses the changes that you need to be aware of when migrating y
+ [float]
+ === Changes in Logstash Core
+ 
++* Logstash 5.0.0 requires Java 8
++
+ * **Application Settings:** Introduced a new way to configure application settings for Logstash through a settings.yml file. This file
+ is typically located in `LS_HOME/config`, or `/etc/logstash` when installed via packages. +
+ [IMPORTANT]
+@@ -15,7 +17,9 @@ after installing it via a package (RPM, DEB).
+ 
+ * **Release Packages:** When Logstash is installed via DEB, RPM packages, it uses `/usr/share/logstash` and `/var/lib/logstash` to install binaries.
+ Previously it used to install in `/opt/logstash` directory. This change was done to make the user experience
+-consistent with other Elastic products. Full directory layout is described in <<dir-layout>>.
++consistent with other Elastic products. Full directory layout is described in <<dir-layout>>. The source of release packages 
++have changed from `packages.elastic.co` to `artifacts.elastic.co`. For example, 5.x and all the patch releases in this series 
++source will be `https://artifacts.elastic.co/packages/5.x/apt`
+ 
+ * **Default Logging Level:** Changed the default log severity level to INFO instead of WARN to match Elasticsearch. Existing logs
+ (in core and plugins) were too noisy at INFO level, so we had to audit log messages and switch some of them to DEBUG
+diff --git a/qa/integration/services/helpers.sh b/qa/integration/services/helpers.sh
+index 872389497db..dbf970a3eba 100644
+--- a/qa/integration/services/helpers.sh
++++ b/qa/integration/services/helpers.sh
+@@ -19,6 +19,8 @@ wait_for_port() {
+         [[ $count -eq 0 ]] && return 1
+         sleep 0.5
+     done
++    # just in case, one more time
++    nc -z localhost $port
+ }
+ 
+ clean_install_dir() {
+diff --git a/qa/integration/services/kafka_setup.sh b/qa/integration/services/kafka_setup.sh
+index 0a836814b84..14b83c79cd0 100755
+--- a/qa/integration/services/kafka_setup.sh
++++ b/qa/integration/services/kafka_setup.sh
+@@ -14,6 +14,7 @@ fi
+ KAFKA_HOME=$INSTALL_DIR/kafka
+ KAFKA_TOPIC=logstash_topic_plain
+ KAFKA_MESSAGES=37
++KAFKA_LOGS_DIR=/tmp/ls_integration/kafka-logs
+ 
+ setup_kafka() {
+     local version=$1
+@@ -30,26 +31,42 @@ start_kafka() {
+     $KAFKA_HOME/bin/zookeeper-server-start.sh -daemon $KAFKA_HOME/config/zookeeper.properties
+     wait_for_port 2181
+     echo "Starting Kafka broker"
+-    $KAFKA_HOME/bin/kafka-server-start.sh -daemon $KAFKA_HOME/config/server.properties --override delete.topic.enable=true --override log.dirs=/tmp/ls_integration/kafka-logs
++    $KAFKA_HOME/bin/kafka-server-start.sh -daemon $KAFKA_HOME/config/server.properties --override delete.topic.enable=true --override log.dirs=$KAFKA_LOGS_DIR
+     wait_for_port 9092
+ }
+ 
+ wait_for_messages() {
+     local count=10
+     local read_lines=0
++    
++    # wait for non empty topic file first
++    while [[ ! -s $KAFKA_LOGS_DIR/$KAFKA_TOPIC-0/00000000000000000000.log ]] && [[ $count -ne 0 ]]; do
++      count=$(( $count - 1 ))
++      [[ $count -eq 0 ]] && return 1
++      sleep 0.5
++    done
++    
++    echo "Kafka topic file has been crated"
++    # reset
++    count=10
++
+     while [[ $read_lines -ne $KAFKA_MESSAGES ]] && [[ $count -ne 0 ]]; do
+-        read_lines=`$KAFKA_HOME/bin/kafka-console-consumer.sh --topic $KAFKA_TOPIC --new-consumer --bootstrap-server localhost:9092 --from-beginning --max-messages $KAFKA_MESSAGES | wc -l`
++        read_lines=`$KAFKA_HOME/bin/kafka-console-consumer.sh --topic $KAFKA_TOPIC --new-consumer --bootstrap-server localhost:9092 --from-beginning --max-messages $KAFKA_MESSAGES --timeout-ms 2000 | wc -l`
+         count=$(( $count - 1 ))
+         [[ $count -eq 0 ]] && return 1
+         sleep 0.5
+     done
++    echo "Kafka topic has been populated with test data"
+ }
+ 
+ setup_install_dir
+ setup_kafka $version
+ start_kafka
+ # Set up topics
+-$KAFKA_HOME/bin/kafka-topics.sh --create --partitions 1 --replication-factor 1 --topic logstash_topic_plain --zookeeper localhost:2181
++$KAFKA_HOME/bin/kafka-topics.sh --create --partitions 1 --replication-factor 1 --topic $KAFKA_TOPIC --zookeeper localhost:2181
++# check topic got created
++num_topic=`$KAFKA_HOME/bin/kafka-topics.sh --list --zookeeper localhost:2181 | grep $KAFKA_TOPIC | wc -l`
++[[ $num_topic -eq 1 ]]
+ # Add test messages to the newly created topic
+ cat $current_dir/../fixtures/how_sample.input | $KAFKA_HOME/bin/kafka-console-producer.sh --topic $KAFKA_TOPIC --broker-list localhost:9092
+ # Wait until broker has all messages
+diff --git a/qa/integration/services/kafka_teardown.sh b/qa/integration/services/kafka_teardown.sh
+index 0d10cffe844..079d781fc27 100755
+--- a/qa/integration/services/kafka_teardown.sh
++++ b/qa/integration/services/kafka_teardown.sh
+@@ -16,7 +16,7 @@ stop_kafka() {
+ # delete test topic
+ echo "Deleting test topic in Kafka"
+ $KAFKA_HOME/bin/kafka-topics.sh --delete --topic logstash_topic_plain --zookeeper localhost:2181 --if-exists
+-stop_kafka
++# stop_kafka
+ rm -rf /tmp/ls_integration/kafka-logs
+ rm -rf /tmp/zookeeper
+ 

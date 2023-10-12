@@ -1,0 +1,1358 @@
+diff --git a/logstash-core/lib/logstash/java_pipeline.rb b/logstash-core/lib/logstash/java_pipeline.rb
+index 3e3b73cc0fd..0f956f3f763 100644
+--- a/logstash-core/lib/logstash/java_pipeline.rb
++++ b/logstash-core/lib/logstash/java_pipeline.rb
+@@ -27,6 +27,7 @@
+ 
+ module LogStash; class JavaBasePipeline
+   include LogStash::Util::Loggable
++  include org.logstash.execution.QueueWriterProvider
+ 
+   attr_reader :settings, :config_str, :config_hash, :inputs, :filters, :outputs, :pipeline_id, :lir, :ephemeral_id
+   attr_reader :pipeline_config
+@@ -59,7 +60,7 @@ def initialize(pipeline_config, namespaced_metric = nil, agent = nil)
+       @logger.debug("Compiled pipeline code", default_logging_keys(:code => @lir.get_graph.to_string))
+     end
+     @inputs = @lir_execution.inputs
+-    @java_inputs = @lir_execution.javaInputs
++    @java_inputs_controller = org.logstash.execution.InputsController.new(@lir_execution.javaInputs)
+     @filters = @lir_execution.filters
+     @outputs = @lir_execution.outputs
+   end
+@@ -400,6 +401,7 @@ def dlq_enabled?
+ 
+   def wait_inputs
+     @input_threads.each(&:join)
++    @java_inputs_controller.awaitStop
+   end
+ 
+   def start_inputs
+@@ -418,6 +420,7 @@ def start_inputs
+ 
+     # then after all input plugins are successfully registered, start them
+     @inputs.each { |input| start_input(input) }
++    @java_inputs_controller.startInputs(self)
+   end
+ 
+   def start_input(plugin)
+@@ -484,6 +487,7 @@ def wait_for_workers
+   def stop_inputs
+     @logger.debug("Closing inputs", default_logging_keys)
+     @inputs.each(&:do_stop)
++    @java_inputs_controller.stopInputs
+     @logger.debug("Closed inputs", default_logging_keys)
+   end
+ 
+@@ -603,6 +607,10 @@ def inspect
+     }
+   end
+ 
++  def getQueueWriter(plugin_name)
++    wrapped_write_client(plugin_name)
++  end
++
+   private
+ 
+   def maybe_setup_out_plugins
+diff --git a/logstash-core/src/main/java/org/logstash/ackedqueue/ext/JRubyAckedQueueExt.java b/logstash-core/src/main/java/org/logstash/ackedqueue/ext/JRubyAckedQueueExt.java
+index bbd3b8aab8c..033f94cdcbd 100644
+--- a/logstash-core/src/main/java/org/logstash/ackedqueue/ext/JRubyAckedQueueExt.java
++++ b/logstash-core/src/main/java/org/logstash/ackedqueue/ext/JRubyAckedQueueExt.java
+@@ -104,6 +104,10 @@ public void rubyWrite(ThreadContext context, Event event) {
+         }
+     }
+ 
++    public void write(Event event) throws IOException {
++        this.queue.write(event);
++    }
++
+     @JRubyMethod(name = "read_batch", required = 2)
+     public IRubyObject ruby_read_batch(ThreadContext context, IRubyObject limit,
+         IRubyObject timeout) {
+diff --git a/logstash-core/src/main/java/org/logstash/execution/Codec.java b/logstash-core/src/main/java/org/logstash/execution/Codec.java
+new file mode 100644
+index 00000000000..bdae01675d8
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/execution/Codec.java
+@@ -0,0 +1,39 @@
++package org.logstash.execution;
++
++import org.logstash.Event;
++
++import java.io.OutputStream;
++import java.nio.ByteBuffer;
++import java.util.Map;
++import java.util.function.Consumer;
++
++public interface Codec extends LsPlugin {
++
++    /**
++     * Decodes events from the specified {@link ByteBuffer} and passes them to the provided
++     * {@link Consumer}. Clients of the codec are responsible for ensuring that the input buffer
++     * is in a valid state for reading. Upon completion of {@link Codec#decode}, the codec is
++     * responsible for ensuring that {@link ByteBuffer#limit} reflects the last point at which
++     * input bytes were decoded to events. The client is then responsible for returning the buffer
++     * to write mode via either {@link ByteBuffer#clear} or {@link ByteBuffer#compact} after
++     * {@link Codec#decode} returns and before resuming writes.
++     * @param buffer Input buffer from which events will be decoded.
++     * @param eventConsumer Consumer to which decoded events will be passed.
++     */
++    void decode(ByteBuffer buffer, Consumer<Map<String, Object>> eventConsumer);
++
++    /**
++     * Decodes all remaining events from the specified {@link ByteBuffer} along with any internal
++     * state that may remain after previous calls to {@link #decode(ByteBuffer, Consumer)}.
++     * @param buffer Input buffer from which events will be decoded.
++     * @param eventConsumer Consumer to which decoded events will be passed.
++     */
++    void flush(ByteBuffer buffer, Consumer<Map<String, Object>> eventConsumer);
++
++    /**
++     * Encodes an {@link Event} and writes it to the specified {@link OutputStream}.
++     * @param event The event to encode.
++     * @param output The stream to which the encoded event should be written.
++     */
++    void encode(Event event, OutputStream output);
++}
+diff --git a/logstash-core/src/main/java/org/logstash/execution/InputsController.java b/logstash-core/src/main/java/org/logstash/execution/InputsController.java
+new file mode 100644
+index 00000000000..71d13d74c76
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/execution/InputsController.java
+@@ -0,0 +1,45 @@
++package org.logstash.execution;
++
++import java.util.ArrayList;
++import java.util.Collection;
++
++/**
++ * Provides a single point of control for a set of Java inputs.
++ */
++public class InputsController {
++
++    private final Collection<Input> inputs;
++    private ArrayList<Thread> threads = new ArrayList<>();
++
++    public InputsController(final Collection<Input> inputs) {
++        this.inputs = inputs;
++    }
++
++    public void startInputs(final QueueWriterProvider provider) {
++        int inputCounter = 0;
++        for (Input input : inputs) {
++            String pluginName = input.getClass().getName(); // TODO: get annotated plugin name
++            Thread t = new Thread(() -> input.start(provider.getQueueWriter(pluginName)));
++            t.setName("input_" + (inputCounter++) + "_" + pluginName);
++            threads.add(t);
++            t.start();
++        }
++    }
++
++    public void stopInputs() {
++        for (Input input : inputs) {
++            input.stop();
++        }
++    }
++
++    public void awaitStop() {
++        // trivial implementation
++        for (Input input : inputs) {
++            try {
++                input.awaitStop();
++            } catch (InterruptedException e) {
++                // do nothing
++            }
++        }
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/execution/PluginHelper.java b/logstash-core/src/main/java/org/logstash/execution/PluginHelper.java
+new file mode 100644
+index 00000000000..61fba5ec39f
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/execution/PluginHelper.java
+@@ -0,0 +1,109 @@
++package org.logstash.execution;
++
++import org.logstash.execution.plugins.PluginConfigSpec;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++
++public final class PluginHelper {
++
++    public static final PluginConfigSpec<Map<String, String>> ADD_FIELD_CONFIG =
++            LsConfiguration.hashSetting("add_field");
++
++    //public static final PluginConfigSpec<Array> ADD_TAG_CONFIG =
++    //        LsConfiguration.arraySetting("add_tag");
++
++    public static final PluginConfigSpec<String> CODEC_CONFIG =
++            LsConfiguration.stringSetting("codec");
++
++    public static final PluginConfigSpec<Boolean> ENABLE_METRIC_CONFIG =
++            LsConfiguration.booleanSetting("enable_metric");
++
++    public static final PluginConfigSpec<String> ID_CONFIG =
++            LsConfiguration.stringSetting("id");
++
++    public static final PluginConfigSpec<Boolean> PERIODIC_FLUSH_CONFIG =
++            LsConfiguration.booleanSetting("periodic_flush");
++
++    //public static final PluginConfigSpec<Array> REMOVE_FIELD_CONFIG =
++    //        LsConfiguration.arraySetting("remove_field");
++
++    //public static final PluginConfigSpec<Array> REMOVE_TAG_CONFIG =
++    //        LsConfiguration.arraySetting("remove_tag");
++
++    //public static final PluginConfigSpec<Array> TAGS_CONFIG =
++    //        LsConfiguration.arraySetting("tags");
++
++    public static final PluginConfigSpec<String> TYPE_CONFIG =
++            LsConfiguration.stringSetting("type");
++
++
++    /**
++     * Returns a list of the options that are common to all input plugins.
++     */
++    public static Collection<PluginConfigSpec<?>> commonInputOptions() {
++        return commonInputOptions(Collections.EMPTY_LIST);
++    }
++
++    /**
++     * Combines the provided list of options with the options that are common to all input plugins
++     * ignoring any that are already present in the provided list. This allows plugins to override
++     * defaults and other values on the common config options.
++     */
++    public static Collection<PluginConfigSpec<?>> commonInputOptions(Collection<PluginConfigSpec<?>> options) {
++        return combineOptions(options, Arrays.asList(ADD_FIELD_CONFIG, ENABLE_METRIC_CONFIG,
++                CODEC_CONFIG,  ID_CONFIG, /*TAGS_CONFIG,*/ TYPE_CONFIG));
++    }
++
++    /**
++     * Returns a list of the options that are common to all output plugins.
++     */
++    public static Collection<PluginConfigSpec<?>> commonOutputOptions() {
++        return commonOutputOptions(Collections.EMPTY_LIST);
++    }
++
++    /**
++     * Combines the provided list of options with the options that are common to all output plugins
++     * ignoring any that are already present in the provided list. This allows plugins to override
++     * defaults and other values on the common config options.
++     */
++    public static Collection<PluginConfigSpec<?>> commonOutputOptions(Collection<PluginConfigSpec<?>> options) {
++        return combineOptions(options, Arrays.asList(ENABLE_METRIC_CONFIG, CODEC_CONFIG,  ID_CONFIG));
++    }
++
++    /**
++     * Returns a list of the options that are common to all filter plugins.
++     */
++    public static Collection<PluginConfigSpec<?>> commonFilterOptions() {
++        return commonFilterOptions(Collections.EMPTY_LIST);
++    }
++
++    /**
++     * Combines the provided list of options with the options that are common to all filter plugins
++     * ignoring any that are already present in the provided list. This allows plugins to override
++     * defaults and other values on the common config options.
++     */
++    public static Collection<PluginConfigSpec<?>> commonFilterOptions(Collection<PluginConfigSpec<?>> options) {
++        return combineOptions(options, Arrays.asList(ADD_FIELD_CONFIG, /*ADD_TAG_CONFIG,*/
++                ENABLE_METRIC_CONFIG, ID_CONFIG, PERIODIC_FLUSH_CONFIG /*, REMOVE_FIELD_CONFIG,
++                REMOVE_TAG_CONFIG*/));
++    }
++
++    private static Collection<PluginConfigSpec<?>> combineOptions(
++            Collection<PluginConfigSpec<?>> providedOptions,
++            Collection<PluginConfigSpec<?>> commonOptions) {
++        List<PluginConfigSpec<?>> options = new ArrayList<>();
++        options.addAll(providedOptions);
++        for (PluginConfigSpec pcs : commonOptions) {
++            if (!options.contains(pcs)) {
++                options.add(pcs);
++            }
++        }
++        return options;
++    }
++
++}
+diff --git a/logstash-core/src/main/java/org/logstash/execution/QueueWriterProvider.java b/logstash-core/src/main/java/org/logstash/execution/QueueWriterProvider.java
+new file mode 100644
+index 00000000000..f4052083d67
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/execution/QueueWriterProvider.java
+@@ -0,0 +1,8 @@
++package org.logstash.execution;
++
++import org.logstash.execution.queue.QueueWriter;
++
++public interface QueueWriterProvider {
++
++    QueueWriter getQueueWriter(String inputName);
++}
+diff --git a/logstash-core/src/main/java/org/logstash/execution/codecs/CodecFactory.java b/logstash-core/src/main/java/org/logstash/execution/codecs/CodecFactory.java
+new file mode 100644
+index 00000000000..5839722cc32
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/execution/codecs/CodecFactory.java
+@@ -0,0 +1,50 @@
++package org.logstash.execution.codecs;
++
++import org.logstash.execution.Codec;
++import org.logstash.execution.LsConfiguration;
++import org.logstash.execution.LsContext;
++
++import java.lang.reflect.Constructor;
++import java.util.concurrent.ConcurrentHashMap;
++
++public class CodecFactory {
++
++    // eagerly initialize singleton
++    private static final CodecFactory INSTANCE;
++
++    private ConcurrentHashMap<String, Class> codecMap = new ConcurrentHashMap<>();
++
++    // not necessary after DiscoverPlugins is implemented
++    static {
++        INSTANCE = new CodecFactory();
++        INSTANCE.addCodec("line", Line.class);
++    }
++
++    private CodecFactory() {
++        // singleton class
++    }
++
++    public static CodecFactory getInstance() {
++        return INSTANCE;
++    }
++
++    public void addCodec(String name, Class codecClass) {
++        codecMap.put(name, codecClass);
++    }
++
++    public Codec getCodec(String name, LsConfiguration configuration, LsContext context) {
++        if (name != null && codecMap.containsKey(name)) {
++            return instantiateCodec(codecMap.get(name), configuration, context);
++        }
++        return null;
++    }
++
++    private Codec instantiateCodec(Class clazz, LsConfiguration configuration, LsContext context) {
++        try {
++            Constructor<Codec> constructor = clazz.getConstructor(LsConfiguration.class, LsContext.class);
++            return constructor.newInstance(configuration, context);
++        } catch (Exception e) {
++            throw new IllegalStateException("Unable to instantiate codec", e);
++        }
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/execution/codecs/Line.java b/logstash-core/src/main/java/org/logstash/execution/codecs/Line.java
+new file mode 100644
+index 00000000000..b5d843658ef
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/execution/codecs/Line.java
+@@ -0,0 +1,131 @@
++package org.logstash.execution.codecs;
++
++import org.logstash.Event;
++import org.logstash.StringInterpolation;
++import org.logstash.execution.Codec;
++import org.logstash.execution.LogstashPlugin;
++import org.logstash.execution.LsConfiguration;
++import org.logstash.execution.LsContext;
++import org.logstash.execution.plugins.PluginConfigSpec;
++
++import java.io.IOException;
++import java.io.OutputStream;
++import java.nio.ByteBuffer;
++import java.nio.CharBuffer;
++import java.nio.charset.CharacterCodingException;
++import java.nio.charset.Charset;
++import java.nio.charset.CharsetDecoder;
++import java.nio.charset.CoderResult;
++import java.nio.charset.CodingErrorAction;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.function.Consumer;
++
++@LogstashPlugin(name = "line")
++public class Line implements Codec {
++
++    /*
++    private static final PluginConfigSpec<String> CHARSET_CONFIG =
++            LsConfiguration.stringSetting("charset", "UTF-8");
++
++    private static final PluginConfigSpec<String> DELIMITER_CONFIG =
++            LsConfiguration.stringSetting("delimiter", System.lineSeparator());
++
++    private static final PluginConfigSpec<String> FORMAT_CONFIG =
++            LsConfiguration.stringSetting("format");
++    */
++
++    static final String MESSAGE_FIELD = "message";
++
++    private final String delimiter;
++    private final Charset charset;
++    private String format = null;
++
++    private final CharBuffer charBuffer = ByteBuffer.allocateDirect(64 * 1024).asCharBuffer();
++    private final CharsetDecoder decoder;
++    private String remainder = "";
++
++    public Line(final LsConfiguration configuration, final LsContext context) {
++        /*
++        delimiter = configuration.get(DELIMITER_CONFIG);
++        charset = Charset.forName(configuration.get(CHARSET_CONFIG));
++        format = configuration.get(FORMAT_CONFIG);
++        */
++        delimiter = "\n";
++        charset = Charset.forName("UTF-8");
++        decoder = charset.newDecoder();
++        decoder.onMalformedInput(CodingErrorAction.IGNORE);
++    }
++
++    @Override
++    public void decode(ByteBuffer buffer, Consumer<Map<String, Object>> eventConsumer) {
++        int bufferPosition = buffer.position();
++        CoderResult result = decoder.decode(buffer, charBuffer, false);
++        charBuffer.flip();
++        String s = (remainder == null ? "" : remainder) + charBuffer.toString();
++        charBuffer.clear();
++
++        if (s.endsWith(delimiter)) {
++            // strip trailing delimiter, if any, to match Ruby implementation
++            s = s.substring(0, s.length() - delimiter.length());
++        } else {
++            int lastIndex = s.lastIndexOf(delimiter);
++            if (lastIndex == -1) {
++                buffer.position(bufferPosition);
++                s = "";
++            } else {
++                remainder = s.substring(lastIndex + 1, s.length());
++                s = s.substring(0, lastIndex);
++            }
++        }
++
++        if (s.length() > 0) {
++            String[] lines = s.split(delimiter, 0);
++            for (int k = 0; k < lines.length; k++) {
++                eventConsumer.accept(simpleMap(lines[k]));
++            }
++        }
++    }
++
++    @Override
++    public void flush(ByteBuffer buffer, Consumer<Map<String, Object>> eventConsumer) {
++        if (remainder.length() > 0 || buffer.position() != buffer.limit()) {
++            try {
++                String remainder = this.remainder + charset.newDecoder().decode(buffer).toString();
++                String[] lines = remainder.split(delimiter, 0);
++                for (int k = 0; k < lines.length; k++) {
++                    eventConsumer.accept(simpleMap(lines[k]));
++                }
++            } catch (CharacterCodingException e) {
++                throw new IllegalStateException(e);
++            }
++        }
++    }
++
++    private static Map<String, Object> simpleMap(String message) {
++        HashMap<String, Object> simpleMap = new HashMap<>();
++        simpleMap.put(MESSAGE_FIELD, message);
++        return simpleMap;
++    }
++
++    @Override
++    public void encode(Event event, OutputStream output) {
++        try {
++            String outputString = (format == null
++                    ? event.toJson()
++                    : StringInterpolation.evaluate(event, format))
++                    + delimiter;
++            output.write(outputString.getBytes(charset));
++        } catch (IOException e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    @Override
++    public Collection<PluginConfigSpec<?>> configSchema() {
++        //return Arrays.asList(CHARSET_CONFIG, DELIMITER_CONFIG, FORMAT_CONFIG);
++        return Collections.EMPTY_LIST;
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/execution/inputs/Stdin.java b/logstash-core/src/main/java/org/logstash/execution/inputs/Stdin.java
+new file mode 100644
+index 00000000000..b2ecb058ada
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/execution/inputs/Stdin.java
+@@ -0,0 +1,128 @@
++package org.logstash.execution.inputs;
++
++import org.logstash.execution.Codec;
++import org.logstash.execution.Input;
++import org.logstash.execution.LogstashPlugin;
++import org.logstash.execution.LsConfiguration;
++import org.logstash.execution.LsContext;
++import org.logstash.execution.plugins.PluginConfigSpec;
++import org.logstash.execution.queue.QueueWriter;
++import org.logstash.execution.codecs.CodecFactory;
++
++import java.io.FileDescriptor;
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.net.InetAddress;
++import java.net.UnknownHostException;
++import java.nio.ByteBuffer;
++import java.nio.channels.AsynchronousCloseException;
++import java.nio.channels.Channel;
++import java.nio.channels.Channels;
++import java.nio.channels.FileChannel;
++import java.nio.channels.InterruptibleChannel;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.Map;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.LongAdder;
++import java.util.function.Consumer;
++
++@LogstashPlugin(name = "java-stdin")
++public class Stdin implements Input, Consumer<Map<String, Object>> {
++
++    /*
++    public static final PluginConfigSpec<String> CODEC_CONFIG =
++            LsConfiguration.stringSetting("codec", "line");
++    */
++
++    private static final int BUFFER_SIZE = 64 * 1024;
++    static final int EVENT_BUFFER_LENGTH = 64;
++
++    private final LongAdder eventCounter = new LongAdder();
++    private String hostname;
++    private Codec codec;
++    private volatile boolean stopRequested = false;
++    private final CountDownLatch isStopped = new CountDownLatch(1);
++    private FileChannel input;
++    private QueueWriter writer;
++
++    /**
++     * Required Constructor Signature only taking a {@link LsConfiguration}.
++     *
++     * @param configuration Logstash Configuration
++     * @param context       Logstash Context
++     */
++    public Stdin(final LsConfiguration configuration, final LsContext context) {
++        this(configuration, context, new FileInputStream(FileDescriptor.in).getChannel());
++    }
++
++    Stdin(final LsConfiguration configuration, final LsContext context, FileChannel inputChannel) {
++        try {
++            hostname = InetAddress.getLocalHost().getHostName();
++        } catch (UnknownHostException e) {
++            hostname = "[unknownHost]";
++        }
++        //codec = CodecFactory.getInstance().getCodec(configuration.get(CODEC_CONFIG),
++        //        configuration, context);
++        codec = CodecFactory.getInstance().getCodec("line",
++                configuration, context);
++        input = inputChannel;
++    }
++
++    @Override
++    public void start(QueueWriter writer) {
++        this.writer = writer;
++        final ByteBuffer buffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
++        try {
++            while (!stopRequested && (input.read(buffer) > -1)) {
++                buffer.flip();
++                codec.decode(buffer, this);
++                buffer.compact();
++            }
++        } catch (AsynchronousCloseException e2) {
++            // do nothing -- this happens when stop is called during a pending read
++        } catch (IOException e) {
++            stopRequested = true;
++            throw new IllegalStateException(e);
++        } finally {
++            try {
++                input.close();
++            } catch (IOException e) {
++                // do nothing
++            }
++
++            buffer.flip();
++            codec.flush(buffer, this);
++            isStopped.countDown();
++        }
++    }
++
++    @Override
++    public void accept(Map<String, Object> event) {
++        event.putIfAbsent("hostname", hostname);
++        writer.push(event);
++        eventCounter.increment();
++    }
++
++    @Override
++    public void stop() {
++        stopRequested = true;
++        try {
++            input.close(); // interrupts any pending reads
++        } catch (IOException e) {
++            // do nothing
++        }
++    }
++
++    @Override
++    public void awaitStop() throws InterruptedException {
++        isStopped.await();
++    }
++
++    @Override
++    public Collection<PluginConfigSpec<?>> configSchema() {
++        //return PluginHelper.commonInputOptions(Collections.singletonList(CODEC_CONFIG));
++        return Collections.EMPTY_LIST;
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/execution/outputs/Stdout.java b/logstash-core/src/main/java/org/logstash/execution/outputs/Stdout.java
+new file mode 100644
+index 00000000000..1e7d05babd4
+--- /dev/null
++++ b/logstash-core/src/main/java/org/logstash/execution/outputs/Stdout.java
+@@ -0,0 +1,63 @@
++package org.logstash.execution.outputs;
++
++import org.logstash.Event;
++import org.logstash.execution.LogstashPlugin;
++import org.logstash.execution.LsConfiguration;
++import org.logstash.execution.LsContext;
++import org.logstash.execution.Output;
++import org.logstash.execution.plugins.PluginConfigSpec;
++import org.logstash.execution.PluginHelper;
++
++import java.io.IOException;
++import java.io.OutputStream;
++import java.io.PrintStream;
++import java.util.Collection;
++import java.util.concurrent.CountDownLatch;
++
++@LogstashPlugin(name = "java-stdout")
++public class Stdout implements Output {
++    public static final String DEFAULT_CODEC_NAME = "line"; // no codec support, yet
++
++    private PrintStream printer;
++    private final CountDownLatch done = new CountDownLatch(1);
++
++    /**
++     * Required Constructor Signature only taking a {@link LsConfiguration}.
++     *
++     * @param configuration Logstash Configuration
++     * @param context       Logstash Context
++     */
++    public Stdout(final LsConfiguration configuration, final LsContext context) {
++        this(configuration, context, System.out);
++    }
++
++    Stdout(final LsConfiguration configuration, final LsContext context, OutputStream targetStream) {
++        printer = new PrintStream(targetStream); // replace this with a codec
++    }
++
++    @Override
++    public void output(final Collection<Event> events) {
++        try {
++            for (Event e : events) {
++                printer.println(e.toJson()); // use codec here
++            }
++        } catch (final IOException ex) {
++            throw new IllegalStateException(ex);
++        }
++    }
++
++    @Override
++    public void stop() {
++        done.countDown();
++    }
++
++    @Override
++    public void awaitStop() throws InterruptedException {
++        done.await();
++    }
++
++    @Override
++    public Collection<PluginConfigSpec<?>> configSchema() {
++        return PluginHelper.commonOutputOptions();
++    }
++}
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JRubyWrappedWriteClientExt.java b/logstash-core/src/main/java/org/logstash/ext/JRubyWrappedWriteClientExt.java
+index 66431f66e88..751dd345b59 100644
+--- a/logstash-core/src/main/java/org/logstash/ext/JRubyWrappedWriteClientExt.java
++++ b/logstash-core/src/main/java/org/logstash/ext/JRubyWrappedWriteClientExt.java
+@@ -1,6 +1,7 @@
+ package org.logstash.ext;
+ 
+ import java.util.Collection;
++import java.util.Map;
+ import java.util.concurrent.TimeUnit;
+ import org.jruby.Ruby;
+ import org.jruby.RubyArray;
+@@ -13,10 +14,11 @@
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
+ import org.logstash.RubyUtil;
++import org.logstash.execution.queue.QueueWriter;
+ import org.logstash.instrument.metrics.counter.LongCounter;
+ 
+ @JRubyClass(name = "WrappedWriteClient")
+-public final class JRubyWrappedWriteClientExt extends RubyObject {
++public final class JRubyWrappedWriteClientExt extends RubyObject implements QueueWriter {
+ 
+     private static final RubySymbol PUSH_DURATION_KEY =
+         RubyUtil.RUBY.newSymbol("queue_push_duration_in_millis");
+@@ -27,6 +29,7 @@ public final class JRubyWrappedWriteClientExt extends RubyObject {
+     private DynamicMethod pushBatch;
+ 
+     private IRubyObject writeClient;
++    private QueueWriter wrappedQueueWriter;
+ 
+     private LongCounter eventsMetricsCounter;
+     private LongCounter eventsMetricsTime;
+@@ -44,6 +47,7 @@ public JRubyWrappedWriteClientExt(final Ruby runtime, final RubyClass metaClass)
+     @JRubyMethod(name = "initialize", optional = 4)
+     public IRubyObject ruby_initialize(final ThreadContext context, final IRubyObject[] args) {
+         this.writeClient = args[0];
++        this.wrappedQueueWriter = (QueueWriter)this.writeClient;
+         final String pipelineId = args[1].asJavaString();
+         final IRubyObject metric = args[2];
+         final IRubyObject pluginId = args[3];
+@@ -130,4 +134,12 @@ private static IRubyObject toSymbolArray(final String... strings) {
+         }
+         return RubyUtil.RUBY.newArray(res);
+     }
++
++    @Override
++    public void push(Map<String, Object> event) {
++        final long start = System.nanoTime();
++        incrementCounters(1L);
++        wrappedQueueWriter.push(event);
++        incrementTimers(start);
++    }
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JrubyAckedWriteClientExt.java b/logstash-core/src/main/java/org/logstash/ext/JrubyAckedWriteClientExt.java
+index ebe14b681d5..71e12c8ebee 100644
+--- a/logstash-core/src/main/java/org/logstash/ext/JrubyAckedWriteClientExt.java
++++ b/logstash-core/src/main/java/org/logstash/ext/JrubyAckedWriteClientExt.java
+@@ -1,6 +1,8 @@
+ package org.logstash.ext;
+ 
++import java.io.IOException;
+ import java.util.Collection;
++import java.util.Map;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import org.jruby.Ruby;
+ import org.jruby.RubyClass;
+@@ -9,11 +11,13 @@
+ import org.jruby.anno.JRubyMethod;
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
++import org.logstash.Event;
+ import org.logstash.RubyUtil;
+ import org.logstash.ackedqueue.ext.JRubyAckedQueueExt;
++import org.logstash.execution.queue.QueueWriter;
+ 
+ @JRubyClass(name = "AckedWriteClient")
+-public final class JrubyAckedWriteClientExt extends RubyObject {
++public final class JrubyAckedWriteClientExt extends RubyObject implements QueueWriter {
+ 
+     private JRubyAckedQueueExt queue;
+ 
+@@ -68,4 +72,14 @@ private void ensureOpen() {
+             throw new IllegalStateException("Tried to write to a closed queue.");
+         }
+     }
++
++    @Override
++    public void push(Map<String, Object> event) {
++        try {
++            queue.write(new Event(event));
++        } catch (IOException e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
+ }
+diff --git a/logstash-core/src/main/java/org/logstash/ext/JrubyMemoryWriteClientExt.java b/logstash-core/src/main/java/org/logstash/ext/JrubyMemoryWriteClientExt.java
+index cb7403fec26..a4927a5f6ee 100644
+--- a/logstash-core/src/main/java/org/logstash/ext/JrubyMemoryWriteClientExt.java
++++ b/logstash-core/src/main/java/org/logstash/ext/JrubyMemoryWriteClientExt.java
+@@ -1,6 +1,7 @@
+ package org.logstash.ext;
+ 
+ import java.util.Collection;
++import java.util.Map;
+ import java.util.concurrent.BlockingQueue;
+ import org.jruby.Ruby;
+ import org.jruby.RubyClass;
+@@ -9,11 +10,13 @@
+ import org.jruby.anno.JRubyMethod;
+ import org.jruby.runtime.ThreadContext;
+ import org.jruby.runtime.builtin.IRubyObject;
++import org.logstash.Event;
+ import org.logstash.RubyUtil;
+ import org.logstash.common.LsQueueUtils;
++import org.logstash.execution.queue.QueueWriter;
+ 
+ @JRubyClass(name = "MemoryWriteClient")
+-public final class JrubyMemoryWriteClientExt extends RubyObject {
++public final class JrubyMemoryWriteClientExt extends RubyObject implements QueueWriter {
+ 
+     private BlockingQueue<JrubyEventExtLibrary.RubyEvent> queue;
+ 
+@@ -49,4 +52,12 @@ public IRubyObject rubyPushBatch(final ThreadContext context, IRubyObject batch)
+         return this;
+     }
+ 
++    @Override
++    public void push(Map<String, Object> event) {
++        try {
++            queue.put(JrubyEventExtLibrary.RubyEvent.newRubyEvent(RubyUtil.RUBY, new Event(event)));
++        } catch (InterruptedException e) {
++            throw new IllegalStateException(e);
++        }
++    }
+ }
+diff --git a/logstash-core/src/test/java/org/logstash/execution/codecs/CodecFactoryTest.java b/logstash-core/src/test/java/org/logstash/execution/codecs/CodecFactoryTest.java
+new file mode 100644
+index 00000000000..3e5c7686e17
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/execution/codecs/CodecFactoryTest.java
+@@ -0,0 +1,37 @@
++package org.logstash.execution.codecs;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.logstash.execution.Codec;
++import org.logstash.execution.LsConfiguration;
++import org.logstash.execution.LsContext;
++
++import java.util.Collections;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++
++public class CodecFactoryTest {
++
++    private CodecFactory codecFactory;
++
++    @Before
++    public void setup() {
++        // shouldn't be necessary once DiscoverPlugins is fully implemented
++        codecFactory = CodecFactory.getInstance();
++        codecFactory.addCodec("line", Line.class);
++    }
++
++    @Test
++    public void testBasicLookups() {
++        LsConfiguration config = new LsConfiguration(Collections.EMPTY_MAP);
++        LsContext context = new LsContext();
++        Codec c = codecFactory.getCodec("line", config, context);
++        assertNotNull(c);
++        assertEquals(Line.class, c.getClass());
++
++        c = codecFactory.getCodec(null, config, context);
++        assertNull(c);
++    }
++}
+diff --git a/logstash-core/src/test/java/org/logstash/execution/codecs/LineTest.java b/logstash-core/src/test/java/org/logstash/execution/codecs/LineTest.java
+new file mode 100644
+index 00000000000..2a3c2be393f
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/execution/codecs/LineTest.java
+@@ -0,0 +1,312 @@
++package org.logstash.execution.codecs;
++
++import org.junit.Test;
++import org.logstash.Event;
++import org.logstash.execution.LsConfiguration;
++
++import java.io.ByteArrayOutputStream;
++import java.nio.ByteBuffer;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.function.Consumer;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++public class LineTest {
++
++    @Test
++    public void testSimpleDecode() {
++        String input = "abc";
++        testDecode(null, null, input, 0, 1, new String[]{input});
++    }
++
++    @Test
++    public void testDecodeDefaultDelimiter() {
++        String[] inputStrings = {"foo", "bar", "baz"};
++        String input = String.join(System.lineSeparator(), inputStrings);
++
++        testDecode(null, null, input, inputStrings.length - 1, 1, inputStrings);
++    }
++
++    @Test
++    public void testDecodeCustomDelimiter() {
++        String delimiter = "z";
++        String[] inputStrings = {"foo", "bar", "bat"};
++        String input = String.join(delimiter, inputStrings);
++
++        testDecode(delimiter, null, input, inputStrings.length - 1, 1, inputStrings);
++    }
++
++    @Test
++    public void testDecodeWithTrailingDelimiter() {
++        String delimiter = "\n";
++        String[] inputs = {"foo", "bar", "baz"};
++        String input = String.join(delimiter, inputs) + delimiter;
++
++        testDecode(null, null, input, inputs.length, 0, inputs);
++    }
++
++    @Test
++    public void testSuccessiveDecodesWithTrailingDelimiter() {
++        // setup inputs
++        String delimiter = "\n";
++        String[] inputs = {"foo", "bar", "baz"};
++        String input = String.join(delimiter, inputs) + delimiter;
++        byte[] inputBytes = input.getBytes();
++        TestEventConsumer eventConsumer = new TestEventConsumer();
++        TestEventConsumer flushedEvents = new TestEventConsumer();
++        Line line = getLineCodec(null, null);
++
++        // first call to decode
++        ByteBuffer buffer = ByteBuffer.allocate(inputBytes.length * 3);
++        buffer.put(inputBytes);
++        buffer.flip();
++        line.decode(buffer, eventConsumer);
++        assertEquals(inputs.length, eventConsumer.events.size());
++        compareMessages(inputs, eventConsumer.events, flushedEvents.events);
++
++        // second call to encode
++        eventConsumer.events.clear();
++        buffer.compact();
++        buffer.put(inputBytes);
++        buffer.flip();
++        line.decode(buffer, eventConsumer);
++        assertEquals(inputs.length, eventConsumer.events.size());
++        compareMessages(inputs, eventConsumer.events, flushedEvents.events);
++
++        buffer.compact();
++        buffer.flip();
++        line.flush(buffer, flushedEvents);
++        assertEquals(0, flushedEvents.events.size());
++    }
++
++    @Test
++    public void testDecodeOnDelimiterOnly() {
++        String delimiter = "z";
++        String input = "z";
++
++        testDecode(delimiter, null, input, 0, 0, new String[]{""});
++    }
++
++    @Test
++    public void testDecodeWithMulticharDelimiter() {
++        String delimiter = "xyz";
++        String[] inputs = {"a", "b", "c"};
++        String input = String.join(delimiter, inputs);
++
++        testDecode(delimiter, null, input, inputs.length - 1, 1, inputs);
++    }
++
++    @Test
++    public void testDecodeWithMulticharTrailingDelimiter() {
++        String delimiter = "xyz";
++        String[] inputs = {"foo", "bar", "baz"};
++        String input = String.join(delimiter, inputs) + delimiter;
++
++        testDecode(delimiter, null, input, inputs.length, 0, inputs);
++    }
++
++    @Test
++    public void testDecodeWithUtf8() {
++        String input = "München 安装中文输入法";
++        testDecode(null, null, input + System.lineSeparator(), 1, 0, new String[]{input});
++    }
++
++    @Test
++    public void testDecodeAcrossMultibyteCharBoundary() {
++        final int BUFFER_SIZE = 12;
++        int lastPos = 0;
++        TestEventConsumer eventConsumer = new TestEventConsumer();
++        String input = "安安安\n安安安\n安安安";
++        byte[] bytes = input.getBytes();
++        assertTrue(bytes.length > input.length());
++        ByteBuffer b1 = ByteBuffer.allocate(BUFFER_SIZE);
++        System.out.println(b1);
++        b1.put(bytes, lastPos, 12);
++        System.out.println(b1);
++        b1.flip();
++        System.out.println(b1);
++
++        Line line = getLineCodec(null, null);
++        line.decode(b1, eventConsumer);
++        System.out.println(b1);
++        b1.compact();
++        System.out.println(b1);
++
++        int remaining = b1.remaining();
++        lastPos += BUFFER_SIZE;
++        b1.put(bytes, lastPos, remaining);
++        System.out.println(b1);
++        b1.flip();
++        System.out.println(b1);
++        line.decode(b1, eventConsumer);
++        System.out.println(b1);
++        b1.compact();
++        System.out.println(b1);
++
++        remaining = b1.remaining();
++        lastPos += remaining;
++        b1.put(bytes, lastPos, bytes.length - lastPos);
++        System.out.println(b1);
++        b1.flip();
++        System.out.println(b1);
++        line.decode(b1, eventConsumer);
++        System.out.println(b1);
++        b1.compact();
++        System.out.println(b1);
++        b1.flip();
++        System.out.println(b1);
++        line.flush(b1, eventConsumer);
++    }
++
++    @Test
++    public void testFlush() {
++        String[] inputs = {"The", "quick", "brown", "fox", "jumps"};
++        String input = String.join(System.lineSeparator(), inputs);
++        testDecode(null, null, input, inputs.length - 1, 1, inputs);
++    }
++
++    private void testDecode(String delimiter, String charset, String inputString, Integer expectedPreflushEvents, Integer expectedFlushEvents, String[] expectedMessages) {
++        Line line = getLineCodec(delimiter, charset);
++
++        byte[] inputBytes = inputString.getBytes();
++        TestEventConsumer eventConsumer = new TestEventConsumer();
++        ByteBuffer inputBuffer = ByteBuffer.wrap(inputBytes, 0, inputBytes.length);
++        line.decode(inputBuffer, eventConsumer);
++        if (expectedPreflushEvents != null) {
++            assertEquals(expectedPreflushEvents.intValue(), eventConsumer.events.size());
++        }
++
++        inputBuffer.compact();
++        inputBuffer.flip();
++
++        TestEventConsumer flushConsumer = new TestEventConsumer();
++        line.flush(inputBuffer, flushConsumer);
++        if (expectedFlushEvents != null) {
++            assertEquals(expectedFlushEvents.intValue(), flushConsumer.events.size());
++        }
++
++        compareMessages(expectedMessages, eventConsumer.events, flushConsumer.events);
++    }
++
++    private static void compareMessages(String[] expectedMessages, List<Map<String, Object>> events, List<Map<String, Object>> flushedEvents) {
++        if (expectedMessages != null) {
++            for (int k = 0; k < events.size(); k++) {
++                assertEquals(expectedMessages[k], events.get(k).get(Line.MESSAGE_FIELD));
++            }
++            for (int k = events.size(); k < (events.size() + flushedEvents.size()); k++) {
++                assertEquals(expectedMessages[k], flushedEvents.get(k - events.size()).get(Line.MESSAGE_FIELD));
++            }
++        }
++    }
++
++    private static Line getLineCodec(String delimiter, String charset) {
++        Map<String, String> config = new HashMap<>();
++        if (delimiter != null) {
++            config.put("delimiter", delimiter);
++        }
++        if (charset != null) {
++            config.put("charset", charset);
++        }
++        return new Line(new LsConfiguration(config), null);
++    }
++
++    @Test
++    public void testDecodeWithCharset() throws Exception {
++        TestEventConsumer flushConsumer = new TestEventConsumer();
++
++        // decode with cp-1252
++        Line cp1252decoder = new Line(new LsConfiguration(Collections.singletonMap("charset", "cp1252")), null);
++        byte[] rightSingleQuoteInCp1252 = {(byte) 0x92};
++        ByteBuffer b1 = ByteBuffer.wrap(rightSingleQuoteInCp1252);
++        cp1252decoder.decode(b1, flushConsumer);
++        assertEquals(0, flushConsumer.events.size());
++        cp1252decoder.flush(b1, flushConsumer);
++        assertEquals(1, flushConsumer.events.size());
++        String fromCp1252 = (String) flushConsumer.events.get(0).get(Line.MESSAGE_FIELD);
++
++        // decode with UTF-8
++        flushConsumer.events.clear();
++        Line utf8decoder = new Line(new LsConfiguration(Collections.EMPTY_MAP), null);
++        byte[] rightSingleQuoteInUtf8 = {(byte) 0xE2, (byte) 0x80, (byte) 0x99};
++        ByteBuffer b2 = ByteBuffer.wrap(rightSingleQuoteInUtf8);
++        utf8decoder.decode(b2, flushConsumer);
++        assertEquals(0, flushConsumer.events.size());
++        utf8decoder.flush(b2, flushConsumer);
++        assertEquals(1, flushConsumer.events.size());
++        String fromUtf8 = (String) flushConsumer.events.get(0).get(Line.MESSAGE_FIELD);
++        assertEquals(fromCp1252, fromUtf8);
++    }
++
++    @Test
++    public void testEncode() {
++        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
++        Line line = new Line(new LsConfiguration(Collections.emptyMap()), null);
++        Event e = new Event();
++        e.setField("myfield1", "myvalue1");
++        e.setField("myfield2", 42L);
++        line.encode(e, outputStream);
++        e.setField("myfield1", "myvalue2");
++        e.setField("myfield2", 43L);
++        line.encode(e, outputStream);
++
++        String delimiter = System.lineSeparator();
++        String resultingString = outputStream.toString();
++        // first delimiter should occur at the halfway point of the string
++        assertEquals(resultingString.indexOf(delimiter), (resultingString.length() / 2) - delimiter.length());
++        // second delimiter should occur at end of string
++        assertEquals(resultingString.lastIndexOf(delimiter), resultingString.length() - delimiter.length());
++    }
++
++    @Test
++    public void testEncodeWithCustomDelimiter() {
++        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
++        String delimiter = "xyz";
++        Line line = new Line(new LsConfiguration(Collections.singletonMap("delimiter", delimiter)), null);
++        Event e = new Event();
++        e.setField("myfield1", "myvalue1");
++        e.setField("myfield2", 42L);
++        line.encode(e, outputStream);
++        e.setField("myfield1", "myvalue2");
++        e.setField("myfield2", 43L);
++        line.encode(e, outputStream);
++
++        String resultingString = outputStream.toString();
++        // first delimiter should occur at the halfway point of the string
++        assertEquals(resultingString.indexOf(delimiter), (resultingString.length() / 2) - delimiter.length());
++        // second delimiter should occur at end of string
++        assertEquals(resultingString.lastIndexOf(delimiter), resultingString.length() - delimiter.length());
++    }
++
++    @Test
++    public void testEncodeWithFormat() {
++        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
++        Line line = new Line(new LsConfiguration(Collections.singletonMap("format", "%{host}-%{message}")), null);
++        String message = "Hello world";
++        String host = "test";
++        String expectedOutput = host + "-" + message + System.lineSeparator();
++        Event e = new Event();
++        e.setField("message", message);
++        e.setField("host", host);
++
++        line.encode(e, outputStream);
++
++        String resultingString = outputStream.toString();
++        assertEquals(expectedOutput, resultingString);
++    }
++
++}
++
++class TestEventConsumer implements Consumer<Map<String, Object>> {
++
++    List<Map<String, Object>> events = new ArrayList<>();
++
++    @Override
++    public void accept(Map<String, Object> stringObjectMap) {
++        events.add(stringObjectMap);
++    }
++}
+diff --git a/logstash-core/src/test/java/org/logstash/execution/inputs/StdinTest.java b/logstash-core/src/test/java/org/logstash/execution/inputs/StdinTest.java
+new file mode 100644
+index 00000000000..d4e1e54aa9a
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/execution/inputs/StdinTest.java
+@@ -0,0 +1,92 @@
++package org.logstash.execution.inputs;
++
++import org.junit.Test;
++import org.logstash.execution.LsConfiguration;
++import org.logstash.execution.queue.QueueWriter;
++
++import java.io.IOException;
++import java.io.RandomAccessFile;
++import java.nio.ByteBuffer;
++import java.nio.channels.FileChannel;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.fail;
++
++public class StdinTest {
++
++
++    @Test
++    public void testSimpleEvent() throws IOException {
++        String testInput = "foo" + System.lineSeparator();
++        TestQueueWriter queueWriter = testStdin(testInput.getBytes());
++        assertEquals(1, queueWriter.getEvents().size());
++    }
++
++    @Test
++    public void testEvents() throws IOException {
++        String testInput = "foo" + System.lineSeparator() + "bar" + System.lineSeparator() + "baz" + System.lineSeparator();
++        TestQueueWriter queueWriter = testStdin(testInput.getBytes());
++        assertEquals(3, queueWriter.getEvents().size());
++    }
++
++    @Test
++    public void testUtf8Events() throws IOException {
++        String[] inputs = {"München1", "安装中文输入法", "München3"};
++        String testInput = String.join(System.lineSeparator(), inputs) + System.lineSeparator();
++        TestQueueWriter queueWriter = testStdin(testInput.getBytes());
++
++        List<Map<String, Object>> events = queueWriter.getEvents();
++        assertEquals(3, events.size());
++        for (int k = 0; k < inputs.length; k++) {
++            assertEquals(inputs[k], events.get(k).get("message"));
++        }
++    }
++
++    private static TestQueueWriter testStdin(byte[] input) throws IOException {
++        TestQueueWriter queueWriter = new TestQueueWriter();
++        try (FileChannel inChannel = getTestFileChannel(input)) {
++            Stdin stdin = new Stdin(new LsConfiguration(Collections.EMPTY_MAP), null, inChannel);
++            Thread t = new Thread(() -> stdin.start(queueWriter));
++            t.start();
++            try {
++                Thread.sleep(50);
++                stdin.awaitStop();
++            } catch (InterruptedException e) {
++                fail("Stdin.awaitStop failed with exception: " + e);
++            }
++        }
++        return queueWriter;
++    }
++
++    private static FileChannel getTestFileChannel(byte[] testBytes) throws IOException {
++        Path tempFile = Files.createTempFile("StdinTest","");
++        RandomAccessFile raf = new RandomAccessFile(tempFile.toString(), "rw");
++        FileChannel fc = raf.getChannel();
++        fc.write(ByteBuffer.wrap(testBytes));
++        fc.position(0);
++        return fc;
++    }
++
++}
++
++class TestQueueWriter implements QueueWriter {
++
++    private List<Map<String, Object>> events = new ArrayList<>();
++
++    @Override
++    public void push(Map<String, Object> event) {
++        synchronized (this) {
++            events.add(event);
++        }
++    }
++
++    public List<Map<String, Object>> getEvents() {
++        return events;
++    }
++}
+diff --git a/logstash-core/src/test/java/org/logstash/execution/outputs/StdoutTest.java b/logstash-core/src/test/java/org/logstash/execution/outputs/StdoutTest.java
+new file mode 100644
+index 00000000000..6af1c1a06f8
+--- /dev/null
++++ b/logstash-core/src/test/java/org/logstash/execution/outputs/StdoutTest.java
+@@ -0,0 +1,64 @@
++package org.logstash.execution.outputs;
++
++import com.fasterxml.jackson.core.JsonProcessingException;
++import org.junit.Test;
++import org.logstash.Event;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.util.Arrays;
++import java.util.Collection;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++
++public class StdoutTest {
++    private static boolean streamWasClosed = false;
++
++    /**
++     * Verifies that the stdout output is reloadable because it does not close the underlying
++     * output stream which, outside of test cases, is always {@link java.lang.System#out}.
++     */
++    @Test
++    public void testUnderlyingStreamIsNotClosed() {
++        OutputStream dummyOutputStream = new ByteArrayOutputStream(0) {
++            @Override
++            public void close() throws IOException {
++                streamWasClosed = true;
++                super.close();
++            }
++        };
++        Stdout stdout = new Stdout(null, null, dummyOutputStream);
++        stdout.output(getTestEvents());
++        stdout.stop();
++
++        assertFalse(streamWasClosed);
++    }
++
++    @Test
++    public void testEvents() throws JsonProcessingException {
++        StringBuilder expectedOutput = new StringBuilder();
++        Collection<Event> testEvents = getTestEvents();
++        for (Event e : testEvents) {
++            expectedOutput.append(String.format(e.toJson() + "%n"));
++        }
++
++        OutputStream dummyOutputStream = new ByteArrayOutputStream(0);
++        Stdout stdout = new Stdout(null, null, dummyOutputStream);
++        stdout.output(testEvents);
++        stdout.stop();
++
++        assertEquals(expectedOutput.toString(), dummyOutputStream.toString());
++    }
++
++    private static Collection<Event> getTestEvents() {
++        Event e1 = new Event();
++        e1.setField("myField", "event1");
++        Event e2 = new Event();
++        e2.setField("myField", "event2");
++        Event e3 = new Event();
++        e3.setField("myField", "event3");
++        return Arrays.asList(new Event[]{e1, e2, e3});
++    }
++}

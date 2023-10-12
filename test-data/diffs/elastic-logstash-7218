@@ -1,0 +1,1708 @@
+diff --git a/config/logstash.yml b/config/logstash.yml
+index c50e6bd614c..4444f155a5e 100644
+--- a/config/logstash.yml
++++ b/config/logstash.yml
+@@ -85,6 +85,25 @@
+ #
+ # config.debug: false
+ #
++# ------------ Module Settings ---------------
++# Define modules here.  Modules definitions must be defined as an array.
++# The simple way to see this is to prepend each `name` with a `-`, and keep
++# all associated variables under the `name` they are associated with, and 
++# above the next, like this:
++#
++# modules:
++#   - name: MODULE_NAME
++#     var.PLUGINTYPE1.PLUGINNAME1.KEY1: VALUE
++#     var.PLUGINTYPE1.PLUGINNAME1.KEY2: VALUE
++#     var.PLUGINTYPE2.PLUGINNAME1.KEY1: VALUE
++#     var.PLUGINTYPE3.PLUGINNAME3.KEY1: VALUE
++#
++# Module variable names must be in the format of 
++#
++# var.PLUGIN_TYPE.PLUGIN_NAME.KEY
++#
++# modules:
++#
+ # ------------ Queuing Settings --------------
+ #
+ # Internal queuing model, "memory" for legacy in-memory based queuing and
+@@ -169,3 +188,4 @@
+ #
+ # Where to find custom plugins
+ # path.plugins: []
++
+diff --git a/logstash-core/lib/logstash/bootstrap_check/default_config.rb b/logstash-core/lib/logstash/bootstrap_check/default_config.rb
+index 8331c861fc7..257e4243189 100644
+--- a/logstash-core/lib/logstash/bootstrap_check/default_config.rb
++++ b/logstash-core/lib/logstash/bootstrap_check/default_config.rb
+@@ -1,21 +1,87 @@
+ # encoding: utf-8
+ require "logstash/errors"
++require "logstash/logging"
+ 
+ module LogStash module BootstrapCheck
+   class DefaultConfig
+-    def self.check(settings)
+-      if settings.get("config.string").nil? && settings.get("path.config").nil?
+-        raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.missing-configuration")
+-      end
++    include LogStash::Util::Loggable
++
++    def initialize(settings)
++      @settings = settings
++    end
++
++    def config_reload?
++      @settings.get("config.reload.automatic")
++    end
++
++    def config_string?
++      @settings.get("config.string")
++    end
+ 
+-      if settings.get("config.string") && settings.get("path.config")
++    def path_config?
++      @settings.get("path.config")
++    end
++
++    def config_modules?
++      # We want it to report true if not empty
++      !@settings.get("modules").empty?
++    end
++
++    def cli_modules?
++      # We want it to report true if not empty
++      !@settings.get("modules.cli").empty?
++    end
++
++    def both_config_flags?
++      config_string? && path_config?
++    end
++
++    def both_module_configs?
++      cli_modules? && config_modules?
++    end
++
++    def config_defined?
++      config_string? || path_config?
++    end
++
++    def modules_defined?
++      cli_modules? || config_modules?
++    end
++
++    def any_config?
++      config_defined? || modules_defined?
++    end
++
++    def check
++      # Check if both -f and -e are present
++      if both_config_flags?
+         raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.config-string-path-exclusive")
+       end
+ 
+-      if settings.get("config.reload.automatic") && settings.get("path.config").nil?
+-        # there's nothing to reload
++      # Make note that if modules are configured in both cli and logstash.yml that cli module  
++      # settings will be used, and logstash.yml modules settings ignored
++      if both_module_configs?
++        logger.info(I18n.t("logstash.runner.cli-module-override"))
++      end
++
++      # Check if both config (-f or -e) and modules are configured
++      if config_defined? && modules_defined?
++        raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.config-module-exclusive")
++      end
++
++      # Check for absence of any configuration
++      if !any_config?
++        raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.missing-configuration")
++      end
++
++      # Check to ensure that if configuration auto-reload is used that -f is specified
++      if config_reload? && !path_config?
+         raise LogStash::BootstrapCheckError, I18n.t("logstash.runner.reload-without-config-path")
+       end
+     end
++
++    def self.check(settings)
++      DefaultConfig.new(settings).check
++    end
+   end
+ end end
+diff --git a/logstash-core/lib/logstash/config/source/modules.rb b/logstash-core/lib/logstash/config/source/modules.rb
+new file mode 100644
+index 00000000000..20e8ce31f6b
+--- /dev/null
++++ b/logstash-core/lib/logstash/config/source/modules.rb
+@@ -0,0 +1,54 @@
++# encoding: utf-8
++require "logstash/config/source/base"
++require "logstash/config/pipeline_config"
++require "logstash/util/loggable"
++require "logstash/elasticsearch_client"
++require "logstash/modules/importer"
++require "logstash/errors"
++
++module LogStash module Config module Source
++  class Modules < Base
++    include LogStash::Util::Loggable
++    def pipeline_configs
++      pipelines = []
++      plugin_modules = LogStash::PLUGIN_REGISTRY.plugins_with_type(:modules)
++
++      modules_array = @settings.get("modules.cli").empty? ? @settings.get("modules") : @settings.get("modules.cli")
++      logger.debug("Configured modules", :modules_array => modules_array.to_s)
++      module_names = []
++      module_names = modules_array.collect {|module_hash| module_hash["name"]}
++      if module_names.length > module_names.uniq.length
++        duplicate_modules = module_names.group_by(&:to_s).select { |_,v| v.size > 1 }.keys
++        raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.modules-must-be-unique", :duplicate_modules => duplicate_modules)
++      end
++      ### Here is where we can force the modules_array to use only [0] for 5.5, and leave
++      ### a warning/error message to that effect.
++      modules_array.each do |module_hash|
++        begin
++          import_engine = LogStash::Modules::Importer.new(LogStash::ElasticsearchClient.build(module_hash))
++
++          current_module = plugin_modules.find { |allmodules| allmodules.module_name == module_hash["name"] }
++          alt_name = "module-#{module_hash["name"]}"
++          pipeline_id = alt_name
++
++          current_module.with_settings(module_hash)
++          current_module.import(import_engine)
++          config_string = current_module.config_string
++
++          logger.debug("Config string for module", :config_string => config_string, :module => module_hash["name"])
++          config_part = org.logstash.common.SourceWithMetadata.new("module", alt_name, config_string)
++
++          pipelines << PipelineConfig.new(self, pipeline_id.to_sym, config_part, @settings)
++        rescue => e
++          raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.parse-failed", :error => e.message)
++        end
++      end
++      pipelines
++    end
++
++    def match?
++      # will fill this later
++      true
++    end
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/config/source_loader.rb b/logstash-core/lib/logstash/config/source_loader.rb
+index 84983c2bd52..abcfd2f5d11 100644
+--- a/logstash-core/lib/logstash/config/source_loader.rb
++++ b/logstash-core/lib/logstash/config/source_loader.rb
+@@ -1,5 +1,6 @@
+ # encoding: utf-8
+ require "logstash/config/source/local"
++require "logstash/config/source/modules"
+ require "logstash/errors"
+ require "thread"
+ require "set"
+diff --git a/logstash-core/lib/logstash/elasticsearch_client.rb b/logstash-core/lib/logstash/elasticsearch_client.rb
+new file mode 100644
+index 00000000000..9e3bfa84491
+--- /dev/null
++++ b/logstash-core/lib/logstash/elasticsearch_client.rb
+@@ -0,0 +1,94 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++require "elasticsearch"
++require "elasticsearch/transport/transport/http/manticore"
++        #
++        #     client = Elasticsearch::Client.new transport_class: Elasticsearch::Transport::Transport::HTTP::Manticore
++module LogStash class ElasticsearchClient
++  include LogStash::Util::Loggable
++
++  class Response
++    # duplicated here from Elasticsearch::Transport::Transport::Response
++    # to create a normailised response across different client IMPL
++    attr_reader :status, :body, :headers
++    def initialize(status, body, headers={})
++      @status, @body, @headers = status, body, headers
++      @body = body.force_encoding('UTF-8') if body.respond_to?(:force_encoding)
++    end
++  end
++
++  def self.build(settings)
++    new(RubyClient.new(settings, logger))
++  end
++
++  class RubyClient
++    def initialize(settings, logger)
++      @settings = settings
++      @logger = logger
++      @client = Elasticsearch::Client.new(client_args)
++    end
++
++    def delete(path)
++      begin
++        normalize_response(@client.perform_request('DELETE', path, {}, nil))
++      rescue Exception => e
++        if e.class.to_s =~ /NotFound/ || e.message =~ /Not\s*Found|404/i
++          Response.new(404, "", {})
++        else
++          raise e
++        end
++      end
++    end
++
++    def put(path, content)
++      normalize_response(@client.perform_request('PUT', path, {}, content))
++    end
++
++    def head(path)
++      begin
++        normalize_response(@client.perform_request('HEAD', path, {}, nil))
++      rescue Exception => e
++        if e.class.to_s =~ /NotFound/ || e.message =~ /Not\s*Found|404/i
++          Response.new(404, "", {})
++        else
++          raise e
++        end
++      end
++    end
++
++    private
++
++    def normalize_response(response)
++      Response.new(response.status, response.body, response.headers)
++    end
++
++    def client_args
++      {
++        :transport_class => Elasticsearch::Transport::Transport::HTTP::Manticore,
++        :hosts => [*unpack_hosts],
++        :logger => @logger,
++      }
++    end
++
++    def unpack_hosts
++      @settings.fetch("var.output.elasticsearch.host", "logstash:9200").split(',').map(&:strip)
++    end
++  end
++
++  def initialize(client)
++    @client = client
++  end
++
++  def delete(path)
++    @client.delete(path)
++  end
++
++  def put(path, content)
++    @client.put(path, content)
++  end
++
++  def head(path)
++    @client.head(path)
++  end
++end end # class LogStash::ModulesImporter
+diff --git a/logstash-core/lib/logstash/environment.rb b/logstash-core/lib/logstash/environment.rb
+index 0eb7e34df9e..44da34a3cc8 100644
+--- a/logstash-core/lib/logstash/environment.rb
++++ b/logstash-core/lib/logstash/environment.rb
+@@ -20,6 +20,8 @@ module Environment
+     Setting::NullableString.new("path.config", nil, false),
+  Setting::WritableDirectory.new("path.data", ::File.join(LogStash::Environment::LOGSTASH_HOME, "data")),
+     Setting::NullableString.new("config.string", nil, false),
++                    Setting.new("modules.cli", Array, []),
++                    Setting.new("modules", Array, []),
+            Setting::Boolean.new("config.test_and_exit", false),
+            Setting::Boolean.new("config.reload.automatic", false),
+            Setting::Numeric.new("config.reload.interval", 3), # in seconds
+diff --git a/logstash-core/lib/logstash/modules/cli_parser.rb b/logstash-core/lib/logstash/modules/cli_parser.rb
+new file mode 100644
+index 00000000000..6c9da0d1e8f
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/cli_parser.rb
+@@ -0,0 +1,74 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++require "logstash/errors"
++
++module LogStash module Modules class CLIParser
++  include LogStash::Util::Loggable
++
++  attr_reader :output
++  def initialize(module_names, module_variables)
++    @output = []
++    # The #compact here catches instances when module_variables may be nil or
++    # [nil] and sets it to []
++    parse_it(module_names, Array(module_variables).compact)
++  end
++
++  def parse_modules(module_list)
++    parsed_modules = []
++    module_list.each do |module_value|
++      # Calling --modules but not filling it results in [nil], so skip that.
++      next if module_value.nil?
++      # Catch if --modules was launched empty but an option/flag (-something)
++      # follows immediately after
++      if module_value.start_with?('-')
++        raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.modules-empty-value", :modules => module_names)
++      end
++      parsed_modules.concat module_value.split(',')
++    end
++    parsed_modules
++  end
++
++  def get_kv(module_name, unparsed)
++    # Ensure that there is at least 1 equals sign in our variable string
++    # Using String#partition to split on the first '='
++    # This hackery is to catch the possibility of an equals (`=`) sign
++    # in a passphrase, which might result in an incomplete key.  The
++    # portion before the first `=` should always be the key, leaving
++    # the rest to be the value
++    k, op, rest = uparsed.partition('=')
++    if rest.size.zero?
++      raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.modules-variables-malformed", :rawvar => (module_name + '.' + unparsed))
++    end
++    return k.strip, rest.strip
++  end
++
++  def name_splitter(unparsed)
++    # It must have at least `modulename.var.PLUGINTYPE.PLUGINNAME.VARNAME`
++    module_name, dot, rest = unparsed.partition('.')
++    if rest.count('.') >= 3
++      return module_name, rest
++    else
++      raise LogStash::ConfigLoadingError, I18n.t("logstash.modules.configuration.modules-variables-malformed", :rawvar => unparsed)
++    end
++  end
++
++  def parse_vars(module_name, vars_list)
++    module_hash = {"name" => module_name}
++    vars_list.each do |unparsed|
++      extracted_name, modvar = name_splitter(unparsed)
++      next if extracted_name != module_name
++      k, v = get_kv(extracted_name, modvar)
++      module_hash[k] = v
++    end
++    module_hash
++  end
++
++  def parse_it(module_list, module_variable_list)
++    if module_list.is_a?(Array)
++      parse_modules(module_list).each do |module_name|
++        @output << parse_vars(module_name, module_variable_list)
++      end
++    end
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/modules/elasticsearch_config.rb b/logstash-core/lib/logstash/modules/elasticsearch_config.rb
+new file mode 100644
+index 00000000000..3bc39ea3672
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/elasticsearch_config.rb
+@@ -0,0 +1,21 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++
++require_relative "elasticsearch_resource"
++
++module LogStash module Modules class ElasticsearchConfig
++  attr_reader :index_name
++
++  def initialize(modul, settings)
++    @directory = ::File.join(modul.directory, "elasticsearch")
++    @name = modul.module_name
++    @settings = settings
++    @full_path = ::File.join(@directory, "#{@name}.json")
++    @index_name = @settings.fetch("elasticsearch.template_path", "_template")
++  end
++
++  def resources
++    [ElasticsearchResource.new(@index_name, "not-used", @full_path)]
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/modules/elasticsearch_resource.rb b/logstash-core/lib/logstash/modules/elasticsearch_resource.rb
+new file mode 100644
+index 00000000000..c432abf2d6f
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/elasticsearch_resource.rb
+@@ -0,0 +1,10 @@
++# encoding: utf-8
++require "logstash/namespace"
++require_relative "resource_base"
++
++module LogStash module Modules class ElasticsearchResource
++  include ResourceBase
++  def import_path
++    base + "/" + content_id
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/modules/file_reader.rb b/logstash-core/lib/logstash/modules/file_reader.rb
+new file mode 100644
+index 00000000000..13787fd3e9d
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/file_reader.rb
+@@ -0,0 +1,37 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++require "logstash/json"
++
++module LogStash module Modules class FileReader
++  # stub these methods for testing
++  include LogStash::Util::Loggable
++
++  def self.read(path)
++    begin
++      ::File.read(path)
++    rescue => e
++      logger.error("Error when reading file from path", :path => path)
++      ""
++    end
++  end
++
++  def self.read_json(path)
++    json = read(path)
++    begin
++      LogStash::Json.load(json)
++    rescue => e
++      STDERR.puts e.message
++      logger.error("Error when parsing json from path", :path => path)
++      return {}
++    end
++  end
++
++  def self.glob(path)
++    files = Dir.glob(path)
++    if files.nil?
++      logger.warn("No files found for glob", :pattern => path)
++    end
++    files
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/modules/importer.rb b/logstash-core/lib/logstash/modules/importer.rb
+new file mode 100644
+index 00000000000..ac1a86162de
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/importer.rb
+@@ -0,0 +1,39 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++
++module LogStash module Modules class Importer
++  include LogStash::Util::Loggable
++
++  attr_reader :client
++
++  def initialize(client)
++    @client = client
++  end
++
++  def put(resource, overwrite = true)
++    path = resource.import_path
++    logger.info("Attempting PUT", :url_path => path, :file_path => resource.content_path)
++    if !overwrite && content_exists?(path)
++      logger.debug("Found existing Elasticsearch resource.", :resource => path)
++      return
++    end
++    put_overwrite(path, resource.content)
++  end
++
++  private
++
++  def put_overwrite(path, content)
++    if content_exists?(path)
++      response = @client.delete(path)
++    end
++    # hmmm, versioning?
++    @client.put(path, content).status == 201
++  end
++
++  def content_exists?(path)
++    response = @client.head(path)
++    response.status >= 200 && response.status <= 299
++  end
++
++end end end # class LogStash::Modules::Importer
+diff --git a/logstash-core/lib/logstash/modules/kibana_base_resource.rb b/logstash-core/lib/logstash/modules/kibana_base_resource.rb
+new file mode 100644
+index 00000000000..e93dda4641a
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/kibana_base_resource.rb
+@@ -0,0 +1,10 @@
++# encoding: utf-8
++require "logstash/namespace"
++require_relative "resource_base"
++
++module LogStash module Modules class KibanaBaseResource
++  include ResourceBase
++  def import_path
++    base
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/modules/kibana_config.rb b/logstash-core/lib/logstash/modules/kibana_config.rb
+new file mode 100644
+index 00000000000..6b6a17037be
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/kibana_config.rb
+@@ -0,0 +1,92 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++
++require_relative "file_reader"
++require_relative "kibana_resource"
++require_relative "kibana_base_resource"
++
++module LogStash module Modules class KibanaConfig
++  include LogStash::Util::Loggable
++
++  ALLOWED_DIRECTORIES = ["search", "visualization"]
++
++  attr_reader :index_name
++
++  def initialize(modul, settings)
++    @directory = ::File.join(modul.directory, "kibana")
++    @name = modul.module_name
++    @settings = settings
++    @index_name = settings.fetch("dashboards.kibana_index", ".kibana")
++  end
++
++  def dashboards
++    # there can be more than one dashboard to load
++    filenames = FileReader.read_json(dynamic("dashboard"))
++    filenames.map do |filename|
++      KibanaResource.new(@index_name, "dashboard", dynamic("dashboard", filename))
++    end
++  end
++
++  def kibana_index_hacks
++    # Copied from libbeat/dashboards/importer.go
++    # CreateKibanaIndex creates the kibana index if it doesn't exists and sets
++    # some index properties which are needed as a workaround for:
++    # https://github.com/elastic/beats-dashboards/issues/94
++    # with kibana 5.4.0 this hack failed to be applied.
++    ha = '{"settings": {"index":{"mapping":{"single_type": false}}}}'
++    hb = '{"search": {"properties": {"hits": {"type": "integer"}, "version": {"type": "integer"}}}}'
++    [
++      KibanaBaseResource.new(@index_name, "not-used", "not-used", ha),
++      KibanaBaseResource.new(@index_name, "not-used", "not-used", hb)
++    ]
++  end
++
++  def resources
++    list = [] # kibana_index_hacks
++    dashboards.each do |board|
++      extract_panels_into(board, list)
++    end
++    list
++  end
++
++  private
++
++  def dynamic(dynamic_folder, filename = @name)
++    ::File.join(@directory, dynamic_folder, "#{filename}.json")
++  end
++
++  def extract_panels_into(dashboard, list)
++    list << dashboard
++
++    dash = FileReader.read_json(dashboard.content_path)
++
++    if !dash.is_a?(Hash)
++      logger.warn("Kibana dashboard JSON is not an Object", :module => @name)
++      return
++    end
++
++    panelsjson = dash["panelsJSON"]
++
++    if panelsjson.nil?
++      logger.info("No panelJSON key found in kibana dashboard", :module => @name)
++      return
++    end
++
++    begin
++      panels = LogStash::Json.load(panelsjson)
++    rescue => e
++      logger.error("JSON parse error when reading kibana panelsJSON", :module => @name)
++      return
++    end
++
++    panels.each do |panel|
++      panel_type = panel["type"]
++      if ALLOWED_DIRECTORIES.member?(panel_type)
++        list << KibanaResource.new(@index_name, panel_type, dynamic(panel_type, panel["id"]))
++      else
++        logger.warn("panelJSON contained unknown type", :type => panel_type)
++      end
++    end
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/modules/kibana_resource.rb b/logstash-core/lib/logstash/modules/kibana_resource.rb
+new file mode 100644
+index 00000000000..6915c5aa47f
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/kibana_resource.rb
+@@ -0,0 +1,10 @@
++# encoding: utf-8
++require "logstash/namespace"
++require_relative "resource_base"
++
++module LogStash module Modules class KibanaResource
++  include ResourceBase
++  def import_path
++    base + "/" + content_type + "/" + content_id
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/modules/logstash_config.rb b/logstash-core/lib/logstash/modules/logstash_config.rb
+new file mode 100644
+index 00000000000..7f77ed61293
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/logstash_config.rb
+@@ -0,0 +1,42 @@
++# encoding: utf-8
++require "logstash/namespace"
++require_relative "file_reader"
++
++module LogStash module Modules class LogStashConfig
++  def initialize(modul, settings)
++    @directory = ::File.join(modul.directory, "logstash")
++    @name = modul.module_name
++    @settings = settings
++  end
++
++  def template
++    ::File.join(@directory, "#{@name}.conf.erb")
++  end
++
++  def setting(value, default)
++    @settings.fetch(value, default)
++  end
++
++  def elasticsearch_output_config
++    hosts = "#{setting("var.output.elasticsearch.host", "localhost:9200")}"
++    index = "#{@name}-#{setting("var.output.elasticsearch.index_suffix", "%{+YYYY.MM.dd}")}"
++    password = "#{setting("var.output.elasticsearch.password", "changeme")}"
++    user = "#{setting("var.output.elasticsearch.user", "elasticsearch")}"
++    <<-CONF
++elasticsearch {
++hosts => [#{hosts}]
++index => "#{index}"
++password => "#{password}"
++user => "#{user}"
++manage_template => false
++}
++CONF
++  end
++
++  def config_string
++    # process the template and settings
++    # send back as a string
++    renderer = ERB.new(FileReader.read(template))
++    renderer.result(binding)
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/modules/resource_base.rb b/logstash-core/lib/logstash/modules/resource_base.rb
+new file mode 100644
+index 00000000000..86e8a21b2b9
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/resource_base.rb
+@@ -0,0 +1,17 @@
++# encoding: utf-8
++require "logstash/namespace"
++require_relative "file_reader"
++
++module LogStash module Modules module ResourceBase
++  attr_reader :base, :content_type, :content_path, :content_id
++
++  def initialize(base, content_type, content_path, content = nil)
++    @base, @content_type, @content_path = base, content_type, content_path
++    @content_id =  ::File.basename(@content_path, ".*")
++    @content = content
++  end
++
++  def content
++    @content || FileReader.read(@content_path)
++  end
++end end end
+diff --git a/logstash-core/lib/logstash/modules/scaffold.rb b/logstash-core/lib/logstash/modules/scaffold.rb
+new file mode 100644
+index 00000000000..242a5f73893
+--- /dev/null
++++ b/logstash-core/lib/logstash/modules/scaffold.rb
+@@ -0,0 +1,79 @@
++# encoding: utf-8
++require "logstash/namespace"
++require "logstash/logging"
++require "erb"
++
++require_relative "elasticsearch_config"
++require_relative "kibana_config"
++require_relative "logstash_config"
++
++module LogStash module Modules class Scaffold
++  include LogStash::Util::Loggable
++
++  attr_reader :directory, :module_name, :logstash_configuration, :kibana_configuration, :elasticsearch_configuration
++
++  def initialize(name, directory)
++    @module_name = name
++    @directory = directory  # this is the 'configuration folder in the GEM root.'
++  end
++
++  def import(import_engine)
++    @elasticsearch_configuration.resources.each do |resource|
++      import_engine.put(resource)
++    end
++    @kibana_configuration.resources.each do |resource|
++      import_engine.put(resource)
++    end
++  end
++
++  def with_settings(module_settings)
++    @logstash_configuration = LogStashConfig.new(self, module_settings)
++    @kibana_configuration = KibanaConfig.new(self, module_settings)
++    @elasticsearch_configuration = ElasticsearchConfig.new(self, module_settings)
++    self
++  end
++
++  def config_string()
++    # settings should be set earlier by the caller.
++    # settings should be the subset from the YAML file with a structure like
++    # {"name" => "plugin name", "k1" => "v1", "k2" => "v2"}, etc.
++    return nil if @logstash_configuration.nil?
++    @logstash_configuration.config_string
++  end
++end end end # class LogStash::Modules::Scaffold
++
++# LogStash::PLUGIN_REGISTRY.add(:modules, "example", LogStash::Modules::Scaffold.new("example", File.join(File.dirname(__FILE__), "..", "configuration"))
++
++__END__
++
++settings logstash.yml
++modules:
++  - name: netflow
++  var.output.elasticsearch.host: "es.mycloud.com"
++  var.output.elasticsearch.user: "foo"
++  var.output.elasticsearch.password: "password"
++  var.input.tcp.port: 5606
++
++File structure
++logstash-module-netflow
++├── configuration
++│   ├── elasticsearch
++│   │   └── netflow.json
++│   ├── kibana
++│   │   ├── dashboard
++│   │   │   └── netflow.json ("panelJSON" contains references to visualization panels 1,2,3)
++│   │   ├── search
++|   |   |   └── netflow-search1.json
++|   |   |   └── netflow-search2.json
++│   │   └── vizualization
++|   |   |   └── netflow-panel1.json
++|   |   |   └── netflow-panel2.json
++|   |   |   └── netflow-panel3.json
++│   └── logstash
++│       └── netflow.conf.erb
++├── lib
++│   ├── logstash
++│   │   └── modules
++│   │       └── netflow.rb
++│   └── logstash_registry.rb
++└── logstash-module-netflow.gemspec
+diff --git a/logstash-core/lib/logstash/namespace.rb b/logstash-core/lib/logstash/namespace.rb
+index 355f0ac25fa..1cf4a35386b 100644
+--- a/logstash-core/lib/logstash/namespace.rb
++++ b/logstash-core/lib/logstash/namespace.rb
+@@ -11,4 +11,5 @@ module Util; end
+   module PluginMixins; end
+   module PluginManager; end
+   module Api; end
++  module Modules; end
+ end # module LogStash
+diff --git a/logstash-core/lib/logstash/plugins/registry.rb b/logstash-core/lib/logstash/plugins/registry.rb
+index 7def8c4f3d5..a00c1cec3bc 100644
+--- a/logstash-core/lib/logstash/plugins/registry.rb
++++ b/logstash-core/lib/logstash/plugins/registry.rb
+@@ -3,6 +3,7 @@
+ require "logstash/util/loggable"
+ require "logstash/plugin"
+ require "logstash/plugins/hooks_registry"
++require "logstash/modules/scaffold"
+ 
+ module LogStash module Plugins
+   class Registry
+diff --git a/logstash-core/lib/logstash/runner.rb b/logstash-core/lib/logstash/runner.rb
+index 9f073e30696..e7913480a13 100644
+--- a/logstash-core/lib/logstash/runner.rb
++++ b/logstash-core/lib/logstash/runner.rb
+@@ -9,6 +9,7 @@
+ require "logstash/namespace"
+ require "logstash-core/logstash-core"
+ require "logstash/environment"
++require "logstash/modules/cli_parser"
+ 
+ LogStash::Environment.load_locale!
+ 
+@@ -61,6 +62,17 @@ class LogStash::Runner < Clamp::StrictCommand
+     :default => LogStash::SETTINGS.get_default("config.string"),
+     :attribute_name => "config.string"
+ 
++  # Module settings
++  option ["--modules"], "MODULES",
++    I18n.t("logstash.runner.flag.modules"),
++    :multivalued => true,
++    :attribute_name => "modules_list"
++
++  option ["-M", "--modules.variable"], "MODULES_VARIABLE",
++    I18n.t("logstash.runner.flag.modules_variable"),
++    :multivalued => true,
++    :attribute_name => "modules_variable_list"
++
+   # Pipeline settings
+   option ["-w", "--pipeline.workers"], "COUNT",
+     I18n.t("logstash.runner.flag.pipeline-workers"),
+@@ -175,6 +187,7 @@ def initialize(*args)
+     # Default we check local sources: `-e`, `-f` and the logstash.yml options.
+     @source_loader = LogStash::Config::SourceLoader.new(@settings)
+     @source_loader.add_source(LogStash::Config::Source::Local.new(@settings))
++    @source_loader.add_source(LogStash::Config::Source::Modules.new(@settings))
+ 
+     super(*args)
+   end
+@@ -248,6 +261,10 @@ def execute
+ 
+     return start_shell(setting("interactive"), binding) if setting("interactive")
+ 
++    module_parser = LogStash::Modules::CLIParser.new(@modules_list, @modules_variable_list)
++    # Now populate Setting for modules.list with our parsed array.
++    @settings.set("modules.cli", module_parser.output)
++
+     begin
+       @bootstrap_checks.each { |bootstrap| bootstrap.check(@settings) }
+     rescue LogStash::BootstrapCheckError => e
+@@ -455,7 +472,7 @@ def fetch_settings_path(cli_args)
+       nil
+     end
+   end
+-  
++
+   # is the user asking for CLI help subcommand?
+   def cli_help?(args)
+     # I know, double negative
+diff --git a/logstash-core/locales/en.yml b/logstash-core/locales/en.yml
+index e1ae825c358..6c59bb2247e 100644
+--- a/logstash-core/locales/en.yml
++++ b/logstash-core/locales/en.yml
+@@ -85,10 +85,23 @@ en:
+       logging:
+         unrecognized_option: |-
+           unrecognized option [%{option}]
++    modules:
++      configuration:
++        parse-failed: |-
++          Failed to parse the module configuration: [%{error}]
++        modules-must-be-unique: >-
++          Only a single instance of any module can be run at a time. Duplicate
++          modules: %{duplicate_modules}
++        modules-empty-value: >-
++          Empty value provided for --modules
++        modules-variables-malformed: >-
++          Failed to parse module variable %{rawvar}.  Must be in -M
++          "MODULE_NAME.var.PLUGIN_TYPE.PLUGIN_NAME.VARIABLE_NAME=VALUE" format
+     runner:
+       short-help: |-
+         usage:
+           bin/logstash -f CONFIG_PATH [-t] [-r] [] [-w COUNT] [-l LOG]
++          bin/logstash --modules MODULE_NAME [-M "MODULE_NAME.var.PLUGIN_TYPE.PLUGIN_NAME.VARIABLE_NAME=VALUE"] [-t] [-w COUNT] [-l LOG]
+           bin/logstash -e CONFIG_STR [-t] [--log.level fatal|error|warn|info|debug|trace] [-w COUNT] [-l LOG]
+           bin/logstash -i SHELL [--log.level fatal|error|warn|info|debug|trace]
+           bin/logstash -V [--log.level fatal|error|warn|info|debug|trace]
+@@ -100,6 +113,13 @@ en:
+         the '-f yourlogstash.conf' flag?
+       config-string-path-exclusive:
+         Settings 'path.config' (-f) and 'config.string' (-e) can't be used simultaneously.
++      config-module-exclusive: >-
++        Settings 'path.config' (-f) or 'config.string' (-e) can't be used in conjunction with
++        (--modules) or the "modules:" block in the logstash.yml file.
++      cli-module-override: >-
++        Both command-line and logstash.yml modules configurations detected. 
++        Using command-line module configuration and ignoring logstash.yml module
++        configuration.
+       reload-without-config-path: >-
+         Configuration reloading also requires passing a configuration path with '-f yourlogstash.conf'
+       locked-data-path: >-
+@@ -185,6 +205,24 @@ en:
+           "%{default_output}"
+           If you wish to use both defaults, please use
+           the empty string for the '-e' flag.
++        modules: |+
++          Load Logstash modules.
++          Modules can be defined using multiple instances 
++          '--modules module1 --modules module2', 
++             or comma-separated syntax 
++          '--modules=module1,module2' 
++          Cannot be used in conjunction with '-e' or '-f'
++          Use of '--modules' will override modules declared
++          in the 'logstash.yml' file.
++        modules_variable: |+
++          Load variables for module template.
++          Multiple instances of '-M' or 
++          '--modules.variable' are supported.
++          Ignored if '--modules' flag is not used.
++          Should be in the format of 
++          '-M "MODULE_NAME.var.PLUGIN_TYPE.PLUGIN_NAME.VARIABLE_NAME=VALUE"'
++          as in 
++          '-M "example.var.filter.mutate.fieldname=fieldvalue"'
+         configtest: |+
+           Check configuration for valid syntax and then exit.
+         http_host: Web API binding host
+diff --git a/logstash-core/logstash-core.gemspec b/logstash-core/logstash-core.gemspec
+index 2aee9a33797..27594a09a54 100644
+--- a/logstash-core/logstash-core.gemspec
++++ b/logstash-core/logstash-core.gemspec
+@@ -28,7 +28,7 @@ Gem::Specification.new do |gem|
+ 
+   # Later versions are ruby 2.0 only. We should remove the rack dep once we support 9k
+   gem.add_runtime_dependency "rack", '1.6.6'
+-  
++
+   gem.add_runtime_dependency "sinatra", '~> 1.4', '>= 1.4.6'
+   gem.add_runtime_dependency 'puma', '~> 2.16'
+   gem.add_runtime_dependency "jruby-openssl", "0.9.16" # >= 0.9.13 Required to support TLSv1.2
+@@ -53,6 +53,7 @@ Gem::Specification.new do |gem|
+   # has an rdoc problem that causes a bundler exception. 3.3.9 is the current latest version
+   # which does not have this problem.
+   gem.add_runtime_dependency "ruby-maven", "~> 3.3.9"
++  gem.add_runtime_dependency "elasticsearch", "~> 5.0", ">= 5.0.4" # Ruby client for ES (Apache 2.0 license)
+ 
+   eval(File.read(File.expand_path("../gemspec_jars.rb", __FILE__)))
+ end
+diff --git a/logstash-core/spec/logstash/modules/scaffold_spec.rb b/logstash-core/spec/logstash/modules/scaffold_spec.rb
+new file mode 100644
+index 00000000000..b9e2e042007
+--- /dev/null
++++ b/logstash-core/spec/logstash/modules/scaffold_spec.rb
+@@ -0,0 +1,178 @@
++# encoding: utf-8
++#
++require "logstash/namespace"
++require "logstash/modules/scaffold"
++require "logstash/modules/importer"
++require "logstash/elasticsearch_client"
++
++require_relative "../../support/helpers"
++
++describe LogStash::Modules::Scaffold do
++  let(:base_dir) { "gem-home" }
++  let(:mname) { "foo" }
++  subject(:test_module) { described_class.new(mname, base_dir) }
++  let(:module_settings) do
++    {
++      "var.output.elasticsearch.host" => "\"es.mycloud.com:9200\"",
++      "var.output.elasticsearch.user" => "foo",
++      "var.output.elasticsearch.password" => "password",
++      "var.input.tcp.port" => 5606,
++      "dashboards.kibana_index" => ".kibana"
++    }
++  end
++  let(:dashboard_json) do
++<<-JSON
++{
++"hits": 0,
++"timeRestore": false,
++"description": "",
++"title": "Filebeat Apache2 Dashboard",
++"uiStateJSON": "{\\"P-1\\":{\\"mapCenter\\":[40.713955826286046,-0.17578125]}}",
++"panelsJSON": "[{\\"col\\":1,\\"id\\":\\"foo-c\\",\\"panelIndex\\":1,\\"row\\":1,\\"size_x\\":12,\\"size_y\\":3,\\"type\\":\\"visualization\\"},{\\"col\\":1,\\"id\\":\\"foo-d\\",\\"panelIndex\\":2,\\"row\\":6,\\"size_x\\":8,\\"size_y\\":3,\\"type\\":\\"visualization\\"},{\\"id\\":\\"foo-e\\",\\"type\\":\\"search\\",\\"panelIndex\\":7,\\"size_x\\":12,\\"size_y\\":3,\\"col\\":1,\\"row\\":11,\\"columns\\":[\\"apache2.error.client\\",\\"apache2.error.level\\",\\"apache2.error.module\\",\\"apache2.error.message\\"],\\"sort\\":[\\"@timestamp\\",\\"desc\\"]}]",
++"optionsJSON": "{\\"darkTheme\\":false}",
++"version": 1,
++"kibanaSavedObjectMeta": {
++  "searchSourceJSON": "{\\"filter\\":[{\\"query\\":{\\"query_string\\":{\\"analyze_wildcard\\":true,\\"query\\":\\"*\\"}}}]}"
++}
++}
++JSON
++  end
++
++  context "logstash operation" do
++    let(:ls_conf) do
++<<-ERB
++input {
++  tcp {
++    port => <%= setting("var.input.tcp.port", 45) %>
++    host => <%= setting("var.input.tcp.host", "localhost") %>
++    type => <%= setting("var.input.tcp.type", "server") %>
++  }
++}
++filter {
++
++}
++output {
++  <%= elasticsearch_output_config() %>
++}
++ERB
++    end
++
++    before do
++      allow(LogStash::Modules::FileReader).to receive(:read).and_return(ls_conf)
++    end
++
++    it "provides a logstash config" do
++      expect(test_module.logstash_configuration).to be_nil
++      test_module.with_settings(module_settings)
++      expect(test_module.logstash_configuration).not_to be_nil
++      config_string = test_module.config_string
++      expect(config_string).to include("port => 5606")
++      expect(config_string).to include('hosts => ["es.mycloud.com:9200"]')
++    end
++  end
++
++  context "elasticsearch operation" do
++    it "provides the elasticsearch mapping file paths" do
++      test_module.with_settings(module_settings)
++      expect(test_module.elasticsearch_configuration).not_to be_nil
++      files = test_module.elasticsearch_configuration.resources
++      expect(files.size).to eq(1)
++      expect(files.first).to be_a(LogStash::Modules::ElasticsearchResource)
++      expect(files.first.content_path).to eq("gem-home/elasticsearch/foo.json")
++      expect(files.first.import_path).to eq("_template/foo")
++    end
++  end
++
++  context "kibana operation" do
++    before do
++      allow(LogStash::Modules::FileReader).to receive(:read).with("gem-home/kibana/dashboard/foo.json").and_return("[\"Foo-Dashboard\"]")
++      allow(LogStash::Modules::FileReader).to receive(:read).with("gem-home/kibana/dashboard/Foo-Dashboard.json").and_return(dashboard_json)
++    end
++
++    it "provides a list of importable files" do
++      expect(test_module.kibana_configuration).to be_nil
++      test_module.with_settings(module_settings)
++      expect(test_module.kibana_configuration).not_to be_nil
++      files = test_module.kibana_configuration.resources
++      expect(files.size).to eq(4)
++      expect(files.map{|o| o.class.name}.uniq).to eq(["LogStash::Modules::KibanaResource"])
++      expect(files[0].content_path).to eq("gem-home/kibana/dashboard/Foo-Dashboard.json")
++      expect(files[0].import_path).to eq(".kibana/dashboard/Foo-Dashboard")
++      expect(files[1].content_path).to eq("gem-home/kibana/visualization/foo-c.json")
++      expect(files[1].import_path).to eq(".kibana/visualization/foo-c")
++      expect(files[2].content_path).to eq("gem-home/kibana/visualization/foo-d.json")
++      expect(files[2].import_path).to eq(".kibana/visualization/foo-d")
++      expect(files[3].content_path).to eq("gem-home/kibana/search/foo-e.json") #<- the panels can contain items from other folders
++      expect(files[3].import_path).to eq(".kibana/search/foo-e")
++    end
++
++    it "provides the kibana index string" do
++      test_module.with_settings(module_settings)
++      expect(test_module.kibana_configuration).not_to be_nil
++      expect(test_module.kibana_configuration.index_name).to eq(".kibana")
++    end
++  end
++
++  context "importing to elasticsearch stubbed client" do
++    let(:mname) { "cef" }
++    let(:base_dir) { File.expand_path(File.join(File.dirname(__FILE__), "..", "..", "modules_test_files", "#{mname}")) }
++    let(:response) { double(:response) }
++    let(:client) { double(:client) }
++    let(:paths) { [] }
++    let(:expected_paths) do
++      [
++        "_template/cef",
++        ".kibana/dashboard/FW-Dashboard",
++        ".kibana/visualization/FW-Metrics",
++        ".kibana/visualization/FW-Last-Update",
++        ".kibana/visualization/FW-Area-by-Outcome",
++        ".kibana/visualization/FW-Count-by-Source,-Destination-Address-and-Ports",
++        ".kibana/visualization/FW-Traffic-by-Outcome",
++        ".kibana/visualization/FW-Device-Vendor-by-Category-Outcome",
++        ".kibana/visualization/FW-Geo-Traffic-by-Destination-Address",
++        ".kibana/visualization/FW-Geo-Traffic-by-Source-Address",
++        ".kibana/visualization/FW-Destination-Country-Data-Table",
++        ".kibana/visualization/FW-Source-Country-Data-Table",
++        ".kibana/visualization/FW-Destination-Ports-by-Outcome",
++        ".kibana/visualization/FW-Source,-Destination-Address-and-Port-Sunburst",
++        ".kibana/search/Firewall-Events"
++      ]
++    end
++
++    before do
++      allow(response).to receive(:status).and_return(404)
++      allow(client).to receive(:head).and_return(response)
++    end
++
++    it "calls the import method" do
++      expect(client).to receive(:put).at_least(15).times do |path, content|
++        paths << path
++        LogStash::ElasticsearchClient::Response.new(201, "", {})
++      end
++      test_module.with_settings(module_settings)
++      test_module.import(LogStash::Modules::Importer.new(client))
++      expect(paths).to eq(expected_paths)
++    end
++  end
++
++  context "import 4 realz", :skip => "integration" do
++    let(:mname) { "cef" }
++    let(:base_dir) { File.expand_path(File.join(File.dirname(__FILE__), "..", "..", "modules_test_files", "#{mname}")) }
++    let(:module_settings) do
++      {
++        "var.output.elasticsearch.host" => "localhost:9200",
++        "var.output.elasticsearch.user" => "foo",
++        "var.output.elasticsearch.password" => "password",
++        "var.input.tcp.port" => 5606,
++        "dashboards.kibana_index" => ".kibana"
++      }
++    end
++    it "puts stuff in ES" do
++      test_module.with_settings(module_settings)
++      client = LogStash::ElasticsearchClient.build(module_settings)
++      import_engine = LogStash::Modules::Importer.new(client)
++      test_module.import(import_engine)
++      expect(1).to eq(1)
++    end
++  end
++end
+diff --git a/logstash-core/spec/modules_test_files/cef/elasticsearch/cef.json b/logstash-core/spec/modules_test_files/cef/elasticsearch/cef.json
+new file mode 100755
+index 00000000000..691b19bc63d
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/elasticsearch/cef.json
+@@ -0,0 +1,221 @@
++{
++    "order": 100,
++    "template": "cef-*",
++    "mappings": {
++      "_default_": {
++        "dynamic": true,
++        "dynamic_templates": [
++          {
++            "string_fields": {
++              "mapping": {
++                "type": "keyword"
++              },
++              "match_mapping_type": "string",
++              "match": "*"
++            }
++          }
++        ],
++        "_all": {
++          "enabled": true
++        },
++        "properties": {
++          "destinationPort": {
++            "type": "integer"
++          },
++          "flexDate1": {
++            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
++            "type": "date"
++          },
++          "sourcePort": {
++            "type": "integer"
++          },
++          "baseEventCount": {
++            "type": "integer"
++          },
++          "destinationAddress": {
++            "type": "ip"
++          },
++          "destinationProcessId": {
++            "type": "integer"
++          },
++          "oldFileSize": {
++            "type": "integer"
++          },
++          "destination": {
++            "dynamic": false,
++            "type": "object",
++            "properties": {
++              "city_name": {
++                "type": "keyword"
++              },
++              "country_name": {
++                "type": "keyword"
++              },
++              "location": {
++                "type": "geo_point"
++              },
++              "region_name": {
++                "type": "keyword"
++              }
++            }
++          },
++          "source": {
++            "dynamic": false,
++            "type": "object",
++            "properties": {
++              "city_name": {
++                "type": "keyword"
++              },
++              "country_name": {
++                "type": "keyword"
++              },
++              "location": {
++                "type": "geo_point"
++              },
++              "region_name": {
++                "type": "keyword"
++              }
++            }
++          },
++          "deviceReceiptTime": {
++            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
++            "type": "date"
++          },
++          "destinationTranslatedPort": {
++            "type": "integer"
++          },
++          "deviceTranslatedAddress": {
++            "type": "ip"
++          },
++          "deviceAddress": {
++            "type": "ip"
++          },
++          "agentReceiptTime": {
++            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
++            "type": "date"
++          },
++          "startTime": {
++            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
++            "type": "date"
++          },
++          "sourceProcessId": {
++            "type": "integer"
++          },
++          "bytesIn": {
++            "type": "integer"
++          },
++          "bytesOut": {
++            "type": "integer"
++          },
++          "severity": {
++            "omit_norms": true,
++            "type": "string"
++          },
++          "deviceProcessId": {
++            "type": "integer"
++          },
++          "agentAddress": {
++            "type": "ip"
++          },
++          "sourceAddress": {
++            "type": "ip"
++          },
++          "sourceTranslatedPort": {
++            "type": "integer"
++          },
++          "deviceCustomDate2": {
++            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
++            "type": "date"
++          },
++          "deviceCustomDate1": {
++            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
++            "type": "date"
++          },
++          "flexNumber1": {
++            "type": "long"
++          },
++          "deviceCustomFloatingPoint1": {
++            "type": "float"
++          },
++          "oldFileModificationTime": {
++            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
++            "type": "date"
++          },
++          "deviceCustomFloatingPoint2": {
++            "type": "float"
++          },
++          "oldFileCreateTime": {
++            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
++            "type": "date"
++          },
++          "deviceCustomFloatingPoint3": {
++            "type": "float"
++          },
++          "sourceTranslatedAddress": {
++            "type": "ip"
++          },
++          "deviceCustomFloatingPoint4": {
++            "type": "float"
++          },
++          "flexNumber2": {
++            "type": "long"
++          },
++          "fileCreateTime": {
++            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
++            "type": "date"
++          },
++          "fileModificationTime": {
++            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
++            "type": "date"
++          },
++          "fileSize": {
++            "type": "integer"
++          },
++          "destinationTranslatedAddress": {
++            "type": "ip"
++          },
++          "endTime": {
++            "format": "epoch_millis||epoch_second||date_time||MMM dd yyyy HH:mm:ss",
++            "type": "date"
++          },
++          "deviceCustomNumber1": {
++            "type": "long"
++          },
++          "deviceDirection": {
++            "type": "integer"
++          },
++          "device": {
++            "dynamic": false,
++            "type": "object",
++            "properties": {
++              "city_name": {
++                "type": "keyword"
++              },
++              "country_name": {
++                "type": "keyword"
++              },
++              "location": {
++                "type": "geo_point"
++              },
++              "region_name": {
++                "type": "keyword"
++              }
++            }
++          },
++          "deviceCustomNumber3": {
++            "type": "long"
++          },
++          "deviceCustomNumber2": {
++            "type": "long"
++          },
++          "categoryOutcome": {
++            "type": "keyword"
++          },
++          "destinationHostName": {
++            "type": "keyword"
++          }
++        }
++      }
++    },
++    "aliases": {}
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/dashboard/FW-Dashboard.json b/logstash-core/spec/modules_test_files/cef/kibana/dashboard/FW-Dashboard.json
+new file mode 100755
+index 00000000000..569c7ffaaa4
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/dashboard/FW-Dashboard.json
+@@ -0,0 +1,20 @@
++{
++  "title": "FW - Dashboard",
++  "hits": 0,
++  "description": "",
++  "panelsJSON": "[{\"col\":1,\"id\":\"FW-Metrics\",\"panelIndex\":7,\"row\":1,\"size_x\":8,\"size_y\":2,\"type\":\"visualization\"},{\"col\":9,\"id\":\"FW-Last-Update\",\"panelIndex\":10,\"row\":1,\"size_x\":4,\"size_y\":2,\"type\":\"visualization\"},{\"col\":1,\"id\":\"FW-Area-by-Outcome\",\"panelIndex\":1,\"row\":3,\"size_x\":4,\"size_y\":3,\"type\":\"visualization\"},{\"col\":5,\"id\":\"FW-Count-by-Source,-Destination-Address-and-Ports\",\"panelIndex\":2,\"row\":3,\"size_x\":4,\"size_y\":3,\"type\":\"visualization\"},{\"col\":9,\"id\":\"FW-Traffic-by-Outcome\",\"panelIndex\":9,\"row\":3,\"size_x\":4,\"size_y\":3,\"type\":\"visualization\"},{\"col\":1,\"id\":\"FW-Device-Vendor-by-Category-Outcome\",\"panelIndex\":4,\"row\":6,\"size_x\":4,\"size_y\":3,\"type\":\"visualization\"},{\"col\":7,\"id\":\"FW-Geo-Traffic-by-Destination-Address\",\"panelIndex\":5,\"row\":9,\"size_x\":6,\"size_y\":4,\"type\":\"visualization\"},{\"col\":1,\"id\":\"FW-Geo-Traffic-by-Source-Address\",\"panelIndex\":6,\"row\":9,\"size_x\":6,\"size_y\":4,\"type\":\"visualization\"},{\"col\":10,\"id\":\"FW-Destination-Country-Data-Table\",\"panelIndex\":3,\"row\":13,\"size_x\":3,\"size_y\":3,\"type\":\"visualization\"},{\"col\":7,\"id\":\"FW-Source-Country-Data-Table\",\"panelIndex\":8,\"row\":13,\"size_x\":3,\"size_y\":3,\"type\":\"visualization\"},{\"id\":\"FW-Destination-Ports-by-Outcome\",\"type\":\"visualization\",\"panelIndex\":12,\"size_x\":4,\"size_y\":3,\"col\":9,\"row\":6},{\"id\":\"FW-Source,-Destination-Address-and-Port-Sunburst\",\"type\":\"visualization\",\"panelIndex\":13,\"size_x\":4,\"size_y\":3,\"col\":5,\"row\":6},{\"id\":\"Firewall-Events\",\"type\":\"search\",\"panelIndex\":14,\"size_x\":6,\"size_y\":3,\"col\":1,\"row\":13,\"columns\":[\"sevCode\",\"name\",\"deviceVendor\",\"deviceProduct\",\"categoryDeviceType\",\"categoryBehavior\",\"categoryOutcome\",\"sourceAddress\",\"sourcePort\",\"sourceHostName\",\"destinationAddress\",\"destinationPort\",\"destinationHostName\",\"sourceUserName\",\"destinationUserName\"],\"sort\":[\"@timestamp\",\"desc\"]}]",
++  "optionsJSON": "{\"darkTheme\":false}",
++  "uiStateJSON": "{\"P-1\":{\"vis\":{\"legendOpen\":true,\"colors\":{\"/Success\":\"#629E51\",\"/Failure\":\"#BF1B00\"}}},\"P-2\":{\"vis\":{\"legendOpen\":true}},\"P-3\":{\"vis\":{\"params\":{\"sort\":{\"columnIndex\":null,\"direction\":null}}}},\"P-4\":{\"vis\":{\"legendOpen\":true,\"colors\":{\"/Success\":\"#629E51\",\"/Failure\":\"#BF1B00\",\"Check Point\":\"#C15C17\",\"CISCO\":\"#EF843C\",\"NetScreen\":\"#F9BA8F\"}}},\"P-5\":{\"mapCenter\":[46.195042108660154,-56.42578125]},\"P-6\":{\"mapCenter\":[15.961329081596647,-0.3515625],\"mapZoom\":1},\"P-8\":{\"vis\":{\"params\":{\"sort\":{\"columnIndex\":null,\"direction\":null}}}},\"P-12\":{\"vis\":{\"legendOpen\":false}}}",
++  "version": 1,
++  "timeRestore": true,
++  "timeTo": "now",
++  "timeFrom": "now-1h",
++  "refreshInterval": {
++    "display": "Off",
++    "pause": false,
++    "value": 0
++  },
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[{\"query\":{\"query_string\":{\"analyze_wildcard\":true,\"query\":\"*\"}}}]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/dashboard/cef.json b/logstash-core/spec/modules_test_files/cef/kibana/dashboard/cef.json
+new file mode 100644
+index 00000000000..6f13d606b0b
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/dashboard/cef.json
+@@ -0,0 +1 @@
++["FW-Dashboard"]
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/search/Firewall-Events.json b/logstash-core/spec/modules_test_files/cef/kibana/search/Firewall-Events.json
+new file mode 100644
+index 00000000000..bebc6ddd655
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/search/Firewall-Events.json
+@@ -0,0 +1,30 @@
++{
++  "title": "Firewall Events",
++  "description": "",
++  "hits": 0,
++  "columns": [
++    "sevCode",
++    "name",
++    "deviceVendor",
++    "deviceProduct",
++    "categoryDeviceType",
++    "categoryBehavior",
++    "categoryOutcome",
++    "sourceAddress",
++    "sourcePort",
++    "sourceHostName",
++    "destinationAddress",
++    "destinationPort",
++    "destinationHostName",
++    "sourceUserName",
++    "destinationUserName"
++  ],
++  "sort": [
++    "@timestamp",
++    "desc"
++  ],
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"index\":\"cef-*\",\"query\":{\"query_string\":{\"query\":\"categoryDeviceType:\\\"Firewall\\\"\",\"analyze_wildcard\":true}},\"filter\":[],\"highlight\":{\"pre_tags\":[\"@kibana-highlighted-field@\"],\"post_tags\":[\"@/kibana-highlighted-field@\"],\"fields\":{\"*\":{}},\"require_field_match\":false,\"fragment_size\":2147483647}}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Area-by-Outcome.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Area-by-Outcome.json
+new file mode 100644
+index 00000000000..1394aac9255
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Area-by-Outcome.json
+@@ -0,0 +1,11 @@
++{
++  "title": "FW - Area by Outcome",
++  "visState": "{\"title\":\"FW - Area by Outcome\",\"type\":\"area\",\"params\":{\"shareYAxis\":true,\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"top\",\"smoothLines\":true,\"scale\":\"linear\",\"interpolate\":\"linear\",\"mode\":\"overlap\",\"times\":[],\"addTimeMarker\":false,\"defaultYExtents\":false,\"setYExtents\":false,\"yAxis\":{}},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"date_histogram\",\"schema\":\"segment\",\"params\":{\"field\":\"@timestamp\",\"interval\":\"auto\",\"customInterval\":\"2h\",\"min_doc_count\":1,\"extended_bounds\":{}}},{\"id\":\"3\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"group\",\"params\":{\"field\":\"categoryOutcome\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\"}}],\"listeners\":{}}",
++  "uiStateJSON": "{\"vis\":{\"colors\":{\"/Success\":\"#629E51\",\"/Failure\":\"#BF1B00\"}}}",
++  "description": "",
++  "savedSearchId": "Firewall-Events",
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Count-by-Source,-Destination-Address-and-Ports.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Count-by-Source,-Destination-Address-and-Ports.json
+new file mode 100644
+index 00000000000..1400070a286
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Count-by-Source,-Destination-Address-and-Ports.json
+@@ -0,0 +1,11 @@
++{
++  "title": "FW - Count by Source, Destination Address and Ports",
++  "visState": "{\"title\":\"FW - Count by Source, Destination Address and Ports\",\"type\":\"line\",\"params\":{\"shareYAxis\":true,\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"top\",\"showCircles\":true,\"smoothLines\":true,\"interpolate\":\"linear\",\"scale\":\"square root\",\"drawLinesBetweenPoints\":true,\"radiusRatio\":\"7\",\"times\":[],\"addTimeMarker\":false,\"defaultYExtents\":false,\"setYExtents\":false,\"yAxis\":{}},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{\"customLabel\":\"Overall Count\"}},{\"id\":\"2\",\"enabled\":true,\"type\":\"date_histogram\",\"schema\":\"segment\",\"params\":{\"field\":\"@timestamp\",\"interval\":\"auto\",\"customInterval\":\"2h\",\"min_doc_count\":1,\"extended_bounds\":{}}},{\"id\":\"3\",\"enabled\":true,\"type\":\"count\",\"schema\":\"radius\",\"params\":{}},{\"id\":\"4\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"sourceAddress\",\"customLabel\":\"Source Address\"}},{\"id\":\"5\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"destinationAddress\",\"customLabel\":\"Destination Address\"}},{\"id\":\"6\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"destinationPort\",\"customLabel\":\"Destination / Service Ports\"}}],\"listeners\":{}}",
++  "uiStateJSON": "{\"vis\":{\"colors\":{\"Overall Count\":\"#BF1B00\",\"Source Address\":\"#E0752D\",\"Destination Address\":\"#E5AC0E\",\"Device Address\":\"#447EBC\",\"Service Port\":\"#447EBC\",\"Destination / Service Ports\":\"#447EBC\"}}}",
++  "description": "",
++  "savedSearchId": "Firewall-Events",
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Destination-Country-Data-Table.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Destination-Country-Data-Table.json
+new file mode 100644
+index 00000000000..88c878bf30a
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Destination-Country-Data-Table.json
+@@ -0,0 +1,11 @@
++{
++  "title": "FW - Destination Country Data Table",
++  "visState": "{\"title\":\"FW - Destination Country Data Table\",\"type\":\"table\",\"params\":{\"perPage\":10,\"showMeticsAtAllLevels\":false,\"showPartialRows\":false,\"showTotal\":false,\"sort\":{\"columnIndex\":null,\"direction\":null},\"totalFunc\":\"sum\"},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"bucket\",\"params\":{\"field\":\"destination.country_name\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\",\"customLabel\":\"Destination Countries\"}}],\"listeners\":{}}",
++  "uiStateJSON": "{\"vis\":{\"params\":{\"sort\":{\"columnIndex\":null,\"direction\":null}}}}",
++  "description": "",
++  "savedSearchId": "Firewall-Events",
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Destination-Ports-by-Outcome.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Destination-Ports-by-Outcome.json
+new file mode 100644
+index 00000000000..ef535d1c0c0
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Destination-Ports-by-Outcome.json
+@@ -0,0 +1,11 @@
++{
++  "title": "FW - Destination Ports by Outcome",
++  "visState": "{\"title\":\"FW - Destination Ports by Outcome\",\"type\":\"histogram\",\"params\":{\"shareYAxis\":true,\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\",\"scale\":\"linear\",\"mode\":\"percentage\",\"times\":[],\"addTimeMarker\":false,\"defaultYExtents\":false,\"setYExtents\":false,\"yAxis\":{}},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"segment\",\"params\":{\"field\":\"destinationPort\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\"}},{\"id\":\"3\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"group\",\"params\":{\"field\":\"categoryOutcome\",\"size\":2,\"order\":\"desc\",\"orderBy\":\"1\"}}],\"listeners\":{}}",
++  "uiStateJSON": "{\"vis\":{\"colors\":{\"/Failure\":\"#BF1B00\",\"/Success\":\"#629E51\"}}}",
++  "description": "",
++  "savedSearchId": "Firewall-Events",
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Device-Vendor-by-Category-Outcome.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Device-Vendor-by-Category-Outcome.json
+new file mode 100644
+index 00000000000..1b37ac79ee8
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Device-Vendor-by-Category-Outcome.json
+@@ -0,0 +1,11 @@
++{
++  "title": "FW - Device Vendor by Category Outcome",
++  "visState": "{\"title\":\"FW - Device Vendor by Category Outcome\",\"type\":\"pie\",\"params\":{\"shareYAxis\":true,\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\",\"isDonut\":true},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"segment\",\"params\":{\"field\":\"deviceVendor\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\"}},{\"id\":\"3\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"segment\",\"params\":{\"field\":\"categoryOutcome\",\"size\":5,\"order\":\"desc\",\"orderBy\":\"1\"}}],\"listeners\":{}}",
++  "uiStateJSON": "{\"vis\":{\"colors\":{\"/Success\":\"#629E51\",\"/Failure\":\"#BF1B00\",\"Check Point\":\"#C15C17\",\"CISCO\":\"#EF843C\",\"NetScreen\":\"#F9BA8F\"}}}",
++  "description": "",
++  "savedSearchId": "Firewall-Events",
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Geo-Traffic-by-Destination-Address.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Geo-Traffic-by-Destination-Address.json
+new file mode 100644
+index 00000000000..afd18fd09a0
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Geo-Traffic-by-Destination-Address.json
+@@ -0,0 +1,11 @@
++{
++  "title": "FW - Geo Traffic by Destination Address",
++  "visState": "{\"title\":\"FW - Geo Traffic by Destination Address\",\"type\":\"tile_map\",\"params\":{\"mapType\":\"Shaded Circle Markers\",\"isDesaturated\":true,\"addTooltip\":true,\"heatMaxZoom\":16,\"heatMinOpacity\":0.1,\"heatRadius\":25,\"heatBlur\":15,\"heatNormalizeData\":true,\"mapZoom\":2,\"mapCenter\":[15,5],\"wms\":{\"enabled\":false,\"url\":\"https://basemap.nationalmap.gov/arcgis/services/USGSTopo/MapServer/WMSServer\",\"options\":{\"version\":\"1.3.0\",\"layers\":\"0\",\"format\":\"image/png\",\"transparent\":true,\"attribution\":\"Maps provided by USGS\",\"styles\":\"\"}}},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"geohash_grid\",\"schema\":\"segment\",\"params\":{\"field\":\"destination.location\",\"autoPrecision\":true,\"customLabel\":\"Source Address\"}}],\"listeners\":{}}",
++  "uiStateJSON": "{\"mapCenter\":[14.604847155053898,4.921875]}",
++  "description": "",
++  "savedSearchId": "Firewall-Events",
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Geo-Traffic-by-Source-Address.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Geo-Traffic-by-Source-Address.json
+new file mode 100644
+index 00000000000..8eed943ae7d
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Geo-Traffic-by-Source-Address.json
+@@ -0,0 +1,11 @@
++{
++  "title": "FW - Geo Traffic by Source Address",
++  "visState": "{\"title\":\"FW - Geo Traffic by Source Address\",\"type\":\"tile_map\",\"params\":{\"mapType\":\"Shaded Circle Markers\",\"isDesaturated\":true,\"addTooltip\":true,\"heatMaxZoom\":16,\"heatMinOpacity\":0.1,\"heatRadius\":25,\"heatBlur\":15,\"heatNormalizeData\":true,\"mapZoom\":2,\"mapCenter\":[15,5],\"wms\":{\"enabled\":false,\"url\":\"https://basemap.nationalmap.gov/arcgis/services/USGSTopo/MapServer/WMSServer\",\"options\":{\"version\":\"1.3.0\",\"layers\":\"0\",\"format\":\"image/png\",\"transparent\":true,\"attribution\":\"Maps provided by USGS\",\"styles\":\"\"}}},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"geohash_grid\",\"schema\":\"segment\",\"params\":{\"field\":\"source.location\",\"autoPrecision\":true,\"customLabel\":\"Source Address\"}}],\"listeners\":{}}",
++  "uiStateJSON": "{\"mapCenter\":[14.944784875088372,4.921875]}",
++  "description": "",
++  "savedSearchId": "Firewall-Events",
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Last-Update.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Last-Update.json
+new file mode 100644
+index 00000000000..e0f9e01cdb8
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Last-Update.json
+@@ -0,0 +1,11 @@
++{
++  "title": "FW - Last Update",
++  "visState": "{\"title\":\"FW - Last Update\",\"type\":\"metric\",\"params\":{\"handleNoResults\":true,\"fontSize\":\"20\"},\"aggs\":[{\"id\":\"2\",\"enabled\":true,\"type\":\"min\",\"schema\":\"metric\",\"params\":{\"field\":\"@timestamp\",\"customLabel\":\"Start Time\"}},{\"id\":\"1\",\"enabled\":true,\"type\":\"max\",\"schema\":\"metric\",\"params\":{\"field\":\"@timestamp\",\"customLabel\":\"Latest Log Time\"}}],\"listeners\":{}}",
++  "uiStateJSON": "{}",
++  "description": "",
++  "savedSearchId": "Firewall-Events",
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Metrics.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Metrics.json
+new file mode 100644
+index 00000000000..23b8a67c8c7
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Metrics.json
+@@ -0,0 +1,11 @@
++{
++  "title": "FW - Metrics",
++  "visState": "{\"title\":\"FW - Metrics\",\"type\":\"metric\",\"params\":{\"handleNoResults\":true,\"fontSize\":60},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"sourceAddress\",\"customLabel\":\"Source IPs\"}},{\"id\":\"3\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"destinationAddress\",\"customLabel\":\"Destination IPs\"}},{\"id\":\"4\",\"enabled\":true,\"type\":\"cardinality\",\"schema\":\"metric\",\"params\":{\"field\":\"destinationPort\",\"customLabel\":\"Destination Ports / Services\"}}],\"listeners\":{}}",
++  "uiStateJSON": "{}",
++  "description": "",
++  "savedSearchId": "Firewall-Events",
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Source,-Destination-Address-and-Port-Sunburst.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Source,-Destination-Address-and-Port-Sunburst.json
+new file mode 100644
+index 00000000000..9824f5f3d4e
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Source,-Destination-Address-and-Port-Sunburst.json
+@@ -0,0 +1,11 @@
++{
++  "title": "FW - Source, Destination Address and Port - Sunburst",
++  "visState": "{\"title\":\"FW - Source, Destination Address and Port - Sunburst\",\"type\":\"pie\",\"params\":{\"shareYAxis\":true,\"addTooltip\":true,\"addLegend\":true,\"legendPosition\":\"right\",\"isDonut\":true},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"segment\",\"params\":{\"field\":\"sourceAddress\",\"size\":5,\"order\":\"desc\",\"orderBy\":\"1\"}},{\"id\":\"3\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"segment\",\"params\":{\"field\":\"destinationAddress\",\"size\":5,\"order\":\"desc\",\"orderBy\":\"1\"}},{\"id\":\"4\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"segment\",\"params\":{\"field\":\"destinationPort\",\"size\":5,\"order\":\"desc\",\"orderBy\":\"1\"}}],\"listeners\":{}}",
++  "uiStateJSON": "{}",
++  "description": "",
++  "savedSearchId": "Firewall-Events",
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Source-Country-Data-Table.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Source-Country-Data-Table.json
+new file mode 100644
+index 00000000000..c16f56e8e0b
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Source-Country-Data-Table.json
+@@ -0,0 +1,11 @@
++{
++  "title": "FW - Source Country Data Table",
++  "visState": "{\"title\":\"FW - Source Country Data Table\",\"type\":\"table\",\"params\":{\"perPage\":10,\"showMeticsAtAllLevels\":false,\"showPartialRows\":false,\"showTotal\":false,\"sort\":{\"columnIndex\":null,\"direction\":null},\"totalFunc\":\"sum\"},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"count\",\"schema\":\"metric\",\"params\":{}},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"bucket\",\"params\":{\"field\":\"source.country_name\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\",\"customLabel\":\"Source Countries\"}}],\"listeners\":{}}",
++  "uiStateJSON": "{\"vis\":{\"params\":{\"sort\":{\"columnIndex\":null,\"direction\":null}}}}",
++  "description": "",
++  "savedSearchId": "Firewall-Events",
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{\"filter\":[]}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Traffic-by-Outcome.json b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Traffic-by-Outcome.json
+new file mode 100644
+index 00000000000..401e9a4383b
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/kibana/visualization/FW-Traffic-by-Outcome.json
+@@ -0,0 +1,10 @@
++{
++  "title": "FW - Traffic by Outcome",
++  "visState": "{\"type\":\"timelion\",\"title\":\"FW - Traffic by Outcome\",\"params\":{\"expression\":\"$i='cef-*', $t='@timestamp', (.es(index=$i,timefield=$t,q='categoryDeviceType:\\\"Firewall\\\" AND categoryOutcome:\\\"/Success\\\"').lines(width=2,fill=2).fit(carry).label(\\\"Accepted Traffic Count\\\"), .es(index=$i,timefield=$t,q='categoryDeviceType:\\\"Firewall\\\" AND categoryOutcome:\\\"/Failure\\\"').lines(width=2,fill=2).fit(carry).label(\\\"Dropped Traffic Count\\\"), .es(index=$i,timefield=$t,q='categoryDeviceType:\\\"Firewall\\\" AND categoryOutcome:\\\"/Success\\\"').mvavg(10).color(green).fit(carry).label(\\\"Mvg Avg - Accepted\\\"), .es(index=$i,timefield=$t,q='categoryDeviceType:\\\"Firewall\\\" AND categoryOutcome:\\\"/Failure\\\"').mvavg(10).color(red).fit(carry).label(\\\"Mvg Avg - Dropped\\\")).title(\\\"Firewall Traffic by Outcome\\\").legend(columns=4)\",\"interval\":\"auto\"}}",
++  "uiStateJSON": "{}",
++  "description": "",
++  "version": 1,
++  "kibanaSavedObjectMeta": {
++    "searchSourceJSON": "{}"
++  }
++}
+diff --git a/logstash-core/spec/modules_test_files/cef/logstash/cef.conf.erb b/logstash-core/spec/modules_test_files/cef/logstash/cef.conf.erb
+new file mode 100755
+index 00000000000..874344837de
+--- /dev/null
++++ b/logstash-core/spec/modules_test_files/cef/logstash/cef.conf.erb
+@@ -0,0 +1,36 @@
++input {
++  tcp {
++    # The delimiter config used is for TCP interpretation
++    codec => cef { delimiter => "\r\n"}
++    port => <%= setting("var.input.tcp.port", 5000) %>
++    type => syslog
++  }
++}
++
++filter {
++  # To map the attacker Geo IP if plausible
++
++  geoip {
++    source => "sourceAddress"
++    target => "source"
++  }
++
++  # To map the target Geo IP if plausible
++
++  geoip {
++    source => "destinationAddress"
++    target => "destination"
++  }
++
++  # To map the log producing device Geo IP if plausible
++
++  geoip {
++    source => "deviceAddress"
++    target => "device"
++  }
++
++}
++
++output {
++  <%= elasticsearch_output_config() %>
++}
